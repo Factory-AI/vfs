@@ -8,9 +8,11 @@ struct SnapshotCase {
     seed: usize,
     crossing_path: String,
     hardlink_path: String,
+    inline_path: String,
     sparse_path: String,
     symlink_path: String,
     crossing_data: Vec<u8>,
+    inline_data: Vec<u8>,
     sparse_offset: u64,
     sparse_tail: Vec<u8>,
 }
@@ -65,6 +67,7 @@ async fn create_snapshot_case(
     let nested_dir = format!("{dir}/nested");
     let crossing_path = format!("{nested_dir}/crossing.bin");
     let hardlink_path = format!("{dir}/hardlink.bin");
+    let inline_path = format!("{dir}/inline.txt");
     let sparse_path = format!("{dir}/sparse.bin");
     let symlink_path = format!("{dir}/link-to-crossing");
 
@@ -89,6 +92,13 @@ async fn create_snapshot_case(
     crossing_file.pwrite(patch_offset as u64, &patch).await?;
 
     agent.fs.link(&crossing_path, &hardlink_path).await?;
+
+    let inline_data = patterned_bytes(512 + seed, 0x30 + seed as u8);
+    let (_, inline_file) = agent
+        .fs
+        .create_file(&inline_path, DEFAULT_FILE_MODE, seed as u32, seed as u32)
+        .await?;
+    inline_file.pwrite(0, &inline_data).await?;
 
     let sparse_offset = (chunk_size * (seed + 1) + 31) as u64;
     let sparse_tail = patterned_bytes(19 + seed, 0x70 + seed as u8);
@@ -128,9 +138,11 @@ async fn create_snapshot_case(
         seed,
         crossing_path,
         hardlink_path,
+        inline_path,
         sparse_path,
         symlink_path,
         crossing_data,
+        inline_data,
         sparse_offset,
         sparse_tail,
     })
@@ -188,6 +200,7 @@ async fn assert_generated_state(
             entries,
             vec![
                 "hardlink.bin".to_string(),
+                "inline.txt".to_string(),
                 "link-to-crossing".to_string(),
                 "nested".to_string(),
                 "sparse.bin".to_string(),
@@ -208,6 +221,13 @@ async fn assert_generated_state(
             agent.fs.read_file(&case.hardlink_path).await?.unwrap(),
             case.crossing_data
         );
+
+        let inline = agent.fs.read_file(&case.inline_path).await?.unwrap();
+        assert_eq!(inline, case.inline_data);
+        let inline_stats = agent.fs.stat(&case.inline_path).await?.unwrap();
+        assert!(inline_stats.is_file());
+        assert_eq!(inline_stats.size, case.inline_data.len() as i64);
+        assert_inline_inode_has_no_chunks(agent, inline_stats.ino, &case.inline_data).await?;
 
         let sparse_stats = agent.fs.stat(&case.sparse_path).await?.unwrap();
         let sparse_size = case.sparse_offset + case.sparse_tail.len() as u64;
@@ -310,6 +330,30 @@ async fn assert_journal_mode_is_wal(agent: &AgentFS) -> Result<()> {
     let mut rows = conn.query("PRAGMA journal_mode", ()).await?;
     let row = rows.next().await?.unwrap();
     assert_eq!(row.get::<String>(0)?.to_lowercase(), "wal");
+    Ok(())
+}
+
+async fn assert_inline_inode_has_no_chunks(
+    agent: &AgentFS,
+    ino: i64,
+    expected: &[u8],
+) -> Result<()> {
+    let conn = agent.get_connection().await?;
+    let mut rows = conn
+        .query(
+            "SELECT storage_kind, data_inline FROM fs_inode WHERE ino = ?",
+            (ino,),
+        )
+        .await?;
+    let row = rows.next().await?.unwrap();
+    assert_eq!(row.get::<i64>(0)?, 1);
+    assert_eq!(row.get::<Vec<u8>>(1)?, expected);
+
+    let mut rows = conn
+        .query("SELECT COUNT(*) FROM fs_data WHERE ino = ?", (ino,))
+        .await?;
+    let row = rows.next().await?.unwrap();
+    assert_eq!(row.get::<i64>(0)?, 0);
     Ok(())
 }
 

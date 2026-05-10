@@ -4,7 +4,7 @@ use crate::error::{Error, Result};
 use turso::Connection;
 
 /// Current schema version.
-pub const AGENTFS_SCHEMA_VERSION: &str = "0.4";
+pub const AGENTFS_SCHEMA_VERSION: &str = "0.5";
 
 /// Detected schema version based on column introspection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,6 +15,8 @@ pub enum SchemaVersion {
     V0_2,
     /// Added atime_nsec, mtime_nsec, ctime_nsec, rdev columns to fs_inode
     V0_4,
+    /// Added inline small-file storage columns to fs_inode
+    V0_5,
 }
 
 impl std::fmt::Display for SchemaVersion {
@@ -23,6 +25,7 @@ impl std::fmt::Display for SchemaVersion {
             SchemaVersion::V0_0 => write!(f, "0.0"),
             SchemaVersion::V0_2 => write!(f, "0.2"),
             SchemaVersion::V0_4 => write!(f, "0.4"),
+            SchemaVersion::V0_5 => write!(f, "0.5"),
         }
     }
 }
@@ -34,12 +37,13 @@ impl SchemaVersion {
             SchemaVersion::V0_0 => "0.0",
             SchemaVersion::V0_2 => "0.2",
             SchemaVersion::V0_4 => "0.4",
+            SchemaVersion::V0_5 => "0.5",
         }
     }
 
     /// Returns true if this version is the current version.
     pub fn is_current(&self) -> bool {
-        matches!(self, SchemaVersion::V0_4)
+        matches!(self, SchemaVersion::V0_5)
     }
 }
 
@@ -73,6 +77,17 @@ pub async fn detect_schema_version(conn: &Connection) -> Result<Option<SchemaVer
     let has_mtime_nsec = columns.iter().any(|c| c.name == "mtime_nsec");
     let has_ctime_nsec = columns.iter().any(|c| c.name == "ctime_nsec");
     let has_rdev = columns.iter().any(|c| c.name == "rdev");
+    let has_data_inline = columns.iter().any(|c| c.name == "data_inline");
+    let has_storage_kind = columns.iter().any(|c| c.name == "storage_kind");
+
+    // v0.5: explicit inline storage columns plus v0.5 fs_config markers
+    if has_data_inline
+        && has_storage_kind
+        && config_value(conn, "schema_version").await?.as_deref() == Some("0.5")
+        && config_value(conn, "inline_threshold").await?.is_some()
+    {
+        return Ok(Some(SchemaVersion::V0_5));
+    }
 
     // v0.4: has all nsec columns and rdev
     if has_atime_nsec && has_mtime_nsec && has_ctime_nsec && has_rdev {
@@ -116,4 +131,28 @@ async fn get_table_columns(conn: &Connection, table_name: &str) -> Result<Vec<Co
     }
 
     Ok(columns)
+}
+
+/// Read a text value from fs_config if the table/key exists.
+async fn config_value(conn: &Connection, key: &str) -> Result<Option<String>> {
+    let mut rows = conn
+        .query(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='fs_config'",
+            (),
+        )
+        .await?;
+
+    if rows.next().await?.is_none() {
+        return Ok(None);
+    }
+
+    let mut rows = conn
+        .query("SELECT value FROM fs_config WHERE key = ?", (key,))
+        .await?;
+
+    if let Some(row) = rows.next().await? {
+        Ok(Some(row.get(0)?))
+    } else {
+        Ok(None)
+    }
 }

@@ -169,6 +169,8 @@ async fn assert_final_state(agent: &AgentFS) -> Result<()> {
 
             let read_back = agent.fs.read_file(&file_path).await?.unwrap();
             assert_eq!(read_back, expected);
+            let stats = agent.fs.stat(&file_path).await?.unwrap();
+            assert_inline_inode_has_no_chunks(agent, stats.ino, &expected).await?;
 
             let key = format!("worker:{worker}:iter:{iteration}");
             let value: Option<Value> = agent.kv.get(&key).await?;
@@ -213,6 +215,30 @@ async fn assert_integrity_check_ok(agent: &AgentFS) -> Result<()> {
         results.push(row.get::<String>(0)?);
     }
     assert_eq!(results, vec!["ok".to_string()]);
+    Ok(())
+}
+
+async fn assert_inline_inode_has_no_chunks(
+    agent: &AgentFS,
+    ino: i64,
+    expected: &[u8],
+) -> Result<()> {
+    let conn = agent.get_connection().await?;
+    let mut rows = conn
+        .query(
+            "SELECT storage_kind, data_inline FROM fs_inode WHERE ino = ?",
+            (ino,),
+        )
+        .await?;
+    let row = rows.next().await?.unwrap();
+    assert_eq!(row.get::<i64>(0)?, 1);
+    assert_eq!(row.get::<Vec<u8>>(1)?, expected);
+
+    let mut rows = conn
+        .query("SELECT COUNT(*) FROM fs_data WHERE ino = ?", (ino,))
+        .await?;
+    let row = rows.next().await?.unwrap();
+    assert_eq!(row.get::<i64>(0)?, 0);
     Ok(())
 }
 
