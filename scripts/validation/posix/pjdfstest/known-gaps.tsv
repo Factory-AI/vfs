@@ -13,12 +13,32 @@ ftruncate/06.t	Depends on chown and alternate uid/gid permission checks.
 ftruncate/12.t	Core large-length ftruncate behavior needs Phase 5 triage.
 ftruncate/13.t	Core negative-length ftruncate path currently cascades from create/EIO and needs Phase 5 triage.
 link/00.t	Mixes hard-link behavior with device-node and alternate-user permission cases; split before gating.
+link/01.t	Depends on block/char mknod cases and cascades into ENOENT when device nodes are rejected.
+link/06.t	Depends on chown and alternate uid/gid permission checks.
+link/07.t	Depends on chown and alternate uid/gid permission checks.
+link/10.t	Mixes EEXIST coverage with block/char mknod cases that cascade after device-node creation is rejected.
+link/11.t	Depends on chown and alternate uid/gid directory ownership checks.
 mkdir/00.t	Includes alternate-user permission cases that cannot run unprivileged.
 mkdir/01.t	Includes alternate-user permission cases that cannot run unprivileged.
+mkdir/05.t	Depends on chown and alternate uid/gid search/write permission checks.
+mkdir/06.t	Depends on chown and alternate uid/gid search/write permission checks.
+mkdir/10.t	Mixes EEXIST coverage with block/char mknod cases that cascade after device-node creation is rejected.
+mkfifo/00.t	Core FIFO creation mostly works, but this file includes chown and alternate uid/gid ownership cases.
+mkfifo/01.t	Depends on block/char mknod cases and cascades into ENOENT when device nodes are rejected.
+mkfifo/05.t	Depends on chown and alternate uid/gid search permission checks.
+mkfifo/06.t	Depends on chown and alternate uid/gid search permission checks.
+mkfifo/09.t	Mixes EEXIST coverage with block/char mknod cases that cascade after device-node creation is rejected.
 open/00.t	Includes alternate-user permission cases that cannot run unprivileged.
 open/01.t	Includes alternate-user permission cases that cannot run unprivileged.
+open/05.t	Depends on chown and alternate uid/gid search permission checks.
+open/06.t	Depends on chown and alternate uid/gid read/write permission matrix coverage.
+open/07.t	Depends on chown and alternate uid/gid O_TRUNC permission checks.
 open/08.t	Needs Phase 5 triage before gating.
+open/22.t	Mixes O_EXCL/EEXIST coverage with block/char mknod cases that cascade after device-node creation is rejected.
 rename/00.t	Mixes core rename coverage with device-node and alternate-user permission cases; split before gating.
+rename/04.t	Depends on chown and alternate uid/gid search permission checks.
+rename/05.t	Depends on chown and alternate uid/gid directory write permission checks.
+rename/09.t	Depends on chown, alternate uid/gid execution, and block/char device cases in the sticky-directory matrix.
 rename/10.t	Full matrix has broad failures and needs Phase 5 triage after unsupported uid/device cases are separated.
 rename/11.t	Core rename gap in full run; needs Phase 5 triage.
 rename/12.t	Core rename gap in full run; needs Phase 5 triage.

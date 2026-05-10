@@ -5,6 +5,7 @@
 AgentFS keeps two pjdfstest modes:
 
 - `phase45-ci`: a conservative, unprivileged supported subset that should pass on the current FUSE implementation.
+- `phase5-ci`: the expanded Phase 5 unprivileged supported subset. It includes `phase45-ci` plus additional currently-passing path, FIFO, symlink-loop, sparse large-file, socket-open, and rename/rmdir error-path coverage.
 - `full`: the upstream pjdfstest suite, used for exploratory POSIX triage and Phase 5 planning.
 
 The supported subset intentionally excludes tests that require root-only capabilities (`mknod` for block/char devices, successful `chown`/`lchown`, and alternate uid/gid execution). Those exclusions are tracked in `scripts/validation/posix/pjdfstest/known-gaps.tsv` so Phase 5 can separate unsupported-by-contract gaps from real filesystem bugs.
@@ -58,6 +59,29 @@ The harness writes a report directory containing:
 - `known-unsupported.tsv` - current known POSIX gaps and triage rationale
 
 Missing prerequisites exit with `77`. A nonzero exit other than `77` means the selected supported profile failed and should be treated as a real regression.
+
+List supported profiles:
+
+```bash
+scripts/validation/posix/run-pjdfstest.sh --list-profiles
+```
+
+Run the expanded Phase 5 supported profile:
+
+```bash
+scripts/validation/posix/run-pjdfstest.sh \
+  --agentfs-bin "$PWD/cli/target/debug/agentfs" \
+  --pjdfstest-dir /path/to/pjdfstest \
+  --profile phase5-ci
+```
+
+Summarize a pjdfstest report and map failures to the known-gap taxonomy:
+
+```bash
+scripts/validation/posix/summarize-pjdfstest-log.py \
+  /path/to/pjdfstest.log \
+  --known-gaps scripts/validation/posix/pjdfstest/known-gaps.tsv
+```
 
 ### Run the full exploratory suite
 

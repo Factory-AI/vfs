@@ -162,6 +162,7 @@ list_profiles() {
     cat <<EOF
 full
 phase45-ci
+phase5-ci
 EOF
 }
 
