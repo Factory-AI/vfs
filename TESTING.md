@@ -1,5 +1,118 @@
 # Testing AgentFS
 
+## Phase 5 profiling and backend-risk helpers
+
+### Large base-file single-byte edit benchmark
+
+Use `scripts/validation/large-edit-benchmark.py` to measure the Phase 5
+copy-up risk called out in the north-star spec: a one-byte edit to a large
+base-layer file should grow the AgentFS delta database by O(changed chunks),
+not O(file size).
+
+```bash
+# Spec-sized run
+scripts/validation/large-edit-benchmark.py --file-size-mib 200 --profile
+
+# Fast smoke
+scripts/validation/large-edit-benchmark.py --file-size-mib 1 --timeout 60
+```
+
+The helper creates identical native and AgentFS-overlay source trees, warms an
+AgentFS session with a metadata-only read pass, performs the same one-byte edit
+natively and through `agentfs run`, then emits JSON. The AgentFS DB growth is
+measured as the total size of `delta.db` plus any `-wal`/`-shm` files after the
+edit minus the same total immediately before the edit. If Python's stdlib
+`sqlite3` can open the database, the output also includes `fs_data` row count,
+stored chunk bytes, inline inode rows, origin rows, and `fs_config`.
+
+Machine-readable schema (`schema_version: 1`):
+
+```json
+{
+  "schema_version": 1,
+  "benchmark": "phase5-large-base-single-byte-edit",
+  "git_commit": "<repo commit>",
+  "parameters": {
+    "file_size_bytes": 209715200,
+    "file_size_mib": 200,
+    "offset": 104857600,
+    "edit_width_bytes": 1
+  },
+  "agentfs": {
+    "bin": "/path/to/agentfs",
+    "session": "large-edit-...",
+    "db_path": "/tmp/.../home/.agentfs/run/.../delta.db",
+    "profile_enabled": true,
+    "profile_summary_count": 2
+  },
+  "database": {
+    "before_edit": {"total_bytes": 32768, "artifacts": []},
+    "after_edit": {"total_bytes": 210000000, "artifacts": []},
+    "growth_bytes": 209967232,
+    "inspect_before": {"inspectable": true},
+    "inspect_after": {
+      "inspectable": true,
+      "fs_data_rows": 3200,
+      "fs_data_bytes": 209715200,
+      "fs_origin_rows": 1,
+      "fs_config": {"schema_version": "0.5", "chunk_size": "65536"}
+    }
+  },
+  "native": {"duration_seconds": 0.1, "run": {}, "result": {}},
+  "agentfs_overlay": {
+    "duration_seconds": 1.2,
+    "warmup": {},
+    "run": {"profile_summaries": []},
+    "result": {}
+  },
+  "base_file": {
+    "original_sha256": "...",
+    "native_sha256_after": "...",
+    "agentfs_base_sha256_after": "..."
+  },
+  "correctness": {
+    "warmup_returncode_zero": true,
+    "native_returncode_zero": true,
+    "agentfs_returncode_zero": true,
+    "outputs_match": true,
+    "agentfs_base_unchanged": true,
+    "native_file_changed": true,
+    "passed": true
+  }
+}
+```
+
+When `--profile` or `AGENTFS_PROFILE=1` is set, parsed
+`agentfs_profile_summary` lines from AgentFS stderr are attached to the
+`agentfs_overlay.warmup.profile_summaries` and
+`agentfs_overlay.run.profile_summaries` arrays.
+
+### Workload baseline profile summaries
+
+`scripts/validation/workload-baseline.py` also attaches parsed
+`agentfs_profile_summary` JSON lines to each AgentFS run as
+`iterations[].agentfs.profile_summaries` and reports
+`agentfs.profile_summary_count` at the top level. This keeps profiling counters
+associated with the native-vs-AgentFS timing and correctness result that
+produced them.
+
+### Backend-risk spike record
+
+Use `scripts/validation/backend-risk-spike.py` to create a machine-readable
+Turso-upgrade/rusqlite-fallback decision input template without changing
+dependencies:
+
+```bash
+scripts/validation/backend-risk-spike.py \
+  --candidate-turso-version 0.5.x \
+  --output backend-risk.json
+```
+
+The output records current Cargo dependency state, the candidate Turso version,
+the fallback crate under consideration, the minimum storage API surface that a
+fallback must cover, validation commands to run in an isolated spike, and empty
+decision fields for the measured result.
+
 ## pjdfstest
 
 AgentFS keeps two pjdfstest modes:

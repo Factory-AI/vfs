@@ -360,6 +360,28 @@ def tail_text(value: Any) -> str:
     return text[-OUTPUT_TAIL_CHARS:]
 
 
+def extract_profile_summaries(stderr: Any) -> list[dict[str, Any]]:
+    if stderr is None:
+        return []
+    if isinstance(stderr, bytes):
+        text = stderr.decode("utf-8", errors="replace")
+    else:
+        text = str(stderr)
+
+    summaries: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or "agentfs_profile_summary" not in line:
+            continue
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and value.get("event") == "agentfs_profile_summary":
+            summaries.append(value)
+    return summaries
+
+
 def run_subprocess(
     argv: list[str],
     cwd: Path,
@@ -389,6 +411,7 @@ def run_subprocess(
             "stderr_tail": tail_text(stderr),
             "stdout_bytes": len(stdout.encode("utf-8", errors="replace")),
             "stderr_bytes": len(stderr.encode("utf-8", errors="replace")),
+            "profile_summaries": extract_profile_summaries(stderr),
         }
     except subprocess.TimeoutExpired:
         terminate_process_tree(proc)
@@ -411,6 +434,7 @@ def run_subprocess(
             "stderr_tail": tail_text(stderr),
             "stdout_bytes": len(tail_text(stdout).encode("utf-8", errors="replace")),
             "stderr_bytes": len(tail_text(stderr).encode("utf-8", errors="replace")),
+            "profile_summaries": extract_profile_summaries(stderr),
         }
 
 
@@ -570,6 +594,9 @@ def main(argv: list[str]) -> int:
                 "bin": agentfs_bin,
                 "overlay_command_prefix": [agentfs_bin, "run", "--no-default-allows", "--"],
                 "profile_enabled": env_flag("AGENTFS_PROFILE"),
+                "profile_summary_count": sum(
+                    len(item["agentfs"].get("profile_summaries", [])) for item in iterations
+                ),
             },
             "source": {
                 "path": str(Path(args.source or ".").expanduser().resolve()) if args.mode == "command" else None,
