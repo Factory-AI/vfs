@@ -4060,9 +4060,8 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    // Turso 0.4.4 currently exposes only OFF=0 and FULL=2 internally; applying
-    // `PRAGMA synchronous = NORMAL` is accepted but observes as 0.
-    const TURSO_OBSERVED_SYNCHRONOUS_NORMAL: i64 = 0;
+    // Turso 0.5.x reports SQLite's standard numeric value for NORMAL.
+    const TURSO_OBSERVED_SYNCHRONOUS_NORMAL: i64 = 1;
 
     async fn create_test_fs() -> Result<(AgentFS, tempfile::TempDir)> {
         let dir = tempdir()?;

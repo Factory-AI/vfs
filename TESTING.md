@@ -286,8 +286,7 @@ produced them.
 ### Backend-risk spike record
 
 Use `scripts/validation/backend-risk-spike.py` to create a machine-readable
-Turso-upgrade/rusqlite-fallback decision input template without changing
-dependencies:
+Turso-upgrade/rusqlite-fallback decision record without changing dependencies:
 
 ```bash
 scripts/validation/backend-risk-spike.py \
@@ -297,8 +296,88 @@ scripts/validation/backend-risk-spike.py \
 
 The output records current Cargo dependency state, the candidate Turso version,
 the fallback crate under consideration, the minimum storage API surface that a
-fallback must cover, validation commands to run in an isolated spike, and empty
-decision fields for the measured result.
+fallback must cover, validation commands to run in an isolated spike, and
+decision fields for measured results.
+
+#### Phase 5.5 Turso backend spike workflow
+
+Run dependency-upgrade experiments in an isolated worktree/branch, not the main
+worktree:
+
+```bash
+git worktree add ../agentfs-backend-spike -b phase55-backend-spike
+cd ../agentfs-backend-spike
+```
+
+Attempt the candidate Turso upgrade by changing the Rust manifests to the
+candidate version/range, then resolve and build with Cargo:
+
+```bash
+cargo check --manifest-path sdk/rust/Cargo.toml
+cargo check --manifest-path cli/Cargo.toml
+```
+
+If the default CLI build is blocked by optional sandbox/nightly-only
+dependencies, also run the no-sandbox build to separate backend API breakage
+from unrelated optional-feature blockers:
+
+```bash
+cargo check --manifest-path cli/Cargo.toml --no-default-features
+```
+
+When the candidate builds, run the meaningful gates that are available in the
+spike environment:
+
+```bash
+cargo test --manifest-path sdk/rust/Cargo.toml
+cargo test --manifest-path cli/Cargo.toml --no-default-features
+cli/tests/all.sh
+scripts/validation/phase0.sh
+scripts/validation/posix/run-pjdfstest.sh \
+  --agentfs-bin "$PWD/cli/target/debug/agentfs" \
+  --pjdfstest-dir /path/to/pjdfstest \
+  --profile phase45-ci
+```
+
+Record the actual candidate results in JSON. Repeat `--validation-*` options for
+each command that was run, and use blockers for exact compiler/API/runtime
+failures:
+
+```bash
+scripts/validation/backend-risk-spike.py \
+  --candidate-turso-version 0.5.x \
+  --resolved-turso-version 0.5.3 \
+  --upgrade-built true \
+  --validation-result sdk_tests=passed \
+  --validation-command 'sdk_tests=cargo test --manifest-path sdk/rust/Cargo.toml' \
+  --validation-exit-code sdk_tests=0 \
+  --validation-summary 'sdk_tests=130 passed' \
+  --validation-result cli_tests=passed \
+  --validation-command 'cli_tests=cargo test --manifest-path cli/Cargo.toml --no-default-features' \
+  --validation-exit-code cli_tests=0 \
+  --validation-summary 'cli_tests=89 passed, 1 ignored' \
+  --decision-status upgraded \
+  --selected-path turso-upgrade-now \
+  --rationale 'Turso 0.5.x built with minimal test expectation updates.' \
+  --output /tmp/backend-risk.json
+```
+
+If the upgrade is blocked, set `--upgrade-built blocked`, add every exact
+compiler/API blocker with `--turso-blocker`, and fill the rusqlite fallback
+fields:
+
+```bash
+scripts/validation/backend-risk-spike.py \
+  --candidate-turso-version 0.5.x \
+  --upgrade-built blocked \
+  --turso-blocker 'cargo check: exact compiler/API error here' \
+  --fallback-trait-practicality 'requires async boundary around open/connect/execute/query/transactions' \
+  --fallback-invasiveness 'high: current SDK and CLI directly expose turso Connection, Row, Value, sync Database, and checkpoint/encryption APIs' \
+  --fallback-risk-reduction 'useful only if Turso remains blocked after a minimal compatibility patch' \
+  --decision-status fallback-required \
+  --selected-path rusqlite-fallback-spike \
+  --output /tmp/backend-risk.json
+```
 
 ## macOS NFS git validation (#333)
 
