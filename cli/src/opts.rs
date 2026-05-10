@@ -323,6 +323,29 @@ pub enum Command {
         #[command(subcommand)]
         command: PruneCommand,
     },
+    /// Check a local AgentFS database for SQLite and schema corruption
+    Integrity {
+        /// Agent ID or database path
+        #[arg(add = ArgValueCompleter::new(id_or_path_completer))]
+        id_or_path: String,
+
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create a portable local AgentFS database backup
+    Backup {
+        /// Agent ID or database path
+        #[arg(add = ArgValueCompleter::new(id_or_path_completer))]
+        id_or_path: String,
+
+        /// Target database path to create
+        target: PathBuf,
+
+        /// Reopen and verify the copied main database
+        #[arg(long)]
+        verify: bool,
+    },
     /// Migrate database schema to the current version
     Migrate {
         /// Agent ID or database path

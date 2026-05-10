@@ -196,6 +196,63 @@ agentfs sync <ID_OR_PATH> <SUBCOMMAND>
 - `stats` - View sync statistics
 - `checkpoint` - Create checkpoint
 
+### agentfs integrity
+
+Run SQLite and AgentFS schema-invariant checks against a local database.
+
+```
+agentfs integrity [OPTIONS] <ID_OR_PATH>
+```
+
+**Arguments:**
+- `ID_OR_PATH` - Agent identifier or database path
+
+**Options:**
+- `--json` - Emit a machine-readable report
+
+**Examples:**
+
+```bash
+# Check by agent ID
+agentfs integrity my-agent --json
+
+# Check by database path
+agentfs integrity .agentfs/my-agent.db --json
+```
+
+The command runs `PRAGMA integrity_check`, validates required AgentFS tables and
+v0.5 config, checks inline/chunk storage invariants, verifies namespace
+references, and checks overlay metadata tables when present. It exits nonzero if
+any check fails.
+
+### agentfs backup
+
+Create a portable main-database snapshot for a local AgentFS database.
+
+```
+agentfs backup <ID_OR_PATH> <TARGET_DB> [OPTIONS]
+```
+
+**Arguments:**
+- `ID_OR_PATH` - Agent identifier or database path
+- `TARGET_DB` - New database path to create
+
+**Options:**
+- `--verify` - Reopen the copied main database and run integrity checks
+
+**Examples:**
+
+```bash
+# Checkpoint, copy, reopen, and verify a portable backup
+agentfs backup my-agent /tmp/my-agent-backup.db --verify
+
+# Backup using database paths
+agentfs backup .agentfs/my-agent.db ./my-agent-backup.db --verify
+```
+
+The command checkpoints and truncates the source WAL before copying only the
+main database file. The target must not already exist.
+
 ### agentfs migrate
 
 Migrate historical database schemas through the legacy v0.4 layout.

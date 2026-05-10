@@ -419,6 +419,35 @@ permitted, or inspect the reported `mount.log`. Until this script passes on a
 real macOS host, #333 should be treated as code-fixed but platform-validation
 pending.
 
+## Production safety checks
+
+### Integrity report
+
+Use `agentfs integrity` to run local SQLite and AgentFS schema checks before
+and after risky operations:
+
+```bash
+cargo run --manifest-path cli/Cargo.toml -- integrity .agentfs/my-agent.db --json
+```
+
+Expected result for a healthy database is JSON with `"ok": true`. A failure
+exits nonzero and includes the failed check names, such as
+`storage.inline_has_no_chunks` or `namespace.dentry_target_exists`.
+
+### Verified backup roundtrip
+
+Use `agentfs backup --verify` to create a portable main-database snapshot. The
+command checkpoints/truncates the source WAL, copies the main database file,
+reopens the copy, and runs the same integrity checks:
+
+```bash
+cargo run --manifest-path cli/Cargo.toml -- \
+  backup .agentfs/my-agent.db /tmp/my-agent-backup.db --verify
+```
+
+The target file must not already exist. A successful run prints `Checkpoint:
+complete`, `Copy: complete`, and `Verification: complete`.
+
 ## pjdfstest
 
 AgentFS keeps three pjdfstest modes:

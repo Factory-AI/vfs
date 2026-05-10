@@ -321,6 +321,33 @@ fn main() {
                 }
             }
         },
+        Command::Integrity { id_or_path, json } => {
+            let rt = get_runtime();
+            if let Err(e) = rt.block_on(cmd::safety::handle_integrity_command(
+                &mut std::io::stdout(),
+                id_or_path,
+                json,
+            )) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Command::Backup {
+            id_or_path,
+            target,
+            verify,
+        } => {
+            let rt = get_runtime();
+            if let Err(e) = rt.block_on(cmd::safety::handle_backup_command(
+                &mut std::io::stdout(),
+                id_or_path,
+                target,
+                verify,
+            )) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
         Command::Migrate {
             id_or_path,
             dry_run,
