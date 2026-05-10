@@ -4,13 +4,16 @@
 //! FileSystem trait, enabling systems to mount AgentFS via NFS without requiring
 //! FUSE or other system extensions.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use libc::{O_RDONLY, O_RDWR};
 
 use crate::nfsserve::nfs::{
-    fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfstime3, sattr3, set_atime, set_gid3,
-    set_mode3, set_mtime, set_size3, set_uid3, specdata3,
+    fattr3, fileid3, filename3, ftype3, nfs_fh3, nfspath3, nfsstat3, nfstime3, sattr3, set_atime,
+    set_gid3, set_mode3, set_mtime, set_size3, set_uid3, specdata3,
 };
 use crate::nfsserve::vfs::{auth_unix, DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 use agentfs_sdk::error::Error as SdkError;
@@ -20,10 +23,13 @@ use agentfs_sdk::{
     S_IFSOCK,
 };
 use async_trait::async_trait;
-use tokio::sync::Mutex;
+use tokio::sync::Mutex as TokioMutex;
 
 /// Root directory inode number
 const ROOT_INO: fileid3 = 1;
+const WRITE_HANDLE_MAGIC: &[u8; 8] = b"AFSWRIT\0";
+const PLAIN_HANDLE_LEN: usize = 16;
+const WRITE_HANDLE_LEN: usize = 32;
 
 /// Convert a fileid3 to a filesystem inode number.
 fn id_to_fs_ino(id: fileid3) -> i64 {
@@ -54,13 +60,70 @@ fn error_to_nfsstat(e: SdkError) -> nfsstat3 {
 /// NFS adapter that wraps an AgentFS FileSystem.
 pub struct AgentNFS {
     /// The underlying filesystem (wrapped in Mutex to serialize operations)
-    fs: Arc<Mutex<dyn FileSystem>>,
+    fs: Arc<TokioMutex<dyn FileSystem>>,
+    /// Server-local generation number embedded in opaque file handles.
+    fh_generation: u64,
+    /// CREATE-returned file-handle tokens that retain open-time write authority.
+    write_handle_tokens: StdMutex<HashMap<u64, fileid3>>,
+    /// Monotonic source for write-authorized file-handle tokens.
+    next_write_handle_token: AtomicU64,
 }
 
 impl AgentNFS {
     /// Create a new NFS adapter wrapping the given filesystem.
-    pub fn new(fs: Arc<Mutex<dyn FileSystem>>) -> Self {
-        AgentNFS { fs }
+    pub fn new(fs: Arc<TokioMutex<dyn FileSystem>>) -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let seed = (now.as_secs() << 32) ^ u64::from(now.subsec_nanos());
+        AgentNFS {
+            fs,
+            fh_generation: seed,
+            write_handle_tokens: StdMutex::new(HashMap::new()),
+            next_write_handle_token: AtomicU64::new(seed.wrapping_add(1)),
+        }
+    }
+
+    fn encode_plain_fh(&self, id: fileid3) -> nfs_fh3 {
+        let mut ret = Vec::with_capacity(PLAIN_HANDLE_LEN);
+        ret.extend_from_slice(&self.fh_generation.to_le_bytes());
+        ret.extend_from_slice(&id.to_le_bytes());
+        nfs_fh3 { data: ret }
+    }
+
+    fn parse_fh(&self, fh: &nfs_fh3) -> Result<(fileid3, Option<u64>), nfsstat3> {
+        if fh.data.len() != PLAIN_HANDLE_LEN && fh.data.len() != WRITE_HANDLE_LEN {
+            return Err(nfsstat3::NFS3ERR_BADHANDLE);
+        }
+
+        let generation = u64::from_le_bytes(
+            fh.data[0..8]
+                .try_into()
+                .map_err(|_| nfsstat3::NFS3ERR_BADHANDLE)?,
+        );
+        if generation != self.fh_generation {
+            return Err(nfsstat3::NFS3ERR_STALE);
+        }
+
+        let id = u64::from_le_bytes(
+            fh.data[8..16]
+                .try_into()
+                .map_err(|_| nfsstat3::NFS3ERR_BADHANDLE)?,
+        );
+
+        if fh.data.len() == PLAIN_HANDLE_LEN {
+            return Ok((id, None));
+        }
+
+        if &fh.data[16..24] != WRITE_HANDLE_MAGIC {
+            return Err(nfsstat3::NFS3ERR_BADHANDLE);
+        }
+        let token = u64::from_le_bytes(
+            fh.data[24..32]
+                .try_into()
+                .map_err(|_| nfsstat3::NFS3ERR_BADHANDLE)?,
+        );
+        Ok((id, Some(token)))
     }
 
     /// Convert AgentFS Stats to NFS fattr3.
@@ -117,6 +180,41 @@ impl NFSFileSystem for AgentNFS {
 
     fn capabilities(&self) -> VFSCapabilities {
         VFSCapabilities::ReadWrite
+    }
+
+    fn id_to_fh(&self, id: fileid3) -> nfs_fh3 {
+        self.encode_plain_fh(id)
+    }
+
+    fn id_to_write_fh(&self, id: fileid3) -> nfs_fh3 {
+        let token = self.next_write_handle_token.fetch_add(1, Ordering::Relaxed);
+        self.write_handle_tokens.lock().unwrap().insert(token, id);
+
+        let mut ret = Vec::with_capacity(WRITE_HANDLE_LEN);
+        ret.extend_from_slice(&self.fh_generation.to_le_bytes());
+        ret.extend_from_slice(&id.to_le_bytes());
+        ret.extend_from_slice(WRITE_HANDLE_MAGIC);
+        ret.extend_from_slice(&token.to_le_bytes());
+        nfs_fh3 { data: ret }
+    }
+
+    fn fh_has_write_authority(&self, fh: &nfs_fh3, id: fileid3) -> bool {
+        let Ok((handle_id, Some(token))) = self.parse_fh(fh) else {
+            return false;
+        };
+        if handle_id != id {
+            return false;
+        }
+        self.write_handle_tokens
+            .lock()
+            .unwrap()
+            .get(&token)
+            .copied()
+            == Some(id)
+    }
+
+    fn fh_to_id(&self, fh: &nfs_fh3) -> Result<fileid3, nfsstat3> {
+        self.parse_fh(fh).map(|(id, _)| id)
     }
 
     async fn lookup(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3> {

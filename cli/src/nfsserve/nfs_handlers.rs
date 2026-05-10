@@ -1313,8 +1313,14 @@ pub async fn nfsproc3_write(
         }
     };
 
-    // Check write permission
-    if !permissions::can_write(&context.auth, &attr) {
+    // Check write permission. NFSv3 is stateless and has no OPEN RPC, but the
+    // file handle returned by CREATE represents the client's open write path.
+    // Honor write authority captured in that handle so git loose objects can
+    // be created with a read-only final mode and still receive writes through
+    // the same handle; fresh LOOKUP handles still fall back to mode checks.
+    if !context.vfs.fh_has_write_authority(&args.file, id)
+        && !permissions::can_write(&context.auth, &attr)
+    {
         debug!("write permission denied for uid={}", context.auth.uid);
         let pre_obj_attr = nfs::pre_op_attr::attributes(nfs::wcc_attr {
             size: attr.size,
@@ -1573,7 +1579,7 @@ pub async fn nfsproc3_create(
             make_success_reply(xid).serialize(output)?;
             nfs::nfsstat3::NFS3_OK.serialize(output)?;
             // serialize CREATE3resok
-            let fh = context.vfs.id_to_fh(fid);
+            let fh = context.vfs.id_to_write_fh(fid);
             nfs::post_op_fh3::handle(fh).serialize(output)?;
             postopattr.serialize(output)?;
             wcc_res.serialize(output)?;
@@ -2995,4 +3001,178 @@ pub async fn nfsproc3_mknod(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nfs::AgentNFS;
+    use crate::nfsserve::rpc::{accept_body, accepted_reply, reply_body, rpc_body, rpc_msg};
+    use crate::nfsserve::transaction_tracker::TransactionTracker;
+    use crate::nfsserve::vfs::NFSFileSystem;
+    use agentfs_sdk::{AgentFS as AgentSdk, AgentFSOptions, FileSystem};
+    use std::io::Cursor;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Mutex;
+
+    const TEST_UID: u32 = 1000;
+    const TEST_GID: u32 = 1000;
+
+    async fn test_context() -> (RPCContext, agentfs_sdk::filesystem::AgentFS) {
+        let agent = AgentSdk::open(AgentFSOptions::ephemeral())
+            .await
+            .expect("open ephemeral AgentFS");
+        agent
+            .fs
+            .chmod(1, 0o777)
+            .await
+            .expect("make root writable to unprivileged test user");
+        let fs = agent.fs.clone();
+        let nfs = AgentNFS::new(Arc::new(Mutex::new(agent.fs)));
+        let vfs: Arc<dyn NFSFileSystem + Send + Sync> = Arc::new(nfs);
+        let context = RPCContext {
+            local_port: 11111,
+            client_addr: "127.0.0.1:1".to_string(),
+            auth: auth_unix {
+                stamp: 0,
+                machinename: b"test".to_vec(),
+                uid: TEST_UID,
+                gid: TEST_GID,
+                gids: vec![TEST_GID],
+            },
+            vfs,
+            mount_signal: None,
+            export_name: Arc::new("/".to_string()),
+            transaction_tracker: Arc::new(TransactionTracker::new(Duration::from_secs(60))),
+        };
+        (context, fs)
+    }
+
+    fn parse_rpc_success(cursor: &mut Cursor<Vec<u8>>) {
+        let mut reply = rpc_msg::default();
+        reply.deserialize(cursor).expect("deserialize RPC reply");
+        match reply.body {
+            rpc_body::REPLY(reply_body::MSG_ACCEPTED(accepted_reply {
+                reply_data: accept_body::SUCCESS,
+                ..
+            })) => {}
+            other => panic!("unexpected RPC reply: {other:?}"),
+        }
+    }
+
+    fn parse_nfs_status(cursor: &mut Cursor<Vec<u8>>) -> nfs::nfsstat3 {
+        let mut status = nfs::nfsstat3::NFS3_OK;
+        status
+            .deserialize(cursor)
+            .expect("deserialize NFS response status");
+        status
+    }
+
+    fn serialize_create_readonly_args(root_fh: nfs::nfs_fh3) -> Vec<u8> {
+        let mut input = Vec::new();
+        let mut cursor = Cursor::new(&mut input);
+        nfs::diropargs3 {
+            dir: root_fh,
+            name: b"loose-object".as_slice().into(),
+        }
+        .serialize(&mut cursor)
+        .expect("serialize CREATE dirops");
+        createmode3::UNCHECKED
+            .serialize(&mut cursor)
+            .expect("serialize CREATE mode");
+        nfs::sattr3 {
+            mode: nfs::set_mode3::mode(0o444),
+            ..Default::default()
+        }
+        .serialize(&mut cursor)
+        .expect("serialize CREATE attrs");
+        input
+    }
+
+    fn serialize_write_args(file: nfs::nfs_fh3, data: &[u8]) -> Vec<u8> {
+        let mut input = Vec::new();
+        let mut cursor = Cursor::new(&mut input);
+        WRITE3args {
+            file,
+            offset: 0,
+            count: data.len() as u32,
+            stable: stable_how::FILE_SYNC as u32,
+            data: data.to_vec(),
+        }
+        .serialize(&mut cursor)
+        .expect("serialize WRITE args");
+        input
+    }
+
+    async fn create_readonly_file(context: &RPCContext) -> nfs::nfs_fh3 {
+        let mut input = Cursor::new(serialize_create_readonly_args(context.vfs.id_to_fh(1)));
+        let mut output = Vec::new();
+        nfsproc3_create(1, &mut input, &mut output, context)
+            .await
+            .expect("CREATE handler");
+
+        let mut cursor = Cursor::new(output);
+        parse_rpc_success(&mut cursor);
+        let status = parse_nfs_status(&mut cursor);
+        assert!(matches!(status, nfs::nfsstat3::NFS3_OK));
+
+        let mut fh = nfs::post_op_fh3::default();
+        fh.deserialize(&mut cursor).expect("deserialize CREATE fh");
+        match fh {
+            nfs::post_op_fh3::handle(fh) => fh,
+            nfs::post_op_fh3::Void => panic!("CREATE did not return a file handle"),
+        }
+    }
+
+    async fn write_status(context: &RPCContext, file: nfs::nfs_fh3, data: &[u8]) -> nfs::nfsstat3 {
+        let mut input = Cursor::new(serialize_write_args(file, data));
+        let mut output = Vec::new();
+        nfsproc3_write(2, &mut input, &mut output, context)
+            .await
+            .expect("WRITE handler");
+
+        let mut cursor = Cursor::new(output);
+        parse_rpc_success(&mut cursor);
+        parse_nfs_status(&mut cursor)
+    }
+
+    async fn read_file(fs: &agentfs_sdk::filesystem::AgentFS, name: &str, len: u64) -> Vec<u8> {
+        let stats = fs
+            .lookup(1, name)
+            .await
+            .expect("lookup file")
+            .expect("file exists");
+        let file = FileSystem::open(fs, stats.ino, libc::O_RDONLY)
+            .await
+            .expect("open file");
+        file.pread(0, len).await.expect("read file")
+    }
+
+    #[tokio::test]
+    async fn create_authorized_handle_can_write_after_readonly_final_mode() {
+        let (context, fs) = test_context().await;
+        let created_fh = create_readonly_file(&context).await;
+
+        let status = write_status(&context, created_fh, b"data").await;
+
+        assert!(matches!(status, nfs::nfsstat3::NFS3_OK));
+        assert_eq!(read_file(&fs, "loose-object", 4).await, b"data");
+    }
+
+    #[tokio::test]
+    async fn fresh_lookup_handle_without_write_permission_stays_denied() {
+        let (context, fs) = test_context().await;
+        let created_fh = create_readonly_file(&context).await;
+        let created_id = context
+            .vfs
+            .fh_to_id(&created_fh)
+            .expect("created handle resolves");
+        let plain_fh = context.vfs.id_to_fh(created_id);
+
+        let status = write_status(&context, plain_fh, b"nope").await;
+
+        assert!(matches!(status, nfs::nfsstat3::NFS3ERR_ACCES));
+        assert_eq!(read_file(&fs, "loose-object", 4).await, b"");
+    }
 }
