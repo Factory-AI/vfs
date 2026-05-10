@@ -335,6 +335,24 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Command::MigrateV0_5 {
+            source,
+            target,
+            verify,
+            overwrite_target,
+        } => {
+            let rt = get_runtime();
+            if let Err(e) = rt.block_on(cmd::migrate::handle_migrate_v0_5_command(
+                &mut std::io::stdout(),
+                source,
+                target,
+                verify,
+                overwrite_target,
+            )) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
     }
 }
 

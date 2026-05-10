@@ -333,6 +333,23 @@ pub enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Copy a v0.4 database into a v0.5 database
+    #[command(name = "migrate-v0-5")]
+    MigrateV0_5 {
+        /// Source v0.4 database path
+        source: PathBuf,
+
+        /// Target v0.5 database path
+        target: PathBuf,
+
+        /// Verify migrated state equivalence
+        #[arg(long)]
+        verify: bool,
+
+        /// Allow replacing an existing target database
+        #[arg(long)]
+        overwrite_target: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
