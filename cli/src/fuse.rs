@@ -131,6 +131,11 @@ impl OpenFile {
 
         let file = self.file.clone();
         let ranges = self.pending.ranges_for_flush();
+        let range_count = ranges.len() as u64;
+        let byte_count = ranges
+            .iter()
+            .map(|(_, data)| data.len() as u64)
+            .sum::<u64>();
 
         for (offset, data) in ranges {
             let file = file.clone();
@@ -138,6 +143,7 @@ impl OpenFile {
         }
 
         self.pending.clear();
+        agentfs_sdk::profiling::record_fuse_flush(range_count, byte_count);
         Ok(())
     }
 }
@@ -323,6 +329,11 @@ impl Filesystem for AgentFSFuse {
     fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         tracing::debug!("FUSE::getattr: ino={}", ino);
 
+        if let Err(e) = self.flush_pending_inode(ino) {
+            reply.error(error_to_errno(&e));
+            return;
+        }
+
         let fs = self.fs.clone();
         let result = self
             .runtime
@@ -413,21 +424,19 @@ impl Filesystem for AgentFSFuse {
 
         // Handle truncate
         if let Some(new_size) = size {
+            if let Err(e) = self.flush_pending_inode(ino) {
+                reply.error(error_to_errno(&e));
+                return;
+            }
+
             let result = if let Some(fh) = fh {
-                // Use file handle if available (ftruncate). Flush buffered
-                // writes first so a later close cannot replay stale writes
-                // after the truncate and grow the file again.
+                // Use file handle if available (ftruncate).
                 let file = {
-                    let mut open_files = self.open_files.lock();
-                    let Some(open_file) = open_files.get_mut(&fh) else {
+                    let open_files = self.open_files.lock();
+                    let Some(open_file) = open_files.get(&fh) else {
                         reply.error(libc::EBADF);
                         return;
                     };
-
-                    if let Err(e) = open_file.flush_pending(&self.runtime) {
-                        reply.error(error_to_errno(&e));
-                        return;
-                    }
 
                     open_file.file.clone()
                 };
@@ -1089,7 +1098,7 @@ impl Filesystem for AgentFSFuse {
     fn write(
         &mut self,
         _req: &Request,
-        _ino: u64,
+        ino: u64,
         fh: u64,
         offset: i64,
         data: &[u8],
@@ -1112,12 +1121,43 @@ impl Filesystem for AgentFSFuse {
 
         let data_len = data.len();
         agentfs_sdk::profiling::record_fuse_write(data_len as u64);
+        if let Err(e) = self.flush_pending_inode_except(ino, fh) {
+            reply.error(error_to_errno(&e));
+            return;
+        }
+
         let result = {
             let mut open_files = self.open_files.lock();
             let Some(open_file) = open_files.get_mut(&fh) else {
                 reply.error(libc::EBADF);
                 return;
             };
+
+            if data_len > MAX_PENDING_WRITE_BYTES {
+                let file = open_file.file.clone();
+                if let Err(e) = open_file.flush_pending(&self.runtime) {
+                    reply.error(error_to_errno(&e));
+                    return;
+                }
+                return match self
+                    .runtime
+                    .block_on(async move { file.pwrite(offset as u64, data).await })
+                {
+                    Ok(()) => {
+                        reply.written(data_len as u32);
+                    }
+                    Err(e) => {
+                        reply.error(error_to_errno(&e));
+                    }
+                };
+            }
+
+            if open_file.pending_bytes().saturating_add(data_len) > MAX_PENDING_WRITE_BYTES {
+                if let Err(e) = open_file.flush_pending(&self.runtime) {
+                    reply.error(error_to_errno(&e));
+                    return;
+                }
+            }
 
             if let Err(errno) = open_file.buffer_write(offset as u64, data) {
                 reply.error(errno);
@@ -1287,11 +1327,15 @@ impl Filesystem for AgentFSFuse {
 
 impl AgentFSFuse {
     fn flush_pending_inode(&self, ino: u64) -> Result<(), SdkError> {
+        self.flush_pending_inode_except(ino, 0)
+    }
+
+    fn flush_pending_inode_except(&self, ino: u64, except_fh: u64) -> Result<(), SdkError> {
         let mut open_files = self.open_files.lock();
-        for open_file in open_files
-            .values_mut()
-            .filter(|open_file| open_file.ino == ino)
-        {
+        for (fh, open_file) in open_files.iter_mut() {
+            if *fh == except_fh || open_file.ino != ino {
+                continue;
+            }
             open_file.flush_pending(&self.runtime)?;
         }
         Ok(())

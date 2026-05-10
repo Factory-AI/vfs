@@ -2,7 +2,7 @@
 //!
 //! Migrates an agentfs SQLite database to the current schema version.
 
-use agentfs_sdk::{AgentFSOptions, SchemaVersion, AGENTFS_SCHEMA_VERSION};
+use agentfs_sdk::{AgentFSOptions, SchemaVersion};
 use anyhow::{Context, Result as AnyhowResult};
 use std::collections::{hash_map::DefaultHasher, HashSet};
 use std::fs;
@@ -48,10 +48,18 @@ pub async fn handle_migrate_command(
         .await?
         .unwrap_or(SchemaVersion::V0_0);
     writeln!(stdout, "Current schema version: {}", current_version)?;
-    writeln!(stdout, "Target schema version: {}", AGENTFS_SCHEMA_VERSION)?;
+    writeln!(stdout, "Target schema version: 0.4 (legacy in-place)")?;
+
+    if current_version == SchemaVersion::V0_5 {
+        writeln!(stdout, "Database is already at schema v0.5.")?;
+        return Ok(());
+    }
 
     if current_version == SchemaVersion::V0_4 {
-        writeln!(stdout, "Database is already at the latest schema version.")?;
+        writeln!(
+            stdout,
+            "Database is at legacy schema v0.4. Use migrate-v0-5 for copy-based v0.5 migration."
+        )?;
         return Ok(());
     }
 
@@ -69,7 +77,7 @@ pub async fn handle_migrate_command(
         // Store schema version in fs_config for future use
         conn.execute(
             "INSERT OR REPLACE INTO fs_config (key, value) VALUES ('schema_version', ?)",
-            [AGENTFS_SCHEMA_VERSION],
+            ["0.4"],
         )
         .await
         .context("Failed to store schema version")?;
@@ -107,6 +115,9 @@ fn print_pending_migrations(
         SchemaVersion::V0_4 => {
             // Already at latest
         }
+        SchemaVersion::V0_5 => {
+            // v0.5 uses the copy-based migrate-v0-5 command.
+        }
     }
     Ok(())
 }
@@ -130,6 +141,9 @@ async fn apply_migrations(
         }
         SchemaVersion::V0_4 => {
             // Already at latest version
+        }
+        SchemaVersion::V0_5 => {
+            // v0.5 uses the copy-based migrate-v0-5 command.
         }
     }
     Ok(())
@@ -268,9 +282,6 @@ async fn migrate_v0_4_to_v0_5(
         remove_db_family(target_path)?;
     }
 
-    let source_hash_before = hash_file(source_path)
-        .with_context(|| format!("Failed to hash source {}", source_path.display()))?;
-
     let source_db_path = source_path
         .to_str()
         .context("Source database path is not valid UTF-8")?;
@@ -281,6 +292,12 @@ async fn migrate_v0_4_to_v0_5(
     let source_conn = source_db
         .connect()
         .context("Failed to connect to source database")?;
+
+    let source_txn = Transaction::new_unchecked(&source_conn, TransactionBehavior::Immediate)
+        .await
+        .context("Failed to lock source database for copy migration")?;
+    let source_hash_before = hash_db_family(source_path)
+        .with_context(|| format!("Failed to hash source {}", source_path.display()))?;
 
     run_integrity_check(&source_conn, "source").await?;
     let source_version = agentfs_sdk::schema::detect_schema_version(&source_conn)
@@ -318,8 +335,9 @@ async fn migrate_v0_4_to_v0_5(
         migrate_inodes_and_file_data(&source_conn, &target_conn, source_chunk_size).await?;
         copy_table_common_columns(&source_conn, &target_conn, "fs_dentry").await?;
         copy_table_common_columns(&source_conn, &target_conn, "fs_symlink").await?;
-        copy_optional_table_common_columns(&source_conn, &target_conn, "fs_whiteout").await?;
+        copy_optional_whiteouts(&source_conn, &target_conn).await?;
         copy_optional_table_common_columns(&source_conn, &target_conn, "fs_origin").await?;
+        copy_optional_table_common_columns(&source_conn, &target_conn, "fs_overlay_config").await?;
         copy_table_common_columns(&source_conn, &target_conn, "kv_store").await?;
         copy_table_common_columns(&source_conn, &target_conn, "tool_calls").await?;
         Ok(())
@@ -341,11 +359,12 @@ async fn migrate_v0_4_to_v0_5(
         checkpoint_target(&target_conn, target_path).await?;
     }
 
-    let source_hash_after = hash_file(source_path)
+    let source_hash_after = hash_db_family(source_path)
         .with_context(|| format!("Failed to re-hash source {}", source_path.display()))?;
     if source_hash_before != source_hash_after {
         anyhow::bail!("Source database changed during copy migration");
     }
+    source_txn.rollback().await?;
 
     writeln!(stdout, "Migration completed successfully.")?;
     writeln!(stdout, "Source database hash unchanged.")?;
@@ -437,6 +456,14 @@ async fn create_v0_5_schema(conn: &Connection) -> AnyhowResult<()> {
         "CREATE TABLE fs_origin (
             delta_ino INTEGER PRIMARY KEY,
             base_ino INTEGER NOT NULL
+        )",
+        (),
+    )
+    .await?;
+    conn.execute(
+        "CREATE TABLE fs_overlay_config (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
         )",
         (),
     )
@@ -571,21 +598,17 @@ async fn migrate_inodes_and_file_data(
         let ctime_nsec = row_i64(&row, 12)?;
 
         let is_regular = (mode & S_IFMT) == S_IFREG;
-        let (storage_kind, data_inline, chunks) = if is_regular {
+        let (storage_kind, data_inline) = if is_regular && (size as usize) <= V0_5_INLINE_THRESHOLD
+        {
             let (bytes, dense) =
                 read_source_file_bytes(source, ino, size as usize, source_chunk_size).await?;
-            if size as usize <= V0_5_INLINE_THRESHOLD && dense {
-                (1_i64, Value::Blob(bytes), Vec::new())
+            if dense {
+                (1_i64, Value::Blob(bytes))
             } else {
-                let chunks = bytes
-                    .chunks(V0_5_CHUNK_SIZE)
-                    .enumerate()
-                    .map(|(index, chunk)| (index as i64, chunk.to_vec()))
-                    .collect::<Vec<_>>();
-                (0_i64, Value::Null, chunks)
+                (0_i64, Value::Null)
             }
         } else {
-            (0_i64, Value::Null, Vec::new())
+            (0_i64, Value::Null)
         };
 
         target
@@ -614,16 +637,107 @@ async fn migrate_inodes_and_file_data(
             )
             .await?;
 
-        for (chunk_index, chunk) in chunks {
-            target
-                .execute(
-                    "INSERT INTO fs_data (ino, chunk_index, data) VALUES (?, ?, ?)",
-                    (ino, chunk_index, Value::Blob(chunk)),
-                )
-                .await?;
+        if is_regular && storage_kind == 0 {
+            copy_source_file_chunks_to_target(
+                source,
+                target,
+                ino,
+                size as usize,
+                source_chunk_size,
+            )
+            .await?;
         }
     }
 
+    Ok(())
+}
+
+async fn copy_source_file_chunks_to_target(
+    source: &Connection,
+    target: &Connection,
+    ino: i64,
+    size: usize,
+    source_chunk_size: usize,
+) -> AnyhowResult<()> {
+    let mut rows = source
+        .query(
+            "SELECT chunk_index, data FROM fs_data WHERE ino = ? ORDER BY chunk_index",
+            (ino,),
+        )
+        .await?;
+    let mut target_chunk_index: Option<i64> = None;
+    let mut target_chunk = Vec::new();
+    let mut target_chunk_has_data = false;
+
+    while let Some(row) = rows.next().await? {
+        let chunk_index = row_i64(&row, 0)? as usize;
+        let chunk_data = match row.get_value(1)? {
+            Value::Blob(data) => data.clone(),
+            _ => Vec::new(),
+        };
+        let mut source_offset = chunk_index.saturating_mul(source_chunk_size);
+        if source_offset >= size {
+            continue;
+        }
+        let mut remaining = &chunk_data[..std::cmp::min(chunk_data.len(), size - source_offset)];
+
+        while !remaining.is_empty() {
+            let next_target_index = (source_offset / V0_5_CHUNK_SIZE) as i64;
+            if target_chunk_index != Some(next_target_index) {
+                flush_target_chunk(
+                    target,
+                    ino,
+                    target_chunk_index,
+                    &target_chunk,
+                    target_chunk_has_data,
+                )
+                .await?;
+                target_chunk_index = Some(next_target_index);
+                let chunk_start = next_target_index as usize * V0_5_CHUNK_SIZE;
+                let chunk_len = std::cmp::min(V0_5_CHUNK_SIZE, size - chunk_start);
+                target_chunk = vec![0; chunk_len];
+            }
+
+            let in_chunk_offset = source_offset % V0_5_CHUNK_SIZE;
+            let copy_len = std::cmp::min(remaining.len(), target_chunk.len() - in_chunk_offset);
+            target_chunk[in_chunk_offset..in_chunk_offset + copy_len]
+                .copy_from_slice(&remaining[..copy_len]);
+            target_chunk_has_data = true;
+            source_offset += copy_len;
+            remaining = &remaining[copy_len..];
+        }
+    }
+
+    flush_target_chunk(
+        target,
+        ino,
+        target_chunk_index,
+        &target_chunk,
+        target_chunk_has_data,
+    )
+    .await
+}
+
+async fn flush_target_chunk(
+    target: &Connection,
+    ino: i64,
+    chunk_index: Option<i64>,
+    chunk: &[u8],
+    has_data: bool,
+) -> AnyhowResult<()> {
+    if !has_data || chunk.iter().all(|byte| *byte == 0) {
+        return Ok(());
+    }
+
+    let Some(chunk_index) = chunk_index else {
+        return Ok(());
+    };
+    target
+        .execute(
+            "INSERT INTO fs_data (ino, chunk_index, data) VALUES (?, ?, ?)",
+            (ino, chunk_index, Value::Blob(chunk.to_vec())),
+        )
+        .await?;
     Ok(())
 }
 
@@ -686,6 +800,36 @@ async fn copy_optional_table_common_columns(
 ) -> AnyhowResult<()> {
     if table_exists(source, table).await? {
         copy_table_common_columns(source, target, table).await?;
+    }
+    Ok(())
+}
+
+async fn copy_optional_whiteouts(source: &Connection, target: &Connection) -> AnyhowResult<()> {
+    if !table_exists(source, "fs_whiteout").await? {
+        return Ok(());
+    }
+
+    let columns = get_table_columns(source, "fs_whiteout").await?;
+    let has_parent_path = columns.iter().any(|column| column == "parent_path");
+    let sql = if has_parent_path {
+        "SELECT path, parent_path, created_at FROM fs_whiteout ORDER BY path"
+    } else {
+        "SELECT path, created_at FROM fs_whiteout ORDER BY path"
+    };
+    let mut rows = source.query(sql, ()).await?;
+    while let Some(row) = rows.next().await? {
+        let path = row.get::<String>(0)?;
+        let (parent_path, created_at) = if has_parent_path {
+            (row.get::<String>(1)?, row_i64(&row, 2)?)
+        } else {
+            (parent_path_for_path(&path), row_i64(&row, 1)?)
+        };
+        target
+            .execute(
+                "INSERT INTO fs_whiteout (path, parent_path, created_at) VALUES (?, ?, ?)",
+                (path, parent_path, created_at),
+            )
+            .await?;
     }
     Ok(())
 }
@@ -777,14 +921,9 @@ async fn verify_migration_equivalence(
     )
     .await?;
     compare_table_rows(source, target, "fs_symlink", &["ino", "target"]).await?;
-    compare_optional_table_rows(
-        source,
-        target,
-        "fs_whiteout",
-        &["path", "parent_path", "created_at"],
-    )
-    .await?;
+    compare_optional_whiteouts(source, target).await?;
     compare_optional_table_rows(source, target, "fs_origin", &["delta_ino", "base_ino"]).await?;
+    compare_optional_table_rows(source, target, "fs_overlay_config", &["key", "value"]).await?;
     compare_table_rows(
         source,
         target,
@@ -858,16 +997,90 @@ async fn compare_regular_file_contents(
             continue;
         }
 
-        let (source_bytes, _) =
-            read_source_file_bytes(source, ino, size, source_chunk_size).await?;
-        let target_bytes = read_target_file_bytes(target, ino, size, target_chunk_size).await?;
-        if source_bytes != target_bytes {
+        let source_hash =
+            hash_regular_file_contents(source, ino, size, source_chunk_size, false).await?;
+        let target_hash =
+            hash_regular_file_contents(target, ino, size, target_chunk_size, true).await?;
+        if source_hash != target_hash {
             anyhow::bail!("Regular file content mismatch for inode {ino}");
         }
     }
     Ok(())
 }
 
+async fn hash_regular_file_contents(
+    conn: &Connection,
+    ino: i64,
+    size: usize,
+    chunk_size: usize,
+    allow_inline: bool,
+) -> AnyhowResult<u64> {
+    let mut hasher = DefaultHasher::new();
+
+    if allow_inline {
+        let mut inode_rows = conn
+            .query(
+                "SELECT storage_kind, data_inline FROM fs_inode WHERE ino = ?",
+                (ino,),
+            )
+            .await?;
+        let row = inode_rows
+            .next()
+            .await?
+            .with_context(|| format!("Missing target inode {ino}"))?;
+        if row_i64(&row, 0)? == 1 {
+            let inline = match row.get_value(1)? {
+                Value::Blob(data) => data.clone(),
+                Value::Null => Vec::new(),
+                _ => Vec::new(),
+            };
+            let copy_len = std::cmp::min(inline.len(), size);
+            hasher.write(&inline[..copy_len]);
+            hash_zero_bytes(&mut hasher, size - copy_len);
+            return Ok(hasher.finish());
+        }
+    }
+
+    let mut rows = conn
+        .query(
+            "SELECT chunk_index, data FROM fs_data WHERE ino = ? ORDER BY chunk_index",
+            (ino,),
+        )
+        .await?;
+    let mut position = 0usize;
+    while let Some(row) = rows.next().await? {
+        let chunk_index = row_i64(&row, 0)? as usize;
+        let data = match row.get_value(1)? {
+            Value::Blob(data) => data.clone(),
+            _ => Vec::new(),
+        };
+        let chunk_start = chunk_index.saturating_mul(chunk_size);
+        if chunk_start >= size {
+            continue;
+        }
+        if chunk_start > position {
+            hash_zero_bytes(&mut hasher, chunk_start - position);
+        }
+        let copy_len = std::cmp::min(data.len(), size - chunk_start);
+        hasher.write(&data[..copy_len]);
+        position = chunk_start + copy_len;
+    }
+    if position < size {
+        hash_zero_bytes(&mut hasher, size - position);
+    }
+    Ok(hasher.finish())
+}
+
+fn hash_zero_bytes(hasher: &mut DefaultHasher, mut len: usize) {
+    const ZEROES: [u8; 8192] = [0; 8192];
+    while len > 0 {
+        let chunk_len = std::cmp::min(len, ZEROES.len());
+        hasher.write(&ZEROES[..chunk_len]);
+        len -= chunk_len;
+    }
+}
+
+#[cfg(test)]
 async fn read_target_file_bytes(
     conn: &Connection,
     ino: i64,
@@ -966,6 +1179,49 @@ async fn compare_optional_table_rows(
         return Ok(());
     }
     compare_table_rows(source, target, table, columns).await
+}
+
+async fn compare_optional_whiteouts(source: &Connection, target: &Connection) -> AnyhowResult<()> {
+    if !table_exists(source, "fs_whiteout").await? {
+        let count = table_count(target, "fs_whiteout").await?;
+        if count != 0 {
+            anyhow::bail!("Target optional table fs_whiteout should be empty");
+        }
+        return Ok(());
+    }
+
+    let source_rows = select_whiteouts_for_compare(source).await?;
+    let target_rows = select_whiteouts_for_compare(target).await?;
+    if source_rows != target_rows {
+        anyhow::bail!("Table row mismatch for fs_whiteout");
+    }
+    Ok(())
+}
+
+async fn select_whiteouts_for_compare(conn: &Connection) -> AnyhowResult<Vec<Vec<String>>> {
+    let columns = get_table_columns(conn, "fs_whiteout").await?;
+    let has_parent_path = columns.iter().any(|column| column == "parent_path");
+    let sql = if has_parent_path {
+        "SELECT path, parent_path, created_at FROM fs_whiteout"
+    } else {
+        "SELECT path, created_at FROM fs_whiteout"
+    };
+    let mut rows = conn.query(sql, ()).await?;
+    let mut result = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let path = row.get::<String>(0)?;
+        let (parent_path, created_at) = if has_parent_path {
+            (row.get::<String>(1)?, value_compare_key(row.get_value(2)?))
+        } else {
+            (
+                parent_path_for_path(&path),
+                value_compare_key(row.get_value(1)?),
+            )
+        };
+        result.push(vec![path, parent_path, created_at]);
+    }
+    result.sort();
+    Ok(result)
 }
 
 async fn compare_common_table_rows(
@@ -1103,6 +1359,18 @@ fn quote_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
+fn parent_path_for_path(path: &str) -> String {
+    if path == "/" {
+        return "/".to_string();
+    }
+
+    let trimmed = path.trim_end_matches('/');
+    match trimmed.rfind('/') {
+        Some(0) | None => "/".to_string(),
+        Some(index) => trimmed[..index].to_string(),
+    }
+}
+
 fn bytes_to_hex(bytes: &[u8]) -> String {
     let mut output = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -1112,18 +1380,51 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
     output
 }
 
+#[cfg(test)]
 fn hash_file(path: &Path) -> AnyhowResult<u64> {
-    let mut file = fs::File::open(path)?;
+    hash_paths([path.to_path_buf()])
+}
+
+fn hash_db_family(path: &Path) -> AnyhowResult<u64> {
+    hash_paths([
+        path.to_path_buf(),
+        sidecar_path(path, "-wal"),
+        sidecar_path(path, "-shm"),
+    ])
+}
+
+fn hash_paths(paths: impl IntoIterator<Item = PathBuf>) -> AnyhowResult<u64> {
     let mut hasher = DefaultHasher::new();
+    for path in paths {
+        path.display().to_string().hash(&mut hasher);
+        match fs::metadata(&path) {
+            Ok(metadata) => {
+                true.hash(&mut hasher);
+                metadata.len().hash(&mut hasher);
+                hash_file_into(&path, &mut hasher)?;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                false.hash(&mut hasher);
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("Failed to stat {}", path.display()));
+            }
+        }
+    }
+    Ok(hasher.finish())
+}
+
+fn hash_file_into(path: &Path, hasher: &mut DefaultHasher) -> AnyhowResult<()> {
+    let mut file = fs::File::open(path)?;
     let mut buffer = [0_u8; 8192];
     loop {
         let bytes_read = file.read(&mut buffer)?;
         if bytes_read == 0 {
             break;
         }
-        buffer[..bytes_read].hash(&mut hasher);
+        hasher.write(&buffer[..bytes_read]);
     }
-    Ok(hasher.finish())
+    Ok(())
 }
 
 fn remove_db_family(path: &Path) -> AnyhowResult<()> {
@@ -1445,6 +1746,10 @@ mod tests {
             1
         );
         assert_eq!(
+            table_count_for_test(&conn, "fs_overlay_config", "key = 'base_path'").await,
+            1
+        );
+        assert_eq!(
             table_count_for_test(&conn, "kv_store", "key = 'metadata'").await,
             1
         );
@@ -1452,6 +1757,58 @@ mod tests {
             table_count_for_test(&conn, "tool_calls", "name = 'migrate-test'").await,
             1
         );
+    }
+
+    #[tokio::test]
+    async fn test_copy_migrate_synthesizes_legacy_whiteout_parent_path() {
+        let source_file = NamedTempFile::new().unwrap();
+        let target_file = NamedTempFile::new().unwrap();
+        let source_db = Builder::new_local(source_file.path().to_str().unwrap())
+            .build()
+            .await
+            .unwrap();
+        let source_conn = source_db.connect().unwrap();
+        source_conn
+            .execute(
+                "CREATE TABLE fs_whiteout (
+                    path TEXT PRIMARY KEY,
+                    created_at INTEGER NOT NULL
+                )",
+                (),
+            )
+            .await
+            .unwrap();
+        source_conn
+            .execute(
+                "INSERT INTO fs_whiteout (path, created_at) VALUES ('/dir/deleted', 123)",
+                (),
+            )
+            .await
+            .unwrap();
+
+        let target_db = Builder::new_local(target_file.path().to_str().unwrap())
+            .build()
+            .await
+            .unwrap();
+        let target_conn = target_db.connect().unwrap();
+        create_v0_5_schema(&target_conn).await.unwrap();
+        copy_optional_whiteouts(&source_conn, &target_conn)
+            .await
+            .unwrap();
+
+        let mut rows = target_conn
+            .query(
+                "SELECT parent_path, created_at FROM fs_whiteout WHERE path = '/dir/deleted'",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<String>(0).unwrap(), "/dir");
+        assert_eq!(row_i64(&row, 1).unwrap(), 123);
+        compare_optional_whiteouts(&source_conn, &target_conn)
+            .await
+            .unwrap();
     }
 
     async fn create_synthetic_v0_4_database(
@@ -1562,6 +1919,15 @@ mod tests {
             "CREATE TABLE fs_origin (
                 delta_ino INTEGER PRIMARY KEY,
                 base_ino INTEGER NOT NULL
+            )",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE fs_overlay_config (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
             )",
             (),
         )
@@ -1684,6 +2050,12 @@ mod tests {
         .unwrap();
         conn.execute(
             "INSERT INTO fs_origin (delta_ino, base_ino) VALUES (4, 44)",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO fs_overlay_config (key, value) VALUES ('base_path', '/tmp/base')",
             (),
         )
         .await

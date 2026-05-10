@@ -18,6 +18,18 @@ use super::{
 /// Root inode number (matches FUSE convention)
 const ROOT_INO: i64 = 1;
 
+fn parent_path_for_whiteout(path: &str) -> String {
+    if path == "/" {
+        return "/".to_string();
+    }
+
+    let trimmed = path.trim_end_matches('/');
+    match trimmed.rfind('/') {
+        Some(0) | None => "/".to_string(),
+        Some(index) => trimmed[..index].to_string(),
+    }
+}
+
 /// Which layer an inode belongs to
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Layer {
@@ -96,8 +108,15 @@ impl OverlayFS {
         conn.execute(
             "CREATE TABLE IF NOT EXISTS fs_whiteout (
                 path TEXT PRIMARY KEY,
+                parent_path TEXT NOT NULL,
                 created_at INTEGER NOT NULL
             )",
+            (),
+        )
+        .await?;
+        Self::ensure_whiteout_parent_path(conn).await?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_fs_whiteout_parent ON fs_whiteout(parent_path)",
             (),
         )
         .await?;
@@ -122,6 +141,49 @@ impl OverlayFS {
             (),
         )
         .await?;
+        Ok(())
+    }
+
+    async fn ensure_whiteout_parent_path(conn: &Connection) -> Result<()> {
+        let mut rows = conn.query("PRAGMA table_info(fs_whiteout)", ()).await?;
+        let mut has_parent_path = false;
+        while let Some(row) = rows.next().await? {
+            if let Some(name) = row.get_value(1).ok().and_then(|value| match value {
+                Value::Text(name) => Some(name.clone()),
+                _ => None,
+            }) {
+                if name == "parent_path" {
+                    has_parent_path = true;
+                    break;
+                }
+            }
+        }
+
+        if !has_parent_path {
+            conn.execute(
+                "ALTER TABLE fs_whiteout ADD COLUMN parent_path TEXT NOT NULL DEFAULT '/'",
+                (),
+            )
+            .await?;
+            let mut rows = conn.query("SELECT path FROM fs_whiteout", ()).await?;
+            let mut paths = Vec::new();
+            while let Some(row) = rows.next().await? {
+                if let Some(path) = row.get_value(0).ok().and_then(|value| match value {
+                    Value::Text(path) => Some(path.clone()),
+                    _ => None,
+                }) {
+                    paths.push(path);
+                }
+            }
+            for path in paths {
+                conn.execute(
+                    "UPDATE fs_whiteout SET parent_path = ? WHERE path = ?",
+                    (parent_path_for_whiteout(&path), path),
+                )
+                .await?;
+            }
+        }
+
         Ok(())
     }
 
@@ -208,9 +270,10 @@ impl OverlayFS {
     async fn create_whiteout(&self, path: &str) -> Result<()> {
         let conn = self.delta.get_connection().await?;
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+        let parent_path = parent_path_for_whiteout(path);
         conn.execute(
-            "INSERT OR REPLACE INTO fs_whiteout (path, created_at) VALUES (?, ?)",
-            (path, now),
+            "INSERT OR REPLACE INTO fs_whiteout (path, parent_path, created_at) VALUES (?, ?, ?)",
+            (path, parent_path, now),
         )
         .await?;
         self.whiteouts.write().unwrap().insert(path.to_string());

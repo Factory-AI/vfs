@@ -26,6 +26,9 @@ pub struct ProfileSnapshot {
     pub wal_checkpoint_nanos: u64,
     pub fuse_write_count: u64,
     pub fuse_write_bytes: u64,
+    pub fuse_flush_count: u64,
+    pub fuse_flush_ranges: u64,
+    pub fuse_flush_bytes: u64,
 }
 
 /// Atomic profiling counters.
@@ -44,6 +47,9 @@ pub struct ProfileCounters {
     wal_checkpoint_nanos: AtomicU64,
     fuse_write_count: AtomicU64,
     fuse_write_bytes: AtomicU64,
+    fuse_flush_count: AtomicU64,
+    fuse_flush_ranges: AtomicU64,
+    fuse_flush_bytes: AtomicU64,
 }
 
 impl ProfileCounters {
@@ -62,6 +68,9 @@ impl ProfileCounters {
             wal_checkpoint_nanos: AtomicU64::new(0),
             fuse_write_count: AtomicU64::new(0),
             fuse_write_bytes: AtomicU64::new(0),
+            fuse_flush_count: AtomicU64::new(0),
+            fuse_flush_ranges: AtomicU64::new(0),
+            fuse_flush_bytes: AtomicU64::new(0),
         }
     }
 
@@ -110,6 +119,12 @@ impl ProfileCounters {
         self.fuse_write_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
+    fn add_fuse_flush(&self, ranges: u64, bytes: u64) {
+        self.fuse_flush_count.fetch_add(1, Ordering::Relaxed);
+        self.fuse_flush_ranges.fetch_add(ranges, Ordering::Relaxed);
+        self.fuse_flush_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> ProfileSnapshot {
         ProfileSnapshot {
             connection_wait_count: self.connection_wait_count.load(Ordering::Relaxed),
@@ -125,6 +140,9 @@ impl ProfileCounters {
             wal_checkpoint_nanos: self.wal_checkpoint_nanos.load(Ordering::Relaxed),
             fuse_write_count: self.fuse_write_count.load(Ordering::Relaxed),
             fuse_write_bytes: self.fuse_write_bytes.load(Ordering::Relaxed),
+            fuse_flush_count: self.fuse_flush_count.load(Ordering::Relaxed),
+            fuse_flush_ranges: self.fuse_flush_ranges.load(Ordering::Relaxed),
+            fuse_flush_bytes: self.fuse_flush_bytes.load(Ordering::Relaxed),
         }
     }
 }
@@ -204,6 +222,12 @@ pub fn record_fuse_write(bytes: u64) {
     }
 }
 
+pub fn record_fuse_flush(ranges: u64, bytes: u64) {
+    if is_enabled() {
+        COUNTERS.add_fuse_flush(ranges, bytes);
+    }
+}
+
 pub fn snapshot() -> ProfileSnapshot {
     COUNTERS.snapshot()
 }
@@ -263,6 +287,7 @@ mod tests {
         counters.add_chunk_write_chunks(5);
         counters.add_wal_checkpoint(Duration::from_nanos(11));
         counters.add_fuse_write(13);
+        counters.add_fuse_flush(2, 21);
 
         let snapshot = counters.snapshot();
         assert_eq!(snapshot.connection_wait_count, 1);
@@ -278,6 +303,9 @@ mod tests {
         assert_eq!(snapshot.wal_checkpoint_nanos, 11);
         assert_eq!(snapshot.fuse_write_count, 1);
         assert_eq!(snapshot.fuse_write_bytes, 13);
+        assert_eq!(snapshot.fuse_flush_count, 1);
+        assert_eq!(snapshot.fuse_flush_ranges, 2);
+        assert_eq!(snapshot.fuse_flush_bytes, 21);
     }
 
     #[test]
