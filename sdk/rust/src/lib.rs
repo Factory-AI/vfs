@@ -2,6 +2,7 @@ pub mod connection_pool;
 pub mod error;
 pub mod filesystem;
 pub mod kvstore;
+pub mod profiling;
 pub mod schema;
 pub mod toolcalls;
 

@@ -106,6 +106,8 @@ struct AgentFSFuse {
     open_files: Arc<Mutex<HashMap<u64, OpenFile>>>,
     /// Next file handle to allocate
     next_fh: AtomicU64,
+    /// Emits a profiling summary when the FUSE session object is dropped.
+    _profile_report: Arc<agentfs_sdk::profiling::ProfileReportGuard>,
 }
 
 impl Filesystem for AgentFSFuse {
@@ -938,6 +940,7 @@ impl Filesystem for AgentFSFuse {
         };
 
         let data_len = data.len();
+        agentfs_sdk::profiling::record_fuse_write(data_len as u64);
         let data_vec = data.to_vec();
         let result = self
             .runtime
@@ -1087,6 +1090,9 @@ impl AgentFSFuse {
             runtime,
             open_files: Arc::new(Mutex::new(HashMap::new())),
             next_fh: AtomicU64::new(1),
+            _profile_report: Arc::new(agentfs_sdk::profiling::ProfileReportGuard::new(
+                "fuse_session",
+            )),
         }
     }
 

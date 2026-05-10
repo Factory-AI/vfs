@@ -120,6 +120,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 Environment:
   AGENTFS_BIN                 path/name of agentfs executable
+  AGENTFS_PROFILE             set to 1 to emit AgentFS profiling summaries
   WORKLOAD_BASELINE_COMMAND  shell command to run when --command is omitted
   WORKLOAD_BASELINE_SOURCE   source tree to copy when --source is omitted
 """,
@@ -568,6 +569,7 @@ def main(argv: list[str]) -> int:
             "agentfs": {
                 "bin": agentfs_bin,
                 "overlay_command_prefix": [agentfs_bin, "run", "--no-default-allows", "--"],
+                "profile_enabled": env_flag("AGENTFS_PROFILE"),
             },
             "source": {
                 "path": str(Path(args.source or ".").expanduser().resolve()) if args.mode == "command" else None,

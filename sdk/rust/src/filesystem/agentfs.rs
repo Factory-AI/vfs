@@ -4,7 +4,7 @@ use lru::LruCache;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use turso::transaction::{Transaction, TransactionBehavior};
 use turso::{Builder, Connection, Value};
 
@@ -35,8 +35,16 @@ pub(crate) fn file_backed_connection_pool_options() -> ConnectionPoolOptions {
 }
 
 async fn checkpoint_wal(conn: &Connection) -> Result<()> {
+    let started = if crate::profiling::is_enabled() {
+        Some(Instant::now())
+    } else {
+        None
+    };
     let mut rows = conn.query(WAL_CHECKPOINT_SQL, ()).await?;
     while rows.next().await?.is_some() {}
+    if let Some(started) = started {
+        crate::profiling::record_wal_checkpoint(started.elapsed());
+    }
     Ok(())
 }
 
@@ -61,11 +69,18 @@ impl DentryCache {
 
     /// Look up a cached entry (updates LRU order)
     fn get(&self, parent_ino: i64, name: &str) -> Option<i64> {
-        self.entries
+        let entry = self
+            .entries
             .lock()
             .unwrap()
             .get(&(parent_ino, name.to_string()))
-            .copied()
+            .copied();
+        if entry.is_some() {
+            crate::profiling::record_dentry_cache_hit();
+        } else {
+            crate::profiling::record_dentry_cache_miss();
+        }
+        entry
     }
 
     /// Insert an entry into the cache (evicts LRU entry if full)
@@ -92,6 +107,8 @@ pub struct AgentFS {
     chunk_size: usize,
     /// Cache for directory entry lookups (shared across clones)
     dentry_cache: Arc<DentryCache>,
+    /// Emits a profiling summary when the final filesystem clone is dropped.
+    _profile_report: Arc<crate::profiling::ProfileReportGuard>,
 }
 
 /// An open file handle for AgentFS.
@@ -138,6 +155,7 @@ impl File for AgentFSFile {
         let mut stmt = conn
             .prepare_cached("SELECT chunk_index, data FROM fs_data WHERE ino = ? AND chunk_index >= ? AND chunk_index <= ? ORDER BY chunk_index")
             .await?;
+        crate::profiling::record_chunk_read_query();
         let mut rows = stmt
             .query((self.ino, start_chunk as i64, end_chunk as i64))
             .await?;
@@ -145,8 +163,10 @@ impl File for AgentFSFile {
         let mut result = Vec::with_capacity(size as usize);
         let start_offset_in_chunk = (offset % chunk_size) as usize;
         let mut next_expected_chunk = start_chunk;
+        let mut chunks_read = 0u64;
 
         while let Some(row) = rows.next().await? {
+            chunks_read += 1;
             let chunk_index = row
                 .get_value(0)
                 .ok()
@@ -201,6 +221,7 @@ impl File for AgentFSFile {
             result.resize(size as usize, 0);
         }
 
+        crate::profiling::record_chunk_read_chunks(chunks_read);
         Ok(result)
     }
 
@@ -369,6 +390,7 @@ impl AgentFSFile {
     ) -> Result<()> {
         let chunk_size = self.chunk_size as u64;
         let mut written = 0usize;
+        let mut chunks_written = 0u64;
 
         if data.is_empty() {
             return Ok(());
@@ -431,10 +453,12 @@ impl AgentFSFile {
                 .execute((self.ino, chunk_index, Value::Blob(chunk_data)))
                 .await?;
             insert_stmt.reset()?;
+            chunks_written += 1;
 
             written += to_write;
         }
 
+        crate::profiling::record_chunk_write_chunks(chunks_written);
         Ok(())
     }
 }
@@ -465,6 +489,7 @@ impl AgentFS {
             pool,
             chunk_size,
             dentry_cache: Arc::new(DentryCache::new(DENTRY_CACHE_MAX_SIZE)),
+            _profile_report: Arc::new(crate::profiling::ProfileReportGuard::new("agentfs")),
         };
         Ok(fs)
     }
@@ -1332,6 +1357,7 @@ impl AgentFS {
             None => return Ok(None),
         };
 
+        crate::profiling::record_chunk_read_query();
         let mut rows = conn
             .query(
                 "SELECT data FROM fs_data WHERE ino = ? ORDER BY chunk_index",
@@ -1340,12 +1366,15 @@ impl AgentFS {
             .await?;
 
         let mut data = Vec::new();
+        let mut chunks_read = 0u64;
         while let Some(row) = rows.next().await? {
+            chunks_read += 1;
             if let Ok(Value::Blob(chunk)) = row.get_value(0) {
                 data.extend_from_slice(&chunk);
             }
         }
 
+        crate::profiling::record_chunk_read_chunks(chunks_read);
         Ok(Some(data))
     }
 
@@ -1367,6 +1396,7 @@ impl AgentFS {
         let start_chunk = offset / chunk_size;
         let end_chunk = (offset + size).saturating_sub(1) / chunk_size;
 
+        crate::profiling::record_chunk_read_query();
         let mut rows = conn
             .query(
                 "SELECT chunk_index, data FROM fs_data WHERE ino = ? AND chunk_index >= ? AND chunk_index <= ? ORDER BY chunk_index",
@@ -1376,8 +1406,10 @@ impl AgentFS {
 
         let mut result = Vec::with_capacity(size as usize);
         let start_offset_in_chunk = (offset % chunk_size) as usize;
+        let mut chunks_read = 0u64;
 
         while let Some(row) = rows.next().await? {
+            chunks_read += 1;
             if let Ok(Value::Blob(chunk_data)) = row.get_value(1) {
                 let skip = if result.is_empty() {
                     start_offset_in_chunk
@@ -1393,6 +1425,7 @@ impl AgentFS {
             }
         }
 
+        crate::profiling::record_chunk_read_chunks(chunks_read);
         Ok(Some(result))
     }
 
@@ -1498,6 +1531,7 @@ impl AgentFS {
             // Calculate affected chunk range
             let start_chunk = offset / chunk_size;
             let end_chunk = (write_end - 1) / chunk_size;
+            let mut chunks_written = 0u64;
 
             // Process each affected chunk
             for chunk_idx in start_chunk..=end_chunk {
@@ -1571,7 +1605,9 @@ impl AgentFS {
                     (ino, chunk_idx as i64, &chunk_data[..actual_len]),
                 )
                 .await?;
+                chunks_written += 1;
             }
+            crate::profiling::record_chunk_write_chunks(chunks_written);
 
             // Update size and mtime (only if not new, since new inodes already have correct values)
             if !is_new {
