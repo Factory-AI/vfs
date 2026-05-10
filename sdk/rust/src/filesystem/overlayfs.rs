@@ -1,4 +1,4 @@
-use crate::error::Result;
+use crate::error::{Error, Result};
 use async_trait::async_trait;
 use std::{
     collections::{HashMap, HashSet},
@@ -9,14 +9,38 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tracing::trace;
+use turso::transaction::{Transaction, TransactionBehavior};
 use turso::{Connection, Value};
 
 use super::{
-    agentfs::AgentFS, BoxedFile, DirEntry, FileSystem, FilesystemStats, FsError, Stats, TimeChange,
+    agentfs::AgentFS, BoxedFile, DirEntry, File, FileSystem, FilesystemStats, FsError, Stats,
+    TimeChange,
 };
 
 /// Root inode number (matches FUSE convention)
 const ROOT_INO: i64 = 1;
+const STORAGE_CHUNKED: i64 = 0;
+const PARTIAL_ORIGIN_ENV: &str = "AGENTFS_OVERLAY_PARTIAL_ORIGIN";
+
+fn current_timestamp() -> Result<(i64, i64)> {
+    let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
+    Ok((dur.as_secs() as i64, dur.subsec_nanos() as i64))
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn is_write_open(flags: i32) -> bool {
+    (flags & libc::O_ACCMODE) != libc::O_RDONLY || (flags & libc::O_TRUNC) != 0
+}
 
 fn parent_path_for_whiteout(path: &str) -> String {
     if path == "/" {
@@ -48,6 +72,19 @@ struct InodeInfo {
     path: String,
 }
 
+#[derive(Debug, Clone)]
+struct PartialOrigin {
+    base_ino: i64,
+}
+
+struct OverlayPartialFile {
+    delta: AgentFS,
+    base_file: BoxedFile,
+    overlay_ino: i64,
+    delta_ino: i64,
+    chunk_size: usize,
+}
+
 /// A copy-on-write overlay filesystem using inode-based operations.
 ///
 /// Combines a read-only base layer with a writable delta layer (AgentFS).
@@ -70,11 +107,21 @@ pub struct OverlayFS {
     whiteouts: RwLock<HashSet<String>>,
     /// Origin mapping: delta_ino -> base_ino (for copy-up consistency)
     origin_map: RwLock<HashMap<i64, i64>>,
+    /// Opt-in prototype flag for chunk-granularity base fallback.
+    partial_origin_enabled: bool,
 }
 
 impl OverlayFS {
     /// Create a new overlay filesystem
     pub fn new(base: Arc<dyn FileSystem>, delta: AgentFS) -> Self {
+        Self::new_with_partial_origin(base, delta, env_flag_enabled(PARTIAL_ORIGIN_ENV))
+    }
+
+    fn new_with_partial_origin(
+        base: Arc<dyn FileSystem>,
+        delta: AgentFS,
+        partial_origin_enabled: bool,
+    ) -> Self {
         let mut inode_map = HashMap::new();
         let mut reverse_map = HashMap::new();
         let mut path_map = HashMap::new();
@@ -100,6 +147,7 @@ impl OverlayFS {
             next_ino: AtomicI64::new(2),
             whiteouts: RwLock::new(HashSet::new()),
             origin_map: RwLock::new(HashMap::new()),
+            partial_origin_enabled,
         }
     }
 
@@ -137,6 +185,26 @@ impl OverlayFS {
             "CREATE TABLE IF NOT EXISTS fs_origin (
                 delta_ino INTEGER PRIMARY KEY,
                 base_ino INTEGER NOT NULL
+            )",
+            (),
+        )
+        .await?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS fs_partial_origin (
+                delta_ino INTEGER PRIMARY KEY,
+                base_ino INTEGER NOT NULL,
+                base_path TEXT NOT NULL,
+                base_size INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            )",
+            (),
+        )
+        .await?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS fs_chunk_override (
+                delta_ino INTEGER NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                PRIMARY KEY (delta_ino, chunk_index)
             )",
             (),
         )
@@ -445,6 +513,66 @@ impl OverlayFS {
         self.origin_map.read().unwrap().get(&delta_ino).copied()
     }
 
+    async fn partial_origin_for_delta(&self, delta_ino: i64) -> Result<Option<PartialOrigin>> {
+        let conn = self.delta.get_connection().await?;
+        let mut rows = conn
+            .query(
+                "SELECT base_ino FROM fs_partial_origin WHERE delta_ino = ?",
+                (delta_ino,),
+            )
+            .await?;
+        if let Some(row) = rows.next().await? {
+            let base_ino = row
+                .get_value(0)
+                .ok()
+                .and_then(|v| v.as_integer().copied())
+                .ok_or_else(|| Error::Internal("invalid partial origin base_ino".to_string()))?;
+            Ok(Some(PartialOrigin { base_ino }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn add_partial_origin_mapping(
+        &self,
+        delta_ino: i64,
+        base_ino: i64,
+        base_path: &str,
+        base_size: i64,
+    ) -> Result<()> {
+        let conn = self.delta.get_connection().await?;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+        conn.execute(
+            "INSERT OR REPLACE INTO fs_partial_origin (delta_ino, base_ino, base_path, base_size, created_at)
+             VALUES (?, ?, ?, ?, ?)",
+            (delta_ino, base_ino, base_path, base_size, now),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn cleanup_partial_origin_if_unlinked(&self, delta_ino: i64) -> Result<()> {
+        let conn = self.delta.get_connection().await?;
+        let mut rows = conn
+            .query("SELECT 1 FROM fs_inode WHERE ino = ?", (delta_ino,))
+            .await?;
+        if rows.next().await?.is_some() {
+            return Ok(());
+        }
+
+        conn.execute(
+            "DELETE FROM fs_chunk_override WHERE delta_ino = ?",
+            (delta_ino,),
+        )
+        .await?;
+        conn.execute(
+            "DELETE FROM fs_partial_origin WHERE delta_ino = ?",
+            (delta_ino,),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Promote an overlay inode from base layer to delta layer.
     ///
     /// When a directory that was originally looked up from base gets a
@@ -687,6 +815,419 @@ impl OverlayFS {
         }
 
         Ok(delta_ino)
+    }
+
+    async fn partial_copy_up_and_update_mapping(
+        &self,
+        overlay_ino: i64,
+        info: &InodeInfo,
+    ) -> Result<i64> {
+        let components: Vec<&str> = info.path.split('/').filter(|s| !s.is_empty()).collect();
+        if components.is_empty() {
+            return Err(FsError::RootOperation.into());
+        }
+        let name = components.last().unwrap();
+
+        let base_stats = self
+            .base
+            .getattr(info.underlying_ino)
+            .await?
+            .ok_or(FsError::NotFound)?;
+        if !base_stats.is_file() {
+            return self.copy_up_and_update_mapping(overlay_ino, info).await;
+        }
+
+        self.ensure_parent_dirs(&info.path, base_stats.uid, base_stats.gid)
+            .await?;
+
+        let mut parent_ino = ROOT_INO;
+        for comp in components.iter().take(components.len() - 1) {
+            let stats = FileSystem::lookup(&self.delta, parent_ino, comp)
+                .await?
+                .ok_or(FsError::NotFound)?;
+            parent_ino = stats.ino;
+        }
+
+        if let Some(stats) = FileSystem::lookup(&self.delta, parent_ino, name).await? {
+            self.refresh_overlay_mapping(overlay_ino, Layer::Delta, stats.ino, &info.path);
+            return Ok(stats.ino);
+        }
+
+        let (stats, _file) = FileSystem::create_file(
+            &self.delta,
+            parent_ino,
+            name,
+            base_stats.mode,
+            base_stats.uid,
+            base_stats.gid,
+        )
+        .await?;
+        let delta_ino = stats.ino;
+
+        let conn = self.delta.get_connection().await?;
+        conn.execute(
+            "UPDATE fs_inode
+             SET mode = ?, uid = ?, gid = ?, size = ?, atime = ?, mtime = ?, ctime = ?,
+                 atime_nsec = ?, mtime_nsec = ?, ctime_nsec = ?, data_inline = NULL, storage_kind = ?
+             WHERE ino = ?",
+            (
+                base_stats.mode as i64,
+                base_stats.uid as i64,
+                base_stats.gid as i64,
+                base_stats.size,
+                base_stats.atime,
+                base_stats.mtime,
+                base_stats.ctime,
+                base_stats.atime_nsec as i64,
+                base_stats.mtime_nsec as i64,
+                base_stats.ctime_nsec as i64,
+                STORAGE_CHUNKED,
+                delta_ino,
+            ),
+        )
+        .await?;
+
+        self.add_origin_mapping(delta_ino, info.underlying_ino)
+            .await?;
+        self.add_partial_origin_mapping(
+            delta_ino,
+            info.underlying_ino,
+            &info.path,
+            base_stats.size,
+        )
+        .await?;
+        self.refresh_overlay_mapping(overlay_ino, Layer::Delta, delta_ino, &info.path);
+
+        Ok(delta_ino)
+    }
+
+    async fn partial_file_for_delta(
+        &self,
+        overlay_ino: i64,
+        delta_ino: i64,
+        flags: i32,
+    ) -> Result<BoxedFile> {
+        if let Some(origin) = self.partial_origin_for_delta(delta_ino).await? {
+            let base_file = self.base.open(origin.base_ino, libc::O_RDONLY).await?;
+            Ok(Arc::new(OverlayPartialFile {
+                delta: self.delta.clone(),
+                base_file,
+                overlay_ino,
+                delta_ino,
+                chunk_size: self.delta.chunk_size(),
+            }))
+        } else {
+            FileSystem::open(&self.delta, delta_ino, flags).await
+        }
+    }
+}
+
+#[async_trait]
+impl File for OverlayPartialFile {
+    async fn pread(&self, offset: u64, size: u64) -> Result<Vec<u8>> {
+        let conn = self.delta.get_connection().await?;
+        let file_size = self.delta_file_size_with_conn(&conn).await?;
+        if offset >= file_size || size == 0 {
+            return Ok(Vec::new());
+        }
+
+        let read_len = std::cmp::min(size, file_size - offset) as usize;
+        let chunk_size = self.chunk_size as u64;
+        let mut result = Vec::with_capacity(read_len);
+
+        while result.len() < read_len {
+            let current_offset = offset + result.len() as u64;
+            let chunk_index = current_offset / chunk_size;
+            let offset_in_chunk = (current_offset % chunk_size) as usize;
+            let take = std::cmp::min(
+                self.chunk_size - offset_in_chunk,
+                read_len.saturating_sub(result.len()),
+            );
+
+            let chunk = self.read_merged_chunk_with_conn(&conn, chunk_index).await?;
+            result.extend_from_slice(&chunk[offset_in_chunk..offset_in_chunk + take]);
+        }
+
+        Ok(result)
+    }
+
+    async fn pwrite(&self, offset: u64, data: &[u8]) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        let write_end = offset
+            .checked_add(data.len() as u64)
+            .ok_or_else(|| Error::Internal("file write offset overflow".to_string()))?;
+        let conn = self.delta.get_connection().await?;
+        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+
+        let result: Result<()> = async {
+            let current_size = self.delta_file_size_with_conn(&conn).await?;
+            let new_size = std::cmp::max(current_size, write_end);
+            let chunk_size = self.chunk_size as u64;
+            let mut written = 0usize;
+
+            while written < data.len() {
+                let current_offset = offset + written as u64;
+                let chunk_index = current_offset / chunk_size;
+                let offset_in_chunk = (current_offset % chunk_size) as usize;
+                let remaining_in_chunk = self.chunk_size - offset_in_chunk;
+                let to_write = std::cmp::min(remaining_in_chunk, data.len() - written);
+
+                let mut chunk = self
+                    .read_merged_chunk_with_conn(&conn, chunk_index)
+                    .await?;
+                chunk[offset_in_chunk..offset_in_chunk + to_write]
+                    .copy_from_slice(&data[written..written + to_write]);
+
+                conn.execute(
+                    "INSERT OR REPLACE INTO fs_data (ino, chunk_index, data) VALUES (?, ?, ?)",
+                    (
+                        self.delta_ino,
+                        chunk_index as i64,
+                        Value::Blob(chunk),
+                    ),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT OR IGNORE INTO fs_chunk_override (delta_ino, chunk_index) VALUES (?, ?)",
+                    (self.delta_ino, chunk_index as i64),
+                )
+                .await?;
+
+                written += to_write;
+            }
+
+            let (now_secs, now_nsec) = current_timestamp()?;
+            conn.execute(
+                "UPDATE fs_inode
+                 SET size = ?, data_inline = NULL, storage_kind = ?, mtime = ?, ctime = ?,
+                     mtime_nsec = ?, ctime_nsec = ?
+                 WHERE ino = ?",
+                (
+                    new_size as i64,
+                    STORAGE_CHUNKED,
+                    now_secs,
+                    now_secs,
+                    now_nsec,
+                    now_nsec,
+                    self.delta_ino,
+                ),
+            )
+            .await?;
+            Ok(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                txn.commit().await?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = txn.rollback().await;
+                Err(e)
+            }
+        }
+    }
+
+    async fn truncate(&self, size: u64) -> Result<()> {
+        let conn = self.delta.get_connection().await?;
+        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+
+        let result: Result<()> = async {
+            let current_size = self.delta_file_size_with_conn(&conn).await?;
+            let chunk_size = self.chunk_size as u64;
+
+            if size == 0 {
+                conn.execute("DELETE FROM fs_data WHERE ino = ?", (self.delta_ino,))
+                    .await?;
+                conn.execute(
+                    "DELETE FROM fs_chunk_override WHERE delta_ino = ?",
+                    (self.delta_ino,),
+                )
+                .await?;
+            } else if size < current_size {
+                let last_chunk = (size - 1) / chunk_size;
+                conn.execute(
+                    "DELETE FROM fs_data WHERE ino = ? AND chunk_index > ?",
+                    (self.delta_ino, last_chunk as i64),
+                )
+                .await?;
+                conn.execute(
+                    "DELETE FROM fs_chunk_override WHERE delta_ino = ? AND chunk_index > ?",
+                    (self.delta_ino, last_chunk as i64),
+                )
+                .await?;
+
+                let end_in_last_chunk = ((size - 1) % chunk_size + 1) as usize;
+                if self.chunk_is_override_with_conn(&conn, last_chunk).await? {
+                    let mut chunk = self
+                        .delta_chunk_with_conn(&conn, last_chunk)
+                        .await?
+                        .unwrap_or_default();
+                    if chunk.len() > end_in_last_chunk {
+                        chunk.truncate(end_in_last_chunk);
+                        conn.execute(
+                            "UPDATE fs_data SET data = ? WHERE ino = ? AND chunk_index = ?",
+                            (Value::Blob(chunk), self.delta_ino, last_chunk as i64),
+                        )
+                        .await?;
+                    }
+                }
+            }
+
+            let origin_base_size = self.partial_base_size_with_conn(&conn).await?;
+            if size < origin_base_size {
+                conn.execute(
+                    "UPDATE fs_partial_origin SET base_size = ? WHERE delta_ino = ?",
+                    (size as i64, self.delta_ino),
+                )
+                .await?;
+            }
+
+            let (now_secs, now_nsec) = current_timestamp()?;
+            conn.execute(
+                "UPDATE fs_inode
+                 SET size = ?, data_inline = NULL, storage_kind = ?, mtime = ?, ctime = ?,
+                     mtime_nsec = ?, ctime_nsec = ?
+                 WHERE ino = ?",
+                (
+                    size as i64,
+                    STORAGE_CHUNKED,
+                    now_secs,
+                    now_secs,
+                    now_nsec,
+                    now_nsec,
+                    self.delta_ino,
+                ),
+            )
+            .await?;
+            Ok(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                txn.commit().await?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = txn.rollback().await;
+                Err(e)
+            }
+        }
+    }
+
+    async fn fsync(&self) -> Result<()> {
+        self.delta.fsync("/").await
+    }
+
+    async fn fstat(&self) -> Result<Stats> {
+        let mut stats = FileSystem::getattr(&self.delta, self.delta_ino)
+            .await?
+            .ok_or(FsError::NotFound)?;
+        stats.ino = self.overlay_ino;
+        Ok(stats)
+    }
+}
+
+impl OverlayPartialFile {
+    async fn delta_file_size_with_conn(&self, conn: &Connection) -> Result<u64> {
+        let mut rows = conn
+            .query("SELECT size FROM fs_inode WHERE ino = ?", (self.delta_ino,))
+            .await?;
+        if let Some(row) = rows.next().await? {
+            Ok(row
+                .get_value(0)
+                .ok()
+                .and_then(|v| v.as_integer().copied())
+                .unwrap_or(0) as u64)
+        } else {
+            Err(FsError::NotFound.into())
+        }
+    }
+
+    async fn partial_base_size_with_conn(&self, conn: &Connection) -> Result<u64> {
+        let mut rows = conn
+            .query(
+                "SELECT base_size FROM fs_partial_origin WHERE delta_ino = ?",
+                (self.delta_ino,),
+            )
+            .await?;
+        if let Some(row) = rows.next().await? {
+            Ok(row
+                .get_value(0)
+                .ok()
+                .and_then(|v| v.as_integer().copied())
+                .unwrap_or(0) as u64)
+        } else {
+            Err(FsError::NotFound.into())
+        }
+    }
+
+    async fn chunk_is_override_with_conn(
+        &self,
+        conn: &Connection,
+        chunk_index: u64,
+    ) -> Result<bool> {
+        let mut rows = conn
+            .query(
+                "SELECT 1 FROM fs_chunk_override WHERE delta_ino = ? AND chunk_index = ?",
+                (self.delta_ino, chunk_index as i64),
+            )
+            .await?;
+        Ok(rows.next().await?.is_some())
+    }
+
+    async fn delta_chunk_with_conn(
+        &self,
+        conn: &Connection,
+        chunk_index: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        let mut rows = conn
+            .query(
+                "SELECT data FROM fs_data WHERE ino = ? AND chunk_index = ?",
+                (self.delta_ino, chunk_index as i64),
+            )
+            .await?;
+        if let Some(row) = rows.next().await? {
+            match row.get_value(0) {
+                Ok(Value::Blob(data)) => Ok(Some(data)),
+                _ => Ok(Some(Vec::new())),
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn read_merged_chunk_with_conn(
+        &self,
+        conn: &Connection,
+        chunk_index: u64,
+    ) -> Result<Vec<u8>> {
+        if self.chunk_is_override_with_conn(conn, chunk_index).await? {
+            let mut chunk = self
+                .delta_chunk_with_conn(conn, chunk_index)
+                .await?
+                .unwrap_or_default();
+            chunk.resize(self.chunk_size, 0);
+            return Ok(chunk);
+        }
+
+        let base_size = self.partial_base_size_with_conn(conn).await?;
+        let chunk_start = chunk_index
+            .checked_mul(self.chunk_size as u64)
+            .ok_or_else(|| Error::Internal("chunk offset overflow".to_string()))?;
+        let mut chunk = if chunk_start < base_size {
+            let readable = std::cmp::min(self.chunk_size as u64, base_size - chunk_start);
+            self.base_file.pread(chunk_start, readable).await?
+        } else {
+            Vec::new()
+        };
+        chunk.resize(self.chunk_size, 0);
+        Ok(chunk)
     }
 }
 
@@ -1025,10 +1566,30 @@ impl FileSystem for OverlayFS {
             return Err(FsError::NotFound.into());
         }
 
-        let delta_ino = match info.layer {
-            Layer::Delta => info.underlying_ino,
-            Layer::Base => self.copy_up_and_update_mapping(ino, &info).await?,
-        };
+        match info.layer {
+            Layer::Delta => {
+                return self
+                    .partial_file_for_delta(ino, info.underlying_ino, flags)
+                    .await;
+            }
+            Layer::Base if self.partial_origin_enabled => {
+                let base_stats = self
+                    .base
+                    .getattr(info.underlying_ino)
+                    .await?
+                    .ok_or(FsError::NotFound)?;
+                if base_stats.is_file() {
+                    if is_write_open(flags) {
+                        let delta_ino = self.partial_copy_up_and_update_mapping(ino, &info).await?;
+                        return self.partial_file_for_delta(ino, delta_ino, flags).await;
+                    }
+                    return self.base.open(info.underlying_ino, flags).await;
+                }
+            }
+            Layer::Base => {}
+        }
+
+        let delta_ino = self.copy_up_and_update_mapping(ino, &info).await?;
 
         FileSystem::open(&self.delta, delta_ino, flags).await
     }
@@ -1192,10 +1753,16 @@ impl FileSystem for OverlayFS {
         // Try to remove from delta. Walk the delta layer to find the parent,
         // since the overlay parent may map to Base even when a copy-up exists in delta.
         if let Some(dpi) = self.resolve_delta_parent(&parent_info).await? {
+            let removed_delta_ino = FileSystem::lookup(&self.delta, dpi, name)
+                .await?
+                .map(|stats| stats.ino);
             match FileSystem::unlink(&self.delta, dpi, name).await {
                 Ok(()) => {}
                 Err(crate::error::Error::Fs(FsError::NotFound)) => {}
                 Err(e) => return Err(e),
+            }
+            if let Some(delta_ino) = removed_delta_ino {
+                self.cleanup_partial_origin_if_unlinked(delta_ino).await?;
             }
         }
 
@@ -1501,6 +2068,158 @@ mod tests {
         assert_eq!(
             stats_after.ino, ino_before,
             "inode should remain stable after copy-up"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overlay_partial_origin_single_byte_write_stores_one_chunk() -> Result<()> {
+        let base_dir = tempdir()?;
+        let delta_dir = tempdir()?;
+        let db_path = delta_dir.path().join("delta.db");
+        let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+        let chunk_size = delta.chunk_size();
+        let base_content = patterned_bytes(chunk_size * 3 + 17, 0x21);
+        std::fs::write(base_dir.path().join("large.bin"), &base_content)?;
+
+        let base = Arc::new(HostFS::new(base_dir.path())?);
+        let overlay = OverlayFS::new_with_partial_origin(base, delta, true);
+        overlay.init(base_dir.path().to_str().unwrap()).await?;
+
+        let stats = overlay.lookup(ROOT_INO, "large.bin").await?.unwrap();
+        let file = overlay.open(stats.ino, libc::O_RDWR).await?;
+        let write_offset = chunk_size as u64 + 123;
+        file.pwrite(write_offset, b"Z").await?;
+
+        assert_eq!(
+            scalar_i64(&overlay, "SELECT COUNT(*) FROM fs_data").await?,
+            1,
+            "single-byte partial-origin write should materialize one chunk"
+        );
+        assert_eq!(
+            scalar_i64(&overlay, "SELECT COUNT(*) FROM fs_chunk_override").await?,
+            1,
+            "single-byte partial-origin write should record one chunk override"
+        );
+        assert_eq!(
+            scalar_i64(&overlay, "SELECT SUM(LENGTH(data)) FROM fs_data").await?,
+            chunk_size as i64,
+            "materialized chunk should be bounded to the configured chunk size"
+        );
+
+        let read_back = file.pread(write_offset - 2, 5).await?;
+        let mut expected =
+            base_content[write_offset as usize - 2..write_offset as usize + 3].to_vec();
+        expected[2] = b'Z';
+        assert_eq!(read_back, expected);
+        assert_eq!(
+            std::fs::read(base_dir.path().join("large.bin"))?,
+            base_content,
+            "base file should remain unchanged"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overlay_partial_origin_reads_across_override_boundaries() -> Result<()> {
+        let base_dir = tempdir()?;
+        let delta_dir = tempdir()?;
+        let db_path = delta_dir.path().join("delta.db");
+        let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+        let chunk_size = delta.chunk_size();
+        let mut expected = patterned_bytes(chunk_size * 2 + 32, 0x42);
+        std::fs::write(base_dir.path().join("large.bin"), &expected)?;
+
+        let base = Arc::new(HostFS::new(base_dir.path())?);
+        let overlay = OverlayFS::new_with_partial_origin(base, delta, true);
+        overlay.init(base_dir.path().to_str().unwrap()).await?;
+
+        let stats = overlay.lookup(ROOT_INO, "large.bin").await?.unwrap();
+        let file = overlay.open(stats.ino, libc::O_RDWR).await?;
+        let write_offset = chunk_size as u64 - 2;
+        file.pwrite(write_offset, b"WXYZ").await?;
+        expected[write_offset as usize..write_offset as usize + 4].copy_from_slice(b"WXYZ");
+
+        assert_eq!(
+            scalar_i64(&overlay, "SELECT COUNT(*) FROM fs_data").await?,
+            2,
+            "cross-boundary write should materialize only the two touched chunks"
+        );
+        assert_eq!(
+            scalar_i64(&overlay, "SELECT COUNT(*) FROM fs_chunk_override").await?,
+            2
+        );
+
+        let read_back = file.pread(chunk_size as u64 - 4, 8).await?;
+        assert_eq!(
+            read_back,
+            expected[chunk_size - 4..chunk_size + 4],
+            "read should merge delta-owned chunks with base fallback bytes"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overlay_partial_origin_truncate_extend_does_not_reexpose_base_tail() -> Result<()>
+    {
+        let base_dir = tempdir()?;
+        let delta_dir = tempdir()?;
+        let db_path = delta_dir.path().join("delta.db");
+        let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+        let chunk_size = delta.chunk_size();
+        let base_content = patterned_bytes(chunk_size * 2, 0x63);
+        std::fs::write(base_dir.path().join("large.bin"), &base_content)?;
+
+        let base = Arc::new(HostFS::new(base_dir.path())?);
+        let overlay = OverlayFS::new_with_partial_origin(base, delta, true);
+        overlay.init(base_dir.path().to_str().unwrap()).await?;
+
+        let stats = overlay.lookup(ROOT_INO, "large.bin").await?.unwrap();
+        let file = overlay.open(stats.ino, libc::O_RDWR).await?;
+        file.truncate((chunk_size + 5) as u64).await?;
+        file.truncate((chunk_size + 12) as u64).await?;
+
+        let after_extend = file.pread(chunk_size as u64 + 4, 8).await?;
+        let mut expected = vec![base_content[chunk_size + 4]];
+        expected.extend(std::iter::repeat_n(0u8, 7));
+        assert_eq!(
+            after_extend, expected,
+            "extend after shrink should return zeros instead of base fallback past the shrink point"
+        );
+        assert_eq!(file.fstat().await?.size, (chunk_size + 12) as i64);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overlay_default_copy_up_still_copies_whole_base_file() -> Result<()> {
+        let base_dir = tempdir()?;
+        let delta_dir = tempdir()?;
+        let db_path = delta_dir.path().join("delta.db");
+        let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+        let chunk_size = delta.chunk_size();
+        let base_content = patterned_bytes(chunk_size * 3 + 17, 0x84);
+        std::fs::write(base_dir.path().join("large.bin"), &base_content)?;
+
+        let base = Arc::new(HostFS::new(base_dir.path())?);
+        let overlay = OverlayFS::new_with_partial_origin(base, delta, false);
+        overlay.init(base_dir.path().to_str().unwrap()).await?;
+
+        let stats = overlay.lookup(ROOT_INO, "large.bin").await?.unwrap();
+        let file = overlay.open(stats.ino, libc::O_RDWR).await?;
+        file.pwrite(chunk_size as u64 + 123, b"Z").await?;
+
+        assert!(
+            scalar_i64(&overlay, "SELECT COUNT(*) FROM fs_data").await? > 1,
+            "default overlay open/write path should keep whole-file copy-up behavior"
+        );
+        assert_eq!(
+            scalar_i64(&overlay, "SELECT COUNT(*) FROM fs_partial_origin").await?,
+            0,
+            "partial-origin metadata must stay opt-in"
         );
 
         Ok(())
@@ -2893,5 +3612,28 @@ mod tests {
         assert!(deleted.is_none(), "newsubdir should be deleted after rmdir");
 
         Ok(())
+    }
+
+    async fn scalar_i64(overlay: &OverlayFS, sql: &str) -> Result<i64> {
+        let conn = overlay.delta().get_connection().await?;
+        let mut rows = conn.query(sql, ()).await?;
+        let row = rows
+            .next()
+            .await?
+            .ok_or_else(|| Error::Internal(format!("no row for scalar query: {sql}")))?;
+        Ok(row
+            .get_value(0)
+            .ok()
+            .and_then(|v| v.as_integer().copied())
+            .unwrap_or(0))
+    }
+
+    fn patterned_bytes(len: usize, seed: u8) -> Vec<u8> {
+        (0..len)
+            .map(|index| {
+                seed.wrapping_add((index % 251) as u8)
+                    .wrapping_add((index / 251) as u8)
+            })
+            .collect()
     }
 }
