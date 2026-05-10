@@ -21,6 +21,7 @@ from typing import Any, Optional
 
 OUTPUT_TAIL_CHARS = 4000
 ONE_MIB = 1024 * 1024
+PARTIAL_ORIGIN_ENV = "AGENTFS_OVERLAY_PARTIAL_ORIGIN"
 
 
 EDIT_WORKLOAD = r'''
@@ -122,6 +123,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 Environment:
   AGENTFS_BIN      path/name of agentfs executable
   AGENTFS_PROFILE  set to 1 to collect AgentFS profile summaries
+  AGENTFS_OVERLAY_PARTIAL_ORIGIN
+                   set to 1 to enable experimental partial-origin copy-up
 """,
     )
     parser.add_argument(
@@ -157,6 +160,21 @@ Environment:
         default=env_flag("AGENTFS_PROFILE"),
         help="enable AGENTFS_PROFILE=1 for AgentFS invocations",
     )
+    partial_origin_default = env_flag(PARTIAL_ORIGIN_ENV)
+    partial_origin_group = parser.add_mutually_exclusive_group()
+    partial_origin_group.add_argument(
+        "--partial-origin",
+        dest="partial_origin",
+        action="store_true",
+        help=f"enable {PARTIAL_ORIGIN_ENV}=1 for AgentFS overlay invocations",
+    )
+    partial_origin_group.add_argument(
+        "--no-partial-origin",
+        dest="partial_origin",
+        action="store_false",
+        help=f"disable {PARTIAL_ORIGIN_ENV} for AgentFS overlay invocations",
+    )
+    parser.set_defaults(partial_origin=partial_origin_default)
     parser.add_argument(
         "--keep-temp",
         action="store_true",
@@ -440,12 +458,16 @@ def inspect_db(db_path: Path) -> dict[str, Any]:
         return {"inspectable": False, "reason": str(exc)}
 
 
-def prepare_environment(temp_root: Path, profile: bool) -> dict[str, str]:
+def prepare_environment(temp_root: Path, profile: bool, partial_origin: bool) -> dict[str, str]:
     env = os.environ.copy()
     env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
     env.setdefault("NO_COLOR", "1")
     if profile:
         env["AGENTFS_PROFILE"] = "1"
+    if partial_origin:
+        env[PARTIAL_ORIGIN_ENV] = "1"
+    else:
+        env.pop(PARTIAL_ORIGIN_ENV, None)
 
     home = temp_root / "home"
     for path in (home, home / ".config", home / ".cache", home / ".local" / "share"):
@@ -482,7 +504,7 @@ def main(argv: list[str]) -> int:
     result: dict[str, Any]
     try:
         agentfs_bin = resolve_agentfs_bin(args.agentfs_bin, repo_root)
-        env = prepare_environment(temp_root, args.profile)
+        env = prepare_environment(temp_root, args.profile, args.partial_origin)
         session = args.session or f"large-edit-{uuid.uuid4()}"
 
         source_root = temp_root / "source"
@@ -569,6 +591,10 @@ def main(argv: list[str]) -> int:
                 "session": session,
                 "db_path": str(db_path),
                 "profile_enabled": args.profile,
+                "partial_origin_enabled": args.partial_origin,
+                "env_flags": {
+                    PARTIAL_ORIGIN_ENV: env.get(PARTIAL_ORIGIN_ENV),
+                },
                 "profile_summary_count": len(warmup["profile_summaries"]) + len(agentfs["profile_summaries"]),
             },
             "database": {

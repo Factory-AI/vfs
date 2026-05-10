@@ -76,6 +76,10 @@ struct InodeInfo {
 struct PartialOrigin {
     base_path: String,
     base_fingerprint_size: i64,
+    base_mtime: i64,
+    base_mtime_nsec: u32,
+    base_ctime: i64,
+    base_ctime_nsec: u32,
 }
 
 struct OverlayPartialFile {
@@ -553,7 +557,8 @@ impl OverlayFS {
         let conn = self.delta.get_connection().await?;
         let mut rows = conn
             .query(
-                "SELECT base_path, base_size, base_fingerprint_size
+                "SELECT base_path, base_size, base_fingerprint_size,
+                        base_mtime, base_mtime_nsec, base_ctime, base_ctime_nsec
                  FROM fs_partial_origin WHERE delta_ino = ?",
                 (delta_ino,),
             )
@@ -577,6 +582,26 @@ impl OverlayFS {
                 .ok()
                 .and_then(|v| v.as_integer().copied())
                 .unwrap_or(base_size);
+            let base_mtime = row
+                .get_value(3)
+                .ok()
+                .and_then(|v| v.as_integer().copied())
+                .unwrap_or(0);
+            let base_mtime_nsec = row
+                .get_value(4)
+                .ok()
+                .and_then(|v| v.as_integer().copied())
+                .unwrap_or(0) as u32;
+            let base_ctime = row
+                .get_value(5)
+                .ok()
+                .and_then(|v| v.as_integer().copied())
+                .unwrap_or(0);
+            let base_ctime_nsec = row
+                .get_value(6)
+                .ok()
+                .and_then(|v| v.as_integer().copied())
+                .unwrap_or(0) as u32;
             Ok(Some(PartialOrigin {
                 base_path,
                 base_fingerprint_size: if base_fingerprint_size < 0 {
@@ -584,6 +609,10 @@ impl OverlayFS {
                 } else {
                     base_fingerprint_size
                 },
+                base_mtime,
+                base_mtime_nsec,
+                base_ctime,
+                base_ctime_nsec,
             }))
         } else {
             Ok(None)
@@ -601,21 +630,28 @@ impl OverlayFS {
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
         conn.execute(
             "INSERT OR REPLACE INTO fs_partial_origin (
-                delta_ino, base_ino, base_path, base_size, base_fingerprint_size, base_mtime, base_mtime_nsec,
-                base_ctime, base_ctime_nsec, created_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            vec![
-                Value::Integer(delta_ino),
-                Value::Integer(base_ino),
-                Value::Text(base_path.to_string()),
-                Value::Integer(base_stats.size),
-                Value::Integer(base_stats.size),
-                Value::Integer(base_stats.mtime),
-                Value::Integer(base_stats.mtime_nsec as i64),
-                Value::Integer(base_stats.ctime),
-                Value::Integer(base_stats.ctime_nsec as i64),
-                Value::Integer(now),
-            ],
+                delta_ino, base_ino, base_path, base_size, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            (delta_ino, base_ino, base_path, base_stats.size, now),
+        )
+        .await?;
+        conn.execute(
+            "UPDATE fs_partial_origin
+             SET base_fingerprint_size = ?1, base_mtime = ?2, base_mtime_nsec = ?3
+             WHERE delta_ino = ?4",
+            (
+                base_stats.size,
+                base_stats.mtime,
+                base_stats.mtime_nsec as i64,
+                delta_ino,
+            ),
+        )
+        .await?;
+        conn.execute(
+            "UPDATE fs_partial_origin
+             SET base_ctime = ?1, base_ctime_nsec = ?2
+             WHERE delta_ino = ?3",
+            (base_stats.ctime, base_stats.ctime_nsec as i64, delta_ino),
         )
         .await?;
         Ok(())
@@ -645,6 +681,24 @@ impl OverlayFS {
                 origin.base_path, origin.base_fingerprint_size, stats.size
             )));
         }
+        if stats.mtime != origin.base_mtime
+            || stats.mtime_nsec != origin.base_mtime_nsec
+            || stats.ctime != origin.base_ctime
+            || stats.ctime_nsec != origin.base_ctime_nsec
+        {
+            return Err(Error::Internal(format!(
+                "partial-origin base changed for {} (stored mtime={}.{}, current mtime={}.{}, stored ctime={}.{}, current ctime={}.{})",
+                origin.base_path,
+                origin.base_mtime,
+                origin.base_mtime_nsec,
+                stats.mtime,
+                stats.mtime_nsec,
+                origin.base_ctime,
+                origin.base_ctime_nsec,
+                stats.ctime,
+                stats.ctime_nsec
+            )));
+        }
         Ok(())
     }
 
@@ -657,6 +711,8 @@ impl OverlayFS {
             return Ok(());
         }
 
+        conn.execute("DELETE FROM fs_origin WHERE delta_ino = ?", (delta_ino,))
+            .await?;
         conn.execute(
             "DELETE FROM fs_chunk_override WHERE delta_ino = ?",
             (delta_ino,),
@@ -925,11 +981,14 @@ impl OverlayFS {
         }
         let name = components.last().unwrap();
 
-        let base_stats = self
-            .base
-            .getattr(info.underlying_ino)
-            .await?
-            .ok_or(FsError::NotFound)?;
+        let base_stats = match self.resolve_base_path(&info.path).await? {
+            Some(stats) => stats,
+            None => self
+                .base
+                .getattr(info.underlying_ino)
+                .await?
+                .ok_or(FsError::NotFound)?,
+        };
         if !base_stats.is_file() {
             return self.copy_up_and_update_mapping(overlay_ino, info).await;
         }
@@ -2513,6 +2572,238 @@ mod tests {
         assert!(
             reopened.open(stats.ino, libc::O_RDONLY).await.is_err(),
             "partial-origin files should fail loudly when the base fallback changed"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overlay_partial_origin_detects_same_size_base_drift() -> Result<()> {
+        let base_dir = tempdir()?;
+        let delta_dir = tempdir()?;
+        let db_path = delta_dir.path().join("delta.db");
+        let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+        let chunk_size = delta.chunk_size();
+        let base_content = patterned_bytes(chunk_size + 16, 0x73);
+        std::fs::write(base_dir.path().join("large.bin"), &base_content)?;
+
+        let base = Arc::new(HostFS::new(base_dir.path())?);
+        let overlay = OverlayFS::new_with_partial_origin(base, delta, true);
+        overlay.init(base_dir.path().to_str().unwrap()).await?;
+
+        let stats = overlay.lookup(ROOT_INO, "large.bin").await?.unwrap();
+        let file = overlay.open(stats.ino, libc::O_RDWR).await?;
+        file.pwrite(0, b"Z").await?;
+        drop(file);
+        drop(overlay);
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let changed_same_size = patterned_bytes(base_content.len(), 0x74);
+        std::fs::write(base_dir.path().join("large.bin"), changed_same_size)?;
+
+        let reopened_delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+        let reopened_base = Arc::new(HostFS::new(base_dir.path())?);
+        let reopened = OverlayFS::new_with_partial_origin(reopened_base, reopened_delta, true);
+        reopened.init(base_dir.path().to_str().unwrap()).await?;
+
+        let stats = reopened.lookup(ROOT_INO, "large.bin").await?.unwrap();
+        assert!(
+            reopened.open(stats.ino, libc::O_RDONLY).await.is_err(),
+            "partial-origin files should fail loudly when same-size base fallback content changed"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overlay_partial_origin_main_db_snapshot_restore() -> Result<()> {
+        let base_dir = tempdir()?;
+        let delta_dir = tempdir()?;
+        let db_path = delta_dir.path().join("delta.db");
+        let restored_db_path = delta_dir.path().join("restored.db");
+        let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+        let chunk_size = delta.chunk_size();
+        let mut expected = patterned_bytes(chunk_size * 2 + 33, 0x91);
+        std::fs::write(base_dir.path().join("large.bin"), &expected)?;
+
+        let base = Arc::new(HostFS::new(base_dir.path())?);
+        let overlay = OverlayFS::new_with_partial_origin(base, delta, true);
+        overlay.init(base_dir.path().to_str().unwrap()).await?;
+
+        let stats = overlay.lookup(ROOT_INO, "large.bin").await?.unwrap();
+        let file = overlay.open(stats.ino, libc::O_RDWR).await?;
+        let write_offset = chunk_size as u64 + 11;
+        file.pwrite(write_offset, b"S").await?;
+        file.fsync().await?;
+        expected[write_offset as usize] = b'S';
+        drop(file);
+        drop(overlay);
+
+        std::fs::copy(&db_path, &restored_db_path)?;
+
+        let restored_delta = AgentFS::new(restored_db_path.to_str().unwrap()).await?;
+        let restored_base = Arc::new(HostFS::new(base_dir.path())?);
+        let restored = OverlayFS::new_with_partial_origin(restored_base, restored_delta, true);
+        restored.init(base_dir.path().to_str().unwrap()).await?;
+
+        let restored_stats = restored.lookup(ROOT_INO, "large.bin").await?.unwrap();
+        let restored_file = restored.open(restored_stats.ino, libc::O_RDONLY).await?;
+        assert_eq!(
+            restored_file.pread(chunk_size as u64 + 8, 8).await?,
+            expected[chunk_size + 8..chunk_size + 16],
+            "main-db snapshot restore should preserve partial-origin metadata and chunk overrides"
+        );
+        assert_eq!(
+            scalar_i64(&restored, "SELECT COUNT(*) FROM fs_partial_origin").await?,
+            1
+        );
+        assert_eq!(
+            scalar_i64(&restored, "SELECT COUNT(*) FROM fs_chunk_override").await?,
+            1
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overlay_partial_origin_unlink_cleans_metadata_and_whiteouts_base() -> Result<()> {
+        let base_dir = tempdir()?;
+        let delta_dir = tempdir()?;
+        let db_path = delta_dir.path().join("delta.db");
+        let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+        let chunk_size = delta.chunk_size();
+        let base_content = patterned_bytes(chunk_size + 19, 0xa1);
+        std::fs::write(base_dir.path().join("large.bin"), &base_content)?;
+
+        let base = Arc::new(HostFS::new(base_dir.path())?);
+        let overlay = OverlayFS::new_with_partial_origin(base, delta, true);
+        overlay.init(base_dir.path().to_str().unwrap()).await?;
+
+        let stats = overlay.lookup(ROOT_INO, "large.bin").await?.unwrap();
+        let file = overlay.open(stats.ino, libc::O_RDWR).await?;
+        file.pwrite(chunk_size as u64 + 1, b"U").await?;
+        drop(file);
+        assert_eq!(
+            scalar_i64(&overlay, "SELECT COUNT(*) FROM fs_partial_origin").await?,
+            1
+        );
+
+        overlay.unlink(ROOT_INO, "large.bin").await?;
+
+        assert!(overlay.lookup(ROOT_INO, "large.bin").await?.is_none());
+        assert_eq!(
+            std::fs::read(base_dir.path().join("large.bin"))?,
+            base_content,
+            "unlink should not mutate the base file"
+        );
+        assert_eq!(
+            scalar_i64(&overlay, "SELECT COUNT(*) FROM fs_partial_origin").await?,
+            0,
+            "last unlink should remove partial-origin rows"
+        );
+        assert_eq!(
+            scalar_i64(&overlay, "SELECT COUNT(*) FROM fs_chunk_override").await?,
+            0,
+            "last unlink should remove chunk override rows"
+        );
+        assert_eq!(
+            scalar_i64(&overlay, "SELECT COUNT(*) FROM fs_origin").await?,
+            0,
+            "last unlink should remove origin rows"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overlay_partial_origin_hardlink_survives_source_unlink() -> Result<()> {
+        let base_dir = tempdir()?;
+        let delta_dir = tempdir()?;
+        let db_path = delta_dir.path().join("delta.db");
+        let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+        let chunk_size = delta.chunk_size();
+        let mut expected = patterned_bytes(chunk_size + 21, 0xb1);
+        std::fs::write(base_dir.path().join("large.bin"), &expected)?;
+
+        let base = Arc::new(HostFS::new(base_dir.path())?);
+        let overlay = OverlayFS::new_with_partial_origin(base, delta, true);
+        overlay.init(base_dir.path().to_str().unwrap()).await?;
+
+        let stats = overlay.lookup(ROOT_INO, "large.bin").await?.unwrap();
+        let file = overlay.open(stats.ino, libc::O_RDWR).await?;
+        file.pwrite(5, b"H").await?;
+        expected[5] = b'H';
+        drop(file);
+
+        overlay.link(stats.ino, ROOT_INO, "linked.bin").await?;
+        let linked = overlay.lookup(ROOT_INO, "linked.bin").await?.unwrap();
+        assert_eq!(linked.ino, stats.ino);
+        assert_eq!(linked.nlink, 2);
+        let linked_file = overlay.open(linked.ino, libc::O_RDONLY).await?;
+        assert_eq!(linked_file.pread(0, 8).await?, expected[..8]);
+        drop(linked_file);
+
+        overlay.unlink(ROOT_INO, "large.bin").await?;
+        assert!(overlay.lookup(ROOT_INO, "large.bin").await?.is_none());
+        let linked_after = overlay.lookup(ROOT_INO, "linked.bin").await?.unwrap();
+        let linked_file = overlay.open(linked_after.ino, libc::O_RDONLY).await?;
+        assert_eq!(
+            linked_file.pread(0, 8).await?,
+            expected[..8],
+            "hardlink should retain merged partial-origin contents after source unlink"
+        );
+        assert_eq!(linked_file.fstat().await?.nlink, 1);
+        assert_eq!(
+            scalar_i64(&overlay, "SELECT COUNT(*) FROM fs_partial_origin").await?,
+            1,
+            "partial-origin metadata should remain while a hardlink keeps the inode alive"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overlay_partial_origin_renamed_file_readdir_plus_after_remount() -> Result<()> {
+        let base_dir = tempdir()?;
+        let delta_dir = tempdir()?;
+        let db_path = delta_dir.path().join("delta.db");
+        let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+        let chunk_size = delta.chunk_size();
+        let mut expected = patterned_bytes(chunk_size + 23, 0xc1);
+        std::fs::write(base_dir.path().join("large.bin"), &expected)?;
+
+        let base = Arc::new(HostFS::new(base_dir.path())?);
+        let overlay = OverlayFS::new_with_partial_origin(base, delta, true);
+        overlay.init(base_dir.path().to_str().unwrap()).await?;
+
+        let stats = overlay.lookup(ROOT_INO, "large.bin").await?.unwrap();
+        let file = overlay.open(stats.ino, libc::O_RDWR).await?;
+        file.pwrite(7, b"N").await?;
+        file.fsync().await?;
+        expected[7] = b'N';
+        drop(file);
+
+        overlay
+            .rename(ROOT_INO, "large.bin", ROOT_INO, "renamed.bin")
+            .await?;
+        drop(overlay);
+
+        let reopened_delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+        let reopened_base = Arc::new(HostFS::new(base_dir.path())?);
+        let reopened = OverlayFS::new_with_partial_origin(reopened_base, reopened_delta, true);
+        reopened.init(base_dir.path().to_str().unwrap()).await?;
+
+        assert!(reopened.lookup(ROOT_INO, "large.bin").await?.is_none());
+        let entries = reopened.readdir_plus(ROOT_INO).await?.unwrap();
+        let renamed = entries
+            .into_iter()
+            .find(|entry| entry.name == "renamed.bin")
+            .expect("renamed.bin from readdir_plus");
+        let file = reopened.open(renamed.stats.ino, libc::O_RDONLY).await?;
+        assert_eq!(
+            file.pread(0, 10).await?,
+            expected[..10],
+            "renamed partial-origin file from readdir_plus should open after remount"
         );
 
         Ok(())

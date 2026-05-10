@@ -181,6 +181,9 @@ scripts/validation/large-edit-benchmark.py --file-size-mib 200 --profile
 
 # Fast smoke
 scripts/validation/large-edit-benchmark.py --file-size-mib 1 --timeout 60
+
+# Experimental partial-origin smoke
+scripts/validation/large-edit-benchmark.py --file-size-mib 1 --partial-origin --timeout 60
 ```
 
 The helper creates identical native and AgentFS-overlay source trees, warms an
@@ -191,6 +194,13 @@ edit minus the same total immediately before the edit. If Python's stdlib
 `sqlite3` can open the database, the output also includes `fs_data` row count,
 stored chunk bytes, inline inode rows, origin rows, partial-origin rows,
 chunk-override rows, and `fs_config`.
+
+Partial-origin overlay copy-up remains opt-in for Phase 5.5. Use
+`--partial-origin` or `AGENTFS_OVERLAY_PARTIAL_ORIGIN=1` to enable it; use
+`--no-partial-origin` to force the default whole-file copy-up path even when the
+environment variable is set. The JSON output reports the selected mode as
+`agentfs.partial_origin_enabled` and echoes the effective env flag under
+`agentfs.env_flags.AGENTFS_OVERLAY_PARTIAL_ORIGIN`.
 
 Machine-readable schema (`schema_version: 1`):
 
@@ -210,6 +220,8 @@ Machine-readable schema (`schema_version: 1`):
     "session": "large-edit-...",
     "db_path": "/tmp/.../home/.agentfs/run/.../delta.db",
     "profile_enabled": true,
+    "partial_origin_enabled": false,
+    "env_flags": {"AGENTFS_OVERLAY_PARTIAL_ORIGIN": null},
     "profile_summary_count": 2
   },
   "database": {
@@ -255,6 +267,12 @@ When `--profile` or `AGENTFS_PROFILE=1` is set, parsed
 `agentfs_profile_summary` lines from AgentFS stderr are attached to the
 `agentfs_overlay.warmup.profile_summaries` and
 `agentfs_overlay.run.profile_summaries` arrays.
+
+The current recommendation is to keep partial-origin disabled by default. SDK
+overlay tests cover remount, main-DB snapshot restore, unlink cleanup, hardlink,
+rename/`readdir_plus`, truncate shrink/extend, and drift detection; defaulting
+should wait until the same flag is included in supported FUSE/CLI torture and
+pjdfstest gates without regressions.
 
 ### Workload baseline profile summaries
 

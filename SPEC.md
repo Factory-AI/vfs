@@ -687,6 +687,51 @@ SELECT base_ino FROM fs_origin WHERE delta_ino = ?
 
 If a mapping exists, return `base_ino` instead of `delta_ino` in stat results.
 
+### Partial-Origin Overlay Mode
+
+Partial-origin copy-up is an experimental opt-in overlay mode enabled with
+`AGENTFS_OVERLAY_PARTIAL_ORIGIN=1`. The default overlay behavior remains
+whole-file copy-up. In opt-in mode, write-opening a regular base-layer file
+creates a delta inode with the original size and metadata, records the base
+path/fingerprint in `fs_partial_origin`, and stores only changed chunk indexes
+in `fs_data` plus `fs_chunk_override`. Reads merge changed chunks from the
+delta layer with unchanged chunks from the base layer.
+
+The base fallback is part of the file's integrity contract. Implementations MUST
+fail reads of partial-origin files if the recorded base size or modification
+metadata no longer matches the current base file. Snapshot/restore of the main
+delta database is supported only when the same unchanged base path is available.
+
+#### Tables: `fs_partial_origin` and `fs_chunk_override`
+
+```sql
+CREATE TABLE fs_partial_origin (
+  delta_ino INTEGER PRIMARY KEY,
+  base_ino INTEGER NOT NULL,
+  base_path TEXT NOT NULL,
+  base_size INTEGER NOT NULL,
+  base_fingerprint_size INTEGER NOT NULL DEFAULT -1,
+  base_mtime INTEGER NOT NULL DEFAULT 0,
+  base_mtime_nsec INTEGER NOT NULL DEFAULT 0,
+  base_ctime INTEGER NOT NULL DEFAULT 0,
+  base_ctime_nsec INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL
+)
+
+CREATE TABLE fs_chunk_override (
+  delta_ino INTEGER NOT NULL,
+  chunk_index INTEGER NOT NULL,
+  PRIMARY KEY (delta_ino, chunk_index)
+)
+```
+
+Phase 5.5 evidence keeps this mode opt-in: SDK coverage now includes remount,
+main-DB snapshot restore, unlink cleanup/whiteout behavior, hardlink survival,
+rename plus `readdir_plus`, truncate shrink/extend, base drift detection, and
+large-edit smoke output that reports whether the env flag was enabled. It SHOULD
+NOT be defaulted until the broader FUSE/CLI torture and POSIX gates pass with
+the flag enabled.
+
 ### Consistency Rules
 
 1. A whiteout MUST be removed when a new file is created at that path
@@ -696,6 +741,7 @@ If a mapping exists, return `base_ino` instead of `delta_ino` in stat results.
 5. When copying a file from base to delta, the origin mapping MUST be stored
 6. When stat'ing a delta file with an origin mapping, the base inode MUST be returned
 7. Existing overlay databases with legacy `fs_whiteout(path, created_at)` rows MUST synthesize `parent_path` before using the v0.5 whiteout schema
+8. Partial-origin files MUST remove `fs_partial_origin`, `fs_chunk_override`, and `fs_origin` rows when the last delta link is unlinked
 
 ## Key-Value Data
 
