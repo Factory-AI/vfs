@@ -1,5 +1,171 @@
 # Testing AgentFS
 
+## Phase 5.5 read-path benchmark and profiling
+
+Use `scripts/validation/read-path-benchmark.py` to capture reproducible
+native-vs-AgentFS read-path baselines before and after read-path changes. The
+script creates a deterministic temporary fixture, runs identical read-only
+workloads natively and through `agentfs run`, writes JSON under `/tmp` by
+default, and also emits the same JSON to stdout.
+
+```bash
+# Fast smoke with profile summaries/counters
+AGENTFS_PROFILE=1 scripts/validation/read-path-benchmark.py \
+  --files 8 \
+  --dirs 3 \
+  --stat-iterations 1 \
+  --readdir-iterations 1 \
+  --open-iterations 1 \
+  --timeout 60
+
+# Larger bounded read-path baseline
+scripts/validation/read-path-benchmark.py \
+  --files 256 \
+  --dirs 32 \
+  --file-size-bytes 8192 \
+  --stat-iterations 8 \
+  --readdir-iterations 16 \
+  --open-iterations 8 \
+  --timeout 180
+
+# Only steady warm-session measurement
+scripts/validation/read-path-benchmark.py --modes warm --output /tmp/agentfs-read-warm.json
+```
+
+The benchmark covers:
+
+- bounded file scan,
+- repeated `stat`/`lstat` storm,
+- `readdir` storm,
+- `readdir_plus` approximation via `os.scandir(...).stat(...)`,
+- open/read/close loop,
+- cold and warm AgentFS sessions,
+- startup/session overhead vs child workload time where measurable.
+
+Environment:
+
+| Variable | Description |
+|---|---|
+| `AGENTFS_BIN` | path/name of the `agentfs` executable |
+| `AGENTFS_PROFILE=1` | include parsed `agentfs_profile_summary` lines and counter summaries |
+| `READ_PATH_BENCHMARK_MODES` | comma-separated default modes, e.g. `cold,warm` |
+| `READ_PATH_BENCHMARK_TIMEOUT` | per-command timeout in seconds |
+| `READ_PATH_BENCHMARK_KEEP_TEMP=1` | keep temporary fixture trees and isolated HOME |
+
+Machine-readable schema (`schema_version: 1`):
+
+```json
+{
+  "schema_version": 1,
+  "benchmark": "phase55-read-path",
+  "git_commit": "<repo commit>",
+  "command": {
+    "argv": ["scripts/validation/read-path-benchmark.py", "..."],
+    "workload_argv": ["python", "-c", "..."],
+    "agentfs_prefix": ["/path/to/agentfs", "run", "--session", "<session>", "--no-default-allows", "--"]
+  },
+  "environment": {
+    "AGENTFS_PROFILE": "1",
+    "AGENTFS_BIN": "/path/to/agentfs"
+  },
+  "parameters": {
+    "files": 64,
+    "dirs": 8,
+    "file_size_bytes": 4096,
+    "scan_bytes": 1024,
+    "stat_iterations": 4,
+    "readdir_iterations": 8,
+    "open_iterations": 3,
+    "open_read_bytes": 512,
+    "modes": ["cold", "warm"]
+  },
+  "agentfs": {
+    "bin": "/path/to/agentfs",
+    "profile_enabled": true,
+    "profile_summary_count": 4
+  },
+  "summary": {
+    "native_seconds": 0.01,
+    "agentfs_seconds": 0.2,
+    "ratio": 20.0,
+    "all_equivalent": true
+  },
+  "modes": [
+    {
+      "mode": "cold",
+      "session": "read-path-...",
+      "summary": {
+        "native_seconds": 0.01,
+        "agentfs_seconds": 0.2,
+        "ratio": 20.0
+      },
+      "steady_state": {
+        "native_workload_seconds": 0.009,
+        "agentfs_workload_seconds": 0.15,
+        "ratio": 16.7
+      },
+      "equivalence": {
+        "checked": true,
+        "equivalent": true,
+        "native_digest": "...",
+        "agentfs_digest": "..."
+      },
+      "native": {
+        "run": {"duration_seconds": 0.01, "returncode": 0},
+        "workload": {
+          "digest": "...",
+          "phase_seconds": {
+            "bounded_file_scan": 0.001,
+            "stat_lstat_storm": 0.001,
+            "readdir_storm": 0.001,
+            "readdir_plus_storm": 0.001,
+            "open_read_close_loop": 0.001
+          },
+          "counts": {}
+        },
+        "timing": {
+          "outer_seconds": 0.01,
+          "workload_seconds": 0.009,
+          "startup_or_session_overhead_seconds": 0.001
+        }
+      },
+      "agentfs": {
+        "warmup": null,
+        "run": {
+          "duration_seconds": 0.2,
+          "returncode": 0,
+          "profile_summaries": []
+        },
+        "workload": {"digest": "...", "phase_seconds": {}, "counts": {}},
+        "timing": {
+          "outer_seconds": 0.2,
+          "workload_seconds": 0.15,
+          "startup_or_session_overhead_seconds": 0.05
+        },
+        "profile_summaries": [],
+        "profile_counters": {
+          "summary_count": 2,
+          "last_by_source": {
+            "fuse_session": {"fuse_lookup_count": 1},
+            "agentfs": {"lookup_count": 1}
+          },
+          "max_counters": {
+            "lookup_count": 1,
+            "getattr_count": 1,
+            "readdir_count": 1,
+            "readdir_plus_count": 1,
+            "fuse_callback_count": 1
+          }
+        }
+      }
+    }
+  ],
+  "temp_dir": "/tmp/agentfs-read-path-benchmark-...",
+  "kept_temp": false,
+  "output_path": "/tmp/agentfs-read-path-benchmark-....json"
+}
+```
+
 ## Phase 5 profiling and backend-risk helpers
 
 ### Large base-file single-byte edit benchmark

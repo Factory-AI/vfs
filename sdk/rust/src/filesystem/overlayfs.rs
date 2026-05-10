@@ -1331,6 +1331,7 @@ impl OverlayPartialFile {
 #[async_trait]
 impl FileSystem for OverlayFS {
     async fn lookup(&self, parent_ino: i64, name: &str) -> Result<Option<Stats>> {
+        crate::profiling::record_lookup();
         trace!(
             "OverlayFS::lookup: parent_ino={}, name={}",
             parent_ino,
@@ -1342,6 +1343,8 @@ impl FileSystem for OverlayFS {
 
         // Check for whiteout
         if self.is_whiteout(&path) {
+            crate::profiling::record_lookup_whiteout();
+            crate::profiling::record_negative_lookup();
             return Ok(None);
         }
 
@@ -1350,7 +1353,10 @@ impl FileSystem for OverlayFS {
 
         // Look up in delta (only if we resolved the correct parent)
         if let Some(delta_stats) = match delta_parent_ino {
-            Some(ino) => self.delta.lookup(ino, name).await?,
+            Some(ino) => {
+                crate::profiling::record_lookup_delta();
+                self.delta.lookup(ino, name).await?
+            }
             None => None,
         } {
             let delta_ino = delta_stats.ino;
@@ -1390,10 +1396,17 @@ impl FileSystem for OverlayFS {
             } else {
                 // Walk the base to find the parent
                 let mut base_ino: i64 = 1;
-                for comp in parent_info.path.split('/').filter(|s| !s.is_empty()) {
+                let components: Vec<_> = parent_info
+                    .path
+                    .split('/')
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                crate::profiling::record_path_resolution(components.len() as u64);
+                for comp in components {
                     if let Some(s) = self.base.lookup(base_ino, comp).await? {
                         base_ino = s.ino;
                     } else {
+                        crate::profiling::record_negative_lookup();
                         return Ok(None);
                     }
                 }
@@ -1401,6 +1414,7 @@ impl FileSystem for OverlayFS {
             }
         };
 
+        crate::profiling::record_lookup_base();
         if let Some(base_stats) = self.base.lookup(base_parent_ino, name).await? {
             let ino = self.get_or_create_overlay_ino(Layer::Base, base_stats.ino, &path);
             let mut stats = base_stats;
@@ -1408,10 +1422,13 @@ impl FileSystem for OverlayFS {
             return Ok(Some(stats));
         }
 
+        crate::profiling::record_negative_lookup();
         Ok(None)
     }
 
     async fn getattr(&self, ino: i64) -> Result<Option<Stats>> {
+        crate::profiling::record_getattr();
+        crate::profiling::record_attr_cache_miss();
         trace!("OverlayFS::getattr: ino={}", ino);
 
         let info = match self.get_inode_info(ino) {
@@ -1419,6 +1436,7 @@ impl FileSystem for OverlayFS {
             None => return Ok(None),
         };
         if info.layer == Layer::Base && self.is_whiteout(&info.path) {
+            crate::profiling::record_lookup_whiteout();
             return Ok(None);
         }
 
@@ -1448,6 +1466,7 @@ impl FileSystem for OverlayFS {
     }
 
     async fn readdir(&self, ino: i64) -> Result<Option<Vec<String>>> {
+        crate::profiling::record_readdir();
         trace!("OverlayFS::readdir: ino={}", ino);
 
         let info = self.get_inode_info(ino).ok_or(FsError::NotFound)?;
@@ -1479,6 +1498,7 @@ impl FileSystem for OverlayFS {
             let components: Vec<&str> = info.path.split('/').filter(|s| !s.is_empty()).collect();
             let mut ino: i64 = 1;
             let mut found_all = true;
+            crate::profiling::record_path_resolution(components.len() as u64);
             for comp in &components {
                 if let Some(s) = self.base.lookup(ino, comp).await? {
                     ino = s.ino;
@@ -1515,6 +1535,7 @@ impl FileSystem for OverlayFS {
     }
 
     async fn readdir_plus(&self, ino: i64) -> Result<Option<Vec<DirEntry>>> {
+        crate::profiling::record_readdir_plus();
         trace!("OverlayFS::readdir_plus: ino={}", ino);
 
         let info = self.get_inode_info(ino).ok_or(FsError::NotFound)?;
@@ -1529,6 +1550,7 @@ impl FileSystem for OverlayFS {
             let components: Vec<&str> = info.path.split('/').filter(|s| !s.is_empty()).collect();
             let mut ino: i64 = 1;
             let mut found_all = true;
+            crate::profiling::record_path_resolution(components.len() as u64);
             for comp in &components {
                 if let Some(s) = self.base.lookup(ino, comp).await? {
                     ino = s.ino;

@@ -299,6 +299,7 @@ impl Filesystem for AgentFSFuse {
     ///
     /// Resolves `name` under the directory identified by `parent` inode.
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        agentfs_sdk::profiling::record_fuse_lookup();
         tracing::debug!("FUSE::lookup: parent={}, name={:?}", parent, name);
 
         let Some(name_str) = name.to_str() else {
@@ -327,6 +328,7 @@ impl Filesystem for AgentFSFuse {
     /// Returns metadata (size, permissions, timestamps, etc.) for the file or
     /// directory identified by `ino`. Root inode (1) is handled specially.
     fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+        agentfs_sdk::profiling::record_fuse_getattr();
         tracing::debug!("FUSE::getattr: ino={}", ino);
 
         if let Err(e) = self.flush_pending_inode(ino) {
@@ -523,6 +525,7 @@ impl Filesystem for AgentFSFuse {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
+        agentfs_sdk::profiling::record_fuse_readdir();
         tracing::debug!("FUSE::readdir: ino={}, offset={}", ino, offset);
 
         let fs = self.fs.clone();
@@ -588,6 +591,7 @@ impl Filesystem for AgentFSFuse {
         offset: i64,
         mut reply: ReplyDirectoryPlus,
     ) {
+        agentfs_sdk::profiling::record_fuse_readdir_plus();
         tracing::debug!("FUSE::readdirplus: ino={}, offset={}", ino, offset);
 
         let fs = self.fs.clone();
@@ -1035,6 +1039,7 @@ impl Filesystem for AgentFSFuse {
     ///
     /// Allocates a file handle and opens the file in the filesystem layer.
     fn open(&mut self, _req: &Request, ino: u64, flags: i32, reply: ReplyOpen) {
+        agentfs_sdk::profiling::record_fuse_open();
         tracing::debug!("FUSE::open: ino={}, flags={}", ino, flags);
 
         let fs = self.fs.clone();
@@ -1064,6 +1069,7 @@ impl Filesystem for AgentFSFuse {
         _lock: Option<u64>,
         reply: ReplyData,
     ) {
+        agentfs_sdk::profiling::record_fuse_read();
         tracing::debug!("FUSE::read: fh={}, offset={}, size={}", fh, offset, size);
         if offset < 0 {
             reply.error(libc::EINVAL);
@@ -1236,6 +1242,7 @@ impl Filesystem for AgentFSFuse {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
+        agentfs_sdk::profiling::record_fuse_release();
         tracing::debug!("FUSE::release: fh={}", fh);
         let result = {
             let mut open_files = self.open_files.lock();

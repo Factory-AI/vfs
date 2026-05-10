@@ -80,8 +80,10 @@ impl DentryCache {
             .copied();
         if entry.is_some() {
             crate::profiling::record_dentry_cache_hit();
+            crate::profiling::record_path_cache_hit();
         } else {
             crate::profiling::record_dentry_cache_miss();
+            crate::profiling::record_path_cache_miss();
         }
         entry
     }
@@ -1235,6 +1237,7 @@ impl AgentFS {
     /// Resolve a path to an inode number using a provided connection
     async fn resolve_path_with_conn(&self, conn: &Connection, path: &str) -> Result<Option<i64>> {
         let components = self.split_path(path);
+        crate::profiling::record_path_resolution(components.len() as u64);
         if components.is_empty() {
             return Ok(Some(ROOT_INO));
         }
@@ -1285,6 +1288,7 @@ impl AgentFS {
                 self.dentry_cache.insert(current_ino, &component, child_ino);
                 current_ino = child_ino;
             } else {
+                crate::profiling::record_negative_lookup();
                 return Ok(None);
             }
         }
@@ -2720,6 +2724,7 @@ impl AgentFS {
 #[async_trait]
 impl FileSystem for AgentFS {
     async fn lookup(&self, parent_ino: i64, name: &str) -> Result<Option<Stats>> {
+        crate::profiling::record_lookup();
         if name.len() > MAX_NAME_LEN {
             return Err(FsError::NameTooLong.into());
         }
@@ -2749,7 +2754,10 @@ impl FileSystem for AgentFS {
         // Look up the child inode
         let child_ino = match self.lookup_child(&conn, parent_ino, name).await? {
             Some(ino) => ino,
-            None => return Ok(None),
+            None => {
+                crate::profiling::record_negative_lookup();
+                return Ok(None);
+            }
         };
 
         // Get stats for the child inode
@@ -2769,6 +2777,8 @@ impl FileSystem for AgentFS {
     }
 
     async fn getattr(&self, ino: i64) -> Result<Option<Stats>> {
+        crate::profiling::record_getattr();
+        crate::profiling::record_attr_cache_miss();
         let conn = self.pool.get_connection().await?;
         self.getattr_with_conn(&conn, ino).await
     }
@@ -2818,6 +2828,7 @@ impl FileSystem for AgentFS {
     }
 
     async fn readdir(&self, ino: i64) -> Result<Option<Vec<String>>> {
+        crate::profiling::record_readdir();
         let conn = self.pool.get_connection().await?;
 
         // Check if inode exists and is a directory
@@ -2867,6 +2878,7 @@ impl FileSystem for AgentFS {
     }
 
     async fn readdir_plus(&self, ino: i64) -> Result<Option<Vec<DirEntry>>> {
+        crate::profiling::record_readdir_plus();
         let conn = self.pool.get_connection().await?;
 
         // Check if inode exists and is a directory
