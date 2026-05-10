@@ -672,3 +672,67 @@ impl NFSFileSystem for AgentNFS {
         Ok(target.into_bytes().into())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nfsserve::vfs::NFSFileSystem;
+    use agentfs_sdk::{AgentFS, AgentFSOptions};
+    use std::sync::Arc;
+
+    async fn test_nfs() -> AgentNFS {
+        let agent = AgentFS::open(AgentFSOptions::ephemeral())
+            .await
+            .expect("ephemeral AgentFS opens");
+        let fs: Arc<TokioMutex<dyn FileSystem>> = Arc::new(TokioMutex::new(agent.fs));
+        AgentNFS::new(fs)
+    }
+
+    #[tokio::test]
+    async fn write_handle_grants_exact_authority_but_plain_lookup_handle_does_not() {
+        let nfs = test_nfs().await;
+
+        let write_fh = nfs.id_to_write_fh(42);
+        assert_eq!(write_fh.data.len(), WRITE_HANDLE_LEN);
+        assert!(matches!(nfs.fh_to_id(&write_fh), Ok(42)));
+        assert!(nfs.fh_has_write_authority(&write_fh, 42));
+        assert!(!nfs.fh_has_write_authority(&write_fh, 43));
+
+        let plain_fh = nfs.id_to_fh(42);
+        assert_eq!(plain_fh.data.len(), PLAIN_HANDLE_LEN);
+        assert!(matches!(nfs.fh_to_id(&plain_fh), Ok(42)));
+        assert!(!nfs.fh_has_write_authority(&plain_fh, 42));
+    }
+
+    #[tokio::test]
+    async fn write_handle_rejects_stale_bad_and_forged_tokens() {
+        let nfs = test_nfs().await;
+        let write_fh = nfs.id_to_write_fh(7);
+
+        let mut stale_fh = write_fh.clone();
+        stale_fh.data[0] ^= 0x80;
+        assert!(matches!(
+            nfs.fh_to_id(&stale_fh),
+            Err(nfsstat3::NFS3ERR_STALE)
+        ));
+        assert!(!nfs.fh_has_write_authority(&stale_fh, 7));
+
+        let mut bad_magic_fh = write_fh.clone();
+        bad_magic_fh.data[16] ^= 0xff;
+        assert!(matches!(
+            nfs.fh_to_id(&bad_magic_fh),
+            Err(nfsstat3::NFS3ERR_BADHANDLE)
+        ));
+        assert!(!nfs.fh_has_write_authority(&bad_magic_fh, 7));
+
+        let mut forged_token_fh = write_fh.clone();
+        let token = u64::from_le_bytes(
+            forged_token_fh.data[24..32]
+                .try_into()
+                .expect("write handle token length"),
+        );
+        forged_token_fh.data[24..32].copy_from_slice(&token.wrapping_add(1).to_le_bytes());
+        assert!(matches!(nfs.fh_to_id(&forged_token_fh), Ok(7)));
+        assert!(!nfs.fh_has_write_authority(&forged_token_fh, 7));
+    }
+}

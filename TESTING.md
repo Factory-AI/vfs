@@ -300,6 +300,46 @@ the fallback crate under consideration, the minimum storage API surface that a
 fallback must cover, validation commands to run in an isolated spike, and empty
 decision fields for the measured result.
 
+## macOS NFS git validation (#333)
+
+Use `scripts/validation/macos-nfs-git-validation.sh` on a real macOS host to
+validate the NFS CREATE-returned write-handle path used by git loose-object
+writes:
+
+```bash
+cd /path/to/agentfs
+cargo build --manifest-path cli/Cargo.toml --no-default-features
+scripts/validation/macos-nfs-git-validation.sh \
+  --agentfs-bin "$PWD/cli/target/debug/agentfs"
+```
+
+The harness is temp-directory scoped under `/tmp`, initializes a fresh AgentFS
+database, mounts it with `agentfs mount --backend nfs`, then runs:
+
+```bash
+git init
+git add README.txt
+git commit -m "validate macos nfs git loose objects"
+git fsck --strict
+```
+
+It also verifies that the repository produced at least one loose object under
+`.git/objects/[0-9a-f][0-9a-f]/`. Expected successful output includes:
+
+```text
+AgentFS binary: /path/to/agentfs
+Report directory: /tmp/agentfs-macos-nfs-git-report...
+Loose object count: <nonzero>
+macOS NFS git validation passed. Logs: /tmp/agentfs-macos-nfs-git-report...
+```
+
+Unsupported platforms or missing prerequisites exit with `77`; on Linux this is
+an expected skip, not a failure. If macOS `mount_nfs` requires privileges in the
+local environment, run the same command from a shell where user NFS mounts are
+permitted, or inspect the reported `mount.log`. Until this script passes on a
+real macOS host, #333 should be treated as code-fixed but platform-validation
+pending.
+
 ## pjdfstest
 
 AgentFS keeps three pjdfstest modes:

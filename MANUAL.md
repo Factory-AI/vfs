@@ -131,6 +131,23 @@ Without arguments, lists all mounted agentfs filesystems.
 - Linux: `fusermount -u <MOUNT_POINT>`
 - macOS: `umount <MOUNT_POINT>`
 
+**macOS NFS git validation (#333):**
+
+To manually validate the macOS NFS path used by git loose-object writes, run the
+repository harness on a macOS host:
+
+```bash
+cargo build --manifest-path cli/Cargo.toml --no-default-features
+scripts/validation/macos-nfs-git-validation.sh \
+  --agentfs-bin "$PWD/cli/target/debug/agentfs"
+```
+
+The script initializes a temporary AgentFS database, mounts it via
+`agentfs mount --backend nfs`, runs `git init`, `git add`, `git commit`, and
+`git fsck --strict`, then unmounts and cleans up. A passing run ends with
+`macOS NFS git validation passed` and a nonzero loose-object count. On non-macOS
+hosts the script exits `77` to report an intentional skip.
+
 ### agentfs serve mcp
 
 Start an MCP (Model Context Protocol) server.
