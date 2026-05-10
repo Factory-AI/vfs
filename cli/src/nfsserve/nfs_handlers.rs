@@ -1692,6 +1692,7 @@ pub async fn nfsproc3_setattr(
     // Check permissions based on what's being changed
     // For size change (truncate), need write permission
     if matches!(args.new_attribute.size, nfs::set_size3::size(_))
+        && !context.vfs.fh_has_write_authority(&args.object, id)
         && !permissions::can_write(&context.auth, &attr)
     {
         debug!(
@@ -3105,6 +3106,22 @@ mod tests {
         input
     }
 
+    fn serialize_setattr_size_args(file: nfs::nfs_fh3, size: u64) -> Vec<u8> {
+        let mut input = Vec::new();
+        let mut cursor = Cursor::new(&mut input);
+        SETATTR3args {
+            object: file,
+            new_attribute: nfs::sattr3 {
+                size: nfs::set_size3::size(size),
+                ..Default::default()
+            },
+            guard: sattrguard3::Void,
+        }
+        .serialize(&mut cursor)
+        .expect("serialize SETATTR size args");
+        input
+    }
+
     async fn create_readonly_file(context: &RPCContext) -> nfs::nfs_fh3 {
         let mut input = Cursor::new(serialize_create_readonly_args(context.vfs.id_to_fh(1)));
         let mut output = Vec::new();
@@ -3131,6 +3148,22 @@ mod tests {
         nfsproc3_write(2, &mut input, &mut output, context)
             .await
             .expect("WRITE handler");
+
+        let mut cursor = Cursor::new(output);
+        parse_rpc_success(&mut cursor);
+        parse_nfs_status(&mut cursor)
+    }
+
+    async fn setattr_size_status(
+        context: &RPCContext,
+        file: nfs::nfs_fh3,
+        size: u64,
+    ) -> nfs::nfsstat3 {
+        let mut input = Cursor::new(serialize_setattr_size_args(file, size));
+        let mut output = Vec::new();
+        nfsproc3_setattr(3, &mut input, &mut output, context)
+            .await
+            .expect("SETATTR handler");
 
         let mut cursor = Cursor::new(output);
         parse_rpc_success(&mut cursor);
@@ -3174,5 +3207,40 @@ mod tests {
 
         assert!(matches!(status, nfs::nfsstat3::NFS3ERR_ACCES));
         assert_eq!(read_file(&fs, "loose-object", 4).await, b"");
+    }
+
+    #[tokio::test]
+    async fn create_authorized_handle_can_truncate_after_readonly_final_mode() {
+        let (context, fs) = test_context().await;
+        let created_fh = create_readonly_file(&context).await;
+        assert!(matches!(
+            write_status(&context, created_fh.clone(), b"abcdef").await,
+            nfs::nfsstat3::NFS3_OK
+        ));
+
+        let status = setattr_size_status(&context, created_fh, 3).await;
+
+        assert!(matches!(status, nfs::nfsstat3::NFS3_OK));
+        assert_eq!(read_file(&fs, "loose-object", 8).await, b"abc");
+    }
+
+    #[tokio::test]
+    async fn fresh_lookup_handle_without_write_permission_cannot_truncate() {
+        let (context, fs) = test_context().await;
+        let created_fh = create_readonly_file(&context).await;
+        assert!(matches!(
+            write_status(&context, created_fh.clone(), b"abcdef").await,
+            nfs::nfsstat3::NFS3_OK
+        ));
+        let created_id = context
+            .vfs
+            .fh_to_id(&created_fh)
+            .expect("created handle resolves");
+        let plain_fh = context.vfs.id_to_fh(created_id);
+
+        let status = setattr_size_status(&context, plain_fh, 3).await;
+
+        assert!(matches!(status, nfs::nfsstat3::NFS3ERR_ACCES));
+        assert_eq!(read_file(&fs, "loose-object", 8).await, b"abcdef");
     }
 }

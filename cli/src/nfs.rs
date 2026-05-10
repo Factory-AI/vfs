@@ -5,7 +5,6 @@
 //! FUSE or other system extensions.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -24,16 +23,23 @@ use agentfs_sdk::{
 };
 use async_trait::async_trait;
 use tokio::sync::Mutex as TokioMutex;
+use uuid::Uuid;
 
 /// Root directory inode number
 const ROOT_INO: fileid3 = 1;
 const WRITE_HANDLE_MAGIC: &[u8; 8] = b"AFSWRIT\0";
 const PLAIN_HANDLE_LEN: usize = 16;
 const WRITE_HANDLE_LEN: usize = 32;
+const MAX_WRITE_HANDLE_TOKENS: usize = 16384;
 
 /// Convert a fileid3 to a filesystem inode number.
 fn id_to_fs_ino(id: fileid3) -> i64 {
     id as i64
+}
+
+fn random_write_handle_token() -> u64 {
+    let bytes = *Uuid::new_v4().as_bytes();
+    u64::from_le_bytes(bytes[0..8].try_into().expect("uuid slice length is fixed"))
 }
 
 /// Convert an SDK error to an NFS status code.
@@ -65,8 +71,6 @@ pub struct AgentNFS {
     fh_generation: u64,
     /// CREATE-returned file-handle tokens that retain open-time write authority.
     write_handle_tokens: StdMutex<HashMap<u64, fileid3>>,
-    /// Monotonic source for write-authorized file-handle tokens.
-    next_write_handle_token: AtomicU64,
 }
 
 impl AgentNFS {
@@ -80,7 +84,6 @@ impl AgentNFS {
             fs,
             fh_generation: seed,
             write_handle_tokens: StdMutex::new(HashMap::new()),
-            next_write_handle_token: AtomicU64::new(seed.wrapping_add(1)),
         }
     }
 
@@ -187,8 +190,18 @@ impl NFSFileSystem for AgentNFS {
     }
 
     fn id_to_write_fh(&self, id: fileid3) -> nfs_fh3 {
-        let token = self.next_write_handle_token.fetch_add(1, Ordering::Relaxed);
-        self.write_handle_tokens.lock().unwrap().insert(token, id);
+        let mut tokens = self.write_handle_tokens.lock().unwrap();
+        if tokens.len() >= MAX_WRITE_HANDLE_TOKENS {
+            if let Some(oldest) = tokens.keys().next().copied() {
+                tokens.remove(&oldest);
+            }
+        }
+        let mut token = random_write_handle_token();
+        while tokens.contains_key(&token) {
+            token = random_write_handle_token();
+        }
+        tokens.insert(token, id);
+        drop(tokens);
 
         let mut ret = Vec::with_capacity(WRITE_HANDLE_LEN);
         ret.extend_from_slice(&self.fh_generation.to_le_bytes());

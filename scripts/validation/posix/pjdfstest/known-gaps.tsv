@@ -1,6 +1,11 @@
 # target	reason
 mknod/	Unprivileged FUSE runs cannot create block/char device nodes; these failures are environment/contract gaps until AgentFS defines privileged-node support.
-chown/	Successful ownership mutation requires root/CAP_CHOWN or a stronger AgentFS privilege model; keep only error-path chown tests in phase45-ci.
+chown/00.t	Successful ownership mutation requires root/CAP_CHOWN or a stronger AgentFS privilege model; keep only error-path chown tests in supported profiles.
+chown/01.t	Depends on block/char mknod cases and cascades into ENOENT when device nodes are rejected.
+chown/02.t	Depends on successful uid/gid changes requiring root/CAP_CHOWN.
+chown/03.t	Depends on successful uid/gid changes requiring root/CAP_CHOWN.
+chown/05.t	Depends on chown/lchown and alternate uid/gid execution.
+chown/07.t	Depends on ownership-change denial matrices with chown/lchown, alternate uid/gid execution, and device nodes.
 chmod/00.t	Mixes regular-file chmod with device-node and alternate-uid cases; split before it can enter a supported gate.
 chmod/01.t	Depends on block/char mknod and cascades into ENOENT when device nodes are rejected.
 chmod/05.t	Depends on chown and alternate uid/gid execution.

@@ -23,7 +23,8 @@ natively and through `agentfs run`, then emits JSON. The AgentFS DB growth is
 measured as the total size of `delta.db` plus any `-wal`/`-shm` files after the
 edit minus the same total immediately before the edit. If Python's stdlib
 `sqlite3` can open the database, the output also includes `fs_data` row count,
-stored chunk bytes, inline inode rows, origin rows, and `fs_config`.
+stored chunk bytes, inline inode rows, origin rows, partial-origin rows,
+chunk-override rows, and `fs_config`.
 
 Machine-readable schema (`schema_version: 1`):
 
@@ -55,6 +56,8 @@ Machine-readable schema (`schema_version: 1`):
       "fs_data_rows": 3200,
       "fs_data_bytes": 209715200,
       "fs_origin_rows": 1,
+      "fs_partial_origin_rows": 0,
+      "fs_chunk_override_rows": 0,
       "fs_config": {"schema_version": "0.5", "chunk_size": "65536"}
     }
   },
@@ -115,7 +118,7 @@ decision fields for the measured result.
 
 ## pjdfstest
 
-AgentFS keeps two pjdfstest modes:
+AgentFS keeps three pjdfstest modes:
 
 - `phase45-ci`: a conservative, unprivileged supported subset that should pass on the current FUSE implementation.
 - `phase5-ci`: the expanded Phase 5 unprivileged supported subset. It includes `phase45-ci` plus additional currently-passing path, FIFO, symlink-loop, sparse large-file, socket-open, and rename/rmdir error-path coverage.
@@ -168,6 +171,7 @@ The harness writes a report directory containing:
 - `pjdfstest.log` - TAP output from `prove`
 - `status.txt` - `prove` exit status
 - `selected-profile.txt` - selected profile name
+- `selected-manifest.tsv` - selected manifest path and SHA-256 when a manifest-backed profile is used
 - `selected-tests.txt` - exact test files run
 - `known-unsupported.tsv` - current known POSIX gaps and triage rationale
 

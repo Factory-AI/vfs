@@ -141,7 +141,7 @@ def main(argv: list[str]) -> int:
             "cargo test --manifest-path cli/Cargo.toml",
             "cli/tests/all.sh",
             "scripts/validation/phase0.sh",
-            "scripts/validation/replay/replay-smoke.sh",
+            "scripts/validation/replay/replay_workload.py --agentfs-bin cli/target/debug/agentfs /path/to/replay.jsonl",
             "scripts/validation/posix/run-pjdfstest.sh --profile phase45-ci --agentfs-bin \"$PWD/cli/target/debug/agentfs\" --pjdfstest-dir /path/to/pjdfstest",
         ],
         "decision": {

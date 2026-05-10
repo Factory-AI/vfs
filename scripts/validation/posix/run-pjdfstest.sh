@@ -34,6 +34,7 @@ MOUNT_PID=""
 AGENTFS_RESOLVED=""
 PJDFSTEST_RESOLVED=""
 PJDFSTEST_TESTS=""
+PJDFSTEST_RESOLVED_MANIFEST=""
 PROVE_TARGETS=()
 
 usage() {
@@ -48,30 +49,23 @@ Relevant setup guidance from TESTING.md:
 ## pjdfstest
 
 ```bash
-git clone git@github.com:pjd/pjdfstest.git
+git clone https://github.com/pjd/pjdfstest.git
 cd pjdfstest
 autoreconf -ifs
-./configure
+./configure --prefix="$HOME/.local"
 make pjdfstest
-sudo make install
-sudo dnf install perl-Test-Harness
-mkdir -p ../agentfs-testing
-cd ../agentfs-testing
-agentfs init testing
-mkdir mnt
-sudo su
-agentfs mount testing ./mnt
-cd mnt
-prove -rv ../../pjdfstest/tests/ 2>&1 | tee /tmp/pjdfstest.log
+install -m 0755 pjdfstest "$HOME/.local/bin/pjdfstest"
+command -v prove
+command -v pjdfstest
 ```
 
-AgentFS executable setup from TESTING.md:
+AgentFS harness command from TESTING.md:
 
 ```bash
-cd cli
-cargo build --release
-cp target/release/agentfs /usr/local/bin
-cp scripts/mount.fuse.agentfs /sbin
+scripts/validation/posix/run-pjdfstest.sh \
+  --agentfs-bin "$PWD/cli/target/debug/agentfs" \
+  --pjdfstest-dir /path/to/pjdfstest \
+  --profile phase45-ci
 ```
 EOF
 }
@@ -177,6 +171,7 @@ resolve_prove_targets() {
 
     if [[ -z "$manifest" ]]; then
         PROVE_TARGETS=("$PJDFSTEST_TESTS")
+        PJDFSTEST_RESOLVED_MANIFEST=""
         return 0
     fi
 
@@ -184,6 +179,7 @@ resolve_prove_targets() {
         printf 'pjdfstest manifest not found for profile %s: %s\n' "$PJDFSTEST_PROFILE" "$manifest" >&2
         exit 2
     fi
+    PJDFSTEST_RESOLVED_MANIFEST="$(cd "$(dirname "$manifest")" && pwd)/$(basename "$manifest")"
 
     while IFS= read -r line || [[ -n "$line" ]]; do
         entry="$(trim_line "$line")"
@@ -362,6 +358,14 @@ printf 'pjdfstest profile: %s\n' "$PJDFSTEST_PROFILE"
 printf 'Report directory: %s\n' "$REPORT_DIR"
 
 printf '%s\n' "$PJDFSTEST_PROFILE" >"$REPORT_DIR/selected-profile.txt"
+if [[ -n "$PJDFSTEST_RESOLVED_MANIFEST" ]]; then
+    {
+        printf 'path\t%s\n' "$PJDFSTEST_RESOLVED_MANIFEST"
+        if command -v sha256sum >/dev/null 2>&1; then
+            printf 'sha256\t%s\n' "$(sha256sum "$PJDFSTEST_RESOLVED_MANIFEST" | awk '{print $1}')"
+        fi
+    } >"$REPORT_DIR/selected-manifest.tsv"
+fi
 for target in "${PROVE_TARGETS[@]}"; do
     if [[ "$target" == "$PJDFSTEST_TESTS" ]]; then
         printf '.\n'

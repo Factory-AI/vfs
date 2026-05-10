@@ -419,6 +419,15 @@ def inspect_db(db_path: Path) -> dict[str, Any]:
             if table_exists(conn, "fs_origin"):
                 row = conn.execute("SELECT COUNT(*) FROM fs_origin").fetchone()
                 result["fs_origin_rows"] = int(row[0])
+            if table_exists(conn, "fs_partial_origin"):
+                row = conn.execute("SELECT COUNT(*) FROM fs_partial_origin").fetchone()
+                result["fs_partial_origin_rows"] = int(row[0])
+            if table_exists(conn, "fs_origin_v2"):
+                row = conn.execute("SELECT COUNT(*) FROM fs_origin_v2").fetchone()
+                result["fs_origin_v2_rows"] = int(row[0])
+            if table_exists(conn, "fs_chunk_override"):
+                row = conn.execute("SELECT COUNT(*) FROM fs_chunk_override").fetchone()
+                result["fs_chunk_override_rows"] = int(row[0])
             if table_exists(conn, "fs_config"):
                 result["fs_config"] = {
                     str(key): str(value)

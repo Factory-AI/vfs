@@ -74,7 +74,8 @@ struct InodeInfo {
 
 #[derive(Debug, Clone)]
 struct PartialOrigin {
-    base_ino: i64,
+    base_path: String,
+    base_fingerprint_size: i64,
 }
 
 struct OverlayPartialFile {
@@ -195,11 +196,46 @@ impl OverlayFS {
                 base_ino INTEGER NOT NULL,
                 base_path TEXT NOT NULL,
                 base_size INTEGER NOT NULL,
+                base_fingerprint_size INTEGER NOT NULL DEFAULT -1,
+                base_mtime INTEGER NOT NULL DEFAULT 0,
+                base_mtime_nsec INTEGER NOT NULL DEFAULT 0,
+                base_ctime INTEGER NOT NULL DEFAULT 0,
+                base_ctime_nsec INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL
             )",
             (),
         )
         .await?;
+        conn.execute(
+            "ALTER TABLE fs_partial_origin ADD COLUMN base_fingerprint_size INTEGER NOT NULL DEFAULT -1",
+            (),
+        )
+        .await
+        .ok();
+        conn.execute(
+            "ALTER TABLE fs_partial_origin ADD COLUMN base_mtime INTEGER NOT NULL DEFAULT 0",
+            (),
+        )
+        .await
+        .ok();
+        conn.execute(
+            "ALTER TABLE fs_partial_origin ADD COLUMN base_mtime_nsec INTEGER NOT NULL DEFAULT 0",
+            (),
+        )
+        .await
+        .ok();
+        conn.execute(
+            "ALTER TABLE fs_partial_origin ADD COLUMN base_ctime INTEGER NOT NULL DEFAULT 0",
+            (),
+        )
+        .await
+        .ok();
+        conn.execute(
+            "ALTER TABLE fs_partial_origin ADD COLUMN base_ctime_nsec INTEGER NOT NULL DEFAULT 0",
+            (),
+        )
+        .await
+        .ok();
         conn.execute(
             "CREATE TABLE IF NOT EXISTS fs_chunk_override (
                 delta_ino INTEGER NOT NULL,
@@ -517,17 +553,38 @@ impl OverlayFS {
         let conn = self.delta.get_connection().await?;
         let mut rows = conn
             .query(
-                "SELECT base_ino FROM fs_partial_origin WHERE delta_ino = ?",
+                "SELECT base_path, base_size, base_fingerprint_size
+                 FROM fs_partial_origin WHERE delta_ino = ?",
                 (delta_ino,),
             )
             .await?;
         if let Some(row) = rows.next().await? {
-            let base_ino = row
-                .get_value(0)
+            let base_path = match row.get_value(0)? {
+                Value::Text(path) => path,
+                _ => {
+                    return Err(Error::Internal(
+                        "invalid partial origin base_path".to_string(),
+                    ))
+                }
+            };
+            let base_size = row
+                .get_value(1)
                 .ok()
                 .and_then(|v| v.as_integer().copied())
-                .ok_or_else(|| Error::Internal("invalid partial origin base_ino".to_string()))?;
-            Ok(Some(PartialOrigin { base_ino }))
+                .ok_or_else(|| Error::Internal("invalid partial origin base_size".to_string()))?;
+            let base_fingerprint_size = row
+                .get_value(2)
+                .ok()
+                .and_then(|v| v.as_integer().copied())
+                .unwrap_or(base_size);
+            Ok(Some(PartialOrigin {
+                base_path,
+                base_fingerprint_size: if base_fingerprint_size < 0 {
+                    base_size
+                } else {
+                    base_fingerprint_size
+                },
+            }))
         } else {
             Ok(None)
         }
@@ -538,16 +595,56 @@ impl OverlayFS {
         delta_ino: i64,
         base_ino: i64,
         base_path: &str,
-        base_size: i64,
+        base_stats: &Stats,
     ) -> Result<()> {
         let conn = self.delta.get_connection().await?;
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
         conn.execute(
-            "INSERT OR REPLACE INTO fs_partial_origin (delta_ino, base_ino, base_path, base_size, created_at)
-             VALUES (?, ?, ?, ?, ?)",
-            (delta_ino, base_ino, base_path, base_size, now),
+            "INSERT OR REPLACE INTO fs_partial_origin (
+                delta_ino, base_ino, base_path, base_size, base_fingerprint_size, base_mtime, base_mtime_nsec,
+                base_ctime, base_ctime_nsec, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            vec![
+                Value::Integer(delta_ino),
+                Value::Integer(base_ino),
+                Value::Text(base_path.to_string()),
+                Value::Integer(base_stats.size),
+                Value::Integer(base_stats.size),
+                Value::Integer(base_stats.mtime),
+                Value::Integer(base_stats.mtime_nsec as i64),
+                Value::Integer(base_stats.ctime),
+                Value::Integer(base_stats.ctime_nsec as i64),
+                Value::Integer(now),
+            ],
         )
         .await?;
+        Ok(())
+    }
+
+    async fn resolve_base_path(&self, path: &str) -> Result<Option<Stats>> {
+        let mut ino = ROOT_INO;
+        if path == "/" {
+            return self.base.getattr(ino).await;
+        }
+
+        let mut stats = None;
+        for component in path.split('/').filter(|s| !s.is_empty()) {
+            let Some(next) = self.base.lookup(ino, component).await? else {
+                return Ok(None);
+            };
+            ino = next.ino;
+            stats = Some(next);
+        }
+        Ok(stats)
+    }
+
+    fn validate_partial_origin(&self, origin: &PartialOrigin, stats: &Stats) -> Result<()> {
+        if stats.size != origin.base_fingerprint_size {
+            return Err(Error::Internal(format!(
+                "partial-origin base changed for {} (stored size={}, current size={})",
+                origin.base_path, origin.base_fingerprint_size, stats.size
+            )));
+        }
         Ok(())
     }
 
@@ -889,13 +986,8 @@ impl OverlayFS {
 
         self.add_origin_mapping(delta_ino, info.underlying_ino)
             .await?;
-        self.add_partial_origin_mapping(
-            delta_ino,
-            info.underlying_ino,
-            &info.path,
-            base_stats.size,
-        )
-        .await?;
+        self.add_partial_origin_mapping(delta_ino, info.underlying_ino, &info.path, &base_stats)
+            .await?;
         self.refresh_overlay_mapping(overlay_ino, Layer::Delta, delta_ino, &info.path);
 
         Ok(delta_ino)
@@ -908,7 +1000,12 @@ impl OverlayFS {
         flags: i32,
     ) -> Result<BoxedFile> {
         if let Some(origin) = self.partial_origin_for_delta(delta_ino).await? {
-            let base_file = self.base.open(origin.base_ino, libc::O_RDONLY).await?;
+            let base_stats = self
+                .resolve_base_path(&origin.base_path)
+                .await?
+                .ok_or(FsError::NotFound)?;
+            self.validate_partial_origin(&origin, &base_stats)?;
+            let base_file = self.base.open(base_stats.ino, libc::O_RDONLY).await?;
             Ok(Arc::new(OverlayPartialFile {
                 delta: self.delta.clone(),
                 base_file,
@@ -1321,7 +1418,7 @@ impl FileSystem for OverlayFS {
             Some(i) => i,
             None => return Ok(None),
         };
-        if self.is_whiteout(&info.path) {
+        if info.layer == Layer::Base && self.is_whiteout(&info.path) {
             return Ok(None);
         }
 
@@ -1340,7 +1437,7 @@ impl FileSystem for OverlayFS {
         trace!("OverlayFS::readlink: ino={}", ino);
 
         let info = self.get_inode_info(ino).ok_or(FsError::NotFound)?;
-        if self.is_whiteout(&info.path) {
+        if info.layer == Layer::Base && self.is_whiteout(&info.path) {
             return Ok(None);
         }
 
@@ -1483,9 +1580,23 @@ impl FileSystem for OverlayFS {
                     }
 
                     // Check for origin mapping
+                    let delta_ino = entry.stats.ino;
                     if let Some(base_ino) = self.get_origin_ino(entry.stats.ino) {
-                        entry.stats.ino =
-                            self.get_or_create_overlay_ino(Layer::Base, base_ino, &entry_path);
+                        let overlay_ino =
+                            self.get_or_create_overlay_ino(Layer::Delta, delta_ino, &entry_path);
+                        let reverse = self.reverse_map.read().unwrap();
+                        if let Some(existing_ino) = reverse.get(&(Layer::Base, base_ino)).copied() {
+                            drop(reverse);
+                            self.refresh_overlay_mapping(
+                                existing_ino,
+                                Layer::Delta,
+                                delta_ino,
+                                &entry_path,
+                            );
+                            entry.stats.ino = existing_ino;
+                        } else {
+                            entry.stats.ino = overlay_ino;
+                        }
                     } else {
                         let overlay_ino = self.get_or_create_overlay_ino(
                             Layer::Delta,
@@ -1509,12 +1620,24 @@ impl FileSystem for OverlayFS {
         trace!("OverlayFS::chmod: ino={}, mode={:o}", ino, mode);
 
         let info = self.get_inode_info(ino).ok_or(FsError::NotFound)?;
-        if self.is_whiteout(&info.path) {
+        if info.layer == Layer::Base && self.is_whiteout(&info.path) {
             return Err(FsError::NotFound.into());
         }
 
         let delta_ino = match info.layer {
             Layer::Delta => info.underlying_ino,
+            Layer::Base if self.partial_origin_enabled => {
+                let base_stats = self
+                    .base
+                    .getattr(info.underlying_ino)
+                    .await?
+                    .ok_or(FsError::NotFound)?;
+                if base_stats.is_file() {
+                    self.partial_copy_up_and_update_mapping(ino, &info).await?
+                } else {
+                    self.copy_up_and_update_mapping(ino, &info).await?
+                }
+            }
             Layer::Base => self.copy_up_and_update_mapping(ino, &info).await?,
         };
 
@@ -1530,12 +1653,24 @@ impl FileSystem for OverlayFS {
         );
 
         let info = self.get_inode_info(ino).ok_or(FsError::NotFound)?;
-        if self.is_whiteout(&info.path) {
+        if info.layer == Layer::Base && self.is_whiteout(&info.path) {
             return Err(FsError::NotFound.into());
         }
 
         let delta_ino = match info.layer {
             Layer::Delta => info.underlying_ino,
+            Layer::Base if self.partial_origin_enabled => {
+                let base_stats = self
+                    .base
+                    .getattr(info.underlying_ino)
+                    .await?
+                    .ok_or(FsError::NotFound)?;
+                if base_stats.is_file() {
+                    self.partial_copy_up_and_update_mapping(ino, &info).await?
+                } else {
+                    self.copy_up_and_update_mapping(ino, &info).await?
+                }
+            }
             Layer::Base => self.copy_up_and_update_mapping(ino, &info).await?,
         };
 
@@ -1546,12 +1681,24 @@ impl FileSystem for OverlayFS {
         trace!("OverlayFS::utimens: ino={}", ino);
 
         let info = self.get_inode_info(ino).ok_or(FsError::NotFound)?;
-        if self.is_whiteout(&info.path) {
+        if info.layer == Layer::Base && self.is_whiteout(&info.path) {
             return Err(FsError::NotFound.into());
         }
 
         let delta_ino = match info.layer {
             Layer::Delta => info.underlying_ino,
+            Layer::Base if self.partial_origin_enabled => {
+                let base_stats = self
+                    .base
+                    .getattr(info.underlying_ino)
+                    .await?
+                    .ok_or(FsError::NotFound)?;
+                if base_stats.is_file() {
+                    self.partial_copy_up_and_update_mapping(ino, &info).await?
+                } else {
+                    self.copy_up_and_update_mapping(ino, &info).await?
+                }
+            }
             Layer::Base => self.copy_up_and_update_mapping(ino, &info).await?,
         };
 
@@ -1562,7 +1709,7 @@ impl FileSystem for OverlayFS {
         trace!("OverlayFS::open: ino={}", ino);
 
         let info = self.get_inode_info(ino).ok_or(FsError::NotFound)?;
-        if self.is_whiteout(&info.path) {
+        if info.layer == Layer::Base && self.is_whiteout(&info.path) {
             return Err(FsError::NotFound.into());
         }
 
@@ -1884,10 +2031,12 @@ impl FileSystem for OverlayFS {
             .get_inode_info(src_stats.ino)
             .ok_or(FsError::NotFound)?;
 
-        // If source is in base, copy to delta first
-        if src_info.layer == Layer::Base {
-            self.copy_up(&old_path, src_info.underlying_ino).await?;
-        }
+        // Ensure source is in delta first.
+        let delta_src_ino = if src_info.layer == Layer::Base {
+            self.copy_up(&old_path, src_info.underlying_ino).await?
+        } else {
+            src_info.underlying_ino
+        };
 
         // Remove whiteout at destination
         self.remove_whiteout(&new_path).await?;
@@ -1913,6 +2062,7 @@ impl FileSystem for OverlayFS {
             newname,
         )
         .await?;
+        self.refresh_overlay_mapping(src_stats.ino, Layer::Delta, delta_src_ino, &new_path);
 
         // If the old file is still visible through the overlay after the rename,
         // it must be coming from the base layer — create a whiteout to hide it.
@@ -2190,6 +2340,155 @@ mod tests {
             "extend after shrink should return zeros instead of base fallback past the shrink point"
         );
         assert_eq!(file.fstat().await?.size, (chunk_size + 12) as i64);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overlay_partial_origin_survives_remount() -> Result<()> {
+        let base_dir = tempdir()?;
+        let delta_dir = tempdir()?;
+        let db_path = delta_dir.path().join("delta.db");
+        let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+        let chunk_size = delta.chunk_size();
+        let mut expected = patterned_bytes(chunk_size * 2 + 9, 0x31);
+        std::fs::write(base_dir.path().join("large.bin"), &expected)?;
+
+        let base = Arc::new(HostFS::new(base_dir.path())?);
+        let overlay = OverlayFS::new_with_partial_origin(base, delta, true);
+        overlay.init(base_dir.path().to_str().unwrap()).await?;
+
+        let stats = overlay.lookup(ROOT_INO, "large.bin").await?.unwrap();
+        let file = overlay.open(stats.ino, libc::O_RDWR).await?;
+        let write_offset = chunk_size as u64 + 7;
+        file.pwrite(write_offset, b"R").await?;
+        file.fsync().await?;
+        expected[write_offset as usize] = b'R';
+
+        drop(file);
+        drop(overlay);
+
+        let reopened_delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+        let reopened_base = Arc::new(HostFS::new(base_dir.path())?);
+        let reopened = OverlayFS::new_with_partial_origin(reopened_base, reopened_delta, true);
+        reopened.init(base_dir.path().to_str().unwrap()).await?;
+
+        let stats = reopened.lookup(ROOT_INO, "large.bin").await?.unwrap();
+        let file = reopened.open(stats.ino, libc::O_RDONLY).await?;
+        assert_eq!(
+            file.pread(chunk_size as u64 + 4, 8).await?,
+            expected[chunk_size + 4..chunk_size + 12],
+            "partial-origin reads must resolve persisted base_path after remount"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overlay_partial_origin_readdir_plus_survives_remount() -> Result<()> {
+        let base_dir = tempdir()?;
+        let delta_dir = tempdir()?;
+        let db_path = delta_dir.path().join("delta.db");
+        let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+        let chunk_size = delta.chunk_size();
+        let mut expected = patterned_bytes(chunk_size + 9, 0x41);
+        std::fs::write(base_dir.path().join("large.bin"), &expected)?;
+
+        let base = Arc::new(HostFS::new(base_dir.path())?);
+        let overlay = OverlayFS::new_with_partial_origin(base, delta, true);
+        overlay.init(base_dir.path().to_str().unwrap()).await?;
+
+        let stats = overlay.lookup(ROOT_INO, "large.bin").await?.unwrap();
+        let file = overlay.open(stats.ino, libc::O_RDWR).await?;
+        file.pwrite(4, b"Q").await?;
+        file.fsync().await?;
+        expected[4] = b'Q';
+        drop(file);
+        drop(overlay);
+
+        let reopened_delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+        let reopened_base = Arc::new(HostFS::new(base_dir.path())?);
+        let reopened = OverlayFS::new_with_partial_origin(reopened_base, reopened_delta, true);
+        reopened.init(base_dir.path().to_str().unwrap()).await?;
+
+        let entries = reopened.readdir_plus(ROOT_INO).await?.unwrap();
+        let entry = entries
+            .into_iter()
+            .find(|entry| entry.name == "large.bin")
+            .expect("large.bin from readdir_plus");
+        let file = reopened.open(entry.stats.ino, libc::O_RDONLY).await?;
+        assert_eq!(
+            file.pread(0, 8).await?,
+            expected[..8],
+            "readdir_plus inode should open the partial-origin delta view after remount"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overlay_partial_origin_rename_keeps_live_mapping() -> Result<()> {
+        let base_dir = tempdir()?;
+        let delta_dir = tempdir()?;
+        let db_path = delta_dir.path().join("delta.db");
+        let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+        let chunk_size = delta.chunk_size();
+        let mut expected = patterned_bytes(chunk_size + 16, 0x51);
+        std::fs::write(base_dir.path().join("large.bin"), &expected)?;
+
+        let base = Arc::new(HostFS::new(base_dir.path())?);
+        let overlay = OverlayFS::new_with_partial_origin(base, delta, true);
+        overlay.init(base_dir.path().to_str().unwrap()).await?;
+
+        let stats = overlay.lookup(ROOT_INO, "large.bin").await?.unwrap();
+        let file = overlay.open(stats.ino, libc::O_RDWR).await?;
+        file.pwrite(3, b"Z").await?;
+        expected[3] = b'Z';
+        drop(file);
+
+        overlay
+            .rename(ROOT_INO, "large.bin", ROOT_INO, "renamed.bin")
+            .await?;
+        assert!(overlay.lookup(ROOT_INO, "large.bin").await?.is_none());
+        let renamed = overlay.lookup(ROOT_INO, "renamed.bin").await?.unwrap();
+        let file = overlay.open(renamed.ino, libc::O_RDONLY).await?;
+        assert_eq!(file.pread(0, 8).await?, expected[..8]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overlay_partial_origin_detects_base_drift() -> Result<()> {
+        let base_dir = tempdir()?;
+        let delta_dir = tempdir()?;
+        let db_path = delta_dir.path().join("delta.db");
+        let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+        let chunk_size = delta.chunk_size();
+        let base_content = patterned_bytes(chunk_size + 16, 0x71);
+        std::fs::write(base_dir.path().join("large.bin"), &base_content)?;
+
+        let base = Arc::new(HostFS::new(base_dir.path())?);
+        let overlay = OverlayFS::new_with_partial_origin(base, delta, true);
+        overlay.init(base_dir.path().to_str().unwrap()).await?;
+
+        let stats = overlay.lookup(ROOT_INO, "large.bin").await?.unwrap();
+        let file = overlay.open(stats.ino, libc::O_RDWR).await?;
+        file.pwrite(0, b"Z").await?;
+        drop(file);
+        drop(overlay);
+
+        std::fs::write(base_dir.path().join("large.bin"), b"changed base")?;
+
+        let reopened_delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+        let reopened_base = Arc::new(HostFS::new(base_dir.path())?);
+        let reopened = OverlayFS::new_with_partial_origin(reopened_base, reopened_delta, true);
+        reopened.init(base_dir.path().to_str().unwrap()).await?;
+
+        let stats = reopened.lookup(ROOT_INO, "large.bin").await?.unwrap();
+        assert!(
+            reopened.open(stats.ino, libc::O_RDONLY).await.is_err(),
+            "partial-origin files should fail loudly when the base fallback changed"
+        );
 
         Ok(())
     }
