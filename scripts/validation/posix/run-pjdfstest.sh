@@ -3,11 +3,14 @@
 # Run pjdfstest against an AgentFS FUSE mount.
 #
 # Usage:
-#   run-pjdfstest.sh [--pjdfstest-dir DIR] [--agentfs-bin PATH] [--report-dir DIR] [--keep-work]
+#   run-pjdfstest.sh [--pjdfstest-dir DIR] [--agentfs-bin PATH] [--profile NAME]
+#                    [--manifest FILE] [--report-dir DIR] [--keep-work]
 #
 # Environment:
 #   PJDFSTEST_DIR  pjdfstest checkout root or tests directory.
 #   AGENTFS_BIN    agentfs executable to invoke (default: agentfs).
+#   PJDFSTEST_PROFILE   test profile to run (default: full).
+#   PJDFSTEST_MANIFEST  explicit manifest overriding --profile.
 #   REPORT_DIR     directory where logs should be written.
 #   SKIP_CODE      exit code for missing prerequisites (default: 77).
 #
@@ -16,6 +19,9 @@ set -Eeuo pipefail
 SKIP_CODE="${SKIP_CODE:-77}"
 AGENTFS_BIN="${AGENTFS_BIN:-agentfs}"
 PJDFSTEST_DIR="${PJDFSTEST_DIR:-}"
+PJDFSTEST_PROFILE="${PJDFSTEST_PROFILE:-full}"
+PJDFSTEST_MANIFEST="${PJDFSTEST_MANIFEST:-}"
+PJDFSTEST_KNOWN_UNSUPPORTED="${PJDFSTEST_KNOWN_UNSUPPORTED:-}"
 REPORT_DIR="${REPORT_DIR:-}"
 KEEP_WORK=0
 
@@ -26,7 +32,9 @@ WORK_DIR=""
 MOUNT_DIR=""
 MOUNT_PID=""
 AGENTFS_RESOLVED=""
+PJDFSTEST_RESOLVED=""
 PJDFSTEST_TESTS=""
+PROVE_TARGETS=()
 
 usage() {
     sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
@@ -83,6 +91,22 @@ resolve_agentfs() {
     fi
 }
 
+resolve_pjdfstest_binary() {
+    if PJDFSTEST_RESOLVED="$(command -v pjdfstest 2>/dev/null)"; then
+        return 0
+    fi
+
+    local checkout_bin
+    checkout_bin="$(cd "$PJDFSTEST_TESTS/.." && pwd)/pjdfstest"
+    if [[ -x "$checkout_bin" ]]; then
+        PJDFSTEST_RESOLVED="$checkout_bin"
+        export PATH="$(dirname "$checkout_bin"):$PATH"
+        return 0
+    fi
+
+    return 1
+}
+
 resolve_pjdfstest_tests() {
     local candidate
     local candidates=()
@@ -110,6 +134,82 @@ resolve_pjdfstest_tests() {
     done
 
     return 1
+}
+
+trim_line() {
+    local value="$1"
+    value="${value%%#*}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
+}
+
+manifest_for_profile() {
+    case "$PJDFSTEST_PROFILE" in
+        full)
+            printf ''
+            ;;
+        phase45-ci)
+            printf '%s\n' "$SCRIPT_DIR/pjdfstest/phase45-ci.txt"
+            ;;
+        *)
+            printf '%s\n' "$SCRIPT_DIR/pjdfstest/$PJDFSTEST_PROFILE.txt"
+            ;;
+    esac
+}
+
+list_profiles() {
+    cat <<EOF
+full
+phase45-ci
+EOF
+}
+
+resolve_prove_targets() {
+    local manifest="${PJDFSTEST_MANIFEST:-}"
+    local entry target
+    declare -A seen=()
+
+    if [[ -z "$manifest" ]]; then
+        manifest="$(manifest_for_profile)"
+    fi
+
+    if [[ -z "$manifest" ]]; then
+        PROVE_TARGETS=("$PJDFSTEST_TESTS")
+        return 0
+    fi
+
+    if [[ ! -f "$manifest" ]]; then
+        printf 'pjdfstest manifest not found for profile %s: %s\n' "$PJDFSTEST_PROFILE" "$manifest" >&2
+        exit 2
+    fi
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        entry="$(trim_line "$line")"
+        [[ -n "$entry" ]] || continue
+
+        case "$entry" in
+            /*|*..*|-*)
+                printf 'invalid pjdfstest manifest entry: %s\n' "$entry" >&2
+                exit 2
+                ;;
+        esac
+
+        target="$PJDFSTEST_TESTS/$entry"
+        if [[ ! -f "$target" && ! -d "$target" ]]; then
+            printf 'pjdfstest manifest entry not found: %s\n' "$entry" >&2
+            exit 2
+        fi
+        if [[ -z "${seen[$target]:-}" ]]; then
+            PROVE_TARGETS+=("$target")
+            seen["$target"]=1
+        fi
+    done <"$manifest"
+
+    if [[ ${#PROVE_TARGETS[@]} -eq 0 ]]; then
+        printf 'pjdfstest manifest selected no tests: %s\n' "$manifest" >&2
+        exit 2
+    fi
 }
 
 safe_rm_tmp() {
@@ -181,6 +281,25 @@ while [[ $# -gt 0 ]]; do
             REPORT_DIR="$2"
             shift 2
             ;;
+        --profile)
+            [[ $# -ge 2 ]] || { echo "missing value for --profile" >&2; exit 2; }
+            PJDFSTEST_PROFILE="$2"
+            shift 2
+            ;;
+        --manifest)
+            [[ $# -ge 2 ]] || { echo "missing value for --manifest" >&2; exit 2; }
+            PJDFSTEST_MANIFEST="$2"
+            shift 2
+            ;;
+        --known-unsupported)
+            [[ $# -ge 2 ]] || { echo "missing value for --known-unsupported" >&2; exit 2; }
+            PJDFSTEST_KNOWN_UNSUPPORTED="$2"
+            shift 2
+            ;;
+        --list-profiles)
+            list_profiles
+            exit 0
+            ;;
         --keep-work)
             KEEP_WORK=1
             shift
@@ -199,9 +318,9 @@ done
 
 missing=()
 command -v prove >/dev/null 2>&1 || missing+=("prove (perl-Test-Harness)")
-command -v pjdfstest >/dev/null 2>&1 || missing+=("pjdfstest executable")
 resolve_agentfs || missing+=("agentfs")
 resolve_pjdfstest_tests || missing+=("pjdfstest tests")
+resolve_pjdfstest_binary || missing+=("pjdfstest executable")
 
 if [[ ${#missing[@]} -gt 0 ]]; then
     skip_missing "${missing[*]}"
@@ -219,6 +338,8 @@ if [[ "$(uname -s)" == "Linux" && ! -e /dev/fuse ]]; then
     skip_missing "/dev/fuse"
 fi
 
+resolve_prove_targets
+
 if [[ -z "$REPORT_DIR" ]]; then
     REPORT_DIR="$(mktemp -d /tmp/agentfs-pjdfstest-report.XXXXXX)"
 else
@@ -234,8 +355,26 @@ AGENT_ID="pjdfstest-$$-$(date +%s)"
 DB_PATH="$WORK_DIR/.agentfs/$AGENT_ID.db"
 
 printf 'AgentFS binary: %s\n' "$AGENTFS_RESOLVED"
+printf 'pjdfstest binary: %s\n' "$PJDFSTEST_RESOLVED"
 printf 'pjdfstest tests: %s\n' "$PJDFSTEST_TESTS"
+printf 'pjdfstest profile: %s\n' "$PJDFSTEST_PROFILE"
 printf 'Report directory: %s\n' "$REPORT_DIR"
+
+printf '%s\n' "$PJDFSTEST_PROFILE" >"$REPORT_DIR/selected-profile.txt"
+for target in "${PROVE_TARGETS[@]}"; do
+    if [[ "$target" == "$PJDFSTEST_TESTS" ]]; then
+        printf '.\n'
+    else
+        printf '%s\n' "${target#"$PJDFSTEST_TESTS"/}"
+    fi
+done >"$REPORT_DIR/selected-tests.txt"
+
+if [[ -z "$PJDFSTEST_KNOWN_UNSUPPORTED" ]]; then
+    PJDFSTEST_KNOWN_UNSUPPORTED="$SCRIPT_DIR/pjdfstest/known-gaps.tsv"
+fi
+if [[ -f "$PJDFSTEST_KNOWN_UNSUPPORTED" ]]; then
+    cp "$PJDFSTEST_KNOWN_UNSUPPORTED" "$REPORT_DIR/known-unsupported.tsv"
+fi
 
 (
     cd "$WORK_DIR"
@@ -272,7 +411,7 @@ fi
 set +e
 (
     cd "$MOUNT_DIR"
-    prove -rv "$PJDFSTEST_TESTS"
+    prove -rv "${PROVE_TARGETS[@]}"
 ) 2>&1 | tee "$REPORT_DIR/pjdfstest.log"
 prove_status=${PIPESTATUS[0]}
 set -e

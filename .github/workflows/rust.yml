@@ -80,11 +80,25 @@ jobs:
         EOF
         ../scripts/validation/replay/replay_workload.py --agentfs-bin target/debug/agentfs /tmp/agentfs-replay-smoke.jsonl
 
+    - name: Build pjdfstest
+      if: matrix.project == 'cli' && matrix.os == 'ubuntu-latest'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y autoconf automake make gcc perl
+        git clone --depth 1 https://github.com/pjd/pjdfstest.git /tmp/pjdfstest
+        cd /tmp/pjdfstest
+        autoreconf -ifs
+        ./configure
+        make pjdfstest
+
     - name: Check pjdfstest harness
       if: matrix.project == 'cli' && matrix.os == 'ubuntu-latest'
       run: |
         set +e
-        ../scripts/validation/posix/run-pjdfstest.sh --agentfs-bin target/debug/agentfs
+        ../scripts/validation/posix/run-pjdfstest.sh \
+          --agentfs-bin target/debug/agentfs \
+          --pjdfstest-dir /tmp/pjdfstest \
+          --profile phase45-ci
         status=$?
         set -e
         if [ "$status" -ne 0 ] && [ "$status" -ne 77 ]; then

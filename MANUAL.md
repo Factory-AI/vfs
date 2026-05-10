@@ -181,13 +181,13 @@ agentfs sync <ID_OR_PATH> <SUBCOMMAND>
 
 ### agentfs migrate
 
-Migrate database schema to the current version.
+Migrate historical database schemas through the legacy v0.4 layout.
 
 ```
 agentfs migrate [OPTIONS] <ID_OR_PATH>
 ```
 
-Upgrades an AgentFS database schema to the latest version. This is necessary when using databases created with older versions of AgentFS.
+Upgrades an AgentFS database schema through the legacy v0.4 layout. v0.5 is a layout-changing schema and uses the copy-based `agentfs migrate-v0-5` command instead of in-place mutation.
 
 **Arguments:**
 - `ID_OR_PATH` - Agent identifier or database path
@@ -230,7 +230,42 @@ Migration completed successfully.
 
 **Notes:**
 - Migrations are idempotent and safe to run multiple times
+- This command does not convert v0.4 databases to v0.5
 - Always backup your database before running migrations on production data
+
+### agentfs migrate-v0-5
+
+Copy a v0.4 database into a new v0.5 database.
+
+```
+agentfs migrate-v0-5 [OPTIONS] <SOURCE> <TARGET>
+```
+
+v0.5 changes the file-content layout by defaulting to 64 KiB chunks and storing dense regular files at or below 4 KiB inline in `fs_inode`. Because this is a layout change, migration is copy-only: the source database is opened for verification and copied into a separate target database.
+
+**Arguments:**
+- `SOURCE` - Source v0.4 database path
+- `TARGET` - Target v0.5 database path
+
+**Options:**
+- `--verify` - Verify migrated filesystem, KV, tool-call, and overlay state equivalence
+- `--overwrite-target` - Replace an existing target database
+
+**Examples:**
+
+```bash
+# Copy and verify a v0.4 database into v0.5
+agentfs migrate-v0-5 .agentfs/my-agent.db .agentfs/my-agent-v05.db --verify
+
+# Replace an existing target
+agentfs migrate-v0-5 old.db new.db --verify --overwrite-target
+```
+
+**Notes:**
+- The source database is never migrated in place
+- Overlay tables (`fs_whiteout`, `fs_origin`, and `fs_overlay_config`) are preserved
+- Sparse and large files are streamed during copy/verification rather than materialized whole-file
+- Verification includes a checkpointed single-file snapshot check for the target database
 
 ### agentfs fs
 
