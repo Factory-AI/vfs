@@ -12,7 +12,7 @@ use agentfs_sdk::filesystem::{S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFM
 use agentfs_sdk::{BoxedFile, FileSystem, Stats, TimeChange};
 use parking_lot::Mutex;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     ffi::OsStr,
     path::PathBuf,
     sync::{
@@ -73,6 +73,9 @@ fn maximize_fd_limit() {
 /// This is safe because we are the only writer to the filesystem.
 const TTL: Duration = Duration::MAX;
 
+/// Maximum pending write data buffered per open FUSE file handle.
+const MAX_PENDING_WRITE_BYTES: usize = 4 * 1024 * 1024;
+
 /// Options for mounting an agent filesystem via FUSE.
 #[derive(Debug, Clone)]
 pub struct FuseMountOptions {
@@ -95,8 +98,148 @@ pub struct FuseMountOptions {
 
 /// Tracks an open file handle
 struct OpenFile {
+    /// Inode associated with this FUSE file handle.
+    ino: u64,
     /// The file handle from the filesystem layer.
     file: BoxedFile,
+    /// Pending writes buffered for coalescing before reaching the filesystem layer.
+    pending: WriteBuffer,
+}
+
+impl OpenFile {
+    fn new(ino: u64, file: BoxedFile) -> Self {
+        Self {
+            ino,
+            file,
+            pending: WriteBuffer::default(),
+        }
+    }
+
+    fn buffer_write(&mut self, offset: u64, data: &[u8]) -> Result<(), i32> {
+        self.pending.write(offset, data)?;
+        Ok(())
+    }
+
+    fn pending_bytes(&self) -> usize {
+        self.pending.bytes()
+    }
+
+    fn flush_pending(&mut self, runtime: &Runtime) -> Result<(), SdkError> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+
+        let file = self.file.clone();
+        let ranges = self.pending.ranges_for_flush();
+
+        for (offset, data) in ranges {
+            let file = file.clone();
+            runtime.block_on(async move { file.pwrite(offset, &data).await })?;
+        }
+
+        self.pending.clear();
+        Ok(())
+    }
+}
+
+/// Pending write ranges for one open FUSE file handle.
+///
+/// Ranges are keyed by start offset and kept non-overlapping. Adjacent and
+/// overlapping writes are merged eagerly so common sequential writes become one
+/// filesystem-layer `pwrite` when the handle is flushed.
+#[derive(Default)]
+struct WriteBuffer {
+    ranges: BTreeMap<u64, Vec<u8>>,
+    bytes: usize,
+}
+
+impl WriteBuffer {
+    fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
+    fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    fn clear(&mut self) {
+        self.ranges.clear();
+        self.bytes = 0;
+    }
+
+    fn ranges_for_flush(&self) -> Vec<(u64, Vec<u8>)> {
+        self.ranges
+            .iter()
+            .map(|(&offset, data)| (offset, data.clone()))
+            .collect()
+    }
+
+    fn write(&mut self, offset: u64, data: &[u8]) -> Result<(), i32> {
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        let data_len = u64::try_from(data.len()).map_err(|_| libc::EINVAL)?;
+        let write_start = offset;
+        let write_end = offset.checked_add(data_len).ok_or(libc::EINVAL)?;
+        let mut start = write_start;
+        let mut end = write_end;
+        let mut existing_ranges = Vec::new();
+
+        if let Some((&prev_start, prev_data)) = self.ranges.range(..=write_start).next_back() {
+            let prev_end = prev_start
+                .checked_add(prev_data.len() as u64)
+                .ok_or(libc::EINVAL)?;
+
+            if prev_end >= write_start {
+                let prev_data = prev_data.clone();
+                self.ranges.remove(&prev_start);
+                self.bytes -= prev_data.len();
+
+                start = prev_start;
+                end = end.max(prev_end);
+                existing_ranges.push((prev_start, prev_data));
+            }
+        }
+
+        loop {
+            let next = self
+                .ranges
+                .range(start..)
+                .next()
+                .map(|(&next_start, next_data)| (next_start, next_data.clone()));
+
+            let Some((next_start, next_data)) = next else {
+                break;
+            };
+
+            if next_start > end {
+                break;
+            }
+
+            let next_end = next_start
+                .checked_add(next_data.len() as u64)
+                .ok_or(libc::EINVAL)?;
+            self.ranges.remove(&next_start);
+            self.bytes -= next_data.len();
+
+            end = end.max(next_end);
+            existing_ranges.push((next_start, next_data));
+        }
+
+        let mut merged = vec![0; (end - start) as usize];
+        for (range_start, range_data) in existing_ranges {
+            let range_offset = (range_start - start) as usize;
+            merged[range_offset..range_offset + range_data.len()].copy_from_slice(&range_data);
+        }
+
+        let write_offset = (write_start - start) as usize;
+        merged[write_offset..write_offset + data.len()].copy_from_slice(data);
+
+        self.bytes += merged.len();
+        self.ranges.insert(start, merged);
+        Ok(())
+    }
 }
 
 struct AgentFSFuse {
@@ -133,6 +276,13 @@ impl Filesystem for AgentFSFuse {
                 | FUSE_NO_OPENDIR_SUPPORT,
         );
         Ok(())
+    }
+
+    fn destroy(&mut self) {
+        tracing::debug!("FUSE::destroy");
+        if let Err(e) = self.flush_all_pending() {
+            tracing::warn!("FUSE::destroy failed to flush pending writes: {}", e);
+        }
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -264,20 +414,32 @@ impl Filesystem for AgentFSFuse {
         // Handle truncate
         if let Some(new_size) = size {
             let result = if let Some(fh) = fh {
-                // Use file handle if available (ftruncate)
+                // Use file handle if available (ftruncate). Flush buffered
+                // writes first so a later close cannot replay stale writes
+                // after the truncate and grow the file again.
                 let file = {
-                    let open_files = self.open_files.lock();
-                    open_files.get(&fh).map(|f| f.file.clone())
+                    let mut open_files = self.open_files.lock();
+                    let Some(open_file) = open_files.get_mut(&fh) else {
+                        reply.error(libc::EBADF);
+                        return;
+                    };
+
+                    if let Err(e) = open_file.flush_pending(&self.runtime) {
+                        reply.error(error_to_errno(&e));
+                        return;
+                    }
+
+                    open_file.file.clone()
                 };
 
-                if let Some(file) = file {
-                    self.runtime
-                        .block_on(async move { file.truncate(new_size).await })
-                } else {
-                    reply.error(libc::EBADF);
+                self.runtime
+                    .block_on(async move { file.truncate(new_size).await })
+            } else {
+                if let Err(e) = self.flush_pending_inode(ino) {
+                    reply.error(error_to_errno(&e));
                     return;
                 }
-            } else {
+
                 // Open file and truncate via file handle
                 let fs = self.fs.clone();
                 self.runtime.block_on(async move {
@@ -673,7 +835,9 @@ impl Filesystem for AgentFSFuse {
                 let attr = fillattr(&stats);
 
                 let fh = self.alloc_fh();
-                self.open_files.lock().insert(fh, OpenFile { file });
+                self.open_files
+                    .lock()
+                    .insert(fh, OpenFile::new(stats.ino as u64, file));
 
                 reply.created(&TTL, &attr, 0, fh, 0);
             }
@@ -872,7 +1036,7 @@ impl Filesystem for AgentFSFuse {
         match result {
             Ok(file) => {
                 let fh = self.alloc_fh();
-                self.open_files.lock().insert(fh, OpenFile { file });
+                self.open_files.lock().insert(fh, OpenFile::new(ino, file));
                 reply.opened(fh, 0);
             }
             Err(e) => reply.error(error_to_errno(&e)),
@@ -883,7 +1047,7 @@ impl Filesystem for AgentFSFuse {
     fn read(
         &mut self,
         _req: &Request,
-        _ino: u64,
+        ino: u64,
         fh: u64,
         offset: i64,
         size: u32,
@@ -892,6 +1056,11 @@ impl Filesystem for AgentFSFuse {
         reply: ReplyData,
     ) {
         tracing::debug!("FUSE::read: fh={}, offset={}, size={}", fh, offset, size);
+        if offset < 0 {
+            reply.error(libc::EINVAL);
+            return;
+        }
+
         let file = {
             let open_files = self.open_files.lock();
             let Some(open_file) = open_files.get(&fh) else {
@@ -900,6 +1069,11 @@ impl Filesystem for AgentFSFuse {
             };
             open_file.file.clone()
         };
+
+        if let Err(e) = self.flush_pending_inode(ino) {
+            reply.error(error_to_errno(&e));
+            return;
+        }
 
         let result = self
             .runtime
@@ -930,6 +1104,63 @@ impl Filesystem for AgentFSFuse {
             offset,
             data.len()
         );
+
+        if offset < 0 {
+            reply.error(libc::EINVAL);
+            return;
+        }
+
+        let data_len = data.len();
+        agentfs_sdk::profiling::record_fuse_write(data_len as u64);
+        let result = {
+            let mut open_files = self.open_files.lock();
+            let Some(open_file) = open_files.get_mut(&fh) else {
+                reply.error(libc::EBADF);
+                return;
+            };
+
+            if let Err(errno) = open_file.buffer_write(offset as u64, data) {
+                reply.error(errno);
+                return;
+            }
+
+            if open_file.pending_bytes() > MAX_PENDING_WRITE_BYTES {
+                open_file.flush_pending(&self.runtime)
+            } else {
+                Ok(())
+            }
+        };
+
+        match result {
+            Ok(()) => reply.written(data_len as u32),
+            Err(e) => reply.error(error_to_errno(&e)),
+        }
+    }
+
+    /// Flushes buffered data to the backend storage.
+    fn flush(&mut self, _req: &Request, _ino: u64, fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
+        tracing::debug!("FUSE::flush: fh={}", fh);
+        let result = {
+            let mut open_files = self.open_files.lock();
+            let Some(open_file) = open_files.get_mut(&fh) else {
+                reply.error(libc::EBADF);
+                return;
+            };
+            open_file.flush_pending(&self.runtime)
+        };
+
+        match result {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(error_to_errno(&e)),
+        }
+    }
+
+    /// Synchronizes file data to persistent storage using the file handle.
+    ///
+    /// This now uses the file handle's fsync which knows which layer(s) the
+    /// file exists in, avoiding errors when a file only exists in one layer.
+    fn fsync(&mut self, _req: &Request, ino: u64, fh: u64, _datasync: bool, reply: ReplyEmpty) {
+        tracing::debug!("FUSE::fsync: fh={}", fh);
         let file = {
             let open_files = self.open_files.lock();
             let Some(open_file) = open_files.get(&fh) else {
@@ -939,48 +1170,10 @@ impl Filesystem for AgentFSFuse {
             open_file.file.clone()
         };
 
-        let data_len = data.len();
-        agentfs_sdk::profiling::record_fuse_write(data_len as u64);
-        let data_vec = data.to_vec();
-        let result = self
-            .runtime
-            .block_on(async move { file.pwrite(offset as u64, &data_vec).await });
-
-        match result {
-            Ok(()) => reply.written(data_len as u32),
-            Err(e) => reply.error(error_to_errno(&e)),
+        if let Err(e) = self.flush_pending_inode(ino) {
+            reply.error(error_to_errno(&e));
+            return;
         }
-    }
-
-    /// Flushes data to the backend storage.
-    ///
-    /// Since writes go directly to the database, this is a no-op.
-    fn flush(&mut self, _req: &Request, _ino: u64, fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
-        tracing::debug!("FUSE::flush: fh={}", fh);
-        let open_files = self.open_files.lock();
-        if open_files.contains_key(&fh) {
-            reply.ok();
-        } else {
-            reply.error(libc::EBADF);
-        }
-    }
-
-    /// Synchronizes file data to persistent storage using the file handle.
-    ///
-    /// This now uses the file handle's fsync which knows which layer(s) the
-    /// file exists in, avoiding errors when a file only exists in one layer.
-    fn fsync(&mut self, _req: &Request, _ino: u64, fh: u64, _datasync: bool, reply: ReplyEmpty) {
-        tracing::debug!("FUSE::fsync: fh={}", fh);
-        let file = {
-            let open_files = self.open_files.lock();
-            match open_files.get(&fh) {
-                Some(open_file) => open_file.file.clone(),
-                None => {
-                    reply.error(libc::EBADF);
-                    return;
-                }
-            }
-        };
 
         let result = self.runtime.block_on(async move { file.fsync().await });
 
@@ -992,8 +1185,7 @@ impl Filesystem for AgentFSFuse {
 
     /// Releases (closes) an open file handle.
     ///
-    /// Removes the file handle from the open files table.
-    /// Since writes go directly to the database, no flushing is needed.
+    /// Flushes pending writes and removes the file handle from the open files table.
     fn release(
         &mut self,
         _req: &Request,
@@ -1005,8 +1197,22 @@ impl Filesystem for AgentFSFuse {
         reply: ReplyEmpty,
     ) {
         tracing::debug!("FUSE::release: fh={}", fh);
-        self.open_files.lock().remove(&fh);
-        reply.ok();
+        let result = {
+            let mut open_files = self.open_files.lock();
+            let Some(open_file) = open_files.get_mut(&fh) else {
+                reply.error(libc::EBADF);
+                return;
+            };
+            open_file.flush_pending(&self.runtime)
+        };
+
+        match result {
+            Ok(()) => {
+                self.open_files.lock().remove(&fh);
+                reply.ok();
+            }
+            Err(e) => reply.error(error_to_errno(&e)),
+        }
     }
 
     /// Returns filesystem statistics.
@@ -1080,6 +1286,25 @@ impl Filesystem for AgentFSFuse {
 }
 
 impl AgentFSFuse {
+    fn flush_pending_inode(&self, ino: u64) -> Result<(), SdkError> {
+        let mut open_files = self.open_files.lock();
+        for open_file in open_files
+            .values_mut()
+            .filter(|open_file| open_file.ino == ino)
+        {
+            open_file.flush_pending(&self.runtime)?;
+        }
+        Ok(())
+    }
+
+    fn flush_all_pending(&self) -> Result<(), SdkError> {
+        let mut open_files = self.open_files.lock();
+        for open_file in open_files.values_mut() {
+            open_file.flush_pending(&self.runtime)?;
+        }
+        Ok(())
+    }
+
     /// Create a new FUSE filesystem adapter wrapping a FileSystem instance.
     ///
     /// The provided Tokio runtime is used to execute async FileSystem operations
@@ -1220,4 +1445,80 @@ pub fn mount(
     crate::fuser::mount2(fs, &opts.mountpoint, &mount_opts)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WriteBuffer;
+
+    fn ranges(buffer: &WriteBuffer) -> Vec<(u64, Vec<u8>)> {
+        buffer.ranges_for_flush()
+    }
+
+    #[test]
+    fn write_buffer_merges_adjacent_ranges() {
+        let mut buffer = WriteBuffer::default();
+
+        buffer.write(0, b"hello").unwrap();
+        buffer.write(5, b" world").unwrap();
+
+        assert_eq!(buffer.bytes(), 11);
+        assert_eq!(ranges(&buffer), vec![(0, b"hello world".to_vec())]);
+    }
+
+    #[test]
+    fn write_buffer_overlays_overlapping_writes() {
+        let mut buffer = WriteBuffer::default();
+
+        buffer.write(0, b"abcdef").unwrap();
+        buffer.write(2, b"ZZ").unwrap();
+
+        assert_eq!(buffer.bytes(), 6);
+        assert_eq!(ranges(&buffer), vec![(0, b"abZZef".to_vec())]);
+    }
+
+    #[test]
+    fn write_buffer_overlays_following_range() {
+        let mut buffer = WriteBuffer::default();
+
+        buffer.write(10, b"abc").unwrap();
+        buffer.write(8, b"ZZZZ").unwrap();
+
+        assert_eq!(buffer.bytes(), 5);
+        assert_eq!(ranges(&buffer), vec![(8, b"ZZZZc".to_vec())]);
+    }
+
+    #[test]
+    fn write_buffer_bridges_two_existing_ranges() {
+        let mut buffer = WriteBuffer::default();
+
+        buffer.write(0, b"ab").unwrap();
+        buffer.write(4, b"ef").unwrap();
+        buffer.write(2, b"cd").unwrap();
+
+        assert_eq!(buffer.bytes(), 6);
+        assert_eq!(ranges(&buffer), vec![(0, b"abcdef".to_vec())]);
+    }
+
+    #[test]
+    fn write_buffer_keeps_disjoint_ranges_ordered() {
+        let mut buffer = WriteBuffer::default();
+
+        buffer.write(10, b"tail").unwrap();
+        buffer.write(0, b"head").unwrap();
+
+        assert_eq!(buffer.bytes(), 8);
+        assert_eq!(
+            ranges(&buffer),
+            vec![(0, b"head".to_vec()), (10, b"tail".to_vec())]
+        );
+    }
+
+    #[test]
+    fn write_buffer_rejects_offset_overflow() {
+        let mut buffer = WriteBuffer::default();
+
+        assert_eq!(buffer.write(u64::MAX, b"x"), Err(libc::EINVAL));
+        assert!(buffer.is_empty());
+    }
 }
