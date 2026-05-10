@@ -310,7 +310,7 @@ fn mount_nfs(port: u32, mountpoint: &Path) -> Result<()> {
         .args([
             "-o",
             &format!(
-                "locallocks,vers=3,tcp,port={},mountport={},soft,timeo=100,retrans=5",
+                "locallocks,vers=3,tcp,port={},mountport={},wsize=1048576,rsize=1048576,soft,timeo=100,retrans=5",
                 port, port
             ),
             "127.0.0.1:/",

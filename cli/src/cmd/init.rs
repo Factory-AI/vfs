@@ -106,7 +106,7 @@ pub async fn init_database(
     }
 
     // Check if agent already exists
-    let db_path = agentfs_dir().join(format!("{}.db", &id));
+    let db_path = agentfs_dir().join(format!("{}.db", id));
     if db_path.exists() {
         if force {
             for entry in std::fs::read_dir(agentfs_dir())? {

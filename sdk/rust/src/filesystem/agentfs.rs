@@ -12,12 +12,33 @@ use super::{
     BoxedFile, DirEntry, File, FileSystem, FilesystemStats, FsError, Stats, TimeChange,
     DEFAULT_DIR_MODE, DEFAULT_FILE_MODE, MAX_NAME_LEN, S_IFLNK, S_IFMT, S_IFREG,
 };
-use crate::connection_pool::ConnectionPool;
+use crate::connection_pool::{ConnectionPool, ConnectionPoolOptions};
 use crate::schema::AGENTFS_SCHEMA_VERSION;
 
 const ROOT_INO: i64 = 1;
 const DEFAULT_CHUNK_SIZE: usize = 4096;
 const DENTRY_CACHE_MAX_SIZE: usize = 10000;
+const FILE_BACKED_MAX_CONNECTIONS: usize = 8;
+const BUSY_TIMEOUT_SQL: &str = "PRAGMA busy_timeout = 5000";
+const WAL_MODE_SQL: &str = "PRAGMA journal_mode = WAL";
+const BASELINE_SYNCHRONOUS_SQL: &str = "PRAGMA synchronous = NORMAL";
+const DURABLE_SYNCHRONOUS_SQL: &str = "PRAGMA synchronous = FULL";
+const WAL_CHECKPOINT_SQL: &str = "PRAGMA wal_checkpoint(TRUNCATE)";
+const FILE_BACKED_SETUP_SQL: &[&str] = &[BUSY_TIMEOUT_SQL, WAL_MODE_SQL, BASELINE_SYNCHRONOUS_SQL];
+
+/// Production connection-pool options for local file-backed AgentFS databases.
+pub(crate) fn file_backed_connection_pool_options() -> ConnectionPoolOptions {
+    ConnectionPoolOptions {
+        max_connections: FILE_BACKED_MAX_CONNECTIONS,
+        ..ConnectionPoolOptions::default().with_setup_sql(FILE_BACKED_SETUP_SQL.iter().copied())
+    }
+}
+
+async fn checkpoint_wal(conn: &Connection) -> Result<()> {
+    let mut rows = conn.query(WAL_CHECKPOINT_SQL, ()).await?;
+    while rows.next().await?.is_some() {}
+    Ok(())
+}
 
 /// LRU cache for directory entry lookups.
 ///
@@ -310,13 +331,12 @@ impl File for AgentFSFile {
 
     async fn fsync(&self) -> Result<()> {
         let conn = self.pool.get_connection().await?;
-        conn.prepare_cached("PRAGMA synchronous = FULL")
+        conn.prepare_cached(DURABLE_SYNCHRONOUS_SQL)
             .await?
             .execute(())
             .await?;
-        conn.prepare_cached("BEGIN").await?.execute(()).await?;
-        conn.prepare_cached("COMMIT").await?.execute(()).await?;
-        conn.prepare_cached("PRAGMA synchronous = OFF")
+        checkpoint_wal(&conn).await?;
+        conn.prepare_cached(BASELINE_SYNCHRONOUS_SQL)
             .await?
             .execute(())
             .await?;
@@ -423,7 +443,12 @@ impl AgentFS {
     /// Create a new filesystem
     pub async fn new(db_path: &str) -> Result<Self> {
         let db = Builder::new_local(db_path).build().await?;
-        Self::from_pool(ConnectionPool::new(db)).await
+        let pool = if db_path == ":memory:" {
+            ConnectionPool::new_single_connection(db)
+        } else {
+            ConnectionPool::with_options(db, file_backed_connection_pool_options())
+        };
+        Self::from_pool(pool).await
     }
 
     /// Create a filesystem from a connection pool
@@ -432,13 +457,6 @@ impl AgentFS {
 
         // Initialize schema first
         Self::initialize_schema(&conn).await?;
-
-        // Disable synchronous mode for filesystem fsync() semantics.
-        conn.execute("PRAGMA synchronous = OFF", ()).await?;
-
-        // Set busy timeout to handle concurrent access gracefully.
-        // Without this, concurrent transactions fail immediately with SQLITE_BUSY.
-        conn.execute("PRAGMA busy_timeout = 5000", ()).await?;
 
         // Get chunk_size from config (or use default)
         let chunk_size = Self::read_chunk_size(&conn).await?;
@@ -2488,19 +2506,18 @@ impl AgentFS {
     /// Synchronize file data to persistent storage
     ///
     /// Temporarily enables FULL synchronous mode, runs a transaction to force
-    /// a checkpoint, then restores OFF mode. This ensures durability while
+    /// a checkpoint, then restores NORMAL mode. This ensures durability while
     /// maintaining high performance for normal operations.
     ///
     /// Note: The path parameter is ignored since all data is in a single database.
     pub async fn fsync(&self, _path: &str) -> Result<()> {
         let conn = self.pool.get_connection().await?;
-        conn.prepare_cached("PRAGMA synchronous = FULL")
+        conn.prepare_cached(DURABLE_SYNCHRONOUS_SQL)
             .await?
             .execute(())
             .await?;
-        conn.prepare_cached("BEGIN").await?.execute(()).await?;
-        conn.prepare_cached("COMMIT").await?.execute(()).await?;
-        conn.prepare_cached("PRAGMA synchronous = OFF")
+        checkpoint_wal(&conn).await?;
+        conn.prepare_cached(BASELINE_SYNCHRONOUS_SQL)
             .await?
             .execute(())
             .await?;
@@ -3762,11 +3779,41 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    // Turso 0.4.4 currently exposes only OFF=0 and FULL=2 internally; applying
+    // `PRAGMA synchronous = NORMAL` is accepted but observes as 0.
+    const TURSO_OBSERVED_SYNCHRONOUS_NORMAL: i64 = 0;
+
     async fn create_test_fs() -> Result<(AgentFS, tempfile::TempDir)> {
         let dir = tempdir()?;
         let db_path = dir.path().join("test.db");
         let fs = AgentFS::new(db_path.to_str().unwrap()).await?;
         Ok((fs, dir))
+    }
+
+    async fn read_pragma_i64(conn: &Connection, sql: &str) -> i64 {
+        let mut rows = conn.query(sql, ()).await.unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        row.get_value(0)
+            .ok()
+            .and_then(|value| match value {
+                Value::Integer(value) => Some(value),
+                Value::Text(value) => value.parse().ok(),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    async fn read_pragma_text(conn: &Connection, sql: &str) -> String {
+        let mut rows = conn.query(sql, ()).await.unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        row.get_value(0)
+            .ok()
+            .and_then(|value| match value {
+                Value::Text(value) => Some(value.clone()),
+                Value::Integer(value) => Some(value.to_string()),
+                _ => None,
+            })
+            .unwrap()
     }
 
     // ==================== Chunk Size Boundary Tests ====================
@@ -4118,6 +4165,116 @@ mod tests {
             .expect("chunk_size should be a text value");
 
         assert_eq!(value, "4096");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_file_backed_connections_use_production_pragmas() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+
+        let conn1 = fs.pool.get_connection().await?;
+        let conn2 = fs.pool.get_connection().await?;
+
+        for conn in [&conn1, &conn2] {
+            assert_eq!(
+                read_pragma_i64(conn, "PRAGMA synchronous").await,
+                TURSO_OBSERVED_SYNCHRONOUS_NORMAL
+            );
+            assert_eq!(read_pragma_i64(conn, "PRAGMA busy_timeout").await, 5000);
+            assert_eq!(
+                read_pragma_text(conn, "PRAGMA journal_mode")
+                    .await
+                    .to_lowercase(),
+                "wal"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_file_backed_options_issue_durable_baseline_sql() {
+        let options = file_backed_connection_pool_options();
+
+        assert_eq!(options.max_connections, FILE_BACKED_MAX_CONNECTIONS);
+        assert_eq!(options.setup_sql[0], BUSY_TIMEOUT_SQL);
+        assert!(options.setup_sql.iter().any(|sql| sql == WAL_MODE_SQL));
+        assert!(options
+            .setup_sql
+            .iter()
+            .any(|sql| sql == BASELINE_SYNCHRONOUS_SQL));
+        assert!(!options
+            .setup_sql
+            .iter()
+            .any(|sql| sql == "PRAGMA synchronous = OFF"));
+    }
+
+    #[tokio::test]
+    async fn test_file_backed_agentfs_concurrent_operations_complete() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        let (_, file) = fs.create_file("/seed.txt", DEFAULT_FILE_MODE, 0, 0).await?;
+        file.pwrite(0, b"seed").await?;
+
+        let mut handles = Vec::new();
+        for worker in 0..8 {
+            let fs = fs.clone();
+            handles.push(tokio::spawn(async move {
+                for iteration in 0..5 {
+                    let data = fs.read_file("/seed.txt").await?.unwrap();
+                    assert_eq!(data, b"seed");
+
+                    let path = format!("/worker-{worker}-{iteration}");
+                    fs.mkdir(&path, 0, 0).await?;
+                }
+                Ok::<(), Error>(())
+            }));
+        }
+
+        for handle in handles {
+            handle.await.unwrap()?;
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fsync_restores_synchronous_normal() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+
+        let conn = fs.pool.get_connection().await?;
+        conn.execute("PRAGMA synchronous = OFF", ()).await?;
+        drop(conn);
+
+        fs.fsync("/").await?;
+
+        let conn = fs.pool.get_connection().await?;
+        assert_eq!(
+            read_pragma_i64(&conn, "PRAGMA synchronous").await,
+            TURSO_OBSERVED_SYNCHRONOUS_NORMAL
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_file_fsync_restores_synchronous_normal() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        let (_, file) = fs
+            .create_file("/fsync.txt", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+
+        let conn = fs.pool.get_connection().await?;
+        conn.execute("PRAGMA synchronous = OFF", ()).await?;
+        drop(conn);
+
+        file.fsync().await?;
+
+        let conn = fs.pool.get_connection().await?;
+        assert_eq!(
+            read_pragma_i64(&conn, "PRAGMA synchronous").await,
+            TURSO_OBSERVED_SYNCHRONOUS_NORMAL
+        );
 
         Ok(())
     }

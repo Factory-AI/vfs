@@ -69,6 +69,28 @@ jobs:
       if: matrix.project == 'cli' && matrix.os == 'ubuntu-latest'
       run: tests/all.sh
 
+    - name: Run workload replay smoke
+      if: matrix.project == 'cli' && matrix.os == 'ubuntu-latest'
+      run: |
+        cat > /tmp/agentfs-replay-smoke.jsonl <<'EOF'
+        {"op":"mkdir","path":"/app"}
+        {"op":"write_file","path":"/app/hello.txt","content":"hello"}
+        {"op":"read_file","path":"/app/hello.txt"}
+        {"op":"stat","path":"/app/hello.txt"}
+        EOF
+        ../scripts/validation/replay/replay_workload.py --agentfs-bin target/debug/agentfs /tmp/agentfs-replay-smoke.jsonl
+
+    - name: Check pjdfstest harness
+      if: matrix.project == 'cli' && matrix.os == 'ubuntu-latest'
+      run: |
+        set +e
+        ../scripts/validation/posix/run-pjdfstest.sh --agentfs-bin target/debug/agentfs
+        status=$?
+        set -e
+        if [ "$status" -ne 0 ] && [ "$status" -ne 77 ]; then
+          exit "$status"
+        fi
+
   check:
     name: Check (${{ matrix.os }}, ${{ matrix.project }})
     runs-on: ${{ matrix.os }}
