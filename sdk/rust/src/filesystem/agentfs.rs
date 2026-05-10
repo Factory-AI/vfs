@@ -28,6 +28,7 @@ const BASELINE_SYNCHRONOUS_SQL: &str = "PRAGMA synchronous = NORMAL";
 const DURABLE_SYNCHRONOUS_SQL: &str = "PRAGMA synchronous = FULL";
 const WAL_CHECKPOINT_SQL: &str = "PRAGMA wal_checkpoint(TRUNCATE)";
 const FILE_BACKED_SETUP_SQL: &[&str] = &[BUSY_TIMEOUT_SQL, WAL_MODE_SQL, BASELINE_SYNCHRONOUS_SQL];
+const ATTR_CACHE_MAX_SIZE: usize = 10000;
 
 /// Production connection-pool options for local file-backed AgentFS databases.
 pub(crate) fn file_backed_connection_pool_options() -> ConnectionPoolOptions {
@@ -105,6 +106,44 @@ impl DentryCache {
     }
 }
 
+/// LRU cache for inode attributes.
+///
+/// FUSE and SDK stat-heavy read paths often ask for the same inode metadata
+/// repeatedly after lookup/readdir_plus. This cache is conservative: every
+/// namespace, metadata, or size/content mutation invalidates the affected inode
+/// and parent directory entries before the mutation is considered complete.
+struct AttrCache {
+    entries: Mutex<LruCache<i64, Stats>>,
+}
+
+impl AttrCache {
+    fn new(max_size: usize) -> Self {
+        Self {
+            entries: Mutex::new(LruCache::new(
+                NonZeroUsize::new(max_size).expect("cache size must be > 0"),
+            )),
+        }
+    }
+
+    fn get(&self, ino: i64) -> Option<Stats> {
+        let stats = self.entries.lock().unwrap().get(&ino).cloned();
+        if stats.is_some() {
+            crate::profiling::record_attr_cache_hit();
+        } else {
+            crate::profiling::record_attr_cache_miss();
+        }
+        stats
+    }
+
+    fn insert(&self, stats: Stats) {
+        self.entries.lock().unwrap().put(stats.ino, stats);
+    }
+
+    fn remove(&self, ino: i64) {
+        self.entries.lock().unwrap().pop(&ino);
+    }
+}
+
 /// A filesystem backed by SQLite
 #[derive(Clone)]
 pub struct AgentFS {
@@ -113,6 +152,8 @@ pub struct AgentFS {
     inline_threshold: usize,
     /// Cache for directory entry lookups (shared across clones)
     dentry_cache: Arc<DentryCache>,
+    /// Cache for inode attributes (shared across clones)
+    attr_cache: Arc<AttrCache>,
     /// Emits a profiling summary when the final filesystem clone is dropped.
     _profile_report: Arc<crate::profiling::ProfileReportGuard>,
 }
@@ -126,6 +167,7 @@ pub struct AgentFSFile {
     ino: i64,
     chunk_size: usize,
     inline_threshold: usize,
+    attr_cache: Arc<AttrCache>,
 }
 
 struct FileStorage {
@@ -157,6 +199,7 @@ impl File for AgentFSFile {
         match result {
             Ok(()) => {
                 txn.commit().await?;
+                self.attr_cache.remove(self.ino);
                 Ok(())
             }
             Err(e) => {
@@ -173,6 +216,7 @@ impl File for AgentFSFile {
         match result {
             Ok(()) => {
                 txn.commit().await?;
+                self.attr_cache.remove(self.ino);
                 Ok(())
             }
             Err(e) => {
@@ -197,6 +241,10 @@ impl File for AgentFSFile {
     }
 
     async fn fstat(&self) -> Result<Stats> {
+        if let Some(stats) = self.attr_cache.get(self.ino) {
+            return Ok(stats);
+        }
+
         let conn = self.pool.get_connection().await?;
         let mut stmt = conn
             .prepare_cached("SELECT ino, mode, nlink, uid, gid, size, atime, mtime, ctime, rdev, atime_nsec, mtime_nsec, ctime_nsec FROM fs_inode WHERE ino = ?")
@@ -204,7 +252,9 @@ impl File for AgentFSFile {
         let mut rows = stmt.query((self.ino,)).await?;
 
         if let Some(row) = rows.next().await? {
-            AgentFS::build_stats_from_row(&row)
+            let stats = AgentFS::build_stats_from_row(&row)?;
+            self.attr_cache.insert(stats.clone());
+            Ok(stats)
         } else {
             Err(FsError::NotFound.into())
         }
@@ -792,6 +842,7 @@ impl AgentFS {
             chunk_size,
             inline_threshold,
             dentry_cache: Arc::new(DentryCache::new(DENTRY_CACHE_MAX_SIZE)),
+            attr_cache: Arc::new(AttrCache::new(ATTR_CACHE_MAX_SIZE)),
             _profile_report: Arc::new(crate::profiling::ProfileReportGuard::new("agentfs")),
         };
         Ok(fs)
@@ -1120,6 +1171,22 @@ impl AgentFS {
         Ok(found_ino)
     }
 
+    fn cache_attr(&self, stats: Stats) {
+        self.attr_cache.insert(stats);
+    }
+
+    pub(crate) fn invalidate_attr(&self, ino: i64) {
+        self.attr_cache.remove(ino);
+    }
+
+    fn invalidate_parent_attr(&self, parent_ino: i64) {
+        self.invalidate_attr(parent_ino);
+    }
+
+    fn invalidate_dentry(&self, parent_ino: i64, name: &str) {
+        self.dentry_cache.remove(parent_ino, name);
+    }
+
     /// Get link count for an inode
     async fn get_link_count(&self, conn: &Connection, ino: i64) -> Result<u32> {
         let mut stmt = conn
@@ -1141,6 +1208,10 @@ impl AgentFS {
 
     /// Get file attributes by inode using an existing connection
     async fn getattr_with_conn(&self, conn: &Connection, ino: i64) -> Result<Option<Stats>> {
+        if let Some(stats) = self.attr_cache.get(ino) {
+            return Ok(Some(stats));
+        }
+
         let mut stmt = conn
             .prepare_cached("SELECT ino, mode, nlink, uid, gid, size, atime, mtime, ctime, rdev, atime_nsec, mtime_nsec, ctime_nsec FROM fs_inode WHERE ino = ?")
             .await?;
@@ -1148,6 +1219,7 @@ impl AgentFS {
 
         if let Some(row) = rows.next().await? {
             let stats = Self::build_stats_from_row(&row)?;
+            self.cache_attr(stats.clone());
             Ok(Some(stats))
         } else {
             Ok(None)
@@ -1305,17 +1377,7 @@ impl AgentFS {
             None => return Ok(None),
         };
 
-        let mut stmt = conn
-            .prepare_cached("SELECT ino, mode, nlink, uid, gid, size, atime, mtime, ctime, rdev, atime_nsec, mtime_nsec, ctime_nsec FROM fs_inode WHERE ino = ?")
-            .await?;
-        let mut rows = stmt.query((ino,)).await?;
-
-        if let Some(row) = rows.next().await? {
-            let stats = Self::build_stats_from_row(&row)?;
-            Ok(Some(stats))
-        } else {
-            Ok(None)
-        }
+        self.getattr_with_conn(&conn, ino).await
     }
 
     /// Get file statistics, following symlinks
@@ -1327,27 +1389,15 @@ impl AgentFS {
         let mut current_path = path;
         let max_symlink_depth = 40; // Standard limit for symlink following
 
-        let mut stmt = conn.prepare_cached(
-            "SELECT ino, mode, nlink, uid, gid, size, atime, mtime, ctime, rdev, atime_nsec, mtime_nsec, ctime_nsec FROM fs_inode WHERE ino = ?",
-        ).await?;
         for _ in 0..max_symlink_depth {
             let ino = match self.resolve_path_with_conn(&conn, &current_path).await? {
                 Some(ino) => ino,
                 None => return Ok(None),
             };
 
-            stmt.reset()?;
-            let mut rows = stmt.query((ino,)).await?;
-
-            if let Some(row) = rows.next().await? {
-                let mode = row
-                    .get_value(1)
-                    .ok()
-                    .and_then(|v| v.as_integer().copied())
-                    .unwrap_or(0) as u32;
-
+            if let Some(stats) = self.getattr_with_conn(&conn, ino).await? {
                 // Check if this is a symlink
-                if (mode & S_IFMT) == S_IFLNK {
+                if (stats.mode & S_IFMT) == S_IFLNK {
                     // Read the symlink target
                     let target = self
                         .readlink_with_conn(&conn, &current_path)
@@ -1369,7 +1419,6 @@ impl AgentFS {
                 }
 
                 // Not a symlink, return the stats
-                let stats = Self::build_stats_from_row(&row)?;
                 return Ok(Some(stats));
             } else {
                 return Ok(None);
@@ -1394,22 +1443,9 @@ impl AgentFS {
                 None => return Ok(None),
             };
 
-            let mut rows = conn
-                .query(
-                    "SELECT ino, mode, nlink, uid, gid, size, atime, mtime, ctime, rdev, atime_nsec, mtime_nsec, ctime_nsec FROM fs_inode WHERE ino = ?",
-                    (ino,),
-                )
-                .await?;
-
-            if let Some(row) = rows.next().await? {
-                let mode = row
-                    .get_value(1)
-                    .ok()
-                    .and_then(|v| v.as_integer().copied())
-                    .unwrap_or(0) as u32;
-
+            if let Some(stats) = self.getattr_with_conn(conn, ino).await? {
                 // Check if this is a symlink
-                if (mode & S_IFMT) == S_IFLNK {
+                if (stats.mode & S_IFMT) == S_IFLNK {
                     // Read the symlink target
                     let target = self
                         .readlink_with_conn(conn, &current_path)
@@ -1431,7 +1467,6 @@ impl AgentFS {
                 }
 
                 // Not a symlink, return the stats
-                let stats = Self::build_stats_from_row(&row)?;
                 return Ok(Some(stats));
             } else {
                 return Ok(None);
@@ -1523,6 +1558,7 @@ impl AgentFS {
 
         // Populate dentry cache
         self.dentry_cache.insert(parent_ino, name, ino);
+        self.invalidate_parent_attr(parent_ino);
 
         Ok(())
     }
@@ -1600,6 +1636,7 @@ impl AgentFS {
 
         // Populate dentry cache
         self.dentry_cache.insert(parent_ino, name, ino);
+        self.invalidate_parent_attr(parent_ino);
 
         Ok(())
     }
@@ -1687,6 +1724,7 @@ impl AgentFS {
         txn.commit().await?;
 
         self.dentry_cache.insert(parent_ino, name, ino);
+        self.invalidate_parent_attr(parent_ino);
 
         let stats = Stats {
             ino,
@@ -1703,12 +1741,14 @@ impl AgentFS {
             ctime_nsec: now_nsec as u32,
             rdev: 0,
         };
+        self.cache_attr(stats.clone());
 
         let file: BoxedFile = Arc::new(AgentFSFile {
             pool: self.pool.clone(),
             ino,
             chunk_size: self.chunk_size,
             inline_threshold: self.inline_threshold,
+            attr_cache: self.attr_cache.clone(),
         });
 
         Ok((stats, file))
@@ -1727,6 +1767,7 @@ impl AgentFS {
             ino,
             chunk_size: self.chunk_size,
             inline_threshold: self.inline_threshold,
+            attr_cache: self.attr_cache.clone(),
         };
         Ok(Some(file.read_inode_with_conn(&conn, 0, u64::MAX).await?))
     }
@@ -1749,6 +1790,7 @@ impl AgentFS {
             ino,
             chunk_size: self.chunk_size,
             inline_threshold: self.inline_threshold,
+            attr_cache: self.attr_cache.clone(),
         };
         Ok(Some(file.read_inode_with_conn(&conn, offset, size).await?))
     }
@@ -1784,10 +1826,10 @@ impl AgentFS {
 
         let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
 
-        let result: Result<()> = async {
+        let result: Result<(i64, bool)> = async {
             // Get or create the inode
-            let ino = if let Some(ino) = self.resolve_path_with_conn(&conn, &path).await? {
-                ino
+            let (ino, created) = if let Some(ino) = self.resolve_path_with_conn(&conn, &path).await? {
+                (ino, false)
             } else {
                 let (now_secs, now_nsec) = current_timestamp()?;
                 let mut stmt = conn
@@ -1820,7 +1862,7 @@ impl AgentFS {
                     .prepare_cached("INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, ?, ?)")
                     .await?;
                 stmt.execute((name.as_str(), parent_ino, ino)).await?;
-                ino
+                (ino, true)
             };
 
             if data.is_empty() {
@@ -1829,7 +1871,7 @@ impl AgentFS {
                     .await?
                     .execute((now_secs, now_nsec, ino))
                     .await?;
-                return Ok(());
+                return Ok((ino, created));
             }
 
             let file = AgentFSFile {
@@ -1837,16 +1879,22 @@ impl AgentFS {
                 ino,
                 chunk_size: self.chunk_size,
                 inline_threshold: self.inline_threshold,
+                attr_cache: self.attr_cache.clone(),
             };
             file.pwrite_inode_with_conn(&conn, offset, data).await?;
 
-            Ok(())
+            Ok((ino, created))
         }
         .await;
 
         match result {
-            Ok(()) => {
+            Ok((ino, created)) => {
                 txn.commit().await?;
+                self.invalidate_attr(ino);
+                if created {
+                    self.dentry_cache.insert(parent_ino, name, ino);
+                    self.invalidate_parent_attr(parent_ino);
+                }
                 Ok(())
             }
             Err(e) => {
@@ -1875,12 +1923,14 @@ impl AgentFS {
             ino,
             chunk_size: self.chunk_size,
             inline_threshold: self.inline_threshold,
+            attr_cache: self.attr_cache.clone(),
         };
         let result = file.truncate_inode_with_conn(&conn, new_size).await;
 
         match result {
             Ok(()) => {
                 txn.commit().await?;
+                self.invalidate_attr(ino);
                 Ok(())
             }
             Err(e) => {
@@ -2025,6 +2075,7 @@ impl AgentFS {
                     .unwrap_or(0) as u64,
             };
 
+            self.cache_attr(stats.clone());
             entries.push(DirEntry { name, stats });
         }
 
@@ -2110,6 +2161,7 @@ impl AgentFS {
 
         // Populate dentry cache
         self.dentry_cache.insert(parent_ino, name, ino);
+        self.invalidate_parent_attr(parent_ino);
 
         Ok(())
     }
@@ -2189,6 +2241,8 @@ impl AgentFS {
 
         // Populate dentry cache
         self.dentry_cache.insert(parent_ino, name, ino);
+        self.invalidate_parent_attr(parent_ino);
+        self.invalidate_attr(ino);
 
         Ok(())
     }
@@ -2311,7 +2365,9 @@ impl AgentFS {
         stmt.execute((parent_ino, name.as_str())).await?;
 
         // Invalidate cache for this entry
-        self.dentry_cache.remove(parent_ino, name);
+        self.invalidate_dentry(parent_ino, name);
+        self.invalidate_parent_attr(parent_ino);
+        self.invalidate_attr(ino);
 
         // Decrement link count
         let mut stmt = conn
@@ -2356,6 +2412,9 @@ impl AgentFS {
             stmt.execute((ino,)).await?;
         }
 
+        self.invalidate_dentry(parent_ino, name);
+        self.invalidate_parent_attr(parent_ino);
+        self.invalidate_attr(ino);
         Ok(())
     }
 
@@ -2386,6 +2445,7 @@ impl AgentFS {
         values.push(Value::Integer(ino));
         let sql = format!("UPDATE fs_inode SET {} WHERE ino = ?", updates.join(", "));
         conn.execute(&sql, values).await?;
+        self.invalidate_attr(ino);
 
         Ok(())
     }
@@ -2461,9 +2521,11 @@ impl AgentFS {
 
         let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
 
-        let result: Result<()> = async {
+        let result: Result<Option<i64>> = async {
+            let mut replaced_dst_ino = None;
             // Check if destination exists (inside transaction for atomicity)
             if let Some(dst_ino) = self.resolve_path_with_conn(&conn, &to_path).await? {
+                replaced_dst_ino = Some(dst_ino);
                 let dst_stats = self.stat_with_conn(&conn, &to_path).await?.ok_or(FsError::NotFound)?;
 
                 // Can't replace directory with non-directory
@@ -2578,17 +2640,23 @@ impl AgentFS {
                 stmt.execute((now_secs, now_secs, now_nsec, now_nsec, dst_parent_ino)).await?;
             }
 
-            Ok(())
+            Ok(replaced_dst_ino)
         }
         .await;
 
         match result {
-            Ok(()) => {
+            Ok(replaced_dst_ino) => {
                 txn.commit().await?;
 
                 // Invalidate cache for source and destination
-                self.dentry_cache.remove(src_parent_ino, &src_name);
-                self.dentry_cache.remove(dst_parent_ino, &dst_name);
+                self.invalidate_dentry(src_parent_ino, &src_name);
+                self.invalidate_dentry(dst_parent_ino, &dst_name);
+                self.invalidate_attr(src_ino);
+                self.invalidate_parent_attr(src_parent_ino);
+                self.invalidate_parent_attr(dst_parent_ino);
+                if let Some(dst_ino) = replaced_dst_ino {
+                    self.invalidate_attr(dst_ino);
+                }
 
                 // Add new entry to cache (source inode is now at destination)
                 self.dentry_cache.insert(dst_parent_ino, &dst_name, src_ino);
@@ -2672,6 +2740,7 @@ impl AgentFS {
             ino,
             chunk_size: self.chunk_size,
             inline_threshold: self.inline_threshold,
+            attr_cache: self.attr_cache.clone(),
         }))
     }
 
@@ -2770,6 +2839,7 @@ impl FileSystem for AgentFS {
             let stats = Self::build_stats_from_row(&row)?;
             // Cache the lookup result
             self.dentry_cache.insert(parent_ino, name, child_ino);
+            self.cache_attr(stats.clone());
             Ok(Some(stats))
         } else {
             Ok(None)
@@ -2997,6 +3067,7 @@ impl FileSystem for AgentFS {
                     .unwrap_or(0) as u64,
             };
 
+            self.cache_attr(stats.clone());
             entries.push(DirEntry { name, stats });
         }
 
@@ -3032,6 +3103,7 @@ impl FileSystem for AgentFS {
             .await?;
         stmt.execute((new_mode as i64, now_secs, now_nsec, ino))
             .await?;
+        self.invalidate_attr(ino);
 
         Ok(())
     }
@@ -3077,6 +3149,7 @@ impl FileSystem for AgentFS {
         values.push(Value::Integer(ino));
         let sql = format!("UPDATE fs_inode SET {} WHERE ino = ?", updates.join(", "));
         conn.execute(&sql, values).await?;
+        self.invalidate_attr(ino);
 
         Ok(())
     }
@@ -3137,6 +3210,7 @@ impl FileSystem for AgentFS {
         values.push(Value::Integer(ino));
         let sql = format!("UPDATE fs_inode SET {} WHERE ino = ?", updates.join(", "));
         conn.execute(&sql, values).await?;
+        self.invalidate_attr(ino);
 
         Ok(())
     }
@@ -3159,6 +3233,7 @@ impl FileSystem for AgentFS {
             ino,
             chunk_size: self.chunk_size,
             inline_threshold: self.inline_threshold,
+            attr_cache: self.attr_cache.clone(),
         }))
     }
 
@@ -3234,8 +3309,9 @@ impl FileSystem for AgentFS {
 
         // Populate dentry cache
         self.dentry_cache.insert(parent_ino, name, ino);
+        self.invalidate_parent_attr(parent_ino);
 
-        Ok(Stats {
+        let stats = Stats {
             ino,
             mode: dir_mode,
             nlink: 2,
@@ -3249,7 +3325,9 @@ impl FileSystem for AgentFS {
             mtime_nsec: now_nsec as u32,
             ctime_nsec: now_nsec as u32,
             rdev: 0,
-        })
+        };
+        self.cache_attr(stats.clone());
+        Ok(stats)
     }
 
     async fn create_file(
@@ -3322,6 +3400,7 @@ impl FileSystem for AgentFS {
         txn.commit().await?;
 
         self.dentry_cache.insert(parent_ino, name, ino);
+        self.invalidate_parent_attr(parent_ino);
 
         let stats = Stats {
             ino,
@@ -3338,12 +3417,14 @@ impl FileSystem for AgentFS {
             ctime_nsec: now_nsec as u32,
             rdev: 0,
         };
+        self.cache_attr(stats.clone());
 
         let file: BoxedFile = Arc::new(AgentFSFile {
             pool: self.pool.clone(),
             ino,
             chunk_size: self.chunk_size,
             inline_threshold: self.inline_threshold,
+            attr_cache: self.attr_cache.clone(),
         });
 
         Ok((stats, file))
@@ -3420,8 +3501,9 @@ impl FileSystem for AgentFS {
 
         // Populate dentry cache
         self.dentry_cache.insert(parent_ino, name, ino);
+        self.invalidate_parent_attr(parent_ino);
 
-        Ok(Stats {
+        let stats = Stats {
             ino,
             mode,
             nlink: 1,
@@ -3435,7 +3517,9 @@ impl FileSystem for AgentFS {
             mtime_nsec: now_nsec as u32,
             ctime_nsec: now_nsec as u32,
             rdev,
-        })
+        };
+        self.cache_attr(stats.clone());
+        Ok(stats)
     }
 
     async fn symlink(
@@ -3511,8 +3595,9 @@ impl FileSystem for AgentFS {
 
         // Populate dentry cache
         self.dentry_cache.insert(parent_ino, name, ino);
+        self.invalidate_parent_attr(parent_ino);
 
-        Ok(Stats {
+        let stats = Stats {
             ino,
             mode,
             nlink: 1,
@@ -3526,7 +3611,9 @@ impl FileSystem for AgentFS {
             mtime_nsec: now_nsec as u32,
             ctime_nsec: now_nsec as u32,
             rdev: 0,
-        })
+        };
+        self.cache_attr(stats.clone());
+        Ok(stats)
     }
 
     async fn unlink(&self, parent_ino: i64, name: &str) -> Result<()> {
@@ -3566,7 +3653,9 @@ impl FileSystem for AgentFS {
         stmt.execute((parent_ino, name)).await?;
 
         // Invalidate cache
-        self.dentry_cache.remove(parent_ino, name);
+        self.invalidate_dentry(parent_ino, name);
+        self.invalidate_parent_attr(parent_ino);
+        self.invalidate_attr(ino);
 
         // Update parent directory mtime and ctime
         let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
@@ -3608,6 +3697,9 @@ impl FileSystem for AgentFS {
             stmt.execute((ino,)).await?;
         }
 
+        self.invalidate_dentry(parent_ino, name);
+        self.invalidate_parent_attr(parent_ino);
+        self.invalidate_attr(ino);
         Ok(())
     }
 
@@ -3671,7 +3763,9 @@ impl FileSystem for AgentFS {
         stmt.execute((parent_ino, name)).await?;
 
         // Invalidate cache
-        self.dentry_cache.remove(parent_ino, name);
+        self.invalidate_dentry(parent_ino, name);
+        self.invalidate_parent_attr(parent_ino);
+        self.invalidate_attr(ino);
 
         // Decrement link count on removed directory
         let mut stmt = conn
@@ -3700,6 +3794,9 @@ impl FileSystem for AgentFS {
             stmt.execute((ino,)).await?;
         }
 
+        self.invalidate_dentry(parent_ino, name);
+        self.invalidate_parent_attr(parent_ino);
+        self.invalidate_attr(ino);
         Ok(())
     }
 
@@ -3764,6 +3861,8 @@ impl FileSystem for AgentFS {
 
         // Populate dentry cache
         self.dentry_cache.insert(newparent_ino, newname, ino);
+        self.invalidate_parent_attr(newparent_ino);
+        self.invalidate_attr(ino);
 
         // Return updated stats
         self.getattr_with_conn(&conn, ino)
@@ -3801,9 +3900,11 @@ impl FileSystem for AgentFS {
 
         let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
 
-        let result: Result<()> = async {
+        let result: Result<Option<i64>> = async {
+            let mut replaced_dst_ino = None;
             // Check if destination exists
             if let Some(dst_ino) = self.lookup_child(&conn, newparent_ino, newname).await? {
+                replaced_dst_ino = Some(dst_ino);
                 let dst_stats = self.getattr_with_conn(&conn, dst_ino).await?.ok_or(FsError::NotFound)?;
 
                 // Can't replace directory with non-directory
@@ -3919,17 +4020,23 @@ impl FileSystem for AgentFS {
                 stmt.execute((now_secs, now_secs, now_nsec, now_nsec, newparent_ino)).await?;
             }
 
-            Ok(())
+            Ok(replaced_dst_ino)
         }
         .await;
 
         match result {
-            Ok(()) => {
+            Ok(replaced_dst_ino) => {
                 txn.commit().await?;
 
                 // Invalidate cache for source and destination
-                self.dentry_cache.remove(oldparent_ino, oldname);
-                self.dentry_cache.remove(newparent_ino, newname);
+                self.invalidate_dentry(oldparent_ino, oldname);
+                self.invalidate_dentry(newparent_ino, newname);
+                self.invalidate_attr(src_ino);
+                self.invalidate_parent_attr(oldparent_ino);
+                self.invalidate_parent_attr(newparent_ino);
+                if let Some(dst_ino) = replaced_dst_ino {
+                    self.invalidate_attr(dst_ino);
+                }
 
                 // Add new entry to cache (source inode is now at destination)
                 self.dentry_cache.insert(newparent_ino, newname, src_ino);
@@ -3962,6 +4069,127 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let fs = AgentFS::new(db_path.to_str().unwrap()).await?;
         Ok((fs, dir))
+    }
+
+    fn cached_attr(fs: &AgentFS, ino: i64) -> Option<Stats> {
+        fs.attr_cache.get(ino)
+    }
+
+    #[tokio::test]
+    async fn attr_cache_invalidates_mutations_and_preserves_visibility() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+
+        FileSystem::getattr(&fs, ROOT_INO).await?.unwrap();
+        assert!(cached_attr(&fs, ROOT_INO).is_some());
+
+        let (created, file) =
+            FileSystem::create_file(&fs, ROOT_INO, "cache.txt", DEFAULT_FILE_MODE, 7, 9).await?;
+        let file_ino = created.ino;
+        assert!(cached_attr(&fs, ROOT_INO).is_none());
+        assert_eq!(cached_attr(&fs, file_ino).unwrap().size, 0);
+
+        file.pwrite(0, b"hello").await?;
+        assert!(cached_attr(&fs, file_ino).is_none());
+        let written = FileSystem::getattr(&fs, file_ino).await?.unwrap();
+        assert_eq!(written.size, 5);
+        assert_eq!(cached_attr(&fs, file_ino).unwrap().size, 5);
+
+        file.pwrite(5, b" world").await?;
+        let after_append = FileSystem::getattr(&fs, file_ino).await?.unwrap();
+        assert_eq!(after_append.size, 11);
+        assert_eq!(file.pread(0, 11).await?, b"hello world");
+
+        file.truncate(5).await?;
+        assert!(cached_attr(&fs, file_ino).is_none());
+        let truncated = FileSystem::getattr(&fs, file_ino).await?.unwrap();
+        assert_eq!(truncated.size, 5);
+        assert_eq!(file.pread(0, 16).await?, b"hello");
+
+        FileSystem::chmod(&fs, file_ino, 0o600).await?;
+        assert!(cached_attr(&fs, file_ino).is_none());
+        let chmodded = FileSystem::getattr(&fs, file_ino).await?.unwrap();
+        assert_eq!(chmodded.mode & 0o7777, 0o600);
+
+        FileSystem::chown(&fs, file_ino, Some(11), Some(13)).await?;
+        assert!(cached_attr(&fs, file_ino).is_none());
+        let chowned = FileSystem::getattr(&fs, file_ino).await?.unwrap();
+        assert_eq!((chowned.uid, chowned.gid), (11, 13));
+
+        FileSystem::utimens(
+            &fs,
+            file_ino,
+            TimeChange::Set(1_700_000_001, 123),
+            TimeChange::Set(1_700_000_002, 456),
+        )
+        .await?;
+        assert!(cached_attr(&fs, file_ino).is_none());
+        let timestamped = FileSystem::getattr(&fs, file_ino).await?.unwrap();
+        assert_eq!(
+            (timestamped.mtime, timestamped.mtime_nsec),
+            (1_700_000_002, 456)
+        );
+
+        FileSystem::getattr(&fs, ROOT_INO).await?.unwrap();
+        let linked = FileSystem::link(&fs, file_ino, ROOT_INO, "hard.txt").await?;
+        assert!(cached_attr(&fs, ROOT_INO).is_none());
+        assert_eq!(linked.nlink, 2);
+        assert_eq!(
+            FileSystem::lookup(&fs, ROOT_INO, "hard.txt")
+                .await?
+                .unwrap()
+                .ino,
+            file_ino
+        );
+
+        FileSystem::getattr(&fs, ROOT_INO).await?.unwrap();
+        let symlink = FileSystem::symlink(&fs, ROOT_INO, "cache.link", "cache.txt", 11, 13).await?;
+        assert!(cached_attr(&fs, ROOT_INO).is_none());
+        assert!(symlink.is_symlink());
+        assert_eq!(
+            FileSystem::readlink(&fs, symlink.ino).await?,
+            Some("cache.txt".to_string())
+        );
+
+        FileSystem::getattr(&fs, ROOT_INO).await?.unwrap();
+        let dir = FileSystem::mkdir(&fs, ROOT_INO, "dir", 0o755, 11, 13).await?;
+        assert!(cached_attr(&fs, ROOT_INO).is_none());
+        assert!(cached_attr(&fs, dir.ino).is_some());
+        FileSystem::getattr(&fs, ROOT_INO).await?.unwrap();
+        FileSystem::rmdir(&fs, ROOT_INO, "dir").await?;
+        assert!(cached_attr(&fs, ROOT_INO).is_none());
+        assert!(cached_attr(&fs, dir.ino).is_none());
+        assert!(FileSystem::lookup(&fs, ROOT_INO, "dir").await?.is_none());
+
+        FileSystem::getattr(&fs, file_ino).await?.unwrap();
+        FileSystem::getattr(&fs, ROOT_INO).await?.unwrap();
+        FileSystem::rename(&fs, ROOT_INO, "cache.txt", ROOT_INO, "renamed.txt").await?;
+        assert!(cached_attr(&fs, file_ino).is_none());
+        assert!(cached_attr(&fs, ROOT_INO).is_none());
+        assert!(FileSystem::lookup(&fs, ROOT_INO, "cache.txt")
+            .await?
+            .is_none());
+        assert_eq!(
+            FileSystem::lookup(&fs, ROOT_INO, "renamed.txt")
+                .await?
+                .unwrap()
+                .ino,
+            file_ino
+        );
+        assert_eq!(file.pread(0, 16).await?, b"hello");
+
+        FileSystem::getattr(&fs, file_ino).await?.unwrap();
+        FileSystem::unlink(&fs, ROOT_INO, "hard.txt").await?;
+        assert!(cached_attr(&fs, file_ino).is_none());
+        let single_link = FileSystem::getattr(&fs, file_ino).await?.unwrap();
+        assert_eq!(single_link.nlink, 1);
+
+        FileSystem::unlink(&fs, ROOT_INO, "renamed.txt").await?;
+        assert!(cached_attr(&fs, file_ino).is_none());
+        assert!(FileSystem::lookup(&fs, ROOT_INO, "renamed.txt")
+            .await?
+            .is_none());
+
+        Ok(())
     }
 
     async fn read_pragma_i64(conn: &Connection, sql: &str) -> i64 {

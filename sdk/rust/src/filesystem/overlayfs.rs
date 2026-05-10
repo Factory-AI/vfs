@@ -983,6 +983,7 @@ impl OverlayFS {
             ),
         )
         .await?;
+        self.delta.invalidate_attr(delta_ino);
 
         self.add_origin_mapping(delta_ino, info.underlying_ino)
             .await?;
@@ -1120,6 +1121,7 @@ impl File for OverlayPartialFile {
         match result {
             Ok(()) => {
                 txn.commit().await?;
+                self.delta.invalidate_attr(self.delta_ino);
                 Ok(())
             }
             Err(e) => {
@@ -1208,6 +1210,7 @@ impl File for OverlayPartialFile {
         match result {
             Ok(()) => {
                 txn.commit().await?;
+                self.delta.invalidate_attr(self.delta_ino);
                 Ok(())
             }
             Err(e) => {
