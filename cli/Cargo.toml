@@ -13,7 +13,7 @@ name = "agentfs"
 path = "src/main.rs"
 
 [features]
-default = ["sandbox"]
+default = ["sandbox", "fuse-modern"]
 strict = []
 sandbox = [
     "dep:agentfs-sandbox",
@@ -21,6 +21,43 @@ sandbox = [
     "dep:reverie-ptrace",
     "dep:reverie-process",
 ]
+
+# Vendored fuser is gated per protocol minor version. Enable the full cascade up
+# to ABI 7.31 so we can both negotiate the kernel protocol that supports the
+# capabilities init() already advertises (FUSE_DO_READDIRPLUS, FUSE_WRITEBACK_CACHE,
+# FUSE_PARALLEL_DIROPS, FUSE_CACHE_SYMLINKS, FUSE_NO_OPENDIR_SUPPORT, FUSE_MAX_PAGES,
+# FUSE_EXPLICIT_INVAL_DATA, etc.) and actually decode the opcodes the kernel sends
+# when those capabilities are negotiated (FUSE_READDIRPLUS=44, FUSE_RENAME2=45,
+# FUSE_LSEEK=46, FUSE_COPY_FILE_RANGE=47). Without these, the kernel may issue
+# opcode 44 and the dispatcher returns ENOSYS, breaking readdir on the mount.
+fuse-modern = [
+    "abi-7-19",
+    "abi-7-20",
+    "abi-7-21",
+    "abi-7-22",
+    "abi-7-23",
+    "abi-7-24",
+    "abi-7-25",
+    "abi-7-26",
+    "abi-7-27",
+    "abi-7-28",
+    "abi-7-29",
+    "abi-7-30",
+    "abi-7-31",
+]
+abi-7-19 = []
+abi-7-20 = []
+abi-7-21 = []
+abi-7-22 = []
+abi-7-23 = []
+abi-7-24 = []
+abi-7-25 = []
+abi-7-26 = []
+abi-7-27 = []
+abi-7-28 = []
+abi-7-29 = []
+abi-7-30 = []
+abi-7-31 = []
 
 [dependencies]
 agentfs-sdk = { path = "../sdk/rust" }

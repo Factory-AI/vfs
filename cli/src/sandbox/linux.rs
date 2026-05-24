@@ -139,6 +139,7 @@ fn install_signal_handlers() {
 }
 
 /// Run a command in an overlay sandbox.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_cmd(
     allow: Vec<PathBuf>,
     no_default_allows: bool,

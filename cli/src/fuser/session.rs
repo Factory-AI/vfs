@@ -144,7 +144,13 @@ impl FuseDispatchMode {
                 );
                 0
             }),
-            Err(_) => return Self::Serial,
+            // Default (unset): resolve as if AGENTFS_FUSE_WORKERS=auto so the
+            // kernel-cache fast path is on by default. Pair this with the
+            // matching default flip in cli/src/fuse.rs::fuse_workers_serial_from_env.
+            Err(_) => workers_from_resource_percent(
+                env_percent("AGENTFS_FUSE_CPU_PERCENT", 25),
+                env_percent("AGENTFS_FUSE_MEMORY_PERCENT", 25),
+            ),
         };
         if workers == 0 {
             return Self::Serial;
