@@ -7,6 +7,7 @@ use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+#[cfg(not(test))]
 static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 static COUNTERS: ProfileCounters = ProfileCounters::new();
 
@@ -832,12 +833,21 @@ impl Default for ProfileCounters {
 }
 
 /// Returns true when profiling is enabled with `AGENTFS_PROFILE=1`.
+/// Always-on under `#[cfg(test)]` so unit tests can assert on counters
+/// without racing the global `OnceCell` init.
 pub fn is_enabled() -> bool {
-    *ENABLED.get_or_init(|| {
-        std::env::var("AGENTFS_PROFILE")
-            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
-            .unwrap_or(false)
-    })
+    #[cfg(test)]
+    {
+        true
+    }
+    #[cfg(not(test))]
+    {
+        *ENABLED.get_or_init(|| {
+            std::env::var("AGENTFS_PROFILE")
+                .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
+                .unwrap_or(false)
+        })
+    }
 }
 
 pub fn record_connection_wait(duration: Duration) {

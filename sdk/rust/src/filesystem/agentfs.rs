@@ -1,6 +1,7 @@
 use crate::error::{Error, Result};
 use async_trait::async_trait;
 use lru::LruCache;
+use parking_lot::RwLock;
 use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -46,6 +47,12 @@ const WRITE_BATCHER_MS_ENV: &str = "AGENTFS_BATCH_MS";
 const WRITE_BATCHER_BYTES_ENV: &str = "AGENTFS_BATCH_BYTES";
 const DEFAULT_WRITE_BATCH_MS: u64 = 5;
 const DEFAULT_WRITE_BATCH_BYTES: usize = 4 * 1024 * 1024;
+/// Tier 4 escape hatch. When `AGENTFS_OVERLAY_READS=0`, the SDK reverts to
+/// Tier 3 semantics: `pwrite` drains before commit, `pread` drains before
+/// read, `merge_pending_size` is a no-op. Defaults to ON so a clean install
+/// gets Tier 4 benefits, but operators can flip it OFF without rebuilding if
+/// a previously-unknown read-merge bug surfaces in production.
+const OVERLAY_READS_ENV: &str = "AGENTFS_OVERLAY_READS";
 
 /// Production connection-pool options for local file-backed AgentFS databases.
 pub(crate) fn file_backed_connection_pool_options() -> ConnectionPoolOptions {
@@ -323,7 +330,13 @@ struct AgentFSWriteBatcher {
     attr_cache: Arc<AttrCache>,
     batch_ms: Duration,
     batch_bytes: usize,
-    state: AsyncMutex<AgentFSWriteBatcherState>,
+    /// Tier 4 mitigation: parking_lot `RwLock` so `peek_pending` /
+    /// `peek_pending_max_end` can acquire read-only access without contending
+    /// with writers. The lock is never held across an `.await`, so a sync
+    /// lock is safe inside async fns. Holding it across an await would block
+    /// the tokio worker — `take_pending_locked` and friends always extract
+    /// owned state under the lock and drop the guard before any I/O.
+    state: RwLock<AgentFSWriteBatcherState>,
     commit_lock: AsyncMutex<()>,
 }
 
@@ -341,7 +354,7 @@ impl AgentFSWriteBatcher {
             attr_cache,
             batch_ms: env_duration_millis(WRITE_BATCHER_MS_ENV, DEFAULT_WRITE_BATCH_MS),
             batch_bytes: env_usize(WRITE_BATCHER_BYTES_ENV, DEFAULT_WRITE_BATCH_BYTES),
-            state: AsyncMutex::new(AgentFSWriteBatcherState::default()),
+            state: RwLock::new(AgentFSWriteBatcherState::default()),
             commit_lock: AsyncMutex::new(()),
         }
     }
@@ -364,7 +377,7 @@ impl AgentFSWriteBatcher {
         let mut schedule_timer = false;
 
         {
-            let mut state = self.state.lock().await;
+            let mut state = self.state.write();
             drain_now = {
                 let entry = state
                     .pending
@@ -425,7 +438,7 @@ impl AgentFSWriteBatcher {
         let _commit_guard = self.commit_lock.lock().await;
         loop {
             let batch = {
-                let mut state = self.state.lock().await;
+                let mut state = self.state.write();
                 Self::take_inode_locked(&mut state, ino)
             };
 
@@ -442,7 +455,7 @@ impl AgentFSWriteBatcher {
         loop {
             self.drain_pending_batched(reason, None).await?;
             let still_pending = {
-                let state = self.state.lock().await;
+                let state = self.state.read();
                 !state.pending.is_empty()
             };
             if !still_pending {
@@ -469,7 +482,7 @@ impl AgentFSWriteBatcher {
         let _commit_guard = self.commit_lock.lock().await;
 
         let batches: Vec<(i64, PendingInodeWrites)> = {
-            let mut state = self.state.lock().await;
+            let mut state = self.state.write();
             std::mem::take(&mut state.pending)
                 .into_iter()
                 .map(|(ino, mut batch)| {
@@ -565,6 +578,7 @@ impl AgentFSWriteBatcher {
                 inline_threshold: self.inline_threshold,
                 attr_cache: self.attr_cache.clone(),
                 write_batcher: None,
+                overlay_reads: true,
             };
             if let Err(error) = file
                 .pwrite_ranges_inode_with_conn(&conn, &normalized_refs)
@@ -611,7 +625,7 @@ impl AgentFSWriteBatcher {
         // ino pending at the moment it fired.
         let mut reschedule_after = None;
         let ripe = {
-            let state = self.state.lock().await;
+            let state = self.state.read();
             let Some(elapsed) = state
                 .pending
                 .get(&ino)
@@ -630,7 +644,7 @@ impl AgentFSWriteBatcher {
         if !ripe {
             // Mark timer_scheduled so we don't lose the entry, then reschedule.
             {
-                let mut state = self.state.lock().await;
+                let mut state = self.state.write();
                 if let Some(entry) = state.pending.get_mut(&ino) {
                     entry.timer_scheduled = true;
                 }
@@ -673,7 +687,7 @@ impl AgentFSWriteBatcher {
     async fn restore_batch(self: &Arc<Self>, ino: i64, mut batch: PendingInodeWrites) {
         let mut schedule_timer = false;
         {
-            let mut state = self.state.lock().await;
+            let mut state = self.state.write();
             if let Some(existing) = state.pending.remove(&ino) {
                 batch.pending_bytes = batch.pending_bytes.saturating_add(existing.pending_bytes);
                 batch.last_enqueue = existing.last_enqueue;
@@ -751,6 +765,7 @@ impl AgentFSWriteBatcher {
             inline_threshold: self.inline_threshold,
             attr_cache: self.attr_cache.clone(),
             write_batcher: None,
+            overlay_reads: true,
         };
         let normalized_refs: Vec<_> = normalized
             .iter()
@@ -790,7 +805,7 @@ impl AgentFSWriteBatcher {
     /// to the requested window. The batcher's pending state is not modified.
     /// Callers merge the result over SQLite data with "pending wins"
     /// semantics; see `AgentFSFile::pread`.
-    async fn peek_pending(&self, ino: i64, offset: u64, size: u64) -> Vec<NormalizedWriteRange> {
+    fn peek_pending(&self, ino: i64, offset: u64, size: u64) -> Vec<NormalizedWriteRange> {
         if size == 0 {
             return Vec::new();
         }
@@ -798,7 +813,10 @@ impl AgentFSWriteBatcher {
             Some(end) => end,
             None => return Vec::new(),
         };
-        let state = self.state.lock().await;
+        // Read-lock: many concurrent readers OK; writers block briefly during
+        // enqueue. Crucially, no `.await` is performed while the guard is
+        // held, so a sync `parking_lot::RwLock` is safe inside an async fn.
+        let state = self.state.read();
         let Some(batch) = state.pending.get(&ino) else {
             return Vec::new();
         };
@@ -839,14 +857,27 @@ impl AgentFSWriteBatcher {
             .collect()
     }
 
+    /// Fast path for "does this inode have ANY pending write?" — used by
+    /// readers to skip the heavier `peek_pending_max_end` / `peek_pending`
+    /// calls entirely when the batcher has nothing for the inode. Read lock,
+    /// O(1) HashMap hit.
+    fn has_pending(&self, ino: i64) -> bool {
+        let state = self.state.read();
+        state
+            .pending
+            .get(&ino)
+            .map(|b| !b.ranges.is_empty())
+            .unwrap_or(false)
+    }
+
     /// Largest write end (offset + length) for `ino` across all pending
     /// ranges. Returns `None` if no pending writes for this inode. Callers
     /// OR this with the SQLite-stored `fs_inode.size` to compute the
     /// file-size view exposed to readers (so a write that grows the file is
     /// visible to subsequent `getattr` even before the timer drain commits
     /// it to SQLite).
-    async fn peek_pending_max_end(&self, ino: i64) -> Option<u64> {
-        let state = self.state.lock().await;
+    fn peek_pending_max_end(&self, ino: i64) -> Option<u64> {
+        let state = self.state.read();
         let batch = state.pending.get(&ino)?;
         batch
             .ranges
@@ -859,8 +890,8 @@ impl AgentFSWriteBatcher {
     /// the truncation boundary. Called by `AgentFSFile::truncate` so the
     /// overlay agrees with the post-truncate file state without needing to
     /// drain first.
-    async fn truncate_pending(&self, ino: i64, new_size: u64) {
-        let mut state = self.state.lock().await;
+    fn truncate_pending(&self, ino: i64, new_size: u64) {
+        let mut state = self.state.write();
         let Some(batch) = state.pending.get_mut(&ino) else {
             return;
         };
@@ -886,8 +917,8 @@ impl AgentFSWriteBatcher {
     /// Discard every pending write for `ino`. Used by `AgentFS::unlink`
     /// after the inode row is deleted, to avoid `fs_data` orphan rows when
     /// the timer later tries to commit ranges for a no-longer-existent ino.
-    async fn discard_pending(&self, ino: i64) {
-        let mut state = self.state.lock().await;
+    fn discard_pending(&self, ino: i64) {
+        let mut state = self.state.write();
         state.pending.remove(&ino);
     }
 }
@@ -907,6 +938,10 @@ pub struct AgentFS {
     attr_cache: Arc<AttrCache>,
     /// Optional write batcher used by FUSE writeback mode.
     write_batcher: Option<Arc<AgentFSWriteBatcher>>,
+    /// Tier 4 escape hatch: when false (`AGENTFS_OVERLAY_READS=0`), the SDK
+    /// behaves like Tier 3 — every pwrite drains, every pread drains,
+    /// `merge_pending_size` is a no-op. ON by default.
+    overlay_reads: bool,
     /// Emits a profiling summary when the final filesystem clone is dropped.
     _profile_report: Arc<crate::profiling::ProfileReportGuard>,
 }
@@ -922,6 +957,9 @@ pub struct AgentFSFile {
     inline_threshold: usize,
     attr_cache: Arc<AttrCache>,
     write_batcher: Option<Arc<AgentFSWriteBatcher>>,
+    /// Same semantics as the field on `AgentFS`; cloned at open time so the
+    /// hot read/write path doesn't have to chase an extra indirection.
+    overlay_reads: bool,
 }
 
 struct FileStorage {
@@ -1070,13 +1108,23 @@ impl File for AgentFSFile {
         if size == 0 {
             return Ok(Vec::new());
         }
+        // Escape hatch: when overlay reads are disabled, behave like Tier 3
+        // — drain the inode's pending writes before reading SQLite. Same
+        // wire result, slower but battle-tested.
+        if !self.overlay_reads {
+            self.drain_writes().await?;
+        }
         let pending_max_end = match &self.write_batcher {
-            Some(batcher) => batcher.peek_pending_max_end(self.ino).await,
-            None => None,
+            Some(batcher) if self.overlay_reads && batcher.has_pending(self.ino) => {
+                batcher.peek_pending_max_end(self.ino)
+            }
+            _ => None,
         };
         let pending_ranges = match &self.write_batcher {
-            Some(batcher) => batcher.peek_pending(self.ino, offset, size).await,
-            None => Vec::new(),
+            Some(batcher) if pending_max_end.is_some() => {
+                batcher.peek_pending(self.ino, offset, size)
+            }
+            _ => Vec::new(),
         };
 
         let conn = self.pool.get_connection().await?;
@@ -1126,19 +1174,25 @@ impl File for AgentFSFile {
         if data.is_empty() {
             return Ok(());
         }
-        // Tier Four: with the batcher wired, route through enqueue so the
-        // overlay holds the write and readers see it via `pread`'s
-        // peek_pending merge. Drain only on fsync/destroy/timer.
+        // Tier Four: with the batcher wired AND overlay reads enabled,
+        // route through enqueue so the overlay holds the write and readers
+        // see it via `pread`'s peek_pending merge. Drain only on
+        // fsync/destroy/timer. When `AGENTFS_OVERLAY_READS=0` the
+        // overlay-reads escape hatch is engaged: skip the batcher and commit
+        // directly so the legacy Tier 3 read path (which drains before
+        // reading) sees the write.
         if let Some(batcher) = &self.write_batcher {
-            return batcher
-                .enqueue(
-                    self.ino,
-                    vec![WriteRange {
-                        offset,
-                        data: data.to_vec(),
-                    }],
-                )
-                .await;
+            if self.overlay_reads {
+                return batcher
+                    .enqueue(
+                        self.ino,
+                        vec![WriteRange {
+                            offset,
+                            data: data.to_vec(),
+                        }],
+                    )
+                    .await;
+            }
         }
         // Fallback (no batcher): direct commit. drain_writes is a no-op
         // when there's no batcher, but keeping the call here makes the
@@ -1165,11 +1219,12 @@ impl File for AgentFSFile {
         if ranges.iter().all(|range| range.data.is_empty()) {
             return Ok(());
         }
-        // Tier Four: route through the batcher when available; otherwise
-        // commit immediately. The Tier Three peek_pending path lets readers
-        // observe pending bytes without forcing a drain here.
+        // Tier Four: route through the batcher when overlay reads are
+        // enabled; otherwise commit immediately (escape hatch — see pwrite).
         if let Some(batcher) = &self.write_batcher {
-            return batcher.enqueue(self.ino, ranges).await;
+            if self.overlay_reads {
+                return batcher.enqueue(self.ino, ranges).await;
+            }
         }
         self.drain_writes().await?;
 
@@ -1213,7 +1268,7 @@ impl File for AgentFSFile {
         // a concurrent reader doesn't observe pending bytes past the new EOF
         // between the SQLite truncate and the batcher catching up.
         if let Some(batcher) = &self.write_batcher {
-            batcher.truncate_pending(self.ino, new_size).await;
+            batcher.truncate_pending(self.ino, new_size);
         }
         // Drain remaining pending so the SQLite truncate sees a consistent
         // size. With truncate_pending called above, the only pending left is
@@ -1935,6 +1990,7 @@ impl AgentFS {
             None
         };
 
+        let overlay_reads = env_flag_default(OVERLAY_READS_ENV, true);
         let fs = Self {
             pool,
             db_path: db_path.map(Arc::new),
@@ -1946,6 +2002,7 @@ impl AgentFS {
             )),
             attr_cache,
             write_batcher,
+            overlay_reads,
             _profile_report: Arc::new(crate::profiling::ProfileReportGuard::new("agentfs")),
         };
         Ok(fs)
@@ -2308,15 +2365,27 @@ impl AgentFS {
     /// Tier Four helper: merge the batcher's pending max-end into `stats.size`
     /// so callers that read fs_inode while holding a pool connection don't
     /// need to drain (which would deadlock on single-conn pools). Mirrors the
-    /// OR logic in `AgentFS::getattr` and `AgentFSFile::pread`.
-    async fn merge_pending_size(&self, ino: i64, stats: Option<&mut Stats>) {
+    /// OR logic in `AgentFS::getattr` and `AgentFSFile::pread`. Fast-paths
+    /// when the batcher has no pending writes for this inode (Tier 4 read
+    /// hot path: most reads see no pending and pay zero lock cost beyond
+    /// `has_pending`'s read-lock HashMap hit).
+    fn merge_pending_size(&self, ino: i64, stats: Option<&mut Stats>) {
         let Some(stats) = stats else {
             return;
         };
+        // Escape hatch: when overlay reads are disabled, callers' SQLite
+        // size view is already authoritative because pwrites went straight
+        // to SQLite (see AgentFSFile::pwrite). No merge needed.
+        if !self.overlay_reads {
+            return;
+        }
         let Some(batcher) = &self.write_batcher else {
             return;
         };
-        if let Some(pending_end) = batcher.peek_pending_max_end(ino).await {
+        if !batcher.has_pending(ino) {
+            return;
+        }
+        if let Some(pending_end) = batcher.peek_pending_max_end(ino) {
             let pending_end_i64 = i64::try_from(pending_end).unwrap_or(i64::MAX);
             if pending_end_i64 > stats.size {
                 stats.size = pending_end_i64;
@@ -2563,7 +2632,7 @@ impl AgentFS {
         // single-conn pools and starve under contention on larger pools).
         // Read SQLite, then OR in pending writes' max-end.
         let mut stats = self.getattr_with_conn(&conn, ino).await?;
-        self.merge_pending_size(ino, stats.as_mut()).await;
+        self.merge_pending_size(ino, stats.as_mut());
         Ok(stats)
     }
 
@@ -2605,7 +2674,7 @@ impl AgentFS {
                     continue; // Follow the symlink
                 }
 
-                self.merge_pending_size(ino, Some(&mut stats)).await;
+                self.merge_pending_size(ino, Some(&mut stats));
                 return Ok(Some(stats));
             } else {
                 return Ok(None);
@@ -2937,6 +3006,7 @@ impl AgentFS {
             inline_threshold: self.inline_threshold,
             attr_cache: self.attr_cache.clone(),
             write_batcher: self.write_batcher.clone(),
+            overlay_reads: self.overlay_reads,
         });
 
         Ok((stats, file))
@@ -2960,6 +3030,7 @@ impl AgentFS {
             inline_threshold: self.inline_threshold,
             attr_cache: self.attr_cache.clone(),
             write_batcher: self.write_batcher.clone(),
+            overlay_reads: self.overlay_reads,
         };
         Ok(Some(file.read_inode_with_conn(&conn, 0, u64::MAX).await?))
     }
@@ -2987,6 +3058,7 @@ impl AgentFS {
             inline_threshold: self.inline_threshold,
             attr_cache: self.attr_cache.clone(),
             write_batcher: self.write_batcher.clone(),
+            overlay_reads: self.overlay_reads,
         };
         Ok(Some(file.read_inode_with_conn(&conn, offset, size).await?))
     }
@@ -3084,6 +3156,7 @@ impl AgentFS {
                 inline_threshold: self.inline_threshold,
                 attr_cache: self.attr_cache.clone(),
                 write_batcher: self.write_batcher.clone(),
+                overlay_reads: self.overlay_reads,
             };
             let ranges = [WriteRangeRef { offset, data }];
             file.pwrite_ranges_inode_with_conn(&conn, &ranges).await?;
@@ -3133,6 +3206,7 @@ impl AgentFS {
             inline_threshold: self.inline_threshold,
             attr_cache: self.attr_cache.clone(),
             write_batcher: self.write_batcher.clone(),
+            overlay_reads: self.overlay_reads,
         };
         let result = file.truncate_inode_with_conn(&conn, new_size).await;
 
@@ -3604,7 +3678,7 @@ impl AgentFS {
             // Tier Four: drop any pending batched writes — see the matching
             // hook in the trait-method `unlink` and in `rename` overwrite.
             if let Some(batcher) = &self.write_batcher {
-                batcher.discard_pending(ino).await;
+                batcher.discard_pending(ino);
             }
             // Manually handle cascading deletes since we don't use foreign keys
             // Delete data blocks
@@ -3794,7 +3868,7 @@ impl AgentFS {
                     // to write into a missing fs_inode row and fails the
                     // whole batch with NotFound.
                     if let Some(batcher) = &self.write_batcher {
-                        batcher.discard_pending(dst_ino).await;
+                        batcher.discard_pending(dst_ino);
                     }
                     let mut stmt = conn
                         .prepare_cached("DELETE FROM fs_data WHERE ino = ?")
@@ -3971,6 +4045,7 @@ impl AgentFS {
             inline_threshold: self.inline_threshold,
             attr_cache: self.attr_cache.clone(),
             write_batcher: self.write_batcher.clone(),
+            overlay_reads: self.overlay_reads,
         }))
     }
 
@@ -4078,14 +4153,7 @@ impl FileSystem for AgentFS {
 
         if let Some(row) = rows.next().await? {
             let mut stats = Self::build_stats_from_row(&row)?;
-            if let Some(batcher) = &self.write_batcher {
-                if let Some(pending_end) = batcher.peek_pending_max_end(child_ino).await {
-                    let pending_end_i64 = i64::try_from(pending_end).unwrap_or(i64::MAX);
-                    if pending_end_i64 > stats.size {
-                        stats.size = pending_end_i64;
-                    }
-                }
-            }
+            self.merge_pending_size(child_ino, Some(&mut stats));
             // Cache the lookup result
             self.cache_dentry(parent_ino, name, child_ino);
             self.cache_attr(stats.clone());
@@ -4104,13 +4172,11 @@ impl FileSystem for AgentFS {
         // what we just returned.
         let conn = self.pool.get_connection().await?;
         let mut stats = self.getattr_with_conn(&conn, ino).await?;
-        if let (Some(stats), Some(batcher)) = (stats.as_mut(), &self.write_batcher) {
-            if let Some(pending_end) = batcher.peek_pending_max_end(ino).await {
-                let pending_end_i64 = i64::try_from(pending_end).unwrap_or(i64::MAX);
-                if pending_end_i64 > stats.size {
-                    stats.size = pending_end_i64;
-                    self.cache_attr(stats.clone());
-                }
+        if let Some(s) = stats.as_mut() {
+            let pre = s.size;
+            self.merge_pending_size(ino, Some(s));
+            if s.size != pre {
+                self.cache_attr(s.clone());
             }
         }
         Ok(stats)
@@ -4502,6 +4568,7 @@ impl FileSystem for AgentFS {
             inline_threshold: self.inline_threshold,
             attr_cache: self.attr_cache.clone(),
             write_batcher: self.write_batcher.clone(),
+            overlay_reads: self.overlay_reads,
         }))
     }
 
@@ -4694,6 +4761,7 @@ impl FileSystem for AgentFS {
             inline_threshold: self.inline_threshold,
             attr_cache: self.attr_cache.clone(),
             write_batcher: self.write_batcher.clone(),
+            overlay_reads: self.overlay_reads,
         });
 
         Ok((stats, file))
@@ -4954,7 +5022,7 @@ impl FileSystem for AgentFS {
             // way the post-unlink state stays clean now that release/forget
             // no longer force a synchronous drain.
             if let Some(batcher) = &self.write_batcher {
-                batcher.discard_pending(ino).await;
+                batcher.discard_pending(ino);
             }
 
             // Delete data blocks
@@ -5242,7 +5310,7 @@ impl FileSystem for AgentFS {
                     // subsequent batched drain doesn't INSERT into a
                     // missing fs_inode row.
                     if let Some(batcher) = &self.write_batcher {
-                        batcher.discard_pending(dst_ino).await;
+                        batcher.discard_pending(dst_ino);
                     }
                     let mut stmt = conn
                         .prepare_cached("DELETE FROM fs_data WHERE ino = ?")
@@ -7385,6 +7453,92 @@ mod tests {
                 .unwrap_or(-1)
         };
         assert_eq!(count, 10, "fsync committed pending size to fs_inode");
+        Ok(())
+    }
+
+    /// Spec acceptance criterion for Tier 4:
+    /// "`agentfs_batcher_drains_explicit / agentfs_batcher_enqueues` ratio
+    /// drops to <0.2 (vs ~1.0 today) — confirms read path no longer triggers
+    /// Explicit drains."
+    ///
+    /// We simulate a read-after-write workload (write, read, write, read, ...)
+    /// and assert that the SDK does NOT call drain_inode_writes
+    /// (Explicit drain) on every read. With Tier 4 the read path peeks the
+    /// overlay; with Tier 3 each read forces drain → ratio ≈ 1.0.
+    #[tokio::test]
+    async fn tier_four_drains_explicit_to_enqueues_ratio_under_0_2() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        let (_, file) = fs
+            .create_file("/ratio.bin", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+
+        let pre = crate::profiling::snapshot();
+        let pre_enq = pre.agentfs_batcher_enqueues;
+        let pre_explicit = pre.agentfs_batcher_drains_explicit;
+
+        // 200 write-then-read cycles, no intervening fsync. Tier 3 would
+        // drain Explicit on every read; Tier 4 must not.
+        for i in 0..200u64 {
+            file.pwrite(i * 4, b"abcd").await?;
+            let _ = file.pread(i * 4, 4).await?;
+        }
+
+        let post = crate::profiling::snapshot();
+        let enq = post.agentfs_batcher_enqueues - pre_enq;
+        let explicit = post.agentfs_batcher_drains_explicit - pre_explicit;
+        assert!(enq >= 200, "expected ≥200 enqueues, got {enq}");
+        let ratio = explicit as f64 / enq.max(1) as f64;
+        assert!(
+            ratio < 0.2,
+            "Tier 4 acceptance: drains_explicit/enqueues should be <0.2; \
+             got {explicit}/{enq} = {ratio:.3}"
+        );
+        Ok(())
+    }
+
+    /// Spec escape-hatch verification: with the overlay disabled, the SDK
+    /// reverts to Tier 3 drain-on-write semantics. `pwrite` should commit
+    /// straight to SQLite (no batcher enqueue), and `pread` should see the
+    /// value without ever consulting `peek_pending`. This locks in the kill
+    /// switch the spec's risk table called for.
+    #[tokio::test]
+    async fn overlay_reads_flag_off_falls_back_to_drain_on_write() -> Result<()> {
+        let (mut fs, _dir) = create_test_fs().await?;
+        fs.overlay_reads = false;
+        let (_, file) = fs
+            .create_file("/escape.bin", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+
+        let pre = crate::profiling::snapshot();
+        let pre_enq = pre.agentfs_batcher_enqueues;
+
+        file.pwrite(0, b"hello world").await?;
+        let got = file.pread(0, 11).await?;
+        assert_eq!(&got, b"hello world");
+
+        let post = crate::profiling::snapshot();
+        assert_eq!(
+            post.agentfs_batcher_enqueues, pre_enq,
+            "with overlay_reads=false, pwrite must not enqueue"
+        );
+
+        // And the file is durably in SQLite without an explicit fsync —
+        // the Tier 3 contract.
+        let ino = fs.resolve_path("/escape.bin").await?.unwrap();
+        let conn = fs.pool.get_connection().await?;
+        let size: i64 = {
+            let mut rows = conn
+                .query("SELECT size FROM fs_inode WHERE ino = ?", (ino,))
+                .await?;
+            rows.next()
+                .await?
+                .and_then(|r| r.get_value(0).ok().and_then(|v| v.as_integer().copied()))
+                .unwrap_or(-1)
+        };
+        assert_eq!(
+            size, 11,
+            "overlay_reads=false → SQLite has full size after pwrite"
+        );
         Ok(())
     }
 }
