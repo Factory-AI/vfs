@@ -1,0 +1,199 @@
+{
+  "agentfs": {
+    "bin": "/home/ain3sh/factory/vfs/cli/target/release/agentfs",
+    "db_path": "/tmp/agentfs-large-edit-mptxma_y/home/.agentfs/run/large-edit-4df84db6-6b63-49d6-9873-d592512ec7c6/delta.db",
+    "env_flags": {
+      "AGENTFS_OVERLAY_PARTIAL_ORIGIN": null
+    },
+    "partial_origin_enabled": false,
+    "profile_enabled": false,
+    "profile_summary_count": 0,
+    "session": "large-edit-4df84db6-6b63-49d6-9873-d592512ec7c6"
+  },
+  "agentfs_overlay": {
+    "duration_seconds": 0.6650406250264496,
+    "result": {
+      "new_byte": 30,
+      "offset": 26214400,
+      "old_byte": 29,
+      "path": "large.bin",
+      "sha256": "4dc308780344702924456d8e603e0c14556f5f3829db12796d0743d973d48a9f",
+      "size": 52428800,
+      "size_before": 52428800
+    },
+    "run": {
+      "argv": [
+        "/home/ain3sh/factory/vfs/cli/target/release/agentfs",
+        "run",
+        "--session",
+        "large-edit-4df84db6-6b63-49d6-9873-d592512ec7c6",
+        "--no-default-allows",
+        "--",
+        "/usr/bin/python3",
+        "-c",
+        "\nimport hashlib\nimport json\nimport os\nimport sys\nfrom pathlib import Path\n\npath = Path(sys.argv[1])\noffset = int(sys.argv[2])\n\nbefore_size = path.stat().st_size\nwith path.open(\"r+b\", buffering=0) as handle:\n    handle.seek(offset)\n    old = handle.read(1)\n    if not old:\n        raise RuntimeError(f\"offset {offset} is outside {path}\")\n    new = bytes([(old[0] + 1) % 256])\n    handle.seek(offset)\n    handle.write(new)\n    handle.flush()\n    os.fsync(handle.fileno())\n\ndigest = hashlib.sha256()\nwith path.open(\"rb\") as handle:\n    while True:\n        chunk = handle.read(1024 * 1024)\n        if not chunk:\n            break\n        digest.update(chunk)\n\nprint(json.dumps({\n    \"path\": str(path),\n    \"size\": path.stat().st_size,\n    \"size_before\": before_size,\n    \"offset\": offset,\n    \"old_byte\": old[0],\n    \"new_byte\": new[0],\n    \"sha256\": digest.hexdigest(),\n}, sort_keys=True))\n",
+        "large.bin",
+        "26214400"
+      ],
+      "cwd": "/tmp/agentfs-large-edit-mptxma_y/agentfs-base",
+      "duration_seconds": 0.6650406250264496,
+      "profile_summaries": [],
+      "returncode": 0,
+      "stderr_bytes": 533,
+      "stderr_tail": "Welcome to AgentFS!\n\nThe following directories are writable:\n\n  - /tmp/agentfs-large-edit-mptxma_y/agentfs-base (copy-on-write)\n\n\ud83d\udd12 Everything else is read-only.\n\nTo join this session from another terminal:\n\n  agentfs run --session large-edit-4df84db6-6b63-49d6-9873-d592512ec7c6 <command>\n\n\nSession: large-edit-4df84db6-6b63-49d6-9873-d592512ec7c6\n\nTo resume this session:\n  agentfs run --session large-edit-4df84db6-6b63-49d6-9873-d592512ec7c6\n\nTo see what changed:\n  agentfs diff large-edit-4df84db6-6b63-49d6-9873-d592512ec7c6\n",
+      "stdout_bytes": 320,
+      "stdout_tail": "2026-05-24T12:53:48.999256Z  INFO agentfs::fuser::session: resolved FUSE dispatch mode: parallel workers=3 queue_capacity=12\n{\"new_byte\": 30, \"offset\": 26214400, \"old_byte\": 29, \"path\": \"large.bin\", \"sha256\": \"4dc308780344702924456d8e603e0c14556f5f3829db12796d0743d973d48a9f\", \"size\": 52428800, \"size_before\": 52428800}\n",
+      "timed_out": false
+    },
+    "warmup": {
+      "argv": [
+        "/home/ain3sh/factory/vfs/cli/target/release/agentfs",
+        "run",
+        "--session",
+        "large-edit-4df84db6-6b63-49d6-9873-d592512ec7c6",
+        "--no-default-allows",
+        "--",
+        "/usr/bin/python3",
+        "-c",
+        "\nimport json\nfrom pathlib import Path\n\nroot = Path(\".\")\nentries = sorted(path.name for path in root.iterdir())\n\nprint(json.dumps({\n    \"path\": str(root),\n    \"entries\": entries,\n}, sort_keys=True))\n"
+      ],
+      "cwd": "/tmp/agentfs-large-edit-mptxma_y/agentfs-base",
+      "duration_seconds": 0.1202043310040608,
+      "profile_summaries": [],
+      "returncode": 0,
+      "stderr_bytes": 533,
+      "stderr_tail": "Welcome to AgentFS!\n\nThe following directories are writable:\n\n  - /tmp/agentfs-large-edit-mptxma_y/agentfs-base (copy-on-write)\n\n\ud83d\udd12 Everything else is read-only.\n\nTo join this session from another terminal:\n\n  agentfs run --session large-edit-4df84db6-6b63-49d6-9873-d592512ec7c6 <command>\n\n\nSession: large-edit-4df84db6-6b63-49d6-9873-d592512ec7c6\n\nTo resume this session:\n  agentfs run --session large-edit-4df84db6-6b63-49d6-9873-d592512ec7c6\n\nTo see what changed:\n  agentfs diff large-edit-4df84db6-6b63-49d6-9873-d592512ec7c6\n",
+      "stdout_bytes": 165,
+      "stdout_tail": "2026-05-24T12:53:48.759443Z  INFO agentfs::fuser::session: resolved FUSE dispatch mode: parallel workers=3 queue_capacity=12\n{\"entries\": [\"large.bin\"], \"path\": \".\"}\n",
+      "timed_out": false
+    }
+  },
+  "base_file": {
+    "agentfs_base_sha256_after": "2ae3472ca74d439d1f8d8dfc37940dfffb7beb5f4e88590127e5a1aa54ffbf70",
+    "native_sha256_after": "4dc308780344702924456d8e603e0c14556f5f3829db12796d0743d973d48a9f",
+    "original_sha256": "2ae3472ca74d439d1f8d8dfc37940dfffb7beb5f4e88590127e5a1aa54ffbf70"
+  },
+  "benchmark": "phase5-large-base-single-byte-edit",
+  "correctness": {
+    "agentfs_base_unchanged": true,
+    "agentfs_returncode_zero": true,
+    "native_file_changed": true,
+    "native_returncode_zero": true,
+    "outputs_match": true,
+    "passed": true,
+    "warmup_returncode_zero": true
+  },
+  "database": {
+    "after_edit": {
+      "artifacts": [
+        {
+          "bytes": 52961280,
+          "path": "/tmp/agentfs-large-edit-mptxma_y/home/.agentfs/run/large-edit-4df84db6-6b63-49d6-9873-d592512ec7c6/delta.db"
+        }
+      ],
+      "path": "/tmp/agentfs-large-edit-mptxma_y/home/.agentfs/run/large-edit-4df84db6-6b63-49d6-9873-d592512ec7c6/delta.db",
+      "total_bytes": 52961280
+    },
+    "before_edit": {
+      "artifacts": [
+        {
+          "bytes": 106496,
+          "path": "/tmp/agentfs-large-edit-mptxma_y/home/.agentfs/run/large-edit-4df84db6-6b63-49d6-9873-d592512ec7c6/delta.db"
+        }
+      ],
+      "path": "/tmp/agentfs-large-edit-mptxma_y/home/.agentfs/run/large-edit-4df84db6-6b63-49d6-9873-d592512ec7c6/delta.db",
+      "total_bytes": 106496
+    },
+    "growth_bytes": 52854784,
+    "inspect_after": {
+      "fs_chunk_override_rows": 0,
+      "fs_config": {
+        "chunk_size": "65536",
+        "inline_threshold": "4096",
+        "schema_version": "0.5"
+      },
+      "fs_data_bytes": 52428800,
+      "fs_data_rows": 800,
+      "fs_inline_bytes": 0,
+      "fs_inode_rows": 2,
+      "fs_materialized_rows": null,
+      "fs_origin_rows": 1,
+      "fs_partial_origin_rows": 0,
+      "inline_inode_rows": 0,
+      "inspectable": true,
+      "portability_status": {
+        "materialized_rows": null,
+        "origin_backed": false,
+        "override_rows": 0,
+        "partial_origin_rows": 0,
+        "portable": true,
+        "stored_bytes": 52428800
+      }
+    },
+    "inspect_before": {
+      "fs_chunk_override_rows": 0,
+      "fs_config": {
+        "chunk_size": "65536",
+        "inline_threshold": "4096",
+        "schema_version": "0.5"
+      },
+      "fs_data_bytes": 0,
+      "fs_data_rows": 0,
+      "fs_inline_bytes": 0,
+      "fs_inode_rows": 1,
+      "fs_materialized_rows": null,
+      "fs_origin_rows": 0,
+      "fs_partial_origin_rows": 0,
+      "inline_inode_rows": 0,
+      "inspectable": true,
+      "portability_status": {
+        "materialized_rows": null,
+        "origin_backed": false,
+        "override_rows": 0,
+        "partial_origin_rows": 0,
+        "portable": true,
+        "stored_bytes": 0
+      }
+    }
+  },
+  "git_commit": "9be0da4052517e3148a29b90c209867d410c888c",
+  "kept_temp": false,
+  "native": {
+    "duration_seconds": 0.12261418998241425,
+    "result": {
+      "new_byte": 30,
+      "offset": 26214400,
+      "old_byte": 29,
+      "path": "large.bin",
+      "sha256": "4dc308780344702924456d8e603e0c14556f5f3829db12796d0743d973d48a9f",
+      "size": 52428800,
+      "size_before": 52428800
+    },
+    "run": {
+      "argv": [
+        "/usr/bin/python3",
+        "-c",
+        "\nimport hashlib\nimport json\nimport os\nimport sys\nfrom pathlib import Path\n\npath = Path(sys.argv[1])\noffset = int(sys.argv[2])\n\nbefore_size = path.stat().st_size\nwith path.open(\"r+b\", buffering=0) as handle:\n    handle.seek(offset)\n    old = handle.read(1)\n    if not old:\n        raise RuntimeError(f\"offset {offset} is outside {path}\")\n    new = bytes([(old[0] + 1) % 256])\n    handle.seek(offset)\n    handle.write(new)\n    handle.flush()\n    os.fsync(handle.fileno())\n\ndigest = hashlib.sha256()\nwith path.open(\"rb\") as handle:\n    while True:\n        chunk = handle.read(1024 * 1024)\n        if not chunk:\n            break\n        digest.update(chunk)\n\nprint(json.dumps({\n    \"path\": str(path),\n    \"size\": path.stat().st_size,\n    \"size_before\": before_size,\n    \"offset\": offset,\n    \"old_byte\": old[0],\n    \"new_byte\": new[0],\n    \"sha256\": digest.hexdigest(),\n}, sort_keys=True))\n",
+        "large.bin",
+        "26214400"
+      ],
+      "cwd": "/tmp/agentfs-large-edit-mptxma_y/native",
+      "duration_seconds": 0.12261418998241425,
+      "profile_summaries": [],
+      "returncode": 0,
+      "stderr_bytes": 0,
+      "stderr_tail": "",
+      "stdout_bytes": 195,
+      "stdout_tail": "{\"new_byte\": 30, \"offset\": 26214400, \"old_byte\": 29, \"path\": \"large.bin\", \"sha256\": \"4dc308780344702924456d8e603e0c14556f5f3829db12796d0743d973d48a9f\", \"size\": 52428800, \"size_before\": 52428800}\n",
+      "timed_out": false
+    }
+  },
+  "parameters": {
+    "edit_width_bytes": 1,
+    "file_size_bytes": 52428800,
+    "file_size_mib": 50,
+    "offset": 26214400
+  },
+  "schema_version": 1,
+  "temp_dir": "/tmp/agentfs-large-edit-mptxma_y"
+}

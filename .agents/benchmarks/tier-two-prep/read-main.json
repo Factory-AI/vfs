@@ -1,0 +1,555 @@
+{
+  "agentfs": {
+    "bin": "/home/ain3sh/factory/vfs-bench-main/cli/target/release/agentfs",
+    "profile_enabled": false,
+    "profile_summary_count": 0
+  },
+  "benchmark": "phase55-read-path",
+  "command": {
+    "agentfs_prefix": [
+      "/home/ain3sh/factory/vfs-bench-main/cli/target/release/agentfs",
+      "run",
+      "--session",
+      "<session>",
+      "--no-default-allows",
+      "--"
+    ],
+    "argv": [
+      "/home/ain3sh/factory/vfs/scripts/validation/read-path-benchmark.py",
+      "--agentfs-bin",
+      "/home/ain3sh/factory/vfs-bench-main/cli/target/release/agentfs",
+      "--files",
+      "8",
+      "--dirs",
+      "2",
+      "--file-size-bytes",
+      "65536",
+      "--stat-iterations",
+      "8",
+      "--readdir-iterations",
+      "8",
+      "--open-iterations",
+      "8",
+      "--repeated-read-iterations",
+      "8",
+      "--repeated-read-files",
+      "4",
+      "--timeout",
+      "120",
+      "--output",
+      ".agents/benchmarks/tier-two-prep/read-main.json"
+    ],
+    "workload_argv": [
+      "/usr/bin/python3",
+      "-c",
+      "\nimport argparse\nimport hashlib\nimport json\nimport os\nimport stat as stat_module\nimport time\nfrom pathlib import Path\n\n\ndef positive_int(value):\n    parsed = int(value)\n    if parsed < 1:\n        raise argparse.ArgumentTypeError(\"must be >= 1\")\n    return parsed\n\n\ndef non_negative_int(value):\n    parsed = int(value)\n    if parsed < 0:\n        raise argparse.ArgumentTypeError(\"must be >= 0\")\n    return parsed\n\n\nparser = argparse.ArgumentParser()\nparser.add_argument(\"--max-files\", type=positive_int, required=True)\nparser.add_argument(\"--max-dirs\", type=positive_int, required=True)\nparser.add_argument(\"--scan-bytes\", type=positive_int, required=True)\nparser.add_argument(\"--stat-iterations\", type=positive_int, required=True)\nparser.add_argument(\"--readdir-iterations\", type=positive_int, required=True)\nparser.add_argument(\"--open-iterations\", type=positive_int, required=True)\nparser.add_argument(\"--open-read-bytes\", type=positive_int, required=True)\nparser.add_argument(\"--repeated-read-iterations\", type=non_negative_int, required=True)\nparser.add_argument(\"--repeated-read-files\", type=positive_int, required=True)\nargs = parser.parse_args()\n\nroot = Path.cwd()\nstarted_total = time.perf_counter()\nstarted = time.perf_counter()\nall_files = sorted(path for path in root.rglob(\"*\") if path.is_file())\nall_dirs = sorted(path for path in root.rglob(\"*\") if path.is_dir())\nfiles = all_files[: args.max_files]\ndirs = [root] + all_dirs[: max(0, args.max_dirs - 1)]\ndigest = hashlib.sha256()\nphase_seconds = {\n    \"tree_discovery\": time.perf_counter() - started,\n}\ncounts = {\n    \"scan_files\": 0,\n    \"scan_bytes\": 0,\n    \"stat_calls\": 0,\n    \"lstat_calls\": 0,\n    \"readdir_calls\": 0,\n    \"readdir_entries\": 0,\n    \"readdir_plus_calls\": 0,\n    \"readdir_plus_entries\": 0,\n    \"open_read_close_calls\": 0,\n    \"open_read_close_bytes\": 0,\n    \"repeated_read_only_base_open_read_close_calls\": 0,\n    \"repeated_read_only_base_open_read_close_bytes\": 0,\n}\n\nstarted = time.perf_counter()\nfor path in files:\n    rel = path.relative_to(root).as_posix()\n    data = path.read_bytes()[: args.scan_bytes]\n    digest.update(b\"scan\\0\")\n    digest.update(rel.encode(\"utf-8\"))\n    digest.update(b\"\\0\")\n    digest.update(data)\n    counts[\"scan_files\"] += 1\n    counts[\"scan_bytes\"] += len(data)\nphase_seconds[\"bounded_file_scan\"] = time.perf_counter() - started\n\nstarted = time.perf_counter()\nfor _ in range(args.stat_iterations):\n    for path in files:\n        stat_result = os.stat(path)\n        lstat_result = os.lstat(path)\n        digest.update(b\"stat\\0\")\n        digest.update(path.relative_to(root).as_posix().encode(\"utf-8\"))\n        digest.update(\n            f\":{stat_result.st_size}:{stat_module.S_IFMT(lstat_result.st_mode)}\".encode(\"ascii\")\n        )\n        counts[\"stat_calls\"] += 1\n        counts[\"lstat_calls\"] += 1\nphase_seconds[\"stat_lstat_storm\"] = time.perf_counter() - started\n\nstarted = time.perf_counter()\nfor _ in range(args.readdir_iterations):\n    for path in dirs:\n        names = sorted(os.listdir(path))\n        digest.update(b\"readdir\\0\")\n        digest.update(path.relative_to(root).as_posix().encode(\"utf-8\"))\n        digest.update(b\"\\0\")\n        digest.update(\"\\0\".join(names).encode(\"utf-8\"))\n        counts[\"readdir_calls\"] += 1\n        counts[\"readdir_entries\"] += len(names)\nphase_seconds[\"readdir_storm\"] = time.perf_counter() - started\n\nstarted = time.perf_counter()\nfor _ in range(args.readdir_iterations):\n    for path in dirs:\n        with os.scandir(path) as iterator:\n            entries = []\n            for entry in iterator:\n                stat_result = entry.stat(follow_symlinks=False)\n                mode_type = stat_module.S_IFMT(stat_result.st_mode)\n                if stat_module.S_ISREG(stat_result.st_mode):\n                    size = stat_result.st_size\n                else:\n                    size = 0\n                entries.append((entry.name, size, mode_type))\n        entries.sort()\n        digest.update(b\"readdir_plus\\0\")\n        digest.update(path.relative_to(root).as_posix().encode(\"utf-8\"))\n        digest.update(b\"\\0\")\n        digest.update(json.dumps(entries, separators=(\",\", \":\")).encode(\"utf-8\"))\n        counts[\"readdir_plus_calls\"] += 1\n        counts[\"readdir_plus_entries\"] += len(entries)\nphase_seconds[\"readdir_plus_storm\"] = time.perf_counter() - started\n\nstarted = time.perf_counter()\nfor _ in range(args.open_iterations):\n    for path in files:\n        with path.open(\"rb\") as handle:\n            data = handle.read(args.open_read_bytes)\n        digest.update(b\"open-read-close\\0\")\n        digest.update(path.relative_to(root).as_posix().encode(\"utf-8\"))\n        digest.update(b\"\\0\")\n        digest.update(data)\n        counts[\"open_read_close_calls\"] += 1\n        counts[\"open_read_close_bytes\"] += len(data)\nphase_seconds[\"open_read_close_loop\"] = time.perf_counter() - started\n\nstarted = time.perf_counter()\nif args.repeated_read_iterations:\n    repeat_files = files[: args.repeated_read_files]\n    for _ in range(args.repeated_read_iterations):\n        for path in repeat_files:\n            with path.open(\"rb\") as handle:\n                data = handle.read(args.open_read_bytes)\n            digest.update(b\"repeated-open-read-close\\0\")\n            digest.update(path.relative_to(root).as_posix().encode(\"utf-8\"))\n            digest.update(b\"\\0\")\n            digest.update(data)\n            counts[\"repeated_read_only_base_open_read_close_calls\"] += 1\n            counts[\"repeated_read_only_base_open_read_close_bytes\"] += len(data)\nphase_seconds[\"repeated_read_only_base_open_read_close_loop\"] = time.perf_counter() - started\n\nprint(json.dumps({\n    \"digest\": digest.hexdigest(),\n    \"phase_seconds\": phase_seconds,\n    \"total_seconds\": time.perf_counter() - started_total,\n    \"counts\": counts,\n    \"parameters\": {\n        \"max_files\": args.max_files,\n        \"max_dirs\": args.max_dirs,\n        \"scan_bytes\": args.scan_bytes,\n        \"stat_iterations\": args.stat_iterations,\n        \"readdir_iterations\": args.readdir_iterations,\n        \"open_iterations\": args.open_iterations,\n        \"open_read_bytes\": args.open_read_bytes,\n        \"repeated_read_iterations\": args.repeated_read_iterations,\n        \"repeated_read_files\": args.repeated_read_files,\n    },\n}, sort_keys=True))\n",
+      "--max-files",
+      "8",
+      "--max-dirs",
+      "6",
+      "--scan-bytes",
+      "1024",
+      "--stat-iterations",
+      "8",
+      "--readdir-iterations",
+      "8",
+      "--open-iterations",
+      "8",
+      "--open-read-bytes",
+      "512",
+      "--repeated-read-iterations",
+      "8",
+      "--repeated-read-files",
+      "4"
+    ]
+  },
+  "environment": {
+    "AGENTFS_BIN": "/home/ain3sh/factory/vfs-bench-main/cli/target/release/agentfs",
+    "AGENTFS_PROFILE": null
+  },
+  "git_commit": "9be0da4052517e3148a29b90c209867d410c888c",
+  "kept_temp": false,
+  "modes": [
+    {
+      "agentfs": {
+        "profile_counters": {
+          "last_by_source": {},
+          "max_counters": {},
+          "summary_count": 0
+        },
+        "profile_summaries": [],
+        "run": {
+          "argv": [
+            "/home/ain3sh/factory/vfs-bench-main/cli/target/release/agentfs",
+            "run",
+            "--session",
+            "read-path-ef380b8289744463aa27c6894b86f145-cold",
+            "--no-default-allows",
+            "--",
+            "/usr/bin/python3",
+            "-c",
+            "\nimport argparse\nimport hashlib\nimport json\nimport os\nimport stat as stat_module\nimport time\nfrom pathlib import Path\n\n\ndef positive_int(value):\n    parsed = int(value)\n    if parsed < 1:\n        raise argparse.ArgumentTypeError(\"must be >= 1\")\n    return parsed\n\n\ndef non_negative_int(value):\n    parsed = int(value)\n    if parsed < 0:\n        raise argparse.ArgumentTypeError(\"must be >= 0\")\n    return parsed\n\n\nparser = argparse.ArgumentParser()\nparser.add_argument(\"--max-files\", type=positive_int, required=True)\nparser.add_argument(\"--max-dirs\", type=positive_int, required=True)\nparser.add_argument(\"--scan-bytes\", type=positive_int, required=True)\nparser.add_argument(\"--stat-iterations\", type=positive_int, required=True)\nparser.add_argument(\"--readdir-iterations\", type=positive_int, required=True)\nparser.add_argument(\"--open-iterations\", type=positive_int, required=True)\nparser.add_argument(\"--open-read-bytes\", type=positive_int, required=True)\nparser.add_argument(\"--repeated-read-iterations\", type=non_negative_int, required=True)\nparser.add_argument(\"--repeated-read-files\", type=positive_int, required=True)\nargs = parser.parse_args()\n\nroot = Path.cwd()\nstarted_total = time.perf_counter()\nstarted = time.perf_counter()\nall_files = sorted(path for path in root.rglob(\"*\") if path.is_file())\nall_dirs = sorted(path for path in root.rglob(\"*\") if path.is_dir())\nfiles = all_files[: args.max_files]\ndirs = [root] + all_dirs[: max(0, args.max_dirs - 1)]\ndigest = hashlib.sha256()\nphase_seconds = {\n    \"tree_discovery\": time.perf_counter() - started,\n}\ncounts = {\n    \"scan_files\": 0,\n    \"scan_bytes\": 0,\n    \"stat_calls\": 0,\n    \"lstat_calls\": 0,\n    \"readdir_calls\": 0,\n    \"readdir_entries\": 0,\n    \"readdir_plus_calls\": 0,\n    \"readdir_plus_entries\": 0,\n    \"open_read_close_calls\": 0,\n    \"open_read_close_bytes\": 0,\n    \"repeated_read_only_base_open_read_close_calls\": 0,\n    \"repeated_read_only_base_open_read_close_bytes\": 0,\n}\n\nstarted = time.perf_counter()\nfor path in files:\n    rel = path.relative_to(root).as_posix()\n    data = path.read_bytes()[: args.scan_bytes]\n    digest.update(b\"scan\\0\")\n    digest.update(rel.encode(\"utf-8\"))\n    digest.update(b\"\\0\")\n    digest.update(data)\n    counts[\"scan_files\"] += 1\n    counts[\"scan_bytes\"] += len(data)\nphase_seconds[\"bounded_file_scan\"] = time.perf_counter() - started\n\nstarted = time.perf_counter()\nfor _ in range(args.stat_iterations):\n    for path in files:\n        stat_result = os.stat(path)\n        lstat_result = os.lstat(path)\n        digest.update(b\"stat\\0\")\n        digest.update(path.relative_to(root).as_posix().encode(\"utf-8\"))\n        digest.update(\n            f\":{stat_result.st_size}:{stat_module.S_IFMT(lstat_result.st_mode)}\".encode(\"ascii\")\n        )\n        counts[\"stat_calls\"] += 1\n        counts[\"lstat_calls\"] += 1\nphase_seconds[\"stat_lstat_storm\"] = time.perf_counter() - started\n\nstarted = time.perf_counter()\nfor _ in range(args.readdir_iterations):\n    for path in dirs:\n        names = sorted(os.listdir(path))\n        digest.update(b\"readdir\\0\")\n        digest.update(path.relative_to(root).as_posix().encode(\"utf-8\"))\n        digest.update(b\"\\0\")\n        digest.update(\"\\0\".join(names).encode(\"utf-8\"))\n        counts[\"readdir_calls\"] += 1\n        counts[\"readdir_entries\"] += len(names)\nphase_seconds[\"readdir_storm\"] = time.perf_counter() - started\n\nstarted = time.perf_counter()\nfor _ in range(args.readdir_iterations):\n    for path in dirs:\n        with os.scandir(path) as iterator:\n            entries = []\n            for entry in iterator:\n                stat_result = entry.stat(follow_symlinks=False)\n                mode_type = stat_module.S_IFMT(stat_result.st_mode)\n                if stat_module.S_ISREG(stat_result.st_mode):\n                    size = stat_result.st_size\n                else:\n                    size = 0\n                entries.append((entry.name, size, mode_type))\n        entries.sort()\n        digest.update(b\"readdir_plus\\0\")\n        digest.update(path.relative_to(root).as_posix().encode(\"utf-8\"))\n        digest.update(b\"\\0\")\n        digest.update(json.dumps(entries, separators=(\",\", \":\")).encode(\"utf-8\"))\n        counts[\"readdir_plus_calls\"] += 1\n        counts[\"readdir_plus_entries\"] += len(entries)\nphase_seconds[\"readdir_plus_storm\"] = time.perf_counter() - started\n\nstarted = time.perf_counter()\nfor _ in range(args.open_iterations):\n    for path in files:\n        with path.open(\"rb\") as handle:\n            data = handle.read(args.open_read_bytes)\n        digest.update(b\"open-read-close\\0\")\n        digest.update(path.relative_to(root).as_posix().encode(\"utf-8\"))\n        digest.update(b\"\\0\")\n        digest.update(data)\n        counts[\"open_read_close_calls\"] += 1\n        counts[\"open_read_close_bytes\"] += len(data)\nphase_seconds[\"open_read_close_loop\"] = time.perf_counter() - started\n\nstarted = time.perf_counter()\nif args.repeated_read_iterations:\n    repeat_files = files[: args.repeated_read_files]\n    for _ in range(args.repeated_read_iterations):\n        for path in repeat_files:\n            with path.open(\"rb\") as handle:\n                data = handle.read(args.open_read_bytes)\n            digest.update(b\"repeated-open-read-close\\0\")\n            digest.update(path.relative_to(root).as_posix().encode(\"utf-8\"))\n            digest.update(b\"\\0\")\n            digest.update(data)\n            counts[\"repeated_read_only_base_open_read_close_calls\"] += 1\n            counts[\"repeated_read_only_base_open_read_close_bytes\"] += len(data)\nphase_seconds[\"repeated_read_only_base_open_read_close_loop\"] = time.perf_counter() - started\n\nprint(json.dumps({\n    \"digest\": digest.hexdigest(),\n    \"phase_seconds\": phase_seconds,\n    \"total_seconds\": time.perf_counter() - started_total,\n    \"counts\": counts,\n    \"parameters\": {\n        \"max_files\": args.max_files,\n        \"max_dirs\": args.max_dirs,\n        \"scan_bytes\": args.scan_bytes,\n        \"stat_iterations\": args.stat_iterations,\n        \"readdir_iterations\": args.readdir_iterations,\n        \"open_iterations\": args.open_iterations,\n        \"open_read_bytes\": args.open_read_bytes,\n        \"repeated_read_iterations\": args.repeated_read_iterations,\n        \"repeated_read_files\": args.repeated_read_files,\n    },\n}, sort_keys=True))\n",
+            "--max-files",
+            "8",
+            "--max-dirs",
+            "6",
+            "--scan-bytes",
+            "1024",
+            "--stat-iterations",
+            "8",
+            "--readdir-iterations",
+            "8",
+            "--open-iterations",
+            "8",
+            "--open-read-bytes",
+            "512",
+            "--repeated-read-iterations",
+            "8",
+            "--repeated-read-files",
+            "4"
+          ],
+          "cwd": "/tmp/agentfs-read-path-benchmark-3q5cbivs/agentfs-base",
+          "duration_seconds": 0.13890027400339022,
+          "profile_summaries": [],
+          "returncode": 0,
+          "stderr_bytes": 542,
+          "stderr_tail": "Welcome to AgentFS!\n\nThe following directories are writable:\n\n  - /tmp/agentfs-read-path-benchmark-3q5cbivs/agentfs-base (copy-on-write)\n\n\ud83d\udd12 Everything else is read-only.\n\nTo join this session from another terminal:\n\n  agentfs run --session read-path-ef380b8289744463aa27c6894b86f145-cold <command>\n\n\nSession: read-path-ef380b8289744463aa27c6894b86f145-cold\n\nTo resume this session:\n  agentfs run --session read-path-ef380b8289744463aa27c6894b86f145-cold\n\nTo see what changed:\n  agentfs diff read-path-ef380b8289744463aa27c6894b86f145-cold\n",
+          "stdout_bytes": 1038,
+          "stdout_tail": "{\"counts\": {\"lstat_calls\": 64, \"open_read_close_bytes\": 32768, \"open_read_close_calls\": 64, \"readdir_calls\": 48, \"readdir_entries\": 112, \"readdir_plus_calls\": 48, \"readdir_plus_entries\": 112, \"repeated_read_only_base_open_read_close_bytes\": 16384, \"repeated_read_only_base_open_read_close_calls\": 32, \"scan_bytes\": 8192, \"scan_files\": 8, \"stat_calls\": 64}, \"digest\": \"2a4cbd6c46e735852e5978c5c5d9b309e3b7fcdb1033d997e4d6e760c67eb3ed\", \"parameters\": {\"max_dirs\": 6, \"max_files\": 8, \"open_iterations\": 8, \"open_read_bytes\": 512, \"readdir_iterations\": 8, \"repeated_read_files\": 4, \"repeated_read_iterations\": 8, \"scan_bytes\": 1024, \"stat_iterations\": 8}, \"phase_seconds\": {\"bounded_file_scan\": 0.0069286589859984815, \"open_read_close_loop\": 0.008698205987457186, \"readdir_plus_storm\": 0.007107554003596306, \"readdir_storm\": 0.005736670980695635, \"repeated_read_only_base_open_read_close_loop\": 0.0027397939702495933, \"stat_lstat_storm\": 0.0009176280000247061, \"tree_discovery\": 0.0038812010316178203}, \"total_seconds\": 0.036035060009453446}\n",
+          "timed_out": false
+        },
+        "timing": {
+          "outer_seconds": 0.13890027400339022,
+          "startup_or_session_overhead_seconds": 0.10286521399393678,
+          "workload_seconds": 0.036035060009453446
+        },
+        "warmup": null,
+        "workload": {
+          "counts": {
+            "lstat_calls": 64,
+            "open_read_close_bytes": 32768,
+            "open_read_close_calls": 64,
+            "readdir_calls": 48,
+            "readdir_entries": 112,
+            "readdir_plus_calls": 48,
+            "readdir_plus_entries": 112,
+            "repeated_read_only_base_open_read_close_bytes": 16384,
+            "repeated_read_only_base_open_read_close_calls": 32,
+            "scan_bytes": 8192,
+            "scan_files": 8,
+            "stat_calls": 64
+          },
+          "digest": "2a4cbd6c46e735852e5978c5c5d9b309e3b7fcdb1033d997e4d6e760c67eb3ed",
+          "parameters": {
+            "max_dirs": 6,
+            "max_files": 8,
+            "open_iterations": 8,
+            "open_read_bytes": 512,
+            "readdir_iterations": 8,
+            "repeated_read_files": 4,
+            "repeated_read_iterations": 8,
+            "scan_bytes": 1024,
+            "stat_iterations": 8
+          },
+          "phase_seconds": {
+            "bounded_file_scan": 0.0069286589859984815,
+            "open_read_close_loop": 0.008698205987457186,
+            "readdir_plus_storm": 0.007107554003596306,
+            "readdir_storm": 0.005736670980695635,
+            "repeated_read_only_base_open_read_close_loop": 0.0027397939702495933,
+            "stat_lstat_storm": 0.0009176280000247061,
+            "tree_discovery": 0.0038812010316178203
+          },
+          "total_seconds": 0.036035060009453446
+        }
+      },
+      "equivalence": {
+        "agentfs_digest": "2a4cbd6c46e735852e5978c5c5d9b309e3b7fcdb1033d997e4d6e760c67eb3ed",
+        "checked": true,
+        "equivalent": true,
+        "native_digest": "2a4cbd6c46e735852e5978c5c5d9b309e3b7fcdb1033d997e4d6e760c67eb3ed"
+      },
+      "mode": "cold",
+      "native": {
+        "run": {
+          "argv": [
+            "/usr/bin/python3",
+            "-c",
+            "\nimport argparse\nimport hashlib\nimport json\nimport os\nimport stat as stat_module\nimport time\nfrom pathlib import Path\n\n\ndef positive_int(value):\n    parsed = int(value)\n    if parsed < 1:\n        raise argparse.ArgumentTypeError(\"must be >= 1\")\n    return parsed\n\n\ndef non_negative_int(value):\n    parsed = int(value)\n    if parsed < 0:\n        raise argparse.ArgumentTypeError(\"must be >= 0\")\n    return parsed\n\n\nparser = argparse.ArgumentParser()\nparser.add_argument(\"--max-files\", type=positive_int, required=True)\nparser.add_argument(\"--max-dirs\", type=positive_int, required=True)\nparser.add_argument(\"--scan-bytes\", type=positive_int, required=True)\nparser.add_argument(\"--stat-iterations\", type=positive_int, required=True)\nparser.add_argument(\"--readdir-iterations\", type=positive_int, required=True)\nparser.add_argument(\"--open-iterations\", type=positive_int, required=True)\nparser.add_argument(\"--open-read-bytes\", type=positive_int, required=True)\nparser.add_argument(\"--repeated-read-iterations\", type=non_negative_int, required=True)\nparser.add_argument(\"--repeated-read-files\", type=positive_int, required=True)\nargs = parser.parse_args()\n\nroot = Path.cwd()\nstarted_total = time.perf_counter()\nstarted = time.perf_counter()\nall_files = sorted(path for path in root.rglob(\"*\") if path.is_file())\nall_dirs = sorted(path for path in root.rglob(\"*\") if path.is_dir())\nfiles = all_files[: args.max_files]\ndirs = [root] + all_dirs[: max(0, args.max_dirs - 1)]\ndigest = hashlib.sha256()\nphase_seconds = {\n    \"tree_discovery\": time.perf_counter() - started,\n}\ncounts = {\n    \"scan_files\": 0,\n    \"scan_bytes\": 0,\n    \"stat_calls\": 0,\n    \"lstat_calls\": 0,\n    \"readdir_calls\": 0,\n    \"readdir_entries\": 0,\n    \"readdir_plus_calls\": 0,\n    \"readdir_plus_entries\": 0,\n    \"open_read_close_calls\": 0,\n    \"open_read_close_bytes\": 0,\n    \"repeated_read_only_base_open_read_close_calls\": 0,\n    \"repeated_read_only_base_open_read_close_bytes\": 0,\n}\n\nstarted = time.perf_counter()\nfor path in files:\n    rel = path.relative_to(root).as_posix()\n    data = path.read_bytes()[: args.scan_bytes]\n    digest.update(b\"scan\\0\")\n    digest.update(rel.encode(\"utf-8\"))\n    digest.update(b\"\\0\")\n    digest.update(data)\n    counts[\"scan_files\"] += 1\n    counts[\"scan_bytes\"] += len(data)\nphase_seconds[\"bounded_file_scan\"] = time.perf_counter() - started\n\nstarted = time.perf_counter()\nfor _ in range(args.stat_iterations):\n    for path in files:\n        stat_result = os.stat(path)\n        lstat_result = os.lstat(path)\n        digest.update(b\"stat\\0\")\n        digest.update(path.relative_to(root).as_posix().encode(\"utf-8\"))\n        digest.update(\n            f\":{stat_result.st_size}:{stat_module.S_IFMT(lstat_result.st_mode)}\".encode(\"ascii\")\n        )\n        counts[\"stat_calls\"] += 1\n        counts[\"lstat_calls\"] += 1\nphase_seconds[\"stat_lstat_storm\"] = time.perf_counter() - started\n\nstarted = time.perf_counter()\nfor _ in range(args.readdir_iterations):\n    for path in dirs:\n        names = sorted(os.listdir(path))\n        digest.update(b\"readdir\\0\")\n        digest.update(path.relative_to(root).as_posix().encode(\"utf-8\"))\n        digest.update(b\"\\0\")\n        digest.update(\"\\0\".join(names).encode(\"utf-8\"))\n        counts[\"readdir_calls\"] += 1\n        counts[\"readdir_entries\"] += len(names)\nphase_seconds[\"readdir_storm\"] = time.perf_counter() - started\n\nstarted = time.perf_counter()\nfor _ in range(args.readdir_iterations):\n    for path in dirs:\n        with os.scandir(path) as iterator:\n            entries = []\n            for entry in iterator:\n                stat_result = entry.stat(follow_symlinks=False)\n                mode_type = stat_module.S_IFMT(stat_result.st_mode)\n                if stat_module.S_ISREG(stat_result.st_mode):\n                    size = stat_result.st_size\n                else:\n                    size = 0\n                entries.append((entry.name, size, mode_type))\n        entries.sort()\n        digest.update(b\"readdir_plus\\0\")\n        digest.update(path.relative_to(root).as_posix().encode(\"utf-8\"))\n        digest.update(b\"\\0\")\n        digest.update(json.dumps(entries, separators=(\",\", \":\")).encode(\"utf-8\"))\n        counts[\"readdir_plus_calls\"] += 1\n        counts[\"readdir_plus_entries\"] += len(entries)\nphase_seconds[\"readdir_plus_storm\"] = time.perf_counter() - started\n\nstarted = time.perf_counter()\nfor _ in range(args.open_iterations):\n    for path in files:\n        with path.open(\"rb\") as handle:\n            data = handle.read(args.open_read_bytes)\n        digest.update(b\"open-read-close\\0\")\n        digest.update(path.relative_to(root).as_posix().encode(\"utf-8\"))\n        digest.update(b\"\\0\")\n        digest.update(data)\n        counts[\"open_read_close_calls\"] += 1\n        counts[\"open_read_close_bytes\"] += len(data)\nphase_seconds[\"open_read_close_loop\"] = time.perf_counter() - started\n\nstarted = time.perf_counter()\nif args.repeated_read_iterations:\n    repeat_files = files[: args.repeated_read_files]\n    for _ in range(args.repeated_read_iterations):\n        for path in repeat_files:\n            with path.open(\"rb\") as handle:\n                data = handle.read(args.open_read_bytes)\n            digest.update(b\"repeated-open-read-close\\0\")\n            digest.update(path.relative_to(root).as_posix().encode(\"utf-8\"))\n            digest.update(b\"\\0\")\n            digest.update(data)\n            counts[\"repeated_read_only_base_open_read_close_calls\"] += 1\n            counts[\"repeated_read_only_base_open_read_close_bytes\"] += len(data)\nphase_seconds[\"repeated_read_only_base_open_read_close_loop\"] = time.perf_counter() - started\n\nprint(json.dumps({\n    \"digest\": digest.hexdigest(),\n    \"phase_seconds\": phase_seconds,\n    \"total_seconds\": time.perf_counter() - started_total,\n    \"counts\": counts,\n    \"parameters\": {\n        \"max_files\": args.max_files,\n        \"max_dirs\": args.max_dirs,\n        \"scan_bytes\": args.scan_bytes,\n        \"stat_iterations\": args.stat_iterations,\n        \"readdir_iterations\": args.readdir_iterations,\n        \"open_iterations\": args.open_iterations,\n        \"open_read_bytes\": args.open_read_bytes,\n        \"repeated_read_iterations\": args.repeated_read_iterations,\n        \"repeated_read_files\": args.repeated_read_files,\n    },\n}, sort_keys=True))\n",
+            "--max-files",
+            "8",
+            "--max-dirs",
+            "6",
+            "--scan-bytes",
+            "1024",
+            "--stat-iterations",
+            "8",
+            "--readdir-iterations",
+            "8",
+            "--open-iterations",
+            "8",
+            "--open-read-bytes",
+            "512",
+            "--repeated-read-iterations",
+            "8",
+            "--repeated-read-files",
+            "4"
+          ],
+          "cwd": "/tmp/agentfs-read-path-benchmark-3q5cbivs/native",
+          "duration_seconds": 0.04775080498075113,
+          "profile_summaries": [],
+          "returncode": 0,
+          "stderr_bytes": 0,
+          "stderr_tail": "",
+          "stdout_bytes": 1044,
+          "stdout_tail": "{\"counts\": {\"lstat_calls\": 64, \"open_read_close_bytes\": 32768, \"open_read_close_calls\": 64, \"readdir_calls\": 48, \"readdir_entries\": 112, \"readdir_plus_calls\": 48, \"readdir_plus_entries\": 112, \"repeated_read_only_base_open_read_close_bytes\": 16384, \"repeated_read_only_base_open_read_close_calls\": 32, \"scan_bytes\": 8192, \"scan_files\": 8, \"stat_calls\": 64}, \"digest\": \"2a4cbd6c46e735852e5978c5c5d9b309e3b7fcdb1033d997e4d6e760c67eb3ed\", \"parameters\": {\"max_dirs\": 6, \"max_files\": 8, \"open_iterations\": 8, \"open_read_bytes\": 512, \"readdir_iterations\": 8, \"repeated_read_files\": 4, \"repeated_read_iterations\": 8, \"scan_bytes\": 1024, \"stat_iterations\": 8}, \"phase_seconds\": {\"bounded_file_scan\": 0.00021643599029630423, \"open_read_close_loop\": 0.0006849460187368095, \"readdir_plus_storm\": 0.0005319470074027777, \"readdir_storm\": 0.0002945849555544555, \"repeated_read_only_base_open_read_close_loop\": 0.0002966630272567272, \"stat_lstat_storm\": 0.0004334250115789473, \"tree_discovery\": 0.00023138796677812934}, \"total_seconds\": 0.0026988849858753383}\n",
+          "timed_out": false
+        },
+        "timing": {
+          "outer_seconds": 0.04775080498075113,
+          "startup_or_session_overhead_seconds": 0.04505191999487579,
+          "workload_seconds": 0.0026988849858753383
+        },
+        "warmup": null,
+        "workload": {
+          "counts": {
+            "lstat_calls": 64,
+            "open_read_close_bytes": 32768,
+            "open_read_close_calls": 64,
+            "readdir_calls": 48,
+            "readdir_entries": 112,
+            "readdir_plus_calls": 48,
+            "readdir_plus_entries": 112,
+            "repeated_read_only_base_open_read_close_bytes": 16384,
+            "repeated_read_only_base_open_read_close_calls": 32,
+            "scan_bytes": 8192,
+            "scan_files": 8,
+            "stat_calls": 64
+          },
+          "digest": "2a4cbd6c46e735852e5978c5c5d9b309e3b7fcdb1033d997e4d6e760c67eb3ed",
+          "parameters": {
+            "max_dirs": 6,
+            "max_files": 8,
+            "open_iterations": 8,
+            "open_read_bytes": 512,
+            "readdir_iterations": 8,
+            "repeated_read_files": 4,
+            "repeated_read_iterations": 8,
+            "scan_bytes": 1024,
+            "stat_iterations": 8
+          },
+          "phase_seconds": {
+            "bounded_file_scan": 0.00021643599029630423,
+            "open_read_close_loop": 0.0006849460187368095,
+            "readdir_plus_storm": 0.0005319470074027777,
+            "readdir_storm": 0.0002945849555544555,
+            "repeated_read_only_base_open_read_close_loop": 0.0002966630272567272,
+            "stat_lstat_storm": 0.0004334250115789473,
+            "tree_discovery": 0.00023138796677812934
+          },
+          "total_seconds": 0.0026988849858753383
+        }
+      },
+      "session": "read-path-ef380b8289744463aa27c6894b86f145-cold",
+      "steady_state": {
+        "agentfs_workload_seconds": 0.036035060009453446,
+        "native_workload_seconds": 0.0026988849858753383,
+        "ratio": 13.351832404138584
+      },
+      "summary": {
+        "agentfs_seconds": 0.13890027400339022,
+        "native_seconds": 0.04775080498075113,
+        "ratio": 2.9088572236506263
+      }
+    },
+    {
+      "agentfs": {
+        "profile_counters": {
+          "last_by_source": {},
+          "max_counters": {},
+          "summary_count": 0
+        },
+        "profile_summaries": [],
+        "run": {
+          "argv": [
+            "/home/ain3sh/factory/vfs-bench-main/cli/target/release/agentfs",
+            "run",
+            "--session",
+            "read-path-ef380b8289744463aa27c6894b86f145-warm",
+            "--no-default-allows",
+            "--",
+            "/usr/bin/python3",
+            "-c",
+            "\nimport argparse\nimport hashlib\nimport json\nimport os\nimport stat as stat_module\nimport time\nfrom pathlib import Path\n\n\ndef positive_int(value):\n    parsed = int(value)\n    if parsed < 1:\n        raise argparse.ArgumentTypeError(\"must be >= 1\")\n    return parsed\n\n\ndef non_negative_int(value):\n    parsed = int(value)\n    if parsed < 0:\n        raise argparse.ArgumentTypeError(\"must be >= 0\")\n    return parsed\n\n\nparser = argparse.ArgumentParser()\nparser.add_argument(\"--max-files\", type=positive_int, required=True)\nparser.add_argument(\"--max-dirs\", type=positive_int, required=True)\nparser.add_argument(\"--scan-bytes\", type=positive_int, required=True)\nparser.add_argument(\"--stat-iterations\", type=positive_int, required=True)\nparser.add_argument(\"--readdir-iterations\", type=positive_int, required=True)\nparser.add_argument(\"--open-iterations\", type=positive_int, required=True)\nparser.add_argument(\"--open-read-bytes\", type=positive_int, required=True)\nparser.add_argument(\"--repeated-read-iterations\", type=non_negative_int, required=True)\nparser.add_argument(\"--repeated-read-files\", type=positive_int, required=True)\nargs = parser.parse_args()\n\nroot = Path.cwd()\nstarted_total = time.perf_counter()\nstarted = time.perf_counter()\nall_files = sorted(path for path in root.rglob(\"*\") if path.is_file())\nall_dirs = sorted(path for path in root.rglob(\"*\") if path.is_dir())\nfiles = all_files[: args.max_files]\ndirs = [root] + all_dirs[: max(0, args.max_dirs - 1)]\ndigest = hashlib.sha256()\nphase_seconds = {\n    \"tree_discovery\": time.perf_counter() - started,\n}\ncounts = {\n    \"scan_files\": 0,\n    \"scan_bytes\": 0,\n    \"stat_calls\": 0,\n    \"lstat_calls\": 0,\n    \"readdir_calls\": 0,\n    \"readdir_entries\": 0,\n    \"readdir_plus_calls\": 0,\n    \"readdir_plus_entries\": 0,\n    \"open_read_close_calls\": 0,\n    \"open_read_close_bytes\": 0,\n    \"repeated_read_only_base_open_read_close_calls\": 0,\n    \"repeated_read_only_base_open_read_close_bytes\": 0,\n}\n\nstarted = time.perf_counter()\nfor path in files:\n    rel = path.relative_to(root).as_posix()\n    data = path.read_bytes()[: args.scan_bytes]\n    digest.update(b\"scan\\0\")\n    digest.update(rel.encode(\"utf-8\"))\n    digest.update(b\"\\0\")\n    digest.update(data)\n    counts[\"scan_files\"] += 1\n    counts[\"scan_bytes\"] += len(data)\nphase_seconds[\"bounded_file_scan\"] = time.perf_counter() - started\n\nstarted = time.perf_counter()\nfor _ in range(args.stat_iterations):\n    for path in files:\n        stat_result = os.stat(path)\n        lstat_result = os.lstat(path)\n        digest.update(b\"stat\\0\")\n        digest.update(path.relative_to(root).as_posix().encode(\"utf-8\"))\n        digest.update(\n            f\":{stat_result.st_size}:{stat_module.S_IFMT(lstat_result.st_mode)}\".encode(\"ascii\")\n        )\n        counts[\"stat_calls\"] += 1\n        counts[\"lstat_calls\"] += 1\nphase_seconds[\"stat_lstat_storm\"] = time.perf_counter() - started\n\nstarted = time.perf_counter()\nfor _ in range(args.readdir_iterations):\n    for path in dirs:\n        names = sorted(os.listdir(path))\n        digest.update(b\"readdir\\0\")\n        digest.update(path.relative_to(root).as_posix().encode(\"utf-8\"))\n        digest.update(b\"\\0\")\n        digest.update(\"\\0\".join(names).encode(\"utf-8\"))\n        counts[\"readdir_calls\"] += 1\n        counts[\"readdir_entries\"] += len(names)\nphase_seconds[\"readdir_storm\"] = time.perf_counter() - started\n\nstarted = time.perf_counter()\nfor _ in range(args.readdir_iterations):\n    for path in dirs:\n        with os.scandir(path) as iterator:\n            entries = []\n            for entry in iterator:\n                stat_result = entry.stat(follow_symlinks=False)\n                mode_type = stat_module.S_IFMT(stat_result.st_mode)\n                if stat_module.S_ISREG(stat_result.st_mode):\n                    size = stat_result.st_size\n                else:\n                    size = 0\n                entries.append((entry.name, size, mode_type))\n        entries.sort()\n        digest.update(b\"readdir_plus\\0\")\n        digest.update(path.relative_to(root).as_posix().encode(\"utf-8\"))\n        digest.update(b\"\\0\")\n        digest.update(json.dumps(entries, separators=(\",\", \":\")).encode(\"utf-8\"))\n        counts[\"readdir_plus_calls\"] += 1\n        counts[\"readdir_plus_entries\"] += len(entries)\nphase_seconds[\"readdir_plus_storm\"] = time.perf_counter() - started\n\nstarted = time.perf_counter()\nfor _ in range(args.open_iterations):\n    for path in files:\n        with path.open(\"rb\") as handle:\n            data = handle.read(args.open_read_bytes)\n        digest.update(b\"open-read-close\\0\")\n        digest.update(path.relative_to(root).as_posix().encode(\"utf-8\"))\n        digest.update(b\"\\0\")\n        digest.update(data)\n        counts[\"open_read_close_calls\"] += 1\n        counts[\"open_read_close_bytes\"] += len(data)\nphase_seconds[\"open_read_close_loop\"] = time.perf_counter() - started\n\nstarted = time.perf_counter()\nif args.repeated_read_iterations:\n    repeat_files = files[: args.repeated_read_files]\n    for _ in range(args.repeated_read_iterations):\n        for path in repeat_files:\n            with path.open(\"rb\") as handle:\n                data = handle.read(args.open_read_bytes)\n            digest.update(b\"repeated-open-read-close\\0\")\n            digest.update(path.relative_to(root).as_posix().encode(\"utf-8\"))\n            digest.update(b\"\\0\")\n            digest.update(data)\n            counts[\"repeated_read_only_base_open_read_close_calls\"] += 1\n            counts[\"repeated_read_only_base_open_read_close_bytes\"] += len(data)\nphase_seconds[\"repeated_read_only_base_open_read_close_loop\"] = time.perf_counter() - started\n\nprint(json.dumps({\n    \"digest\": digest.hexdigest(),\n    \"phase_seconds\": phase_seconds,\n    \"total_seconds\": time.perf_counter() - started_total,\n    \"counts\": counts,\n    \"parameters\": {\n        \"max_files\": args.max_files,\n        \"max_dirs\": args.max_dirs,\n        \"scan_bytes\": args.scan_bytes,\n        \"stat_iterations\": args.stat_iterations,\n        \"readdir_iterations\": args.readdir_iterations,\n        \"open_iterations\": args.open_iterations,\n        \"open_read_bytes\": args.open_read_bytes,\n        \"repeated_read_iterations\": args.repeated_read_iterations,\n        \"repeated_read_files\": args.repeated_read_files,\n    },\n}, sort_keys=True))\n",
+            "--max-files",
+            "8",
+            "--max-dirs",
+            "6",
+            "--scan-bytes",
+            "1024",
+            "--stat-iterations",
+            "8",
+            "--readdir-iterations",
+            "8",
+            "--open-iterations",
+            "8",
+            "--open-read-bytes",
+            "512",
+            "--repeated-read-iterations",
+            "8",
+            "--repeated-read-files",
+            "4"
+          ],
+          "cwd": "/tmp/agentfs-read-path-benchmark-3q5cbivs/agentfs-base",
+          "duration_seconds": 0.13396335195284337,
+          "profile_summaries": [],
+          "returncode": 0,
+          "stderr_bytes": 542,
+          "stderr_tail": "Welcome to AgentFS!\n\nThe following directories are writable:\n\n  - /tmp/agentfs-read-path-benchmark-3q5cbivs/agentfs-base (copy-on-write)\n\n\ud83d\udd12 Everything else is read-only.\n\nTo join this session from another terminal:\n\n  agentfs run --session read-path-ef380b8289744463aa27c6894b86f145-warm <command>\n\n\nSession: read-path-ef380b8289744463aa27c6894b86f145-warm\n\nTo resume this session:\n  agentfs run --session read-path-ef380b8289744463aa27c6894b86f145-warm\n\nTo see what changed:\n  agentfs diff read-path-ef380b8289744463aa27c6894b86f145-warm\n",
+          "stdout_bytes": 1036,
+          "stdout_tail": "{\"counts\": {\"lstat_calls\": 64, \"open_read_close_bytes\": 32768, \"open_read_close_calls\": 64, \"readdir_calls\": 48, \"readdir_entries\": 112, \"readdir_plus_calls\": 48, \"readdir_plus_entries\": 112, \"repeated_read_only_base_open_read_close_bytes\": 16384, \"repeated_read_only_base_open_read_close_calls\": 32, \"scan_bytes\": 8192, \"scan_files\": 8, \"stat_calls\": 64}, \"digest\": \"2a4cbd6c46e735852e5978c5c5d9b309e3b7fcdb1033d997e4d6e760c67eb3ed\", \"parameters\": {\"max_dirs\": 6, \"max_files\": 8, \"open_iterations\": 8, \"open_read_bytes\": 512, \"readdir_iterations\": 8, \"repeated_read_files\": 4, \"repeated_read_iterations\": 8, \"scan_bytes\": 1024, \"stat_iterations\": 8}, \"phase_seconds\": {\"bounded_file_scan\": 0.0015994979767128825, \"open_read_close_loop\": 0.006539949041325599, \"readdir_plus_storm\": 0.004276896012015641, \"readdir_storm\": 0.002759224036708474, \"repeated_read_only_base_open_read_close_loop\": 0.002996590978000313, \"stat_lstat_storm\": 0.000990521046333015, \"tree_discovery\": 0.0028513279976323247}, \"total_seconds\": 0.022043189965188503}\n",
+          "timed_out": false
+        },
+        "timing": {
+          "outer_seconds": 0.13396335195284337,
+          "startup_or_session_overhead_seconds": 0.11192016198765486,
+          "workload_seconds": 0.022043189965188503
+        },
+        "warmup": {
+          "argv": [
+            "/home/ain3sh/factory/vfs-bench-main/cli/target/release/agentfs",
+            "run",
+            "--session",
+            "read-path-ef380b8289744463aa27c6894b86f145-warm",
+            "--no-default-allows",
+            "--",
+            "/usr/bin/python3",
+            "-c",
+            "\nimport argparse\nimport hashlib\nimport json\nimport os\nimport stat as stat_module\nimport time\nfrom pathlib import Path\n\n\ndef positive_int(value):\n    parsed = int(value)\n    if parsed < 1:\n        raise argparse.ArgumentTypeError(\"must be >= 1\")\n    return parsed\n\n\ndef non_negative_int(value):\n    parsed = int(value)\n    if parsed < 0:\n        raise argparse.ArgumentTypeError(\"must be >= 0\")\n    return parsed\n\n\nparser = argparse.ArgumentParser()\nparser.add_argument(\"--max-files\", type=positive_int, required=True)\nparser.add_argument(\"--max-dirs\", type=positive_int, required=True)\nparser.add_argument(\"--scan-bytes\", type=positive_int, required=True)\nparser.add_argument(\"--stat-iterations\", type=positive_int, required=True)\nparser.add_argument(\"--readdir-iterations\", type=positive_int, required=True)\nparser.add_argument(\"--open-iterations\", type=positive_int, required=True)\nparser.add_argument(\"--open-read-bytes\", type=positive_int, required=True)\nparser.add_argument(\"--repeated-read-iterations\", type=non_negative_int, required=True)\nparser.add_argument(\"--repeated-read-files\", type=positive_int, required=True)\nargs = parser.parse_args()\n\nroot = Path.cwd()\nstarted_total = time.perf_counter()\nstarted = time.perf_counter()\nall_files = sorted(path for path in root.rglob(\"*\") if path.is_file())\nall_dirs = sorted(path for path in root.rglob(\"*\") if path.is_dir())\nfiles = all_files[: args.max_files]\ndirs = [root] + all_dirs[: max(0, args.max_dirs - 1)]\ndigest = hashlib.sha256()\nphase_seconds = {\n    \"tree_discovery\": time.perf_counter() - started,\n}\ncounts = {\n    \"scan_files\": 0,\n    \"scan_bytes\": 0,\n    \"stat_calls\": 0,\n    \"lstat_calls\": 0,\n    \"readdir_calls\": 0,\n    \"readdir_entries\": 0,\n    \"readdir_plus_calls\": 0,\n    \"readdir_plus_entries\": 0,\n    \"open_read_close_calls\": 0,\n    \"open_read_close_bytes\": 0,\n    \"repeated_read_only_base_open_read_close_calls\": 0,\n    \"repeated_read_only_base_open_read_close_bytes\": 0,\n}\n\nstarted = time.perf_counter()\nfor path in files:\n    rel = path.relative_to(root).as_posix()\n    data = path.read_bytes()[: args.scan_bytes]\n    digest.update(b\"scan\\0\")\n    digest.update(rel.encode(\"utf-8\"))\n    digest.update(b\"\\0\")\n    digest.update(data)\n    counts[\"scan_files\"] += 1\n    counts[\"scan_bytes\"] += len(data)\nphase_seconds[\"bounded_file_scan\"] = time.perf_counter() - started\n\nstarted = time.perf_counter()\nfor _ in range(args.stat_iterations):\n    for path in files:\n        stat_result = os.stat(path)\n        lstat_result = os.lstat(path)\n        digest.update(b\"stat\\0\")\n        digest.update(path.relative_to(root).as_posix().encode(\"utf-8\"))\n        digest.update(\n            f\":{stat_result.st_size}:{stat_module.S_IFMT(lstat_result.st_mode)}\".encode(\"ascii\")\n        )\n        counts[\"stat_calls\"] += 1\n        counts[\"lstat_calls\"] += 1\nphase_seconds[\"stat_lstat_storm\"] = time.perf_counter() - started\n\nstarted = time.perf_counter()\nfor _ in range(args.readdir_iterations):\n    for path in dirs:\n        names = sorted(os.listdir(path))\n        digest.update(b\"readdir\\0\")\n        digest.update(path.relative_to(root).as_posix().encode(\"utf-8\"))\n        digest.update(b\"\\0\")\n        digest.update(\"\\0\".join(names).encode(\"utf-8\"))\n        counts[\"readdir_calls\"] += 1\n        counts[\"readdir_entries\"] += len(names)\nphase_seconds[\"readdir_storm\"] = time.perf_counter() - started\n\nstarted = time.perf_counter()\nfor _ in range(args.readdir_iterations):\n    for path in dirs:\n        with os.scandir(path) as iterator:\n            entries = []\n            for entry in iterator:\n                stat_result = entry.stat(follow_symlinks=False)\n                mode_type = stat_module.S_IFMT(stat_result.st_mode)\n                if stat_module.S_ISREG(stat_result.st_mode):\n                    size = stat_result.st_size\n                else:\n                    size = 0\n                entries.append((entry.name, size, mode_type))\n        entries.sort()\n        digest.update(b\"readdir_plus\\0\")\n        digest.update(path.relative_to(root).as_posix().encode(\"utf-8\"))\n        digest.update(b\"\\0\")\n        digest.update(json.dumps(entries, separators=(\",\", \":\")).encode(\"utf-8\"))\n        counts[\"readdir_plus_calls\"] += 1\n        counts[\"readdir_plus_entries\"] += len(entries)\nphase_seconds[\"readdir_plus_storm\"] = time.perf_counter() - started\n\nstarted = time.perf_counter()\nfor _ in range(args.open_iterations):\n    for path in files:\n        with path.open(\"rb\") as handle:\n            data = handle.read(args.open_read_bytes)\n        digest.update(b\"open-read-close\\0\")\n        digest.update(path.relative_to(root).as_posix().encode(\"utf-8\"))\n        digest.update(b\"\\0\")\n        digest.update(data)\n        counts[\"open_read_close_calls\"] += 1\n        counts[\"open_read_close_bytes\"] += len(data)\nphase_seconds[\"open_read_close_loop\"] = time.perf_counter() - started\n\nstarted = time.perf_counter()\nif args.repeated_read_iterations:\n    repeat_files = files[: args.repeated_read_files]\n    for _ in range(args.repeated_read_iterations):\n        for path in repeat_files:\n            with path.open(\"rb\") as handle:\n                data = handle.read(args.open_read_bytes)\n            digest.update(b\"repeated-open-read-close\\0\")\n            digest.update(path.relative_to(root).as_posix().encode(\"utf-8\"))\n            digest.update(b\"\\0\")\n            digest.update(data)\n            counts[\"repeated_read_only_base_open_read_close_calls\"] += 1\n            counts[\"repeated_read_only_base_open_read_close_bytes\"] += len(data)\nphase_seconds[\"repeated_read_only_base_open_read_close_loop\"] = time.perf_counter() - started\n\nprint(json.dumps({\n    \"digest\": digest.hexdigest(),\n    \"phase_seconds\": phase_seconds,\n    \"total_seconds\": time.perf_counter() - started_total,\n    \"counts\": counts,\n    \"parameters\": {\n        \"max_files\": args.max_files,\n        \"max_dirs\": args.max_dirs,\n        \"scan_bytes\": args.scan_bytes,\n        \"stat_iterations\": args.stat_iterations,\n        \"readdir_iterations\": args.readdir_iterations,\n        \"open_iterations\": args.open_iterations,\n        \"open_read_bytes\": args.open_read_bytes,\n        \"repeated_read_iterations\": args.repeated_read_iterations,\n        \"repeated_read_files\": args.repeated_read_files,\n    },\n}, sort_keys=True))\n",
+            "--max-files",
+            "8",
+            "--max-dirs",
+            "6",
+            "--scan-bytes",
+            "1024",
+            "--stat-iterations",
+            "8",
+            "--readdir-iterations",
+            "8",
+            "--open-iterations",
+            "8",
+            "--open-read-bytes",
+            "512",
+            "--repeated-read-iterations",
+            "8",
+            "--repeated-read-files",
+            "4"
+          ],
+          "cwd": "/tmp/agentfs-read-path-benchmark-3q5cbivs/agentfs-base",
+          "duration_seconds": 0.14251168997725472,
+          "profile_summaries": [],
+          "returncode": 0,
+          "stderr_bytes": 542,
+          "stderr_tail": "Welcome to AgentFS!\n\nThe following directories are writable:\n\n  - /tmp/agentfs-read-path-benchmark-3q5cbivs/agentfs-base (copy-on-write)\n\n\ud83d\udd12 Everything else is read-only.\n\nTo join this session from another terminal:\n\n  agentfs run --session read-path-ef380b8289744463aa27c6894b86f145-warm <command>\n\n\nSession: read-path-ef380b8289744463aa27c6894b86f145-warm\n\nTo resume this session:\n  agentfs run --session read-path-ef380b8289744463aa27c6894b86f145-warm\n\nTo see what changed:\n  agentfs diff read-path-ef380b8289744463aa27c6894b86f145-warm\n",
+          "stdout_bytes": 1034,
+          "stdout_tail": "{\"counts\": {\"lstat_calls\": 64, \"open_read_close_bytes\": 32768, \"open_read_close_calls\": 64, \"readdir_calls\": 48, \"readdir_entries\": 112, \"readdir_plus_calls\": 48, \"readdir_plus_entries\": 112, \"repeated_read_only_base_open_read_close_bytes\": 16384, \"repeated_read_only_base_open_read_close_calls\": 32, \"scan_bytes\": 8192, \"scan_files\": 8, \"stat_calls\": 64}, \"digest\": \"2a4cbd6c46e735852e5978c5c5d9b309e3b7fcdb1033d997e4d6e760c67eb3ed\", \"parameters\": {\"max_dirs\": 6, \"max_files\": 8, \"open_iterations\": 8, \"open_read_bytes\": 512, \"readdir_iterations\": 8, \"repeated_read_files\": 4, \"repeated_read_iterations\": 8, \"scan_bytes\": 1024, \"stat_iterations\": 8}, \"phase_seconds\": {\"bounded_file_scan\": 0.006063108041416854, \"open_read_close_loop\": 0.00797596201300621, \"readdir_plus_storm\": 0.004367112007457763, \"readdir_storm\": 0.003733032033778727, \"repeated_read_only_base_open_read_close_loop\": 0.0032521660323254764, \"stat_lstat_storm\": 0.0005500889965333045, \"tree_discovery\": 0.003896751964930445}, \"total_seconds\": 0.02986235701246187}\n",
+          "timed_out": false
+        },
+        "workload": {
+          "counts": {
+            "lstat_calls": 64,
+            "open_read_close_bytes": 32768,
+            "open_read_close_calls": 64,
+            "readdir_calls": 48,
+            "readdir_entries": 112,
+            "readdir_plus_calls": 48,
+            "readdir_plus_entries": 112,
+            "repeated_read_only_base_open_read_close_bytes": 16384,
+            "repeated_read_only_base_open_read_close_calls": 32,
+            "scan_bytes": 8192,
+            "scan_files": 8,
+            "stat_calls": 64
+          },
+          "digest": "2a4cbd6c46e735852e5978c5c5d9b309e3b7fcdb1033d997e4d6e760c67eb3ed",
+          "parameters": {
+            "max_dirs": 6,
+            "max_files": 8,
+            "open_iterations": 8,
+            "open_read_bytes": 512,
+            "readdir_iterations": 8,
+            "repeated_read_files": 4,
+            "repeated_read_iterations": 8,
+            "scan_bytes": 1024,
+            "stat_iterations": 8
+          },
+          "phase_seconds": {
+            "bounded_file_scan": 0.0015994979767128825,
+            "open_read_close_loop": 0.006539949041325599,
+            "readdir_plus_storm": 0.004276896012015641,
+            "readdir_storm": 0.002759224036708474,
+            "repeated_read_only_base_open_read_close_loop": 0.002996590978000313,
+            "stat_lstat_storm": 0.000990521046333015,
+            "tree_discovery": 0.0028513279976323247
+          },
+          "total_seconds": 0.022043189965188503
+        }
+      },
+      "equivalence": {
+        "agentfs_digest": "2a4cbd6c46e735852e5978c5c5d9b309e3b7fcdb1033d997e4d6e760c67eb3ed",
+        "checked": true,
+        "equivalent": true,
+        "native_digest": "2a4cbd6c46e735852e5978c5c5d9b309e3b7fcdb1033d997e4d6e760c67eb3ed"
+      },
+      "mode": "warm",
+      "native": {
+        "run": {
+          "argv": [
+            "/usr/bin/python3",
+            "-c",
+            "\nimport argparse\nimport hashlib\nimport json\nimport os\nimport stat as stat_module\nimport time\nfrom pathlib import Path\n\n\ndef positive_int(value):\n    parsed = int(value)\n    if parsed < 1:\n        raise argparse.ArgumentTypeError(\"must be >= 1\")\n    return parsed\n\n\ndef non_negative_int(value):\n    parsed = int(value)\n    if parsed < 0:\n        raise argparse.ArgumentTypeError(\"must be >= 0\")\n    return parsed\n\n\nparser = argparse.ArgumentParser()\nparser.add_argument(\"--max-files\", type=positive_int, required=True)\nparser.add_argument(\"--max-dirs\", type=positive_int, required=True)\nparser.add_argument(\"--scan-bytes\", type=positive_int, required=True)\nparser.add_argument(\"--stat-iterations\", type=positive_int, required=True)\nparser.add_argument(\"--readdir-iterations\", type=positive_int, required=True)\nparser.add_argument(\"--open-iterations\", type=positive_int, required=True)\nparser.add_argument(\"--open-read-bytes\", type=positive_int, required=True)\nparser.add_argument(\"--repeated-read-iterations\", type=non_negative_int, required=True)\nparser.add_argument(\"--repeated-read-files\", type=positive_int, required=True)\nargs = parser.parse_args()\n\nroot = Path.cwd()\nstarted_total = time.perf_counter()\nstarted = time.perf_counter()\nall_files = sorted(path for path in root.rglob(\"*\") if path.is_file())\nall_dirs = sorted(path for path in root.rglob(\"*\") if path.is_dir())\nfiles = all_files[: args.max_files]\ndirs = [root] + all_dirs[: max(0, args.max_dirs - 1)]\ndigest = hashlib.sha256()\nphase_seconds = {\n    \"tree_discovery\": time.perf_counter() - started,\n}\ncounts = {\n    \"scan_files\": 0,\n    \"scan_bytes\": 0,\n    \"stat_calls\": 0,\n    \"lstat_calls\": 0,\n    \"readdir_calls\": 0,\n    \"readdir_entries\": 0,\n    \"readdir_plus_calls\": 0,\n    \"readdir_plus_entries\": 0,\n    \"open_read_close_calls\": 0,\n    \"open_read_close_bytes\": 0,\n    \"repeated_read_only_base_open_read_close_calls\": 0,\n    \"repeated_read_only_base_open_read_close_bytes\": 0,\n}\n\nstarted = time.perf_counter()\nfor path in files:\n    rel = path.relative_to(root).as_posix()\n    data = path.read_bytes()[: args.scan_bytes]\n    digest.update(b\"scan\\0\")\n    digest.update(rel.encode(\"utf-8\"))\n    digest.update(b\"\\0\")\n    digest.update(data)\n    counts[\"scan_files\"] += 1\n    counts[\"scan_bytes\"] += len(data)\nphase_seconds[\"bounded_file_scan\"] = time.perf_counter() - started\n\nstarted = time.perf_counter()\nfor _ in range(args.stat_iterations):\n    for path in files:\n        stat_result = os.stat(path)\n        lstat_result = os.lstat(path)\n        digest.update(b\"stat\\0\")\n        digest.update(path.relative_to(root).as_posix().encode(\"utf-8\"))\n        digest.update(\n            f\":{stat_result.st_size}:{stat_module.S_IFMT(lstat_result.st_mode)}\".encode(\"ascii\")\n        )\n        counts[\"stat_calls\"] += 1\n        counts[\"lstat_calls\"] += 1\nphase_seconds[\"stat_lstat_storm\"] = time.perf_counter() - started\n\nstarted = time.perf_counter()\nfor _ in range(args.readdir_iterations):\n    for path in dirs:\n        names = sorted(os.listdir(path))\n        digest.update(b\"readdir\\0\")\n        digest.update(path.relative_to(root).as_posix().encode(\"utf-8\"))\n        digest.update(b\"\\0\")\n        digest.update(\"\\0\".join(names).encode(\"utf-8\"))\n        counts[\"readdir_calls\"] += 1\n        counts[\"readdir_entries\"] += len(names)\nphase_seconds[\"readdir_storm\"] = time.perf_counter() - started\n\nstarted = time.perf_counter()\nfor _ in range(args.readdir_iterations):\n    for path in dirs:\n        with os.scandir(path) as iterator:\n            entries = []\n            for entry in iterator:\n                stat_result = entry.stat(follow_symlinks=False)\n                mode_type = stat_module.S_IFMT(stat_result.st_mode)\n                if stat_module.S_ISREG(stat_result.st_mode):\n                    size = stat_result.st_size\n                else:\n                    size = 0\n                entries.append((entry.name, size, mode_type))\n        entries.sort()\n        digest.update(b\"readdir_plus\\0\")\n        digest.update(path.relative_to(root).as_posix().encode(\"utf-8\"))\n        digest.update(b\"\\0\")\n        digest.update(json.dumps(entries, separators=(\",\", \":\")).encode(\"utf-8\"))\n        counts[\"readdir_plus_calls\"] += 1\n        counts[\"readdir_plus_entries\"] += len(entries)\nphase_seconds[\"readdir_plus_storm\"] = time.perf_counter() - started\n\nstarted = time.perf_counter()\nfor _ in range(args.open_iterations):\n    for path in files:\n        with path.open(\"rb\") as handle:\n            data = handle.read(args.open_read_bytes)\n        digest.update(b\"open-read-close\\0\")\n        digest.update(path.relative_to(root).as_posix().encode(\"utf-8\"))\n        digest.update(b\"\\0\")\n        digest.update(data)\n        counts[\"open_read_close_calls\"] += 1\n        counts[\"open_read_close_bytes\"] += len(data)\nphase_seconds[\"open_read_close_loop\"] = time.perf_counter() - started\n\nstarted = time.perf_counter()\nif args.repeated_read_iterations:\n    repeat_files = files[: args.repeated_read_files]\n    for _ in range(args.repeated_read_iterations):\n        for path in repeat_files:\n            with path.open(\"rb\") as handle:\n                data = handle.read(args.open_read_bytes)\n            digest.update(b\"repeated-open-read-close\\0\")\n            digest.update(path.relative_to(root).as_posix().encode(\"utf-8\"))\n            digest.update(b\"\\0\")\n            digest.update(data)\n            counts[\"repeated_read_only_base_open_read_close_calls\"] += 1\n            counts[\"repeated_read_only_base_open_read_close_bytes\"] += len(data)\nphase_seconds[\"repeated_read_only_base_open_read_close_loop\"] = time.perf_counter() - started\n\nprint(json.dumps({\n    \"digest\": digest.hexdigest(),\n    \"phase_seconds\": phase_seconds,\n    \"total_seconds\": time.perf_counter() - started_total,\n    \"counts\": counts,\n    \"parameters\": {\n        \"max_files\": args.max_files,\n        \"max_dirs\": args.max_dirs,\n        \"scan_bytes\": args.scan_bytes,\n        \"stat_iterations\": args.stat_iterations,\n        \"readdir_iterations\": args.readdir_iterations,\n        \"open_iterations\": args.open_iterations,\n        \"open_read_bytes\": args.open_read_bytes,\n        \"repeated_read_iterations\": args.repeated_read_iterations,\n        \"repeated_read_files\": args.repeated_read_files,\n    },\n}, sort_keys=True))\n",
+            "--max-files",
+            "8",
+            "--max-dirs",
+            "6",
+            "--scan-bytes",
+            "1024",
+            "--stat-iterations",
+            "8",
+            "--readdir-iterations",
+            "8",
+            "--open-iterations",
+            "8",
+            "--open-read-bytes",
+            "512",
+            "--repeated-read-iterations",
+            "8",
+            "--repeated-read-files",
+            "4"
+          ],
+          "cwd": "/tmp/agentfs-read-path-benchmark-3q5cbivs/native",
+          "duration_seconds": 0.053466735989786685,
+          "profile_summaries": [],
+          "returncode": 0,
+          "stderr_bytes": 0,
+          "stderr_tail": "",
+          "stdout_bytes": 1045,
+          "stdout_tail": "{\"counts\": {\"lstat_calls\": 64, \"open_read_close_bytes\": 32768, \"open_read_close_calls\": 64, \"readdir_calls\": 48, \"readdir_entries\": 112, \"readdir_plus_calls\": 48, \"readdir_plus_entries\": 112, \"repeated_read_only_base_open_read_close_bytes\": 16384, \"repeated_read_only_base_open_read_close_calls\": 32, \"scan_bytes\": 8192, \"scan_files\": 8, \"stat_calls\": 64}, \"digest\": \"2a4cbd6c46e735852e5978c5c5d9b309e3b7fcdb1033d997e4d6e760c67eb3ed\", \"parameters\": {\"max_dirs\": 6, \"max_files\": 8, \"open_iterations\": 8, \"open_read_bytes\": 512, \"readdir_iterations\": 8, \"repeated_read_files\": 4, \"repeated_read_iterations\": 8, \"scan_bytes\": 1024, \"stat_iterations\": 8}, \"phase_seconds\": {\"bounded_file_scan\": 0.00020308303646743298, \"open_read_close_loop\": 0.0007963979733176529, \"readdir_plus_storm\": 0.0005390289588831365, \"readdir_storm\": 0.00029465899569913745, \"repeated_read_only_base_open_read_close_loop\": 0.0002948609762825072, \"stat_lstat_storm\": 0.00045614101691171527, \"tree_discovery\": 0.0002476610243320465}, \"total_seconds\": 0.0028409650549292564}\n",
+          "timed_out": false
+        },
+        "timing": {
+          "outer_seconds": 0.053466735989786685,
+          "startup_or_session_overhead_seconds": 0.05062577093485743,
+          "workload_seconds": 0.0028409650549292564
+        },
+        "warmup": {
+          "argv": [
+            "/usr/bin/python3",
+            "-c",
+            "\nimport argparse\nimport hashlib\nimport json\nimport os\nimport stat as stat_module\nimport time\nfrom pathlib import Path\n\n\ndef positive_int(value):\n    parsed = int(value)\n    if parsed < 1:\n        raise argparse.ArgumentTypeError(\"must be >= 1\")\n    return parsed\n\n\ndef non_negative_int(value):\n    parsed = int(value)\n    if parsed < 0:\n        raise argparse.ArgumentTypeError(\"must be >= 0\")\n    return parsed\n\n\nparser = argparse.ArgumentParser()\nparser.add_argument(\"--max-files\", type=positive_int, required=True)\nparser.add_argument(\"--max-dirs\", type=positive_int, required=True)\nparser.add_argument(\"--scan-bytes\", type=positive_int, required=True)\nparser.add_argument(\"--stat-iterations\", type=positive_int, required=True)\nparser.add_argument(\"--readdir-iterations\", type=positive_int, required=True)\nparser.add_argument(\"--open-iterations\", type=positive_int, required=True)\nparser.add_argument(\"--open-read-bytes\", type=positive_int, required=True)\nparser.add_argument(\"--repeated-read-iterations\", type=non_negative_int, required=True)\nparser.add_argument(\"--repeated-read-files\", type=positive_int, required=True)\nargs = parser.parse_args()\n\nroot = Path.cwd()\nstarted_total = time.perf_counter()\nstarted = time.perf_counter()\nall_files = sorted(path for path in root.rglob(\"*\") if path.is_file())\nall_dirs = sorted(path for path in root.rglob(\"*\") if path.is_dir())\nfiles = all_files[: args.max_files]\ndirs = [root] + all_dirs[: max(0, args.max_dirs - 1)]\ndigest = hashlib.sha256()\nphase_seconds = {\n    \"tree_discovery\": time.perf_counter() - started,\n}\ncounts = {\n    \"scan_files\": 0,\n    \"scan_bytes\": 0,\n    \"stat_calls\": 0,\n    \"lstat_calls\": 0,\n    \"readdir_calls\": 0,\n    \"readdir_entries\": 0,\n    \"readdir_plus_calls\": 0,\n    \"readdir_plus_entries\": 0,\n    \"open_read_close_calls\": 0,\n    \"open_read_close_bytes\": 0,\n    \"repeated_read_only_base_open_read_close_calls\": 0,\n    \"repeated_read_only_base_open_read_close_bytes\": 0,\n}\n\nstarted = time.perf_counter()\nfor path in files:\n    rel = path.relative_to(root).as_posix()\n    data = path.read_bytes()[: args.scan_bytes]\n    digest.update(b\"scan\\0\")\n    digest.update(rel.encode(\"utf-8\"))\n    digest.update(b\"\\0\")\n    digest.update(data)\n    counts[\"scan_files\"] += 1\n    counts[\"scan_bytes\"] += len(data)\nphase_seconds[\"bounded_file_scan\"] = time.perf_counter() - started\n\nstarted = time.perf_counter()\nfor _ in range(args.stat_iterations):\n    for path in files:\n        stat_result = os.stat(path)\n        lstat_result = os.lstat(path)\n        digest.update(b\"stat\\0\")\n        digest.update(path.relative_to(root).as_posix().encode(\"utf-8\"))\n        digest.update(\n            f\":{stat_result.st_size}:{stat_module.S_IFMT(lstat_result.st_mode)}\".encode(\"ascii\")\n        )\n        counts[\"stat_calls\"] += 1\n        counts[\"lstat_calls\"] += 1\nphase_seconds[\"stat_lstat_storm\"] = time.perf_counter() - started\n\nstarted = time.perf_counter()\nfor _ in range(args.readdir_iterations):\n    for path in dirs:\n        names = sorted(os.listdir(path))\n        digest.update(b\"readdir\\0\")\n        digest.update(path.relative_to(root).as_posix().encode(\"utf-8\"))\n        digest.update(b\"\\0\")\n        digest.update(\"\\0\".join(names).encode(\"utf-8\"))\n        counts[\"readdir_calls\"] += 1\n        counts[\"readdir_entries\"] += len(names)\nphase_seconds[\"readdir_storm\"] = time.perf_counter() - started\n\nstarted = time.perf_counter()\nfor _ in range(args.readdir_iterations):\n    for path in dirs:\n        with os.scandir(path) as iterator:\n            entries = []\n            for entry in iterator:\n                stat_result = entry.stat(follow_symlinks=False)\n                mode_type = stat_module.S_IFMT(stat_result.st_mode)\n                if stat_module.S_ISREG(stat_result.st_mode):\n                    size = stat_result.st_size\n                else:\n                    size = 0\n                entries.append((entry.name, size, mode_type))\n        entries.sort()\n        digest.update(b\"readdir_plus\\0\")\n        digest.update(path.relative_to(root).as_posix().encode(\"utf-8\"))\n        digest.update(b\"\\0\")\n        digest.update(json.dumps(entries, separators=(\",\", \":\")).encode(\"utf-8\"))\n        counts[\"readdir_plus_calls\"] += 1\n        counts[\"readdir_plus_entries\"] += len(entries)\nphase_seconds[\"readdir_plus_storm\"] = time.perf_counter() - started\n\nstarted = time.perf_counter()\nfor _ in range(args.open_iterations):\n    for path in files:\n        with path.open(\"rb\") as handle:\n            data = handle.read(args.open_read_bytes)\n        digest.update(b\"open-read-close\\0\")\n        digest.update(path.relative_to(root).as_posix().encode(\"utf-8\"))\n        digest.update(b\"\\0\")\n        digest.update(data)\n        counts[\"open_read_close_calls\"] += 1\n        counts[\"open_read_close_bytes\"] += len(data)\nphase_seconds[\"open_read_close_loop\"] = time.perf_counter() - started\n\nstarted = time.perf_counter()\nif args.repeated_read_iterations:\n    repeat_files = files[: args.repeated_read_files]\n    for _ in range(args.repeated_read_iterations):\n        for path in repeat_files:\n            with path.open(\"rb\") as handle:\n                data = handle.read(args.open_read_bytes)\n            digest.update(b\"repeated-open-read-close\\0\")\n            digest.update(path.relative_to(root).as_posix().encode(\"utf-8\"))\n            digest.update(b\"\\0\")\n            digest.update(data)\n            counts[\"repeated_read_only_base_open_read_close_calls\"] += 1\n            counts[\"repeated_read_only_base_open_read_close_bytes\"] += len(data)\nphase_seconds[\"repeated_read_only_base_open_read_close_loop\"] = time.perf_counter() - started\n\nprint(json.dumps({\n    \"digest\": digest.hexdigest(),\n    \"phase_seconds\": phase_seconds,\n    \"total_seconds\": time.perf_counter() - started_total,\n    \"counts\": counts,\n    \"parameters\": {\n        \"max_files\": args.max_files,\n        \"max_dirs\": args.max_dirs,\n        \"scan_bytes\": args.scan_bytes,\n        \"stat_iterations\": args.stat_iterations,\n        \"readdir_iterations\": args.readdir_iterations,\n        \"open_iterations\": args.open_iterations,\n        \"open_read_bytes\": args.open_read_bytes,\n        \"repeated_read_iterations\": args.repeated_read_iterations,\n        \"repeated_read_files\": args.repeated_read_files,\n    },\n}, sort_keys=True))\n",
+            "--max-files",
+            "8",
+            "--max-dirs",
+            "6",
+            "--scan-bytes",
+            "1024",
+            "--stat-iterations",
+            "8",
+            "--readdir-iterations",
+            "8",
+            "--open-iterations",
+            "8",
+            "--open-read-bytes",
+            "512",
+            "--repeated-read-iterations",
+            "8",
+            "--repeated-read-files",
+            "4"
+          ],
+          "cwd": "/tmp/agentfs-read-path-benchmark-3q5cbivs/native",
+          "duration_seconds": 0.04427310702158138,
+          "profile_summaries": [],
+          "returncode": 0,
+          "stderr_bytes": 0,
+          "stderr_tail": "",
+          "stdout_bytes": 1041,
+          "stdout_tail": "{\"counts\": {\"lstat_calls\": 64, \"open_read_close_bytes\": 32768, \"open_read_close_calls\": 64, \"readdir_calls\": 48, \"readdir_entries\": 112, \"readdir_plus_calls\": 48, \"readdir_plus_entries\": 112, \"repeated_read_only_base_open_read_close_bytes\": 16384, \"repeated_read_only_base_open_read_close_calls\": 32, \"scan_bytes\": 8192, \"scan_files\": 8, \"stat_calls\": 64}, \"digest\": \"2a4cbd6c46e735852e5978c5c5d9b309e3b7fcdb1033d997e4d6e760c67eb3ed\", \"parameters\": {\"max_dirs\": 6, \"max_files\": 8, \"open_iterations\": 8, \"open_read_bytes\": 512, \"readdir_iterations\": 8, \"repeated_read_files\": 4, \"repeated_read_iterations\": 8, \"scan_bytes\": 1024, \"stat_iterations\": 8}, \"phase_seconds\": {\"bounded_file_scan\": 0.00042195699643343687, \"open_read_close_loop\": 0.0009297900251112878, \"readdir_plus_storm\": 0.001158547995146364, \"readdir_storm\": 0.000642688013613224, \"repeated_read_only_base_open_read_close_loop\": 0.00030214700382202864, \"stat_lstat_storm\": 0.0009805219597183168, \"tree_discovery\": 0.0004802049952559173}, \"total_seconds\": 0.004928548005409539}\n",
+          "timed_out": false
+        },
+        "workload": {
+          "counts": {
+            "lstat_calls": 64,
+            "open_read_close_bytes": 32768,
+            "open_read_close_calls": 64,
+            "readdir_calls": 48,
+            "readdir_entries": 112,
+            "readdir_plus_calls": 48,
+            "readdir_plus_entries": 112,
+            "repeated_read_only_base_open_read_close_bytes": 16384,
+            "repeated_read_only_base_open_read_close_calls": 32,
+            "scan_bytes": 8192,
+            "scan_files": 8,
+            "stat_calls": 64
+          },
+          "digest": "2a4cbd6c46e735852e5978c5c5d9b309e3b7fcdb1033d997e4d6e760c67eb3ed",
+          "parameters": {
+            "max_dirs": 6,
+            "max_files": 8,
+            "open_iterations": 8,
+            "open_read_bytes": 512,
+            "readdir_iterations": 8,
+            "repeated_read_files": 4,
+            "repeated_read_iterations": 8,
+            "scan_bytes": 1024,
+            "stat_iterations": 8
+          },
+          "phase_seconds": {
+            "bounded_file_scan": 0.00020308303646743298,
+            "open_read_close_loop": 0.0007963979733176529,
+            "readdir_plus_storm": 0.0005390289588831365,
+            "readdir_storm": 0.00029465899569913745,
+            "repeated_read_only_base_open_read_close_loop": 0.0002948609762825072,
+            "stat_lstat_storm": 0.00045614101691171527,
+            "tree_discovery": 0.0002476610243320465
+          },
+          "total_seconds": 0.0028409650549292564
+        }
+      },
+      "session": "read-path-ef380b8289744463aa27c6894b86f145-warm",
+      "steady_state": {
+        "agentfs_workload_seconds": 0.022043189965188503,
+        "native_workload_seconds": 0.0028409650549292564,
+        "ratio": 7.7590500196199725
+      },
+      "summary": {
+        "agentfs_seconds": 0.13396335195284337,
+        "native_seconds": 0.053466735989786685,
+        "ratio": 2.505545728066013
+      }
+    }
+  ],
+  "output_path": ".agents/benchmarks/tier-two-prep/read-main.json",
+  "parameters": {
+    "dirs": 2,
+    "file_size_bytes": 65536,
+    "files": 8,
+    "modes": [
+      "cold",
+      "warm"
+    ],
+    "open_iterations": 8,
+    "open_read_bytes": 512,
+    "readdir_iterations": 8,
+    "repeated_read_files": 4,
+    "repeated_read_iterations": 8,
+    "scan_bytes": 1024,
+    "stat_iterations": 8
+  },
+  "schema_version": 1,
+  "summary": {
+    "agentfs_seconds": 0.1364318129781168,
+    "all_equivalent": true,
+    "native_seconds": 0.050608770485268906,
+    "ratio": 2.6958136241983803
+  },
+  "temp_dir": "/tmp/agentfs-read-path-benchmark-3q5cbivs"
+}
