@@ -413,6 +413,30 @@ def table_exists(conn: sqlite3.Connection, name: str) -> bool:
     return row is not None
 
 
+def optional_count(conn: sqlite3.Connection, table_name: str) -> Optional[int]:
+    if not table_exists(conn, table_name):
+        return None
+    row = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()
+    return int(row[0])
+
+
+def portability_status(inspect: dict[str, Any]) -> dict[str, Any]:
+    partial_origin_rows = int(inspect.get("fs_partial_origin_rows", 0) or 0)
+    override_rows = int(inspect.get("fs_chunk_override_rows", 0) or 0)
+    stored_bytes = int(inspect.get("fs_data_bytes", 0) or 0) + int(
+        inspect.get("fs_inline_bytes", 0) or 0
+    )
+    materialized_rows = inspect.get("fs_materialized_rows")
+    return {
+        "portable": partial_origin_rows == 0,
+        "origin_backed": partial_origin_rows > 0,
+        "partial_origin_rows": partial_origin_rows,
+        "override_rows": override_rows,
+        "stored_bytes": stored_bytes,
+        "materialized_rows": materialized_rows,
+    }
+
+
 def inspect_db(db_path: Path) -> dict[str, Any]:
     if not db_path.exists():
         return {"inspectable": False, "reason": "database file does not exist"}
@@ -430,10 +454,14 @@ def inspect_db(db_path: Path) -> dict[str, Any]:
                 result["fs_data_bytes"] = int(row[1])
             if table_exists(conn, "fs_inode"):
                 row = conn.execute(
-                    "SELECT COUNT(*), COALESCE(SUM(CASE WHEN storage_kind = 1 THEN 1 ELSE 0 END), 0) FROM fs_inode"
+                    "SELECT COUNT(*), "
+                    "COALESCE(SUM(CASE WHEN storage_kind = 1 THEN 1 ELSE 0 END), 0), "
+                    "COALESCE(SUM(CASE WHEN storage_kind = 1 THEN LENGTH(data_inline) ELSE 0 END), 0) "
+                    "FROM fs_inode"
                 ).fetchone()
                 result["fs_inode_rows"] = int(row[0])
                 result["inline_inode_rows"] = int(row[1])
+                result["fs_inline_bytes"] = int(row[2])
             if table_exists(conn, "fs_origin"):
                 row = conn.execute("SELECT COUNT(*) FROM fs_origin").fetchone()
                 result["fs_origin_rows"] = int(row[0])
@@ -446,11 +474,13 @@ def inspect_db(db_path: Path) -> dict[str, Any]:
             if table_exists(conn, "fs_chunk_override"):
                 row = conn.execute("SELECT COUNT(*) FROM fs_chunk_override").fetchone()
                 result["fs_chunk_override_rows"] = int(row[0])
+            result["fs_materialized_rows"] = optional_count(conn, "fs_materialized")
             if table_exists(conn, "fs_config"):
                 result["fs_config"] = {
                     str(key): str(value)
                     for key, value in conn.execute("SELECT key, value FROM fs_config").fetchall()
                 }
+            result["portability_status"] = portability_status(result)
             return result
         finally:
             conn.close()

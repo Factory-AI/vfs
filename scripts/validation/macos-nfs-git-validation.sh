@@ -44,13 +44,18 @@ safe_rm_tmp() {
     local path="$1"
     [[ -n "$path" ]] || return 0
     case "$path" in
-        /tmp/agentfs-macos-nfs-git-work.*|/tmp/agentfs-macos-nfs-git-mnt.*)
+        /tmp/agentfs-macos-nfs-git-work.*|/tmp/agentfs-macos-nfs-git-mnt.*|/private/tmp/agentfs-macos-nfs-git-work.*|/private/tmp/agentfs-macos-nfs-git-mnt.*)
             rm -rf -- "$path"
             ;;
         *)
             printf 'Refusing to remove non-harness temp path: %s\n' "$path" >&2
             ;;
     esac
+}
+
+canonical_dir() {
+    local path="$1"
+    (cd "$path" && pwd -P)
 }
 
 is_mounted() {
@@ -147,8 +152,8 @@ else
     REPORT_DIR="$(cd "$REPORT_DIR" && pwd)"
 fi
 
-WORK_DIR="$(mktemp -d /tmp/agentfs-macos-nfs-git-work.XXXXXX)"
-MOUNT_DIR="$(mktemp -d /tmp/agentfs-macos-nfs-git-mnt.XXXXXX)"
+WORK_DIR="$(canonical_dir "$(mktemp -d /tmp/agentfs-macos-nfs-git-work.XXXXXX)")"
+MOUNT_DIR="$(canonical_dir "$(mktemp -d /tmp/agentfs-macos-nfs-git-mnt.XXXXXX)")"
 trap cleanup EXIT INT TERM
 
 AGENT_ID="macos-nfs-git-$$-$(date +%s)"

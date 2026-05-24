@@ -1,5 +1,126 @@
 # Testing AgentFS
 
+## Phase 8 FUSE concurrency and Git workload gates
+
+Use the Phase 8 validation scripts when changing FUSE dispatch, kernel cache
+policy, OverlayFS/HostFS inode accounting, or AgentFS write batching. These
+gates assert the two AgentFS safety principles while measuring the remaining
+performance gap against native filesystem operations:
+
+- the AgentFS database remains portable and inspectable as a single main DB,
+- the source/base tree is unchanged after sandboxed writes,
+- concurrent Git status/diff/log output matches native output,
+- FUSE read dispatch can overlap without the old backend mutex fallback,
+- crash/writeback durability tests preserve accepted data or report an
+  explicitly accepted no-fsync state.
+
+Recommended fast gate after FUSE/overlay changes:
+
+```bash
+cargo +nightly build --manifest-path cli/Cargo.toml
+AGENTFS_FUSE_WORKERS=25% \
+  scripts/validation/phase8-validation.py --smoke --timeout 45
+```
+
+Focused gates:
+
+```bash
+# Concurrent Git correctness, base immutability, database integrity, portability
+AGENTFS_FUSE_WORKERS=25% \
+  scripts/validation/phase8-concurrent-git-stress.py \
+  --timeout 45 \
+  --fixture-files 12 \
+  --fixture-dirs 3 \
+  --fixture-file-size-bytes 512 \
+  --edit-files 2 \
+  --append-bytes 32
+
+# FUSE read-lane parallelism and global-backend-serialization detection
+AGENTFS_FUSE_WORKERS=25% \
+  scripts/validation/fuse-serialization-stress.py \
+  --timeout 60 \
+  --files 8 \
+  --file-size-bytes 2048 \
+  --threads 4 \
+  --iterations 20 \
+  --read-bytes 512
+
+# Git phase timing breakdown against native
+AGENTFS_FUSE_WORKERS=25% \
+  scripts/validation/git-workload-benchmark.py \
+  --timeout 45 \
+  --fixture-files 12 \
+  --fixture-dirs 3 \
+  --fixture-file-size-bytes 512 \
+  --read-files 8 \
+  --read-bytes 512 \
+  --edit-files 2 \
+  --skip-fsck \
+  --profile
+```
+
+Important counters in profile summaries:
+
+| Counter | Expected meaning |
+|---|---|
+| `fuse_workers_configured` | Number of configured FUSE workers for the session. |
+| `fuse_dispatch_max_concurrent` | Maximum concurrent request callbacks observed. |
+| `fuse_read_lane_max_concurrent` | Maximum concurrent read-lane admissions. |
+| `fuse_exclusive_fallback_count` | Legacy backend-global mutex fallback count; should be `0` for the direct `Arc<dyn FileSystem>` mount path. |
+| `fuse_adapter_lock_wait_count` | Legacy backend mutex wait count; should be `0` for the direct mount path. |
+| `base_fast_inode_invalidations` | Inode invalidations from FUSE cache/drift handling. |
+
+For full policy enforcement, run:
+
+```bash
+AGENTFS_FUSE_WORKERS=25% \
+  scripts/validation/phase8-validation.py --full --timeout 120
+```
+
+The full gate enforces Phase 8 performance thresholds. It is stricter than the
+smoke gate and may fail while correctness, portability, and no-real-write gates
+pass; use its phase ratios to identify the next optimization target.
+
+### Validating the default-on kernel cache
+
+As of Tier One, parallel FUSE dispatch with deferred (off-thread) cache
+invalidation is the default, so the kernel cache fast path is engaged
+out-of-the-box. Synchronous invalidation (`AGENTFS_FUSE_SYNC_INVAL=1`) is
+opt-in because pairing it with parallel workers can deadlock on git
+fork/fsync paths (a synchronous notify issued from a request handler blocks
+waiting for inline `FUSE_FORGET` traffic that cannot be drained while every
+worker lane is busy). To verify the gates pass with **no env vars set**
+(the operator's actual experience), run each gate with the AgentFS-prefixed
+vars explicitly unset:
+
+```bash
+# Smoke + concurrent-git correctness with default-on cache
+env -u AGENTFS_FUSE_WORKERS -u AGENTFS_FUSE_SYNC_INVAL \
+    -u AGENTFS_FUSE_WRITEBACK -u AGENTFS_FUSE_KEEPCACHE \
+    -u AGENTFS_FUSE_READDIRPLUS -u AGENTFS_FUSE_ENTRY_TTL_MS \
+    -u AGENTFS_FUSE_ATTR_TTL_MS -u AGENTFS_FUSE_NEG_TTL_MS \
+  scripts/validation/phase8-validation.py --smoke --timeout 60
+
+# Robust before/after benchmark wrapper (median + p25/p75 + stdev)
+env -u AGENTFS_FUSE_WORKERS -u AGENTFS_FUSE_SYNC_INVAL \
+    -u AGENTFS_FUSE_WRITEBACK -u AGENTFS_FUSE_KEEPCACHE \
+    -u AGENTFS_FUSE_READDIRPLUS -u AGENTFS_FUSE_ENTRY_TTL_MS \
+    -u AGENTFS_FUSE_ATTR_TTL_MS -u AGENTFS_FUSE_NEG_TTL_MS \
+  scripts/validation/git-workload-benchmark-multi.py \
+    --label default-cache \
+    --iterations 5 --warmup 1 \
+    --source <local openai/codex checkout> \
+    --read-files 32 --read-bytes 4096 --edit-files 4 --skip-fsck \
+    --timeout 600
+```
+
+Expected counters in `agentfs_profile_summary` when default-on cache is active:
+`fuse_workers_configured > 0`, `fuse_ttl_entry_ms = 1000`, `fuse_ttl_attr_ms = 1000`,
+`fuse_writeback_cache_enabled = 1`, `fuse_readdirplus_mode > 0`, and zero
+`fuse_exclusive_fallback_count` / `fuse_adapter_lock_wait_count`. Debug builds
+also assert in every mutation handler that the kernel cache was invalidated
+before the FUSE reply, catching missed invalidations during development.
+
 ## Phase 5.5 read-path benchmark and profiling
 
 Use `scripts/validation/read-path-benchmark.py` to capture reproducible
@@ -430,6 +551,14 @@ and after risky operations:
 cargo run --manifest-path cli/Cargo.toml -- integrity .agentfs/my-agent.db --json
 ```
 
+For encrypted databases, pass the same key and cipher used by other CLI
+commands:
+
+```bash
+cargo run --manifest-path cli/Cargo.toml -- \
+  integrity .agentfs/secure.db --json --key "$AGENTFS_KEY" --cipher aegis256
+```
+
 Expected result for a healthy database is JSON with `"ok": true`. A failure
 exits nonzero and includes the failed check names, such as
 `storage.inline_has_no_chunks` or `namespace.dentry_target_exists`.
@@ -447,6 +576,10 @@ cargo run --manifest-path cli/Cargo.toml -- \
 
 The target file must not already exist. A successful run prints `Checkpoint:
 complete`, `Copy: complete`, and `Verification: complete`.
+
+For encrypted databases, pass `--key` and `--cipher`. Partial-origin overlay
+databases are rejected by this portable main-DB backup command because they
+depend on an external base tree for non-overridden chunks.
 
 ## pjdfstest
 

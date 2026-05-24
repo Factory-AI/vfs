@@ -4,6 +4,7 @@
 //! - Linux: FUSE + namespace sandbox (or experimental ptrace)
 //! - Darwin: NFS + sandbox-exec
 
+use agentfs_sdk::PartialOriginPolicy;
 use anyhow::Result;
 use std::path::PathBuf;
 
@@ -26,6 +27,7 @@ pub async fn handle_run_command(
     session: Option<String>,
     system: bool,
     encryption: Option<(String, String)>,
+    partial_origin_policy: Option<PartialOriginPolicy>,
     command: PathBuf,
     args: Vec<String>,
 ) -> Result<()> {
@@ -37,6 +39,7 @@ pub async fn handle_run_command(
         session,
         system,
         encryption,
+        partial_origin_policy,
         command,
         args,
     )

@@ -4,13 +4,15 @@
 #
 # Usage:
 #   run-pjdfstest.sh [--pjdfstest-dir DIR] [--agentfs-bin PATH] [--profile NAME]
-#                    [--manifest FILE] [--report-dir DIR] [--keep-work]
+#                    [--manifest FILE] [--report-dir DIR] [--partial-origin]
+#                    [--no-partial-origin] [--keep-work]
 #
 # Environment:
 #   PJDFSTEST_DIR  pjdfstest checkout root or tests directory.
 #   AGENTFS_BIN    agentfs executable to invoke (default: agentfs).
 #   PJDFSTEST_PROFILE   test profile to run (default: full).
 #   PJDFSTEST_MANIFEST  explicit manifest overriding --profile.
+#   AGENTFS_OVERLAY_PARTIAL_ORIGIN  enable partial-origin overlay mode when true/1.
 #   REPORT_DIR     directory where logs should be written.
 #   SKIP_CODE      exit code for missing prerequisites (default: 77).
 #
@@ -22,6 +24,7 @@ PJDFSTEST_DIR="${PJDFSTEST_DIR:-}"
 PJDFSTEST_PROFILE="${PJDFSTEST_PROFILE:-full}"
 PJDFSTEST_MANIFEST="${PJDFSTEST_MANIFEST:-}"
 PJDFSTEST_KNOWN_UNSUPPORTED="${PJDFSTEST_KNOWN_UNSUPPORTED:-}"
+PARTIAL_ORIGIN="${AGENTFS_OVERLAY_PARTIAL_ORIGIN:-}"
 REPORT_DIR="${REPORT_DIR:-}"
 KEEP_WORK=0
 
@@ -160,6 +163,17 @@ phase5-ci
 EOF
 }
 
+env_flag_enabled() {
+    case "${1,,}" in
+        1|true|yes|on)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 resolve_prove_targets() {
     local manifest="${PJDFSTEST_MANIFEST:-}"
     local entry target
@@ -293,6 +307,14 @@ while [[ $# -gt 0 ]]; do
             PJDFSTEST_KNOWN_UNSUPPORTED="$2"
             shift 2
             ;;
+        --partial-origin)
+            PARTIAL_ORIGIN=1
+            shift
+            ;;
+        --no-partial-origin)
+            PARTIAL_ORIGIN=
+            shift
+            ;;
         --list-profiles)
             list_profiles
             exit 0
@@ -355,9 +377,17 @@ printf 'AgentFS binary: %s\n' "$AGENTFS_RESOLVED"
 printf 'pjdfstest binary: %s\n' "$PJDFSTEST_RESOLVED"
 printf 'pjdfstest tests: %s\n' "$PJDFSTEST_TESTS"
 printf 'pjdfstest profile: %s\n' "$PJDFSTEST_PROFILE"
+if env_flag_enabled "$PARTIAL_ORIGIN"; then
+    export AGENTFS_OVERLAY_PARTIAL_ORIGIN=1
+    printf 'partial-origin overlay: enabled\n'
+else
+    unset AGENTFS_OVERLAY_PARTIAL_ORIGIN
+    printf 'partial-origin overlay: disabled\n'
+fi
 printf 'Report directory: %s\n' "$REPORT_DIR"
 
 printf '%s\n' "$PJDFSTEST_PROFILE" >"$REPORT_DIR/selected-profile.txt"
+printf '%s\n' "${AGENTFS_OVERLAY_PARTIAL_ORIGIN:-}" >"$REPORT_DIR/partial-origin-env.txt"
 if [[ -n "$PJDFSTEST_RESOLVED_MANIFEST" ]]; then
     {
         printf 'path\t%s\n' "$PJDFSTEST_RESOLVED_MANIFEST"

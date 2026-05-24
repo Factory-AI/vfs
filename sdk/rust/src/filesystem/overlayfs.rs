@@ -4,7 +4,7 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicI64, Ordering},
-        Arc, RwLock,
+        Arc, Mutex, RwLock,
     },
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -14,13 +14,78 @@ use turso::{Connection, Value};
 
 use super::{
     agentfs::AgentFS, BoxedFile, DirEntry, File, FileSystem, FilesystemStats, FsError, Stats,
-    TimeChange,
+    TimeChange, WriteRange,
 };
 
 /// Root inode number (matches FUSE convention)
 const ROOT_INO: i64 = 1;
 const STORAGE_CHUNKED: i64 = 0;
 const PARTIAL_ORIGIN_ENV: &str = "AGENTFS_OVERLAY_PARTIAL_ORIGIN";
+pub const DEFAULT_PARTIAL_ORIGIN_THRESHOLD_BYTES: u64 = 1024 * 1024;
+
+/// Explicit policy for partial-origin copy-up of regular base files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartialOriginMode {
+    /// Always use whole-file copy-up.
+    Off,
+    /// Use partial-origin copy-up for eligible regular base files.
+    On,
+    /// Use partial-origin copy-up for eligible regular base files at or above a threshold.
+    Auto,
+}
+
+/// Runtime policy controlling when overlay writes may create partial-origin rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartialOriginPolicy {
+    pub mode: PartialOriginMode,
+    pub threshold_bytes: u64,
+}
+
+impl Default for PartialOriginPolicy {
+    fn default() -> Self {
+        Self {
+            mode: PartialOriginMode::Off,
+            threshold_bytes: DEFAULT_PARTIAL_ORIGIN_THRESHOLD_BYTES,
+        }
+    }
+}
+
+impl PartialOriginPolicy {
+    pub fn new(mode: PartialOriginMode) -> Self {
+        Self {
+            mode,
+            ..Self::default()
+        }
+    }
+
+    pub fn with_threshold_bytes(mut self, threshold_bytes: u64) -> Self {
+        self.threshold_bytes = threshold_bytes;
+        self
+    }
+
+    /// Preserve legacy env-var opt-in while keeping ordinary defaults strict/off.
+    pub fn from_env_compat() -> Self {
+        if env_flag_enabled(PARTIAL_ORIGIN_ENV) {
+            Self::new(PartialOriginMode::On)
+        } else {
+            Self::default()
+        }
+    }
+
+    fn permits(&self, stats: &Stats) -> bool {
+        if !stats.is_file() {
+            return false;
+        }
+
+        match self.mode {
+            PartialOriginMode::Off => false,
+            PartialOriginMode::On => true,
+            PartialOriginMode::Auto => u64::try_from(stats.size)
+                .map(|size| size >= self.threshold_bytes)
+                .unwrap_or(false),
+        }
+    }
+}
 
 fn current_timestamp() -> Result<(i64, i64)> {
     let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
@@ -84,7 +149,9 @@ struct PartialOrigin {
 
 struct OverlayPartialFile {
     delta: AgentFS,
+    base: Arc<dyn FileSystem>,
     base_file: BoxedFile,
+    origin: PartialOrigin,
     overlay_ino: i64,
     delta_ino: i64,
     chunk_size: usize,
@@ -106,26 +173,50 @@ pub struct OverlayFS {
     reverse_map: RwLock<HashMap<(Layer, i64), i64>>,
     /// Map from path to overlay inode (for path-based operations)
     path_map: RwLock<HashMap<String, i64>>,
+    /// Serializes multi-map overlay inode updates.
+    map_lock: Mutex<()>,
     /// Next inode number to allocate
     next_ino: AtomicI64,
     /// Set of whiteout paths (deleted from base)
     whiteouts: RwLock<HashSet<String>>,
     /// Origin mapping: delta_ino -> base_ino (for copy-up consistency)
     origin_map: RwLock<HashMap<i64, i64>>,
-    /// Opt-in prototype flag for chunk-granularity base fallback.
-    partial_origin_enabled: bool,
+    /// Explicit policy for chunk-granularity base fallback.
+    partial_origin_policy: PartialOriginPolicy,
 }
 
 impl OverlayFS {
     /// Create a new overlay filesystem
     pub fn new(base: Arc<dyn FileSystem>, delta: AgentFS) -> Self {
-        Self::new_with_partial_origin(base, delta, env_flag_enabled(PARTIAL_ORIGIN_ENV))
+        Self::new_with_partial_origin_policy(base, delta, PartialOriginPolicy::from_env_compat())
     }
 
+    pub fn new_with_partial_origin_policy(
+        base: Arc<dyn FileSystem>,
+        delta: AgentFS,
+        partial_origin_policy: PartialOriginPolicy,
+    ) -> Self {
+        Self::new_with_partial_origin_policy_inner(base, delta, partial_origin_policy)
+    }
+
+    #[cfg(test)]
     fn new_with_partial_origin(
         base: Arc<dyn FileSystem>,
         delta: AgentFS,
         partial_origin_enabled: bool,
+    ) -> Self {
+        let mode = if partial_origin_enabled {
+            PartialOriginMode::On
+        } else {
+            PartialOriginMode::Off
+        };
+        Self::new_with_partial_origin_policy_inner(base, delta, PartialOriginPolicy::new(mode))
+    }
+
+    fn new_with_partial_origin_policy_inner(
+        base: Arc<dyn FileSystem>,
+        delta: AgentFS,
+        partial_origin_policy: PartialOriginPolicy,
     ) -> Self {
         let mut inode_map = HashMap::new();
         let mut reverse_map = HashMap::new();
@@ -149,10 +240,11 @@ impl OverlayFS {
             inode_map: RwLock::new(inode_map),
             reverse_map: RwLock::new(reverse_map),
             path_map: RwLock::new(path_map),
+            map_lock: Mutex::new(()),
             next_ino: AtomicI64::new(2),
             whiteouts: RwLock::new(HashSet::new()),
             origin_map: RwLock::new(HashMap::new()),
-            partial_origin_enabled,
+            partial_origin_policy,
         }
     }
 
@@ -440,6 +532,7 @@ impl OverlayFS {
 
     /// Get or create an overlay inode for a layer inode
     fn get_or_create_overlay_ino(&self, layer: Layer, underlying_ino: i64, path: &str) -> i64 {
+        let _map_guard = self.map_lock.lock().unwrap();
         // Check reverse map first
         {
             let reverse = self.reverse_map.read().unwrap();
@@ -485,6 +578,7 @@ impl OverlayFS {
         new_underlying_ino: i64,
         new_path: &str,
     ) {
+        let _map_guard = self.map_lock.lock().unwrap();
         let old_path = {
             let mut inode_map = self.inode_map.write().unwrap();
             let Some(info) = inode_map.get_mut(&overlay_ino) else {
@@ -514,6 +608,19 @@ impl OverlayFS {
     /// Get inode info for an overlay inode
     fn get_inode_info(&self, ino: i64) -> Option<InodeInfo> {
         self.inode_map.read().unwrap().get(&ino).cloned()
+    }
+
+    fn live_origin_overlay_ino(&self, base_ino: i64, path: &str) -> Option<i64> {
+        let overlay_ino = {
+            let reverse = self.reverse_map.read().unwrap();
+            reverse.get(&(Layer::Base, base_ino)).copied()?
+        };
+        let info = self.get_inode_info(overlay_ino)?;
+        if info.path == path {
+            Some(overlay_ino)
+        } else {
+            None
+        }
     }
 
     /// Build path from parent inode and name
@@ -733,6 +840,7 @@ impl OverlayFS {
     /// we need to update the overlay inode to point to delta. This ensures
     /// that operations like readdir and unlink will check the delta layer.
     fn promote_to_delta(&self, path: &str, delta_ino: i64) {
+        let _map_guard = self.map_lock.lock().unwrap();
         let path_map = self.path_map.read().unwrap();
         let overlay_ino = match path_map.get(path) {
             Some(&ino) => ino,
@@ -948,6 +1056,7 @@ impl OverlayFS {
         let delta_ino = self.copy_up(&info.path, info.underlying_ino).await?;
 
         // Update the inode mapping to point to delta
+        let _map_guard = self.map_lock.lock().unwrap();
         {
             let mut inode_map = self.inode_map.write().unwrap();
             inode_map.insert(
@@ -1066,13 +1175,19 @@ impl OverlayFS {
                 .ok_or(FsError::NotFound)?;
             self.validate_partial_origin(&origin, &base_stats)?;
             let base_file = self.base.open(base_stats.ino, libc::O_RDONLY).await?;
-            Ok(Arc::new(OverlayPartialFile {
+            let file: BoxedFile = Arc::new(OverlayPartialFile {
                 delta: self.delta.clone(),
+                base: self.base.clone(),
                 base_file,
+                origin,
                 overlay_ino,
                 delta_ino,
                 chunk_size: self.delta.chunk_size(),
-            }))
+            });
+            if (flags & libc::O_TRUNC) != 0 {
+                file.truncate(0).await?;
+            }
+            Ok(file)
         } else {
             FileSystem::open(&self.delta, delta_ino, flags).await
         }
@@ -1082,6 +1197,7 @@ impl OverlayFS {
 #[async_trait]
 impl File for OverlayPartialFile {
     async fn pread(&self, offset: u64, size: u64) -> Result<Vec<u8>> {
+        self.validate_current_origin().await?;
         let conn = self.delta.get_connection().await?;
         let file_size = self.delta_file_size_with_conn(&conn).await?;
         if offset >= file_size || size == 0 {
@@ -1112,48 +1228,64 @@ impl File for OverlayPartialFile {
         if data.is_empty() {
             return Ok(());
         }
+        self.pwrite_ranges(vec![WriteRange {
+            offset,
+            data: data.to_vec(),
+        }])
+        .await
+    }
 
-        let write_end = offset
-            .checked_add(data.len() as u64)
-            .ok_or_else(|| Error::Internal("file write offset overflow".to_string()))?;
+    async fn pwrite_ranges(&self, ranges: Vec<WriteRange>) -> Result<()> {
+        if ranges.iter().all(|range| range.data.is_empty()) {
+            return Ok(());
+        }
         let conn = self.delta.get_connection().await?;
         let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
 
         let result: Result<()> = async {
-            let current_size = self.delta_file_size_with_conn(&conn).await?;
-            let new_size = std::cmp::max(current_size, write_end);
-            let chunk_size = self.chunk_size as u64;
-            let mut written = 0usize;
+            let mut new_size = self.delta_file_size_with_conn(&conn).await?;
+            for range in ranges {
+                if range.data.is_empty() {
+                    continue;
+                }
+                let write_end = range
+                    .offset
+                    .checked_add(range.data.len() as u64)
+                    .ok_or_else(|| Error::Internal("file write offset overflow".to_string()))?;
+                new_size = std::cmp::max(new_size, write_end);
+                let chunk_size = self.chunk_size as u64;
+                let mut written = 0usize;
 
-            while written < data.len() {
-                let current_offset = offset + written as u64;
-                let chunk_index = current_offset / chunk_size;
-                let offset_in_chunk = (current_offset % chunk_size) as usize;
-                let remaining_in_chunk = self.chunk_size - offset_in_chunk;
-                let to_write = std::cmp::min(remaining_in_chunk, data.len() - written);
+                while written < range.data.len() {
+                    let current_offset = range.offset + written as u64;
+                    let chunk_index = current_offset / chunk_size;
+                    let offset_in_chunk = (current_offset % chunk_size) as usize;
+                    let remaining_in_chunk = self.chunk_size - offset_in_chunk;
+                    let to_write = std::cmp::min(remaining_in_chunk, range.data.len() - written);
 
-                let mut chunk = self
-                    .read_merged_chunk_with_conn(&conn, chunk_index)
+                    let mut chunk = self
+                        .read_merged_chunk_with_conn(&conn, chunk_index)
+                        .await?;
+                    chunk[offset_in_chunk..offset_in_chunk + to_write]
+                        .copy_from_slice(&range.data[written..written + to_write]);
+
+                    conn.execute(
+                        "INSERT OR REPLACE INTO fs_data (ino, chunk_index, data) VALUES (?, ?, ?)",
+                        (
+                            self.delta_ino,
+                            chunk_index as i64,
+                            Value::Blob(chunk),
+                        ),
+                    )
                     .await?;
-                chunk[offset_in_chunk..offset_in_chunk + to_write]
-                    .copy_from_slice(&data[written..written + to_write]);
+                    conn.execute(
+                        "INSERT OR IGNORE INTO fs_chunk_override (delta_ino, chunk_index) VALUES (?, ?)",
+                        (self.delta_ino, chunk_index as i64),
+                    )
+                    .await?;
 
-                conn.execute(
-                    "INSERT OR REPLACE INTO fs_data (ino, chunk_index, data) VALUES (?, ?, ?)",
-                    (
-                        self.delta_ino,
-                        chunk_index as i64,
-                        Value::Blob(chunk),
-                    ),
-                )
-                .await?;
-                conn.execute(
-                    "INSERT OR IGNORE INTO fs_chunk_override (delta_ino, chunk_index) VALUES (?, ?)",
-                    (self.delta_ino, chunk_index as i64),
-                )
-                .await?;
-
-                written += to_write;
+                    written += to_write;
+                }
             }
 
             let (now_secs, now_nsec) = current_timestamp()?;
@@ -1293,6 +1425,42 @@ impl File for OverlayPartialFile {
 }
 
 impl OverlayPartialFile {
+    async fn resolve_origin_base_stats(&self) -> Result<Option<Stats>> {
+        let mut ino = ROOT_INO;
+        if self.origin.base_path == "/" {
+            return self.base.getattr(ino).await;
+        }
+
+        let mut stats = None;
+        for component in self.origin.base_path.split('/').filter(|s| !s.is_empty()) {
+            let Some(next) = self.base.lookup(ino, component).await? else {
+                return Ok(None);
+            };
+            ino = next.ino;
+            stats = Some(next);
+        }
+        Ok(stats)
+    }
+
+    async fn validate_current_origin(&self) -> Result<()> {
+        let stats = self
+            .resolve_origin_base_stats()
+            .await?
+            .ok_or(FsError::NotFound)?;
+        if stats.size != self.origin.base_fingerprint_size
+            || stats.mtime != self.origin.base_mtime
+            || stats.mtime_nsec != self.origin.base_mtime_nsec
+            || stats.ctime != self.origin.base_ctime
+            || stats.ctime_nsec != self.origin.base_ctime_nsec
+        {
+            return Err(Error::Internal(format!(
+                "partial-origin base changed for {}",
+                self.origin.base_path
+            )));
+        }
+        Ok(())
+    }
+
     async fn delta_file_size_with_conn(&self, conn: &Connection) -> Result<u64> {
         let mut rows = conn
             .query("SELECT size FROM fs_inode WHERE ino = ?", (self.delta_ino,))
@@ -1380,6 +1548,7 @@ impl OverlayPartialFile {
             .checked_mul(self.chunk_size as u64)
             .ok_or_else(|| Error::Internal("chunk offset overflow".to_string()))?;
         let mut chunk = if chunk_start < base_size {
+            self.validate_current_origin().await?;
             let readable = std::cmp::min(self.chunk_size as u64, base_size - chunk_start);
             self.base_file.pread(chunk_start, readable).await?
         } else {
@@ -1432,9 +1601,7 @@ impl FileSystem for OverlayFS {
             // Otherwise keep the Delta overlay inode — the downstream code
             // already walks base from root when the parent is tagged Delta.
             if let Some(base_ino) = self.get_origin_ino(stats.ino) {
-                let reverse = self.reverse_map.read().unwrap();
-                if let Some(existing_ino) = reverse.get(&(Layer::Base, base_ino)).copied() {
-                    drop(reverse);
+                if let Some(existing_ino) = self.live_origin_overlay_ino(base_ino, &path) {
                     self.refresh_overlay_mapping(existing_ino, Layer::Delta, delta_ino, &path);
                     stats.ino = existing_ino;
                 } else {
@@ -1668,9 +1835,9 @@ impl FileSystem for OverlayFS {
                     if let Some(base_ino) = self.get_origin_ino(entry.stats.ino) {
                         let overlay_ino =
                             self.get_or_create_overlay_ino(Layer::Delta, delta_ino, &entry_path);
-                        let reverse = self.reverse_map.read().unwrap();
-                        if let Some(existing_ino) = reverse.get(&(Layer::Base, base_ino)).copied() {
-                            drop(reverse);
+                        if let Some(existing_ino) =
+                            self.live_origin_overlay_ino(base_ino, &entry_path)
+                        {
                             self.refresh_overlay_mapping(
                                 existing_ino,
                                 Layer::Delta,
@@ -1710,19 +1877,18 @@ impl FileSystem for OverlayFS {
 
         let delta_ino = match info.layer {
             Layer::Delta => info.underlying_ino,
-            Layer::Base if self.partial_origin_enabled => {
+            Layer::Base => {
                 let base_stats = self
                     .base
                     .getattr(info.underlying_ino)
                     .await?
                     .ok_or(FsError::NotFound)?;
-                if base_stats.is_file() {
+                if self.partial_origin_policy.permits(&base_stats) {
                     self.partial_copy_up_and_update_mapping(ino, &info).await?
                 } else {
                     self.copy_up_and_update_mapping(ino, &info).await?
                 }
             }
-            Layer::Base => self.copy_up_and_update_mapping(ino, &info).await?,
         };
 
         self.delta.chmod(delta_ino, mode).await
@@ -1743,19 +1909,18 @@ impl FileSystem for OverlayFS {
 
         let delta_ino = match info.layer {
             Layer::Delta => info.underlying_ino,
-            Layer::Base if self.partial_origin_enabled => {
+            Layer::Base => {
                 let base_stats = self
                     .base
                     .getattr(info.underlying_ino)
                     .await?
                     .ok_or(FsError::NotFound)?;
-                if base_stats.is_file() {
+                if self.partial_origin_policy.permits(&base_stats) {
                     self.partial_copy_up_and_update_mapping(ino, &info).await?
                 } else {
                     self.copy_up_and_update_mapping(ino, &info).await?
                 }
             }
-            Layer::Base => self.copy_up_and_update_mapping(ino, &info).await?,
         };
 
         self.delta.chown(delta_ino, uid, gid).await
@@ -1771,22 +1936,38 @@ impl FileSystem for OverlayFS {
 
         let delta_ino = match info.layer {
             Layer::Delta => info.underlying_ino,
-            Layer::Base if self.partial_origin_enabled => {
+            Layer::Base => {
                 let base_stats = self
                     .base
                     .getattr(info.underlying_ino)
                     .await?
                     .ok_or(FsError::NotFound)?;
-                if base_stats.is_file() {
+                if self.partial_origin_policy.permits(&base_stats) {
                     self.partial_copy_up_and_update_mapping(ino, &info).await?
                 } else {
                     self.copy_up_and_update_mapping(ino, &info).await?
                 }
             }
-            Layer::Base => self.copy_up_and_update_mapping(ino, &info).await?,
         };
 
         self.delta.utimens(delta_ino, atime, mtime).await
+    }
+
+    async fn keep_cache_for_read_open(&self, ino: i64, flags: i32) -> Result<bool> {
+        if is_write_open(flags) {
+            return Ok(false);
+        }
+
+        let info = self.get_inode_info(ino).ok_or(FsError::NotFound)?;
+        if info.layer != Layer::Base || self.is_whiteout(&info.path) {
+            return Ok(false);
+        }
+
+        let Some(stats) = self.base.getattr(info.underlying_ino).await? else {
+            return Ok(false);
+        };
+
+        Ok(stats.is_file())
     }
 
     async fn open(&self, ino: i64, flags: i32) -> Result<BoxedFile> {
@@ -1803,21 +1984,20 @@ impl FileSystem for OverlayFS {
                     .partial_file_for_delta(ino, info.underlying_ino, flags)
                     .await;
             }
-            Layer::Base if self.partial_origin_enabled => {
+            Layer::Base if !is_write_open(flags) => {
+                return self.base.open(info.underlying_ino, flags).await;
+            }
+            Layer::Base => {
                 let base_stats = self
                     .base
                     .getattr(info.underlying_ino)
                     .await?
                     .ok_or(FsError::NotFound)?;
-                if base_stats.is_file() {
-                    if is_write_open(flags) {
-                        let delta_ino = self.partial_copy_up_and_update_mapping(ino, &info).await?;
-                        return self.partial_file_for_delta(ino, delta_ino, flags).await;
-                    }
-                    return self.base.open(info.underlying_ino, flags).await;
+                if self.partial_origin_policy.permits(&base_stats) {
+                    let delta_ino = self.partial_copy_up_and_update_mapping(ino, &info).await?;
+                    return self.partial_file_for_delta(ino, delta_ino, flags).await;
                 }
             }
-            Layer::Base => {}
         }
 
         let delta_ino = self.copy_up_and_update_mapping(ino, &info).await?;
@@ -2161,6 +2341,36 @@ impl FileSystem for OverlayFS {
         FileSystem::statfs(&self.delta).await
     }
 
+    async fn drain_inode_writes(&self, ino: i64) -> Result<()> {
+        let info = self.get_inode_info(ino).ok_or(FsError::NotFound)?;
+        match info.layer {
+            Layer::Delta => FileSystem::drain_inode_writes(&self.delta, info.underlying_ino).await,
+            Layer::Base => self.base.drain_inode_writes(info.underlying_ino).await,
+        }
+    }
+
+    async fn drain_all(&self) -> Result<()> {
+        FileSystem::drain_all(&self.delta).await?;
+        self.base.drain_all().await?;
+        Ok(())
+    }
+
+    async fn finalize(&self) -> Result<()> {
+        FileSystem::finalize(&self.delta).await?;
+        self.base.finalize().await?;
+        Ok(())
+    }
+
+    async fn retain_lookup(&self, ino: i64, nlookup: u64) -> Result<()> {
+        let info = self.get_inode_info(ino).ok_or(FsError::NotFound)?;
+        match info.layer {
+            Layer::Delta => {
+                FileSystem::retain_lookup(&self.delta, info.underlying_ino, nlookup).await
+            }
+            Layer::Base => self.base.retain_lookup(info.underlying_ino, nlookup).await,
+        }
+    }
+
     async fn forget(&self, ino: i64, nlookup: u64) {
         // Look up the inode info to determine which layer it belongs to
         let info = match self.get_inode_info(ino) {
@@ -2286,6 +2496,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_overlay_read_only_base_open_does_not_copy_up() -> Result<()> {
+        let (overlay, _base_dir, _delta_dir) = create_test_overlay().await?;
+
+        let stats = overlay.lookup(ROOT_INO, "base.txt").await?.unwrap();
+        let file = overlay.open(stats.ino, libc::O_RDONLY).await?;
+
+        assert_eq!(file.pread(0, 100).await?, b"base content");
+        assert_eq!(
+            scalar_i64(&overlay, "SELECT COUNT(*) FROM fs_origin").await?,
+            0,
+            "read-only open of a base file should not create origin mappings"
+        );
+        assert_eq!(
+            scalar_i64(&overlay, "SELECT COUNT(*) FROM fs_data").await?,
+            0,
+            "read-only open of a base file should not copy file bytes into delta"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overlay_keep_cache_only_for_read_only_base_files() -> Result<()> {
+        let (overlay, _base_dir, _delta_dir) = create_test_overlay().await?;
+
+        let stats = overlay.lookup(ROOT_INO, "base.txt").await?.unwrap();
+        assert!(
+            overlay
+                .keep_cache_for_read_open(stats.ino, libc::O_RDONLY)
+                .await?,
+            "read-only base files are eligible for FOPEN_KEEP_CACHE"
+        );
+        assert!(
+            !overlay
+                .keep_cache_for_read_open(stats.ino, libc::O_RDWR)
+                .await?,
+            "writable opens must not keep the base page cache"
+        );
+
+        let file = overlay.open(stats.ino, libc::O_RDWR).await?;
+        file.pwrite(0, b"modified content").await?;
+        assert!(
+            !overlay
+                .keep_cache_for_read_open(stats.ino, libc::O_RDONLY)
+                .await?,
+            "after copy-up, the inode is delta-backed and must not keep stale base data"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_overlay_copy_on_write_inode_stability() -> Result<()> {
         let (overlay, _base_dir, _delta_dir) = create_test_overlay().await?;
 
@@ -2302,6 +2564,40 @@ mod tests {
         assert_eq!(
             stats_after.ino, ino_before,
             "inode should remain stable after copy-up"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overlay_origin_mapping_rejects_wrong_path_base_inode() -> Result<()> {
+        let (overlay, _base_dir, _delta_dir) = create_test_overlay().await?;
+
+        let subdir = overlay.lookup(ROOT_INO, "subdir").await?.unwrap();
+        let nested = overlay.lookup(subdir.ino, "nested.txt").await?.unwrap();
+        let nested_base_ino = overlay.get_inode_info(nested.ino).unwrap().underlying_ino;
+
+        let (delta_stats, _file) = <AgentFS as FileSystem>::create_file(
+            overlay.delta(),
+            ROOT_INO,
+            "base.txt",
+            DEFAULT_FILE_MODE,
+            0,
+            0,
+        )
+        .await?;
+        overlay
+            .add_origin_mapping(delta_stats.ino, nested_base_ino)
+            .await?;
+
+        let resolved = overlay.lookup(ROOT_INO, "base.txt").await?.unwrap();
+        assert_ne!(
+            resolved.ino, nested.ino,
+            "origin mapping must not reuse a live base inode for a different path"
+        );
+        assert_eq!(
+            overlay.get_inode_info(resolved.ino).unwrap().path,
+            "/base.txt"
         );
 
         Ok(())
@@ -2352,6 +2648,153 @@ mod tests {
             base_content,
             "base file should remain unchanged"
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overlay_partial_origin_policy_off_uses_whole_copy_up() -> Result<()> {
+        let base_dir = tempdir()?;
+        let delta_dir = tempdir()?;
+        let db_path = delta_dir.path().join("delta.db");
+        let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+        let chunk_size = delta.chunk_size();
+        let base_content = patterned_bytes(chunk_size * 2 + 11, 0x17);
+        std::fs::write(base_dir.path().join("large.bin"), &base_content)?;
+
+        let base = Arc::new(HostFS::new(base_dir.path())?);
+        let overlay = OverlayFS::new_with_partial_origin_policy(
+            base,
+            delta,
+            PartialOriginPolicy::new(PartialOriginMode::Off),
+        );
+        overlay.init(base_dir.path().to_str().unwrap()).await?;
+
+        let stats = overlay.lookup(ROOT_INO, "large.bin").await?.unwrap();
+        let file = overlay.open(stats.ino, libc::O_RDWR).await?;
+        file.pwrite(chunk_size as u64 + 3, b"X").await?;
+
+        assert_eq!(
+            scalar_i64(&overlay, "SELECT COUNT(*) FROM fs_partial_origin").await?,
+            0,
+            "explicit off policy must keep whole-file copy-up semantics"
+        );
+        assert_eq!(
+            std::fs::read(base_dir.path().join("large.bin"))?,
+            base_content,
+            "whole-file copy-up must not mutate the base file"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overlay_partial_origin_policy_auto_threshold() -> Result<()> {
+        let base_dir = tempdir()?;
+        let delta_dir = tempdir()?;
+        let db_path = delta_dir.path().join("delta.db");
+        let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+        let chunk_size = delta.chunk_size();
+        let threshold = (chunk_size * 2) as u64;
+        let small_content = patterned_bytes(chunk_size + 31, 0x05);
+        let large_content = patterned_bytes(chunk_size * 2 + 31, 0x55);
+        std::fs::write(base_dir.path().join("small.bin"), &small_content)?;
+        std::fs::write(base_dir.path().join("large.bin"), &large_content)?;
+
+        let base = Arc::new(HostFS::new(base_dir.path())?);
+        let overlay = OverlayFS::new_with_partial_origin_policy(
+            base,
+            delta,
+            PartialOriginPolicy::new(PartialOriginMode::Auto).with_threshold_bytes(threshold),
+        );
+        overlay.init(base_dir.path().to_str().unwrap()).await?;
+
+        let small_stats = overlay.lookup(ROOT_INO, "small.bin").await?.unwrap();
+        let small_file = overlay.open(small_stats.ino, libc::O_RDWR).await?;
+        small_file.pwrite(3, b"s").await?;
+        assert_eq!(
+            scalar_i64(&overlay, "SELECT COUNT(*) FROM fs_partial_origin").await?,
+            0,
+            "auto policy should whole-copy files below the threshold"
+        );
+
+        let large_stats = overlay.lookup(ROOT_INO, "large.bin").await?.unwrap();
+        let large_file = overlay.open(large_stats.ino, libc::O_RDWR).await?;
+        large_file.pwrite(chunk_size as u64 + 7, b"L").await?;
+        assert_eq!(
+            scalar_i64(&overlay, "SELECT COUNT(*) FROM fs_partial_origin").await?,
+            1,
+            "auto policy should use partial-origin at or above the threshold"
+        );
+        assert_eq!(
+            std::fs::read(base_dir.path().join("small.bin"))?,
+            small_content,
+            "small-file write must not mutate the base file"
+        );
+        assert_eq!(
+            std::fs::read(base_dir.path().join("large.bin"))?,
+            large_content,
+            "large-file partial-origin write must not mutate the base file"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overlay_partial_origin_metadata_paths_do_not_mutate_base() -> Result<()> {
+        let base_dir = tempdir()?;
+        let delta_dir = tempdir()?;
+        let db_path = delta_dir.path().join("delta.db");
+        let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+        let base_path = base_dir.path().join("file.txt");
+        std::fs::write(&base_path, b"metadata base")?;
+
+        let base_meta_before = std::fs::metadata(&base_path)?;
+        let base_mode_before = base_meta_before.permissions().mode() & 0o777;
+        let base_modified_before = base_meta_before.modified()?;
+
+        let base = Arc::new(HostFS::new(base_dir.path())?);
+        let overlay = OverlayFS::new_with_partial_origin_policy(
+            base,
+            delta,
+            PartialOriginPolicy::new(PartialOriginMode::On),
+        );
+        overlay.init(base_dir.path().to_str().unwrap()).await?;
+
+        let stats = overlay.lookup(ROOT_INO, "file.txt").await?.unwrap();
+        overlay.chmod(stats.ino, 0o600).await?;
+        overlay
+            .utimens(
+                stats.ino,
+                TimeChange::Set(123, 456),
+                TimeChange::Set(789, 123),
+            )
+            .await?;
+
+        let overlay_stats = overlay.getattr(stats.ino).await?.unwrap();
+        assert_eq!(overlay_stats.mode & 0o777, 0o600);
+        assert_eq!(overlay_stats.atime, 123);
+        assert_eq!(overlay_stats.atime_nsec, 456);
+        assert_eq!(overlay_stats.mtime, 789);
+        assert_eq!(overlay_stats.mtime_nsec, 123);
+        assert_eq!(
+            scalar_i64(&overlay, "SELECT COUNT(*) FROM fs_partial_origin").await?,
+            1,
+            "metadata-only paths should target partial-origin delta metadata"
+        );
+
+        let base_meta_after = std::fs::metadata(&base_path)?;
+        assert_eq!(
+            base_meta_after.permissions().mode() & 0o777,
+            base_mode_before,
+            "chmod through overlay must not mutate base permissions"
+        );
+        assert_eq!(
+            base_meta_after.modified()?,
+            base_modified_before,
+            "utimens through overlay must not mutate base mtime"
+        );
+        assert_eq!(std::fs::read(&base_path)?, b"metadata base");
 
         Ok(())
     }
@@ -2424,6 +2867,61 @@ mod tests {
             "extend after shrink should return zeros instead of base fallback past the shrink point"
         );
         assert_eq!(file.fstat().await?.size, (chunk_size + 12) as i64);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overlay_partial_origin_open_truncates_base_file_mapping() -> Result<()> {
+        let base_dir = tempdir()?;
+        let delta_dir = tempdir()?;
+        let db_path = delta_dir.path().join("delta.db");
+        let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+        std::fs::write(base_dir.path().join("large.bin"), b"base contents")?;
+
+        let base = Arc::new(HostFS::new(base_dir.path())?);
+        let overlay = OverlayFS::new_with_partial_origin(base, delta, true);
+        overlay.init(base_dir.path().to_str().unwrap()).await?;
+
+        let stats = overlay.lookup(ROOT_INO, "large.bin").await?.unwrap();
+        let file = overlay
+            .open(stats.ino, libc::O_RDWR | libc::O_TRUNC)
+            .await?;
+        assert_eq!(file.fstat().await?.size, 0);
+        assert_eq!(file.pread(0, 32).await?, b"");
+        assert_eq!(overlay.getattr(stats.ino).await?.unwrap().size, 0);
+        assert_eq!(
+            std::fs::read(base_dir.path().join("large.bin"))?,
+            b"base contents",
+            "O_TRUNC through the overlay must not mutate the base file"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overlay_partial_origin_open_truncates_existing_partial_file() -> Result<()> {
+        let base_dir = tempdir()?;
+        let delta_dir = tempdir()?;
+        let db_path = delta_dir.path().join("delta.db");
+        let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+        std::fs::write(base_dir.path().join("large.bin"), b"base contents")?;
+
+        let base = Arc::new(HostFS::new(base_dir.path())?);
+        let overlay = OverlayFS::new_with_partial_origin(base, delta, true);
+        overlay.init(base_dir.path().to_str().unwrap()).await?;
+
+        let stats = overlay.lookup(ROOT_INO, "large.bin").await?.unwrap();
+        let file = overlay.open(stats.ino, libc::O_RDWR).await?;
+        file.pwrite(5, b"X").await?;
+        assert_eq!(file.pread(0, 16).await?, b"base Xontents");
+
+        let truncated = overlay
+            .open(stats.ino, libc::O_RDWR | libc::O_TRUNC)
+            .await?;
+        assert_eq!(truncated.fstat().await?.size, 0);
+        assert_eq!(truncated.pread(0, 32).await?, b"");
+        assert_eq!(overlay.getattr(stats.ino).await?.unwrap().size, 0);
 
         Ok(())
     }
@@ -2572,6 +3070,37 @@ mod tests {
         assert!(
             reopened.open(stats.ino, libc::O_RDONLY).await.is_err(),
             "partial-origin files should fail loudly when the base fallback changed"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overlay_partial_origin_detects_base_drift_after_open() -> Result<()> {
+        let base_dir = tempdir()?;
+        let delta_dir = tempdir()?;
+        let db_path = delta_dir.path().join("delta.db");
+        let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+        let chunk_size = delta.chunk_size();
+        let base_file = base_dir.path().join("large.bin");
+        let base_content = patterned_bytes(chunk_size * 2, 0x37);
+        std::fs::write(&base_file, &base_content)?;
+
+        let base = Arc::new(HostFS::new(base_dir.path())?);
+        let overlay = OverlayFS::new_with_partial_origin(base, delta, true);
+        overlay.init(base_dir.path().to_str().unwrap()).await?;
+
+        let stats = overlay.lookup(ROOT_INO, "large.bin").await?.unwrap();
+        let file = overlay.open(stats.ino, libc::O_RDWR).await?;
+        file.pwrite(chunk_size as u64, b"X").await?;
+
+        let read_handle = overlay.open(stats.ino, libc::O_RDONLY).await?;
+        std::fs::write(&base_file, patterned_bytes(chunk_size * 2, 0x91))?;
+
+        let err = read_handle.pread(0, 8).await.unwrap_err();
+        assert!(
+            err.to_string().contains("partial-origin base changed"),
+            "unexpected error: {err}"
         );
 
         Ok(())

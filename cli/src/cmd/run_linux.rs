@@ -3,6 +3,7 @@
 //! Dispatches to either the FUSE+namespace sandbox (default) or the experimental
 //! ptrace-based sandbox based on command-line flags.
 
+use agentfs_sdk::PartialOriginPolicy;
 use anyhow::Result;
 use std::path::PathBuf;
 
@@ -16,6 +17,7 @@ pub async fn run(
     session: Option<String>,
     system: bool,
     encryption: Option<(String, String)>,
+    partial_origin_policy: Option<PartialOriginPolicy>,
     command: PathBuf,
     args: Vec<String>,
 ) -> Result<()> {
@@ -29,6 +31,11 @@ pub async fn run(
         if encryption.is_some() {
             eprintln!("Warning: --key is not supported with --experimental-sandbox, ignoring");
         }
+        if partial_origin_policy.is_some() {
+            eprintln!(
+                "Warning: --partial-origin is not supported with --experimental-sandbox, ignoring"
+            );
+        }
         crate::sandbox::linux_ptrace::run_cmd(strace, command, args).await;
     } else {
         if strace {
@@ -40,6 +47,7 @@ pub async fn run(
             session,
             system,
             encryption,
+            partial_origin_policy,
             command,
             args,
         )

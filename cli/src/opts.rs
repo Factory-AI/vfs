@@ -39,6 +39,27 @@ impl std::fmt::Display for MountBackend {
     }
 }
 
+/// Partial-origin copy-up policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum PartialOriginMode {
+    /// Whole-file copy-up; portable by default
+    Off,
+    /// Partial-origin copy-up for eligible regular base files
+    On,
+    /// Partial-origin copy-up above a conservative size threshold
+    Auto,
+}
+
+impl From<PartialOriginMode> for agentfs_sdk::PartialOriginMode {
+    fn from(value: PartialOriginMode) -> Self {
+        match value {
+            PartialOriginMode::Off => agentfs_sdk::PartialOriginMode::Off,
+            PartialOriginMode::On => agentfs_sdk::PartialOriginMode::On,
+            PartialOriginMode::Auto => agentfs_sdk::PartialOriginMode::Auto,
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "agentfs")]
 #[command(version = env!("AGENTFS_VERSION"))]
@@ -164,6 +185,14 @@ pub enum Command {
         #[arg(long = "system")]
         system: bool,
 
+        /// Partial-origin policy for base-file writes: off, on, or auto
+        #[arg(long = "partial-origin", value_enum, value_name = "MODE")]
+        partial_origin: Option<PartialOriginMode>,
+
+        /// Size threshold for --partial-origin auto
+        #[arg(long = "partial-origin-threshold-bytes", value_name = "BYTES")]
+        partial_origin_threshold_bytes: Option<u64>,
+
         /// Hex-encoded encryption key for the delta layer.
         /// Enables local encryption when provided.
         #[arg(long, env = "AGENTFS_KEY")]
@@ -251,6 +280,14 @@ pub enum Command {
         /// Backend to use for mounting
         #[arg(long, default_value_t = MountBackend::default())]
         backend: MountBackend,
+
+        /// Partial-origin policy for base-file writes: off, on, or auto
+        #[arg(long = "partial-origin", value_enum, value_name = "MODE")]
+        partial_origin: Option<PartialOriginMode>,
+
+        /// Size threshold for --partial-origin auto
+        #[arg(long = "partial-origin-threshold-bytes", value_name = "BYTES")]
+        partial_origin_threshold_bytes: Option<u64>,
     },
     /// Show differences between base filesystem and delta (overlay mode only)
     Diff {
@@ -332,6 +369,22 @@ pub enum Command {
         /// Emit machine-readable JSON
         #[arg(long)]
         json: bool,
+
+        /// Fail if the database depends on external partial-origin base files
+        #[arg(long)]
+        require_portable: bool,
+
+        /// Validate partial-origin base file fingerprints against the current base tree
+        #[arg(long)]
+        check_base: bool,
+
+        /// Hex-encoded encryption key for encrypted databases
+        #[arg(long)]
+        key: Option<String>,
+
+        /// Encryption cipher (required with --key)
+        #[arg(long)]
+        cipher: Option<String>,
     },
     /// Create a portable local AgentFS database backup
     Backup {
@@ -345,6 +398,40 @@ pub enum Command {
         /// Reopen and verify the copied main database
         #[arg(long)]
         verify: bool,
+
+        /// Materialize partial-origin files into a portable backup
+        #[arg(long)]
+        materialize: bool,
+
+        /// Hex-encoded encryption key for encrypted databases
+        #[arg(long)]
+        key: Option<String>,
+
+        /// Encryption cipher (required with --key)
+        #[arg(long)]
+        cipher: Option<String>,
+    },
+    /// Create a portable database by materializing partial-origin files
+    Materialize {
+        /// Agent ID or database path
+        #[arg(add = ArgValueCompleter::new(id_or_path_completer))]
+        id_or_path: String,
+
+        /// Target database path to create
+        #[arg(long)]
+        output: PathBuf,
+
+        /// Reopen and verify the materialized database
+        #[arg(long)]
+        verify: bool,
+
+        /// Hex-encoded encryption key for encrypted databases
+        #[arg(long)]
+        key: Option<String>,
+
+        /// Encryption cipher (required with --key)
+        #[arg(long)]
+        cipher: Option<String>,
     },
     /// Migrate database schema to the current version
     Migrate {
@@ -516,4 +603,69 @@ fn id_or_path_completer(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
     completions.append(&mut path_completions);
 
     completions
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn run_partial_origin_options_parse() {
+        let args = Args::try_parse_from([
+            "agentfs",
+            "run",
+            "--partial-origin",
+            "auto",
+            "--partial-origin-threshold-bytes",
+            "4096",
+            "bash",
+        ])
+        .unwrap();
+
+        match args.command {
+            Command::Run {
+                partial_origin,
+                partial_origin_threshold_bytes,
+                command,
+                ..
+            } => {
+                assert_eq!(partial_origin, Some(PartialOriginMode::Auto));
+                assert_eq!(partial_origin_threshold_bytes, Some(4096));
+                assert_eq!(command, Some(PathBuf::from("bash")));
+            }
+            other => panic!("expected run command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mount_partial_origin_options_parse() {
+        let args = Args::try_parse_from([
+            "agentfs",
+            "mount",
+            "--partial-origin",
+            "on",
+            "--partial-origin-threshold-bytes",
+            "8192",
+            "agent",
+            "/tmp/agentfs-mnt",
+        ])
+        .unwrap();
+
+        match args.command {
+            Command::Mount {
+                partial_origin,
+                partial_origin_threshold_bytes,
+                id_or_path,
+                mountpoint,
+                ..
+            } => {
+                assert_eq!(partial_origin, Some(PartialOriginMode::On));
+                assert_eq!(partial_origin_threshold_bytes, Some(8192));
+                assert_eq!(id_or_path.as_deref(), Some("agent"));
+                assert_eq!(mountpoint, Some(PathBuf::from("/tmp/agentfs-mnt")));
+            }
+            other => panic!("expected mount command, got {other:?}"),
+        }
+    }
 }

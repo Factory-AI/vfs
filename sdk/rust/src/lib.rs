@@ -20,8 +20,9 @@ pub use turso::sync::{DatabaseSyncStats, PartialBootstrapStrategy, PartialSyncOp
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use filesystem::HostFS;
 pub use filesystem::{
-    BoxedFile, DirEntry, File, FileSystem, FilesystemStats, FsError, OverlayFS, Stats, TimeChange,
-    DEFAULT_DIR_MODE, DEFAULT_FILE_MODE, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT,
+    BoxedFile, DirEntry, File, FileSystem, FilesystemStats, FsError, OverlayFS, PartialOriginMode,
+    PartialOriginPolicy, Stats, TimeChange, WriteRange, DEFAULT_DIR_MODE, DEFAULT_FILE_MODE,
+    DEFAULT_PARTIAL_ORIGIN_THRESHOLD_BYTES, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT,
     S_IFREG, S_IFSOCK,
 };
 pub use kvstore::KvStore;
@@ -372,7 +373,13 @@ impl AgentFS {
             OverlayFS::init_schema(&conn, &base_path_str).await?;
         }
 
-        Self::open_with_pool(pool, sync_db).await
+        let db_path_for_fs = if sync_db.is_none() && db_path != ":memory:" {
+            Some(PathBuf::from(&db_path))
+        } else {
+            None
+        };
+
+        Self::open_with_pool_and_path(pool, sync_db, db_path_for_fs).await
     }
 
     /// Open an AgentFS instance from a connection pool
@@ -382,6 +389,24 @@ impl AgentFS {
     ) -> Result<Self> {
         let kv = KvStore::from_pool(pool.clone()).await?;
         let fs = filesystem::AgentFS::from_pool(pool.clone()).await?;
+        let tools = ToolCalls::from_pool(pool.clone()).await?;
+
+        Ok(Self {
+            pool,
+            sync_db,
+            kv,
+            fs,
+            tools,
+        })
+    }
+
+    async fn open_with_pool_and_path(
+        pool: connection_pool::ConnectionPool,
+        sync_db: Option<turso::sync::Database>,
+        db_path: Option<PathBuf>,
+    ) -> Result<Self> {
+        let kv = KvStore::from_pool(pool.clone()).await?;
+        let fs = filesystem::AgentFS::from_pool_with_path(pool.clone(), db_path).await?;
         let tools = ToolCalls::from_pool(pool.clone()).await?;
 
         Ok(Self {

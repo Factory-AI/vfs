@@ -289,20 +289,16 @@ impl HostFS {
             dev: stat.st_dev,
         };
 
-        // Check if we already have this source file
-        {
-            let src_map = self.src_to_ino.read().unwrap();
-            if let Some(&ino) = src_map.get(&src_id) {
-                // Increment nlookup on existing inode
-                let inodes = self.inodes.read().unwrap();
-                if let Some(inode) = inodes.get(&ino) {
-                    inode.nlookup.fetch_add(1, Ordering::Relaxed);
-                    return (ino, false);
-                }
+        let mut src_map = self.src_to_ino.write().unwrap();
+        if let Some(&ino) = src_map.get(&src_id) {
+            let inodes = self.inodes.read().unwrap();
+            if let Some(inode) = inodes.get(&ino) {
+                inode.nlookup.fetch_add(1, Ordering::Relaxed);
+                return (ino, false);
             }
+            src_map.remove(&src_id);
         }
 
-        // Create new inode
         let ino = self.alloc_ino();
         let inode = Inode {
             fd,
@@ -315,10 +311,7 @@ impl HostFS {
             let mut inodes = self.inodes.write().unwrap();
             inodes.insert(ino, inode);
         }
-        {
-            let mut src_map = self.src_to_ino.write().unwrap();
-            src_map.insert(src_id, ino);
-        }
+        src_map.insert(src_id, ino);
 
         (ino, true)
     }
@@ -326,13 +319,16 @@ impl HostFS {
     /// Remove an inode from the cache
     #[allow(dead_code)]
     fn remove_inode(&self, ino: i64) {
+        let mut src_map = self.src_to_ino.write().unwrap();
         let mut inodes = self.inodes.write().unwrap();
         if let Some(inode) = inodes.remove(&ino) {
-            let mut src_map = self.src_to_ino.write().unwrap();
-            src_map.remove(&SrcId {
+            let src_id = SrcId {
                 ino: inode.src_ino,
                 dev: inode.src_dev,
-            });
+            };
+            if src_map.get(&src_id).copied() == Some(ino) {
+                src_map.remove(&src_id);
+            }
         }
     }
 }
@@ -921,37 +917,41 @@ impl FileSystem for HostFS {
         .map_err(|e| Error::Internal(e.to_string()))?
     }
 
+    async fn retain_lookup(&self, ino: i64, nlookup: u64) -> Result<()> {
+        if ino == ROOT_INO {
+            return Ok(());
+        }
+        let inodes = self.inodes.read().unwrap();
+        let inode = inodes.get(&ino).ok_or(FsError::NotFound)?;
+        inode.nlookup.fetch_add(nlookup, Ordering::Relaxed);
+        Ok(())
+    }
+
     async fn forget(&self, ino: i64, nlookup: u64) {
         // Never forget root inode
         if ino == ROOT_INO {
             return;
         }
 
-        // Decrement nlookup and check if we should remove the inode
-        let should_remove = {
-            let inodes = self.inodes.read().unwrap();
-            if let Some(inode) = inodes.get(&ino) {
-                // Subtract nlookup from current count
-                let old = inode.nlookup.fetch_sub(nlookup, Ordering::Relaxed);
-                old <= nlookup // Will be zero or underflow
-            } else {
-                false
-            }
+        let mut src_map = self.src_to_ino.write().unwrap();
+        let mut inodes = self.inodes.write().unwrap();
+        let should_remove = if let Some(inode) = inodes.get(&ino) {
+            let old = inode.nlookup.fetch_sub(nlookup, Ordering::Relaxed);
+            old <= nlookup
+        } else {
+            false
         };
 
         if should_remove {
-            // Remove the inode from cache (this closes the O_PATH fd)
-            let mut inodes = self.inodes.write().unwrap();
             if let Some(inode) = inodes.remove(&ino) {
-                let mut src_map = self.src_to_ino.write().unwrap();
-                src_map.remove(&SrcId {
+                let src_id = SrcId {
                     ino: inode.src_ino,
                     dev: inode.src_dev,
-                });
+                };
+                if src_map.get(&src_id).copied() == Some(ino) {
+                    src_map.remove(&src_id);
+                }
             }
-            // Also remove from path_map if present
-            // Note: We'd need to track path->ino mapping to do this properly,
-            // but for now the inode cache cleanup is the critical part for fd management
         }
     }
 }

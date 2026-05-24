@@ -39,6 +39,13 @@ def positive_int(value):
     return parsed
 
 
+def non_negative_int(value):
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be >= 0")
+    return parsed
+
+
 parser = argparse.ArgumentParser()
 parser.add_argument("--max-files", type=positive_int, required=True)
 parser.add_argument("--max-dirs", type=positive_int, required=True)
@@ -47,15 +54,21 @@ parser.add_argument("--stat-iterations", type=positive_int, required=True)
 parser.add_argument("--readdir-iterations", type=positive_int, required=True)
 parser.add_argument("--open-iterations", type=positive_int, required=True)
 parser.add_argument("--open-read-bytes", type=positive_int, required=True)
+parser.add_argument("--repeated-read-iterations", type=non_negative_int, required=True)
+parser.add_argument("--repeated-read-files", type=positive_int, required=True)
 args = parser.parse_args()
 
 root = Path.cwd()
+started_total = time.perf_counter()
+started = time.perf_counter()
 all_files = sorted(path for path in root.rglob("*") if path.is_file())
 all_dirs = sorted(path for path in root.rglob("*") if path.is_dir())
 files = all_files[: args.max_files]
 dirs = [root] + all_dirs[: max(0, args.max_dirs - 1)]
 digest = hashlib.sha256()
-phase_seconds = {}
+phase_seconds = {
+    "tree_discovery": time.perf_counter() - started,
+}
 counts = {
     "scan_files": 0,
     "scan_bytes": 0,
@@ -67,9 +80,9 @@ counts = {
     "readdir_plus_entries": 0,
     "open_read_close_calls": 0,
     "open_read_close_bytes": 0,
+    "repeated_read_only_base_open_read_close_calls": 0,
+    "repeated_read_only_base_open_read_close_bytes": 0,
 }
-
-started_total = time.perf_counter()
 
 started = time.perf_counter()
 for path in files:
@@ -144,6 +157,21 @@ for _ in range(args.open_iterations):
         counts["open_read_close_bytes"] += len(data)
 phase_seconds["open_read_close_loop"] = time.perf_counter() - started
 
+started = time.perf_counter()
+if args.repeated_read_iterations:
+    repeat_files = files[: args.repeated_read_files]
+    for _ in range(args.repeated_read_iterations):
+        for path in repeat_files:
+            with path.open("rb") as handle:
+                data = handle.read(args.open_read_bytes)
+            digest.update(b"repeated-open-read-close\0")
+            digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(data)
+            counts["repeated_read_only_base_open_read_close_calls"] += 1
+            counts["repeated_read_only_base_open_read_close_bytes"] += len(data)
+phase_seconds["repeated_read_only_base_open_read_close_loop"] = time.perf_counter() - started
+
 print(json.dumps({
     "digest": digest.hexdigest(),
     "phase_seconds": phase_seconds,
@@ -157,6 +185,8 @@ print(json.dumps({
         "readdir_iterations": args.readdir_iterations,
         "open_iterations": args.open_iterations,
         "open_read_bytes": args.open_read_bytes,
+        "repeated_read_iterations": args.repeated_read_iterations,
+        "repeated_read_files": args.repeated_read_files,
     },
 }, sort_keys=True))
 '''
@@ -173,6 +203,13 @@ def positive_float(value: str) -> float:
     parsed = float(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be > 0")
+    return parsed
+
+
+def non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be >= 0")
     return parsed
 
 
@@ -248,6 +285,18 @@ Environment:
         type=positive_int,
         default=512,
         help="bytes read per open/read/close operation",
+    )
+    parser.add_argument(
+        "--repeated-read-iterations",
+        type=non_negative_int,
+        default=0,
+        help="extra repeated read-only open/read/close iterations over a stable file set",
+    )
+    parser.add_argument(
+        "--repeated-read-files",
+        type=positive_int,
+        default=1,
+        help="number of files used by --repeated-read-iterations",
     )
     parser.add_argument(
         "--modes",
@@ -546,6 +595,10 @@ def workload_argv(args: argparse.Namespace) -> list[str]:
         str(args.open_iterations),
         "--open-read-bytes",
         str(args.open_read_bytes),
+        "--repeated-read-iterations",
+        str(args.repeated_read_iterations),
+        "--repeated-read-files",
+        str(args.repeated_read_files),
     ]
 
 
@@ -709,6 +762,8 @@ def main(argv: list[str]) -> int:
                 "readdir_iterations": args.readdir_iterations,
                 "open_iterations": args.open_iterations,
                 "open_read_bytes": args.open_read_bytes,
+                "repeated_read_iterations": args.repeated_read_iterations,
+                "repeated_read_files": args.repeated_read_files,
                 "modes": args.modes,
             },
             "agentfs": {

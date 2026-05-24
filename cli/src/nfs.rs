@@ -22,7 +22,6 @@ use agentfs_sdk::{
     S_IFSOCK,
 };
 use async_trait::async_trait;
-use tokio::sync::Mutex as TokioMutex;
 use uuid::Uuid;
 
 /// Root directory inode number
@@ -65,8 +64,8 @@ fn error_to_nfsstat(e: SdkError) -> nfsstat3 {
 
 /// NFS adapter that wraps an AgentFS FileSystem.
 pub struct AgentNFS {
-    /// The underlying filesystem (wrapped in Mutex to serialize operations)
-    fs: Arc<TokioMutex<dyn FileSystem>>,
+    /// The underlying concurrency-safe filesystem.
+    fs: Arc<dyn FileSystem>,
     /// Server-local generation number embedded in opaque file handles.
     fh_generation: u64,
     /// CREATE-returned file-handle tokens that retain open-time write authority.
@@ -75,7 +74,7 @@ pub struct AgentNFS {
 
 impl AgentNFS {
     /// Create a new NFS adapter wrapping the given filesystem.
-    pub fn new(fs: Arc<TokioMutex<dyn FileSystem>>) -> Self {
+    pub fn new(fs: Arc<dyn FileSystem>) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
@@ -238,7 +237,7 @@ impl NFSFileSystem for AgentNFS {
             return Ok(dirid);
         }
 
-        let fs = self.fs.lock().await;
+        let fs = self.fs.clone();
 
         // Handle .. via filesystem lookup
         if name == ".." {
@@ -272,7 +271,7 @@ impl NFSFileSystem for AgentNFS {
     }
 
     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
-        let fs = self.fs.lock().await;
+        let fs = self.fs.clone();
         let stats = fs
             .getattr(id_to_fs_ino(id))
             .await
@@ -284,7 +283,7 @@ impl NFSFileSystem for AgentNFS {
 
     async fn setattr(&self, id: fileid3, setattr: sattr3) -> Result<fattr3, nfsstat3> {
         let fs_ino = id_to_fs_ino(id);
-        let fs = self.fs.lock().await;
+        let fs = self.fs.clone();
 
         // Handle chmod (mode change)
         if let set_mode3::mode(mode) = setattr.mode {
@@ -347,7 +346,7 @@ impl NFSFileSystem for AgentNFS {
         offset: u64,
         count: u32,
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
-        let fs = self.fs.lock().await;
+        let fs = self.fs.clone();
 
         let file = fs
             .open(id_to_fs_ino(id), O_RDONLY)
@@ -366,7 +365,7 @@ impl NFSFileSystem for AgentNFS {
     }
 
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
-        let fs = self.fs.lock().await;
+        let fs = self.fs.clone();
 
         let file = fs
             .open(id_to_fs_ino(id), O_RDWR)
@@ -399,7 +398,7 @@ impl NFSFileSystem for AgentNFS {
             set_mode3::Void => 0o644,
         };
 
-        let fs = self.fs.lock().await;
+        let fs = self.fs.clone();
         let (stats, _file) = fs
             .create_file(dir_fs_ino, name, S_IFREG | mode, auth.uid, auth.gid)
             .await
@@ -419,7 +418,7 @@ impl NFSFileSystem for AgentNFS {
         let dir_fs_ino = id_to_fs_ino(dirid);
         let name = std::str::from_utf8(filename).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
 
-        let fs = self.fs.lock().await;
+        let fs = self.fs.clone();
 
         // Check if file already exists
         if fs
@@ -456,7 +455,7 @@ impl NFSFileSystem for AgentNFS {
             set_mode3::Void => 0o755,
         };
 
-        let fs = self.fs.lock().await;
+        let fs = self.fs.clone();
 
         let stats = fs
             .mkdir(dir_fs_ino, name, mode, auth.uid, auth.gid)
@@ -498,7 +497,7 @@ impl NFSFileSystem for AgentNFS {
         // Convert rdev from specdata3 (major/minor) to u64
         let rdev_val = libc::makedev(rdev.specdata1 as _, rdev.specdata2 as _) as u64;
 
-        let fs = self.fs.lock().await;
+        let fs = self.fs.clone();
 
         let stats = fs
             .mknod(
@@ -521,7 +520,7 @@ impl NFSFileSystem for AgentNFS {
         let dir_fs_ino = id_to_fs_ino(dirid);
         let name = std::str::from_utf8(filename).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
 
-        let fs = self.fs.lock().await;
+        let fs = self.fs.clone();
 
         // Check if it's a file or directory and use appropriate method
         let stats = fs
@@ -553,7 +552,7 @@ impl NFSFileSystem for AgentNFS {
         let from_name = std::str::from_utf8(from_filename).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
         let to_name = std::str::from_utf8(to_filename).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
 
-        let fs = self.fs.lock().await;
+        let fs = self.fs.clone();
 
         fs.rename(from_dir_fs_ino, from_name, to_dir_fs_ino, to_name)
             .await
@@ -572,7 +571,7 @@ impl NFSFileSystem for AgentNFS {
         let dir_fs_ino = id_to_fs_ino(dirid);
         let name = std::str::from_utf8(filename).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
 
-        let fs = self.fs.lock().await;
+        let fs = self.fs.clone();
         let stats = fs
             .link(fs_ino, dir_fs_ino, name)
             .await
@@ -589,7 +588,7 @@ impl NFSFileSystem for AgentNFS {
     ) -> Result<ReadDirResult, nfsstat3> {
         let dir_fs_ino = id_to_fs_ino(dirid);
 
-        let fs = self.fs.lock().await;
+        let fs = self.fs.clone();
 
         let entries = fs
             .readdir_plus(dir_fs_ino)
@@ -648,7 +647,7 @@ impl NFSFileSystem for AgentNFS {
         let name = std::str::from_utf8(linkname).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
         let target = std::str::from_utf8(symlink).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
 
-        let fs = self.fs.lock().await;
+        let fs = self.fs.clone();
 
         let stats = fs
             .symlink(dir_fs_ino, name, target, auth.uid, auth.gid)
@@ -661,7 +660,7 @@ impl NFSFileSystem for AgentNFS {
     }
 
     async fn readlink(&self, id: fileid3) -> Result<nfspath3, nfsstat3> {
-        let fs = self.fs.lock().await;
+        let fs = self.fs.clone();
 
         let target = fs
             .readlink(id_to_fs_ino(id))
@@ -684,7 +683,7 @@ mod tests {
         let agent = AgentFS::open(AgentFSOptions::ephemeral())
             .await
             .expect("ephemeral AgentFS opens");
-        let fs: Arc<TokioMutex<dyn FileSystem>> = Arc::new(TokioMutex::new(agent.fs));
+        let fs: Arc<dyn FileSystem> = Arc::new(agent.fs);
         AgentNFS::new(fs)
     }
 

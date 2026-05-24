@@ -110,6 +110,44 @@ Linux uses FUSE + overlay filesystem with user namespaces. macOS uses NFS + over
 
 Default allowed directories (macOS): `~/.claude`, `~/.codex`, `~/.config`, `~/.cache`, `~/.local`, `~/.npm`, `/tmp`
 
+**Linux FUSE performance and cache controls:**
+
+AgentFS uses a bounded FUSE worker pool on Linux. The pool removes the old
+global backend mutex from read paths while preserving copy-on-write isolation:
+reads are admitted through a shared read lane, and metadata/content mutations
+are admitted through an exclusive write lane before reaching the SQLite-backed
+delta.
+
+| Variable | Default | Description |
+|---|---:|---|
+| `AGENTFS_FUSE_WORKERS` | `auto` | `serial`, `auto`, an integer worker count, or a percent such as `25%`. Defaults to `auto` (~`AGENTFS_FUSE_CPU_PERCENT`% of host CPUs). Set to `serial` to fall back to single-threaded dispatch. |
+| `AGENTFS_FUSE_QUEUE` | derived | Request queue capacity. Accepts an integer or memory percent. |
+| `AGENTFS_FUSE_CPU_PERCENT` | `25` | Target CPU fraction when `AGENTFS_FUSE_WORKERS=auto`. |
+| `AGENTFS_FUSE_MEMORY_PERCENT` | `25` | Target memory fraction for derived queue sizing. |
+| `AGENTFS_FUSE_SYNC_INVAL` | `0` | Opt-in synchronous kernel cache invalidation. Default uses deferred (off-thread) invalidation which is safer under parallel workers: synchronous notifies issued from a request handler can block waiting for inline `FUSE_FORGET` traffic that the session thread cannot deliver while every dispatch lane is busy, so combining `AGENTFS_FUSE_SYNC_INVAL=1` with parallel `AGENTFS_FUSE_WORKERS` can deadlock under git workloads. The kernel cache fast path no longer requires this flag. |
+| `AGENTFS_FUSE_ENTRY_TTL_MS` | `1000` | Kernel dentry TTL when the kernel cache fast path is active (parallel workers); otherwise forced to `0`. |
+| `AGENTFS_FUSE_ATTR_TTL_MS` | `1000` | Kernel attribute TTL when the kernel cache fast path is active (parallel workers); otherwise forced to `0`. |
+| `AGENTFS_FUSE_NEG_TTL_MS` | `1000` | Kernel negative-entry TTL when the kernel cache fast path is active (parallel workers); otherwise forced to `0`. |
+| `AGENTFS_FUSE_READDIRPLUS` | `auto` | `off`, `auto`, or `always`; accepted when the kernel cache fast path is active (parallel workers). |
+| `AGENTFS_FUSE_WRITEBACK` | `1` | Requests FUSE writeback cache; accepted when the kernel cache fast path is active (parallel workers). |
+| `AGENTFS_FUSE_KEEPCACHE` | `1` | Requests `FOPEN_KEEP_CACHE` for eligible read-only base files; accepted when the kernel cache fast path is active (parallel workers). |
+
+By default (no env vars set), AgentFS runs with parallel FUSE dispatch and
+deferred kernel-cache invalidation, which enables the kernel cache fast path:
+1 s TTLs on dentries/attrs/negative lookups, writeback cache, `FOPEN_KEEP_CACHE`
+on eligible reads, and readdirplus auto. Each mutation path (`create`, `mkdir`,
+`mknod`, `symlink`, `link`, `unlink`, `rmdir`, `rename`, `write`, `flush`,
+`setattr`) is audited in debug builds to confirm a kernel cache invalidation
+(synchronous or deferred) is queued before any success reply.
+
+Override to `AGENTFS_FUSE_WORKERS=serial` to fall back to the pre-Phase-8
+behavior where the kernel cache fast path is fully disabled (TTLs=0, no
+writeback, no keepcache, no readdirplus). Setting `AGENTFS_FUSE_SYNC_INVAL=1`
+re-enables synchronous invalidation; use it only with `AGENTFS_FUSE_WORKERS=serial`
+to avoid the parallel-dispatch deadlock described above. All copy-on-write
+writes remain in the AgentFS database; no sandbox write is applied to the base
+filesystem regardless of the cache configuration.
+
 ### agentfs mount
 
 Mount an agent filesystem or list mounted filesystems.
@@ -209,6 +247,8 @@ agentfs integrity [OPTIONS] <ID_OR_PATH>
 
 **Options:**
 - `--json` - Emit a machine-readable report
+- `--key <KEY>` - Hex-encoded encryption key for encrypted databases
+- `--cipher <CIPHER>` - Cipher algorithm (required with `--key`)
 
 **Examples:**
 
@@ -239,6 +279,8 @@ agentfs backup <ID_OR_PATH> <TARGET_DB> [OPTIONS]
 
 **Options:**
 - `--verify` - Reopen the copied main database and run integrity checks
+- `--key <KEY>` - Hex-encoded encryption key for encrypted databases
+- `--cipher <CIPHER>` - Cipher algorithm (required with `--key`)
 
 **Examples:**
 
@@ -251,7 +293,10 @@ agentfs backup .agentfs/my-agent.db ./my-agent-backup.db --verify
 ```
 
 The command checkpoints and truncates the source WAL before copying only the
-main database file. The target must not already exist.
+main database file. The target must not already exist. Databases with
+partial-origin overlay rows are rejected because their file contents still
+depend on the external base tree; keep the base tree with the database or
+materialize the overlay before creating a portable backup.
 
 ### agentfs migrate
 

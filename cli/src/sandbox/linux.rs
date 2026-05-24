@@ -16,7 +16,9 @@
 //! bypassing the FUSE mount entirely.
 
 use super::group_paths_by_parent;
-use agentfs_sdk::{AgentFS, AgentFSOptions, EncryptionConfig, HostFS, OverlayFS};
+use agentfs_sdk::{
+    AgentFS, AgentFSOptions, EncryptionConfig, HostFS, OverlayFS, PartialOriginPolicy,
+};
 use anyhow::{bail, Context, Result};
 use std::{
     cmp::Reverse,
@@ -32,7 +34,6 @@ use std::{
         Arc,
     },
 };
-use tokio::sync::Mutex;
 
 /// Global child PID for signal forwarding.
 /// Set by the parent before installing signal handlers.
@@ -144,6 +145,7 @@ pub async fn run_cmd(
     session_id: Option<String>,
     system: bool,
     encryption: Option<(String, String)>,
+    partial_origin_policy: Option<PartialOriginPolicy>,
     command: PathBuf,
     args: Vec<String>,
 ) -> Result<()> {
@@ -208,7 +210,11 @@ pub async fn run_cmd(
     };
 
     let base = Arc::new(hostfs);
-    let overlay = OverlayFS::new(base, agentfs.fs);
+    let overlay = if let Some(policy) = partial_origin_policy {
+        OverlayFS::new_with_partial_origin_policy(base, agentfs.fs, policy)
+    } else {
+        OverlayFS::new(base, agentfs.fs)
+    };
 
     let cwd_str = cwd
         .to_str()
@@ -240,7 +246,7 @@ pub async fn run_cmd(
     };
 
     // Mount the overlay filesystem
-    let mount_handle = mount_fs(Arc::new(Mutex::new(overlay)), mount_opts).await?;
+    let mount_handle = mount_fs(Arc::new(overlay), mount_opts).await?;
 
     // Create pipes for parent-child coordination.
     // The parent needs to write uid_map/gid_map for the child after unshare.
@@ -393,6 +399,8 @@ fn run_in_existing_session(
 
         // Clean up proc file
         crate::cmd::ps::remove_proc_file(session_id);
+
+        agentfs_sdk::profiling::report_summary("run_parent");
 
         std::process::exit(exit_code);
     }
@@ -931,6 +939,8 @@ fn run_parent(
     eprintln!();
     eprintln!("To see what changed:");
     eprintln!("  agentfs diff {}", session_id);
+
+    agentfs_sdk::profiling::report_summary("run_parent");
 
     std::process::exit(exit_code);
 }

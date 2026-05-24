@@ -9,7 +9,6 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::signal;
-use tokio::sync::Mutex;
 
 use crate::cmd::init::open_agentfs;
 use crate::nfs::AgentNFS;
@@ -34,16 +33,16 @@ pub async fn handle_nfs_command(id_or_path: String, bind: String, port: u32) -> 
         .context("Failed to check overlay config")?;
 
     // Create filesystem - either direct AgentFS or overlay with base
-    let fs: Arc<Mutex<dyn FileSystem>> = if let Some(base_str) = base_path {
+    let fs: Arc<dyn FileSystem> = if let Some(base_str) = base_path {
         let hostfs = HostFS::new(&base_str).context("Failed to create HostFS")?;
         let overlay = OverlayFS::new(Arc::new(hostfs), agentfs.fs);
         overlay.load().await?; // Load persisted whiteouts and origin mappings
 
         eprintln!("Mode: overlay (base: {})", base_str);
-        Arc::new(Mutex::new(overlay))
+        Arc::new(overlay)
     } else {
         eprintln!("Mode: direct AgentFS");
-        Arc::new(Mutex::new(agentfs.fs))
+        Arc::new(agentfs.fs)
     };
 
     // Create NFS adapter

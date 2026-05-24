@@ -1855,6 +1855,7 @@ pub async fn nfsproc3_setattr(
                 make_success_reply(xid).serialize(output)?;
                 nfs::nfsstat3::NFS3ERR_NOT_SYNC.serialize(output)?;
                 nfs::wcc_data::default().serialize(output)?;
+                return Ok(());
             }
         }
     }
@@ -3015,7 +3016,6 @@ mod tests {
     use std::io::Cursor;
     use std::sync::Arc;
     use std::time::Duration;
-    use tokio::sync::Mutex;
 
     const TEST_UID: u32 = 1000;
     const TEST_GID: u32 = 1000;
@@ -3030,7 +3030,7 @@ mod tests {
             .await
             .expect("make root writable to unprivileged test user");
         let fs = agent.fs.clone();
-        let nfs = AgentNFS::new(Arc::new(Mutex::new(agent.fs)));
+        let nfs = AgentNFS::new(Arc::new(agent.fs));
         let vfs: Arc<dyn NFSFileSystem + Send + Sync> = Arc::new(nfs);
         let context = RPCContext {
             local_port: 11111,
@@ -3107,6 +3107,14 @@ mod tests {
     }
 
     fn serialize_setattr_size_args(file: nfs::nfs_fh3, size: u64) -> Vec<u8> {
+        serialize_setattr_size_args_with_guard(file, size, sattrguard3::Void)
+    }
+
+    fn serialize_setattr_size_args_with_guard(
+        file: nfs::nfs_fh3,
+        size: u64,
+        guard: sattrguard3,
+    ) -> Vec<u8> {
         let mut input = Vec::new();
         let mut cursor = Cursor::new(&mut input);
         SETATTR3args {
@@ -3115,7 +3123,7 @@ mod tests {
                 size: nfs::set_size3::size(size),
                 ..Default::default()
             },
-            guard: sattrguard3::Void,
+            guard,
         }
         .serialize(&mut cursor)
         .expect("serialize SETATTR size args");
@@ -3160,6 +3168,23 @@ mod tests {
         size: u64,
     ) -> nfs::nfsstat3 {
         let mut input = Cursor::new(serialize_setattr_size_args(file, size));
+        let mut output = Vec::new();
+        nfsproc3_setattr(3, &mut input, &mut output, context)
+            .await
+            .expect("SETATTR handler");
+
+        let mut cursor = Cursor::new(output);
+        parse_rpc_success(&mut cursor);
+        parse_nfs_status(&mut cursor)
+    }
+
+    async fn setattr_size_status_with_guard(
+        context: &RPCContext,
+        file: nfs::nfs_fh3,
+        size: u64,
+        guard: sattrguard3,
+    ) -> nfs::nfsstat3 {
+        let mut input = Cursor::new(serialize_setattr_size_args_with_guard(file, size, guard));
         let mut output = Vec::new();
         nfsproc3_setattr(3, &mut input, &mut output, context)
             .await
@@ -3241,6 +3266,25 @@ mod tests {
         let status = setattr_size_status(&context, plain_fh, 3).await;
 
         assert!(matches!(status, nfs::nfsstat3::NFS3ERR_ACCES));
+        assert_eq!(read_file(&fs, "loose-object", 8).await, b"abcdef");
+    }
+
+    #[tokio::test]
+    async fn setattr_guard_mismatch_does_not_truncate() {
+        let (context, fs) = test_context().await;
+        let created_fh = create_readonly_file(&context).await;
+        assert!(matches!(
+            write_status(&context, created_fh.clone(), b"abcdef").await,
+            nfs::nfsstat3::NFS3_OK
+        ));
+
+        let stale_guard = sattrguard3::obj_ctime(nfs::nfstime3 {
+            seconds: 0,
+            nseconds: 0,
+        });
+        let status = setattr_size_status_with_guard(&context, created_fh, 3, stale_guard).await;
+
+        assert!(matches!(status, nfs::nfsstat3::NFS3ERR_NOT_SYNC));
         assert_eq!(read_file(&fs, "loose-object", 8).await, b"abcdef");
     }
 }

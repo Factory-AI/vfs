@@ -176,6 +176,17 @@ AgentFS is an agent filesystem accessible through an SDK that provides three ess
 
 At the heart of AgentFS is the [agent filesystem](SPEC.md), a complete SQLite-based storage system for agents implemented using [Turso](https://github.com/tursodatabase/turso). Everything an agent does—every file it creates, every piece of state it stores, every tool it invokes—lives in a single SQLite database file.
 
+For sandboxed coding-agent workloads, AgentFS can layer that SQLite-backed
+filesystem over a read-only host directory. Reads are scoped to the configured
+base tree, while writes go only to the AgentFS delta database. The real
+filesystem is never modified by copy-on-write operations. On Linux, the FUSE
+backend dispatches requests through a bounded worker pool and a read/write lane:
+read-heavy operations can run concurrently against internally synchronized
+backends, while namespace and data mutations remain serialized at the
+filesystem/SQLite transaction boundaries. This preserves AgentFS's two core
+safety properties: one portable database contains the virtual filesystem state,
+and sandboxed writes do not touch the real filesystem.
+
 ## 🤔 FAQ
 
 ### How is AgentFS different from _X_?

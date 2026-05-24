@@ -1,25 +1,27 @@
 use crate::fuser::{
     consts::{
-        FUSE_ASYNC_READ, FUSE_CACHE_SYMLINKS, FUSE_NO_OPENDIR_SUPPORT, FUSE_PARALLEL_DIROPS,
-        FUSE_WRITEBACK_CACHE,
+        FOPEN_KEEP_CACHE, FUSE_ASYNC_READ, FUSE_CACHE_SYMLINKS, FUSE_DO_READDIRPLUS,
+        FUSE_NO_OPENDIR_SUPPORT, FUSE_PARALLEL_DIROPS, FUSE_READDIRPLUS_AUTO, FUSE_WRITEBACK_CACHE,
     },
     fuse_forget_one, FileAttr, FileType, Filesystem, KernelConfig, MountOption, ReplyAttr,
     ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen,
     ReplyStatfs, ReplyWrite, Request,
 };
 use agentfs_sdk::error::Error as SdkError;
-use agentfs_sdk::filesystem::{S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFSOCK};
-use agentfs_sdk::{BoxedFile, FileSystem, Stats, TimeChange};
+use agentfs_sdk::filesystem::{
+    WriteRange, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFSOCK,
+};
+use agentfs_sdk::{BoxedFile, DirEntry, FileSystem, FsError, Stats, TimeChange};
 use parking_lot::Mutex;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     ffi::OsStr,
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::runtime::Runtime;
 use tracing;
@@ -68,13 +70,175 @@ fn maximize_fd_limit() {
     }
 }
 
-/// Cache entries never expire — we use deferred kernel cache invalidation
-/// (via Notifier::inval_entry) after mutations to keep the dcache consistent.
-/// This is safe because we are the only writer to the filesystem.
-const TTL: Duration = Duration::MAX;
+const DEFAULT_FUSE_TTL_MS: u64 = 1000;
+const READDIRPLUS_MODE_OFF: u64 = 0;
+const READDIRPLUS_MODE_AUTO: u64 = 1;
+const READDIRPLUS_MODE_ALWAYS: u64 = 2;
 
-/// Maximum pending write data buffered per open FUSE file handle.
-const MAX_PENDING_WRITE_BYTES: usize = 4 * 1024 * 1024;
+/// FUSE kernel cache policy derived once per mount from environment knobs.
+#[derive(Debug, Clone)]
+struct FuseKernelCacheConfig {
+    entry_ttl: Duration,
+    attr_ttl: Duration,
+    neg_ttl: Duration,
+    entry_ttl_ms: u64,
+    attr_ttl_ms: u64,
+    neg_ttl_ms: u64,
+    writeback_cache_enabled: bool,
+    keepcache_enabled: bool,
+    readdirplus_mode: ReaddirPlusMode,
+}
+
+impl FuseKernelCacheConfig {
+    fn from_env() -> Self {
+        let entry_ttl_ms = env_duration_ms("AGENTFS_FUSE_ENTRY_TTL_MS", DEFAULT_FUSE_TTL_MS);
+        let attr_ttl_ms = env_duration_ms("AGENTFS_FUSE_ATTR_TTL_MS", DEFAULT_FUSE_TTL_MS);
+        let neg_ttl_ms = env_duration_ms("AGENTFS_FUSE_NEG_TTL_MS", DEFAULT_FUSE_TTL_MS);
+
+        // Kernel cache safety requires non-serial workers: we need a worker thread
+        // distinct from the session loop to send FUSE_NOTIFY_INVAL_* without
+        // blocking the request reader. Serial mode keeps reply+notify on the same
+        // thread which deadlocks per cli/src/fuser/deferred_notify.rs.
+        //
+        // Whether AGENTFS_FUSE_SYNC_INVAL is on does NOT affect safety here:
+        // - On (sync): worker writev's notify directly. Risk: kernel may block
+        //   the worker's writev waiting for an inline FUSE_FORGET that the
+        //   session thread cannot deliver if its lane queue is full. This
+        //   reproduces under git clone on Linux 6+ kernels.
+        // - Off (deferred, the default): notify is enqueued to the dedicated
+        //   notify thread that owns its own writev fd. The notify thread is
+        //   never blocked by the dispatch path, so the kernel-side FORGET
+        //   round-trip drains independently. Cache coherency is bounded by
+        //   the few-microsecond latency between mutation reply and notify
+        //   delivery, which is well within the entry/attr TTL window.
+        //
+        // So: safe_kernel_cache only requires non-serial workers, and the
+        // sync_invalidation env var is treated as an unsafe opt-in.
+        let workers_not_serial = fuse_workers_not_serial_from_env();
+        let safe_kernel_cache = workers_not_serial;
+        let (entry_ttl_ms, attr_ttl_ms, neg_ttl_ms) = if safe_kernel_cache {
+            (entry_ttl_ms, attr_ttl_ms, neg_ttl_ms)
+        } else {
+            if entry_ttl_ms != 0 || attr_ttl_ms != 0 || neg_ttl_ms != 0 {
+                tracing::warn!(
+                    "Refusing nonzero FUSE TTLs: kernel entry/attr/negative TTLs require non-serial AGENTFS_FUSE_WORKERS"
+                );
+            }
+            (0, 0, 0)
+        };
+
+        let writeback_requested = env_flag_default("AGENTFS_FUSE_WRITEBACK", true);
+        let writeback_cache_enabled = writeback_requested && safe_kernel_cache;
+        if writeback_requested && !writeback_cache_enabled {
+            tracing::warn!(
+                "Refusing FUSE writeback cache: AGENTFS_FUSE_WRITEBACK requires non-serial AGENTFS_FUSE_WORKERS"
+            );
+        }
+
+        let keepcache_requested = env_flag_default("AGENTFS_FUSE_KEEPCACHE", true);
+        let keepcache_enabled = keepcache_requested && safe_kernel_cache;
+        if keepcache_requested && !keepcache_enabled {
+            tracing::warn!(
+                "Refusing FOPEN_KEEP_CACHE: AGENTFS_FUSE_KEEPCACHE requires non-serial AGENTFS_FUSE_WORKERS"
+            );
+        }
+        let readdirplus_mode = if safe_kernel_cache {
+            readdirplus_mode_from_env()
+        } else {
+            tracing::warn!(
+                "Refusing FUSE readdirplus: readdirplus requires non-serial AGENTFS_FUSE_WORKERS"
+            );
+            ReaddirPlusMode::Off
+        };
+
+        Self {
+            entry_ttl: Duration::from_millis(entry_ttl_ms),
+            attr_ttl: Duration::from_millis(attr_ttl_ms),
+            neg_ttl: Duration::from_millis(neg_ttl_ms),
+            entry_ttl_ms,
+            attr_ttl_ms,
+            neg_ttl_ms,
+            writeback_cache_enabled,
+            keepcache_enabled,
+            readdirplus_mode,
+        }
+    }
+
+    fn record_profile(&self) {
+        agentfs_sdk::profiling::set_fuse_ttl_ms(
+            self.entry_ttl_ms,
+            self.attr_ttl_ms,
+            self.neg_ttl_ms,
+        );
+        agentfs_sdk::profiling::set_fuse_keepcache_enabled(self.keepcache_enabled);
+        agentfs_sdk::profiling::set_fuse_readdirplus_mode(self.readdirplus_mode.profile_value());
+    }
+}
+
+#[derive(Debug, Default)]
+struct KeepCacheDriftGuard {
+    eligible: HashSet<u64>,
+    dropped: HashSet<u64>,
+    fingerprints: HashMap<u64, KeepCacheFingerprint>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct KeepCacheFingerprint {
+    mode: u32,
+    size: i64,
+    mtime: i64,
+    mtime_nsec: u32,
+    ctime: i64,
+    ctime_nsec: u32,
+    rdev: u64,
+}
+
+impl KeepCacheFingerprint {
+    fn from_stats(stats: &Stats) -> Self {
+        Self {
+            mode: stats.mode,
+            size: stats.size,
+            mtime: stats.mtime,
+            mtime_nsec: stats.mtime_nsec,
+            ctime: stats.ctime,
+            ctime_nsec: stats.ctime_nsec,
+            rdev: stats.rdev,
+        }
+    }
+}
+
+impl KeepCacheDriftGuard {
+    fn allows(&self, ino: u64, fingerprint: &KeepCacheFingerprint) -> bool {
+        !self.dropped.contains(&ino)
+            && self
+                .fingerprints
+                .get(&ino)
+                .map(|existing| existing == fingerprint)
+                .unwrap_or(true)
+    }
+
+    fn mark_eligible(&mut self, ino: u64, fingerprint: KeepCacheFingerprint) {
+        if !self.dropped.contains(&ino) {
+            self.eligible.insert(ino);
+            self.fingerprints.insert(ino, fingerprint);
+        }
+    }
+
+    fn drop_eligibility(&mut self, ino: u64) -> bool {
+        let was_eligible = self.eligible.remove(&ino);
+        self.fingerprints.remove(&ino);
+        let newly_dropped = self.dropped.insert(ino);
+        was_eligible || newly_dropped
+    }
+}
+
+/// Kernel readdirplus policy.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ReaddirPlusMode {
+    Off,
+    Auto,
+    Always,
+}
 
 /// Options for mounting an agent filesystem via FUSE.
 #[derive(Debug, Clone)]
@@ -115,13 +279,10 @@ impl OpenFile {
         }
     }
 
+    #[cfg(test)]
     fn buffer_write(&mut self, offset: u64, data: &[u8]) -> Result<(), i32> {
         self.pending.write(offset, data)?;
         Ok(())
-    }
-
-    fn pending_bytes(&self) -> usize {
-        self.pending.bytes()
     }
 
     fn flush_pending(&mut self, runtime: &Runtime) -> Result<(), SdkError> {
@@ -134,17 +295,24 @@ impl OpenFile {
         let range_count = ranges.len() as u64;
         let byte_count = ranges
             .iter()
-            .map(|(_, data)| data.len() as u64)
+            .map(|range| range.data.len() as u64)
             .sum::<u64>();
 
-        for (offset, data) in ranges {
-            let file = file.clone();
-            runtime.block_on(async move { file.pwrite(offset, &data).await })?;
-        }
+        runtime.block_on(async move { file.pwrite_ranges(ranges).await })?;
 
         self.pending.clear();
         agentfs_sdk::profiling::record_fuse_flush(range_count, byte_count);
         Ok(())
+    }
+
+    fn drain_writes(&self, runtime: &Runtime) -> Result<(), SdkError> {
+        let file = self.file.clone();
+        runtime.block_on(async move { file.drain_writes().await })
+    }
+
+    fn flush_pending_and_drain(&mut self, runtime: &Runtime) -> Result<(), SdkError> {
+        self.flush_pending(runtime)?;
+        self.drain_writes(runtime)
     }
 }
 
@@ -164,6 +332,7 @@ impl WriteBuffer {
         self.ranges.is_empty()
     }
 
+    #[cfg(test)]
     fn bytes(&self) -> usize {
         self.bytes
     }
@@ -173,13 +342,17 @@ impl WriteBuffer {
         self.bytes = 0;
     }
 
-    fn ranges_for_flush(&self) -> Vec<(u64, Vec<u8>)> {
+    fn ranges_for_flush(&self) -> Vec<WriteRange> {
         self.ranges
             .iter()
-            .map(|(&offset, data)| (offset, data.clone()))
+            .map(|(&offset, data)| WriteRange {
+                offset,
+                data: data.clone(),
+            })
             .collect()
     }
 
+    #[cfg(test)]
     fn write(&mut self, offset: u64, data: &[u8]) -> Result<(), i32> {
         if data.is_empty() {
             return Ok(());
@@ -248,15 +421,90 @@ impl WriteBuffer {
     }
 }
 
+struct CachedDirEntry {
+    name: String,
+    attr: FileAttr,
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static MUTATION_INVALIDATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Records that an invalidation flowed through this thread for the active
+/// mutation. Zero overhead in release builds.
+#[inline(always)]
+fn record_mutation_invalidation() {
+    #[cfg(debug_assertions)]
+    MUTATION_INVALIDATIONS.with(|c| c.set(c.get().saturating_add(1)));
+}
+
+/// RAII audit guard: captures the per-thread invalidation count at the start of
+/// a mutation. Calling [`MutationAudit::assert_invalidated`] on the success path
+/// asserts (debug builds only) that at least one kernel-cache invalidation was
+/// recorded between construction and the assertion. Compiles to a ZST with
+/// no instructions in release builds.
+struct MutationAudit {
+    #[cfg(debug_assertions)]
+    start: u64,
+}
+
+impl MutationAudit {
+    #[inline(always)]
+    fn new() -> Self {
+        Self {
+            #[cfg(debug_assertions)]
+            start: MUTATION_INVALIDATIONS.with(|c| c.get()),
+        }
+    }
+
+    /// Asserts that the success branch of a mutation called
+    /// `invalidate_inode_cache` or `invalidate_entry_cache` at least once.
+    /// No-op in release; intentionally takes `self` so the audit can only be
+    /// asserted once per mutation.
+    #[inline(always)]
+    fn assert_invalidated(self, _op: &'static str) {
+        #[cfg(debug_assertions)]
+        {
+            let end = MUTATION_INVALIDATIONS.with(|c| c.get());
+            debug_assert!(
+                end > self.start,
+                "FUSE mutation `{}` must call invalidate_inode_cache or invalidate_entry_cache before replying with success",
+                _op
+            );
+        }
+    }
+}
+
 struct AgentFSFuse {
     fs: Arc<dyn FileSystem>,
     runtime: Runtime,
+    /// Env-backed kernel cache safety configuration for this mount.
+    cache_config: FuseKernelCacheConfig,
     /// Maps file handle -> open file state
     open_files: Arc<Mutex<HashMap<u64, OpenFile>>>,
+    /// Caches fully materialized directory entries across FUSE readdir offset calls.
+    dir_entries_cache: Arc<Mutex<HashMap<u64, Arc<Vec<CachedDirEntry>>>>>,
+    /// Caches attributes discovered by lookup/readdir_plus for read-heavy traversals.
+    attr_cache: Arc<Mutex<HashMap<u64, Stats>>>,
+    /// Caches positive parent/name lookups discovered by lookup/readdir_plus.
+    entry_cache: Arc<Mutex<HashMap<(u64, String), Stats>>>,
+    /// Caches negative parent/name lookups; exact namespace mutations remove or update keys.
+    negative_entry_cache: Arc<Mutex<HashMap<(u64, String), ()>>>,
+    /// Drops FOPEN_KEEP_CACHE eligibility after mutations that can stale kernel pages.
+    keepcache_drift_guard: Arc<Mutex<KeepCacheDriftGuard>>,
+    /// Serializes cacheable FUSE replies against mutation invalidations.
+    cache_reply_lock: Arc<Mutex<()>>,
+    /// Monotonic epoch bumped whenever a mutation invalidates cached namespace or attrs.
+    cache_epoch: AtomicU64,
     /// Next file handle to allocate
     next_fh: AtomicU64,
+    /// Whether kernel cache invalidations are sent synchronously before replies.
+    sync_inval: bool,
     /// Emits a profiling summary when the FUSE session object is dropped.
     _profile_report: Arc<agentfs_sdk::profiling::ProfileReportGuard>,
+    /// Whether FUSE writeback mode is enabled for this mount.
+    writeback_enabled: bool,
 }
 
 impl Filesystem for AgentFSFuse {
@@ -264,30 +512,33 @@ impl Filesystem for AgentFSFuse {
     ///
     /// - Async read: allows the kernel to issue multiple read requests in parallel,
     ///   improving throughput for concurrent file access.
-    /// - Writeback caching: allows the kernel to buffer writes and flush them
-    ///   later, significantly improving write performance for small writes.
+    /// - Writeback caching is enabled only when the Phase 8 safety interlocks
+    ///   indicate non-serial workers and synchronous invalidation; batched writes
+    ///   drain on flush/fsync/release before durability replies.
     /// - Parallel dirops: allows concurrent lookup() and readdir() on the same
     ///   directory, improving performance for parallel file access patterns.
     /// - Cache symlinks: caches readlink responses, avoiding repeated round-trips
     ///   for symlink resolution.
     /// - No opendir support: skips opendir/releasedir calls since we don't track
     ///   directory handles, reducing round-trips for directory operations.
-    fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> Result<(), libc::c_int> {
+    fn init(&self, _req: &Request, config: &mut KernelConfig) -> Result<(), libc::c_int> {
         tracing::debug!("FUSE::init");
+        self.cache_config.record_profile();
         let _ = config.add_capabilities(
-            FUSE_ASYNC_READ
-                | FUSE_WRITEBACK_CACHE
-                | FUSE_PARALLEL_DIROPS
-                | FUSE_CACHE_SYMLINKS
-                | FUSE_NO_OPENDIR_SUPPORT,
+            FUSE_ASYNC_READ | FUSE_PARALLEL_DIROPS | FUSE_CACHE_SYMLINKS | FUSE_NO_OPENDIR_SUPPORT,
         );
+        configure_writeback_cache(config, self.cache_config.writeback_cache_enabled);
+        configure_readdirplus(config, self.cache_config.readdirplus_mode);
         Ok(())
     }
 
-    fn destroy(&mut self) {
+    fn destroy(&self) {
         tracing::debug!("FUSE::destroy");
         if let Err(e) = self.flush_all_pending() {
             tracing::warn!("FUSE::destroy failed to flush pending writes: {}", e);
+        }
+        if let Err(e) = self.finalize_filesystem() {
+            tracing::warn!("FUSE::destroy failed to finalize filesystem: {}", e);
         }
     }
 
@@ -298,7 +549,7 @@ impl Filesystem for AgentFSFuse {
     /// Looks up a directory entry by name within a parent directory.
     ///
     /// Resolves `name` under the directory identified by `parent` inode.
-    fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
+    fn lookup(&self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         agentfs_sdk::profiling::record_fuse_lookup();
         tracing::debug!("FUSE::lookup: parent={}, name={:?}", parent, name);
 
@@ -307,18 +558,100 @@ impl Filesystem for AgentFSFuse {
             return;
         };
 
-        let fs = self.fs.clone();
-        let name_owned = name_str.to_string();
-        let result = self
-            .runtime
-            .block_on(async move { fs.lookup(parent as i64, &name_owned).await });
+        let cache_epoch = self.cache_epoch();
+        if let Some(stats) = self
+            .entry_cache
+            .lock()
+            .get(&(parent, name_str.to_string()))
+            .cloned()
+        {
+            let fs = self.fs.clone();
+            let retained = self
+                .runtime
+                .block_on(async move { fs.retain_lookup(stats.ino, 1).await })
+                .is_ok();
+            let cache_reply = self.cache_reply_lock.try_lock();
+            if retained && cache_reply.is_some() && !self.cache_epoch_changed(cache_epoch) {
+                let attr = fillattr(&stats);
+                reply.entry_with_ttls(
+                    &self.cache_config.entry_ttl,
+                    &self.cache_config.attr_ttl,
+                    &attr,
+                    0,
+                );
+                return;
+            }
+            if retained {
+                let fs = self.fs.clone();
+                let ino = stats.ino;
+                self.runtime
+                    .block_on(async move { fs.forget(ino, 1).await });
+            }
+        }
+
+        let cache_epoch = self.cache_epoch();
+        if self
+            .negative_entry_cache
+            .lock()
+            .contains_key(&(parent, name_str.to_string()))
+        {
+            let cache_reply = self.cache_reply_lock.try_lock();
+            if cache_reply.is_some() && !self.cache_epoch_changed(cache_epoch) {
+                agentfs_sdk::profiling::record_negative_cache_hit();
+                self.reply_negative_entry(reply);
+                return;
+            }
+        }
+        agentfs_sdk::profiling::record_negative_cache_miss();
+
+        let mut stable = false;
+        let mut stable_epoch = 0;
+        let mut result = None;
+        for _ in 0..2 {
+            let epoch = self.cache_epoch();
+            let fs = self.fs.clone();
+            let name_owned = name_str.to_string();
+            let lookup_result = self
+                .runtime
+                .block_on(async move { fs.lookup(parent as i64, &name_owned).await });
+            stable = !self.cache_epoch_changed(epoch);
+            stable_epoch = epoch;
+            result = Some(lookup_result);
+            if stable {
+                break;
+            }
+        }
+        let result = result.expect("lookup loop always runs");
+        let cache_reply = self.cache_reply_lock.try_lock();
+        stable = stable && cache_reply.is_some() && !self.cache_epoch_changed(stable_epoch);
 
         match result {
             Ok(Some(stats)) => {
+                if stable {
+                    self.cache_entry(parent, name_str, &stats);
+                }
                 let attr = fillattr(&stats);
-                reply.entry(&TTL, &attr, 0);
+                reply.entry_with_ttls(
+                    if stable {
+                        &self.cache_config.entry_ttl
+                    } else {
+                        &Duration::ZERO
+                    },
+                    if stable {
+                        &self.cache_config.attr_ttl
+                    } else {
+                        &Duration::ZERO
+                    },
+                    &attr,
+                    0,
+                );
             }
-            Ok(None) => reply.error(libc::ENOENT),
+            Ok(None) => {
+                if stable {
+                    self.cache_negative_entry(parent, name_str);
+                }
+                self.reply_negative_entry_with_ttl(reply, stable);
+            }
             Err(e) => reply.error(error_to_errno(&e)),
         }
     }
@@ -327,7 +660,7 @@ impl Filesystem for AgentFSFuse {
     ///
     /// Returns metadata (size, permissions, timestamps, etc.) for the file or
     /// directory identified by `ino`. Root inode (1) is handled specially.
-    fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+    fn getattr(&self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         agentfs_sdk::profiling::record_fuse_getattr();
         tracing::debug!("FUSE::getattr: ino={}", ino);
 
@@ -336,13 +669,49 @@ impl Filesystem for AgentFSFuse {
             return;
         }
 
-        let fs = self.fs.clone();
-        let result = self
-            .runtime
-            .block_on(async move { fs.getattr(ino as i64).await });
+        let cache_epoch = self.cache_epoch();
+        if let Some(stats) = self.attr_cache.lock().get(&ino).cloned() {
+            let cache_reply = self.cache_reply_lock.try_lock();
+            if cache_reply.is_some() && !self.cache_epoch_changed(cache_epoch) {
+                reply.attr(&self.cache_config.attr_ttl, &fillattr(&stats));
+                return;
+            }
+        }
+
+        let mut stable = false;
+        let mut stable_epoch = 0;
+        let mut result = None;
+        for _ in 0..2 {
+            let epoch = self.cache_epoch();
+            let fs = self.fs.clone();
+            let getattr_result = self
+                .runtime
+                .block_on(async move { fs.getattr(ino as i64).await });
+            stable = !self.cache_epoch_changed(epoch);
+            stable_epoch = epoch;
+            result = Some(getattr_result);
+            if stable {
+                break;
+            }
+        }
+        let result = result.expect("getattr loop always runs");
+        let cache_reply = self.cache_reply_lock.try_lock();
+        stable = stable && cache_reply.is_some() && !self.cache_epoch_changed(stable_epoch);
 
         match result {
-            Ok(Some(stats)) => reply.attr(&TTL, &fillattr(&stats)),
+            Ok(Some(stats)) => {
+                if stable {
+                    self.cache_attr(&stats);
+                }
+                reply.attr(
+                    if stable {
+                        &self.cache_config.attr_ttl
+                    } else {
+                        &Duration::ZERO
+                    },
+                    &fillattr(&stats),
+                );
+            }
             Ok(None) => reply.error(libc::ENOENT),
             Err(e) => reply.error(error_to_errno(&e)),
         }
@@ -352,7 +721,7 @@ impl Filesystem for AgentFSFuse {
     ///
     /// Returns the path that the symlink points to. This is called by operations
     /// like `ls -l` to display symlink targets.
-    fn readlink(&mut self, _req: &Request, ino: u64, reply: ReplyData) {
+    fn readlink(&self, _req: &Request, ino: u64, reply: ReplyData) {
         tracing::debug!("FUSE::readlink: ino={}", ino);
 
         let fs = self.fs.clone();
@@ -372,8 +741,8 @@ impl Filesystem for AgentFSFuse {
     /// Currently `size` changes (truncate) and `mode` changes (chmod) are supported.
     /// Other attribute changes (uid, gid, timestamps) are accepted but ignored.
     fn setattr(
-        &mut self,
-        _req: &Request,
+        &self,
+        req: &Request,
         ino: u64,
         mode: Option<u32>,
         uid: Option<u32>,
@@ -397,6 +766,13 @@ impl Filesystem for AgentFSFuse {
             gid,
             size
         );
+        let audit = MutationAudit::new();
+        let mutated = mode.is_some()
+            || uid.is_some()
+            || gid.is_some()
+            || size.is_some()
+            || atime.is_some()
+            || mtime.is_some();
 
         // Handle chmod
         if let Some(new_mode) = mode {
@@ -409,6 +785,7 @@ impl Filesystem for AgentFSFuse {
                 reply.error(error_to_errno(&e));
                 return;
             }
+            self.invalidate_inode_cache(req, ino);
         }
 
         // Handle chown
@@ -422,6 +799,7 @@ impl Filesystem for AgentFSFuse {
                 reply.error(error_to_errno(&e));
                 return;
             }
+            self.invalidate_inode_cache(req, ino);
         }
 
         // Handle truncate
@@ -463,6 +841,7 @@ impl Filesystem for AgentFSFuse {
                 reply.error(error_to_errno(&e));
                 return;
             }
+            self.invalidate_inode_cache(req, ino);
         }
 
         // Handle atime/mtime changes (utimensat)
@@ -491,6 +870,7 @@ impl Filesystem for AgentFSFuse {
                 reply.error(error_to_errno(&e));
                 return;
             }
+            self.invalidate_inode_cache(req, ino);
         }
 
         // Return updated attributes
@@ -500,7 +880,15 @@ impl Filesystem for AgentFSFuse {
             .block_on(async move { fs.getattr(ino as i64).await });
 
         match result {
-            Ok(Some(stats)) => reply.attr(&TTL, &fillattr(&stats)),
+            Ok(Some(stats)) => {
+                self.cache_attr(&stats);
+                if mutated {
+                    audit.assert_invalidated("setattr");
+                } else {
+                    let _ = audit;
+                }
+                reply.attr(&self.cache_config.attr_ttl, &fillattr(&stats));
+            }
             Ok(None) => reply.error(libc::ENOENT),
             Err(e) => reply.error(error_to_errno(&e)),
         }
@@ -517,61 +905,20 @@ impl Filesystem for AgentFSFuse {
     ///
     /// Uses readdir_plus to fetch entries with stats in a single query,
     /// avoiding N+1 database queries.
-    fn readdir(
-        &mut self,
-        _req: &Request,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
-        mut reply: ReplyDirectory,
-    ) {
+    fn readdir(&self, _req: &Request, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
         agentfs_sdk::profiling::record_fuse_readdir();
         tracing::debug!("FUSE::readdir: ino={}, offset={}", ino, offset);
 
-        let fs = self.fs.clone();
-        let entries_result = self
-            .runtime
-            .block_on(async move { fs.readdir_plus(ino as i64).await });
-
-        let entries = match entries_result {
-            Ok(Some(entries)) => entries,
-            Ok(None) => {
-                reply.error(libc::ENOENT);
-                return;
-            }
+        let all_entries = match self.cached_readdir_entries(ino) {
+            Ok((entries, _stable, _epoch)) => entries,
             Err(e) => {
                 reply.error(error_to_errno(&e));
                 return;
             }
         };
 
-        // Determine parent inode for ".." entry
-        // In the inode-based API we don't track parent relationships directly.
-        // The kernel tracks this information and will resolve ".." correctly.
-        // We use 1 (root) as a fallback which is safe since the kernel
-        // won't actually use this value for path resolution.
-        let parent_ino = 1u64;
-
-        let mut all_entries = vec![
-            (ino, FileType::Directory, "."),
-            (parent_ino, FileType::Directory, ".."),
-        ];
-
-        // Process entries with stats already available (no N+1 queries!)
-        for entry in &entries {
-            let kind = if entry.stats.is_directory() {
-                FileType::Directory
-            } else if entry.stats.is_symlink() {
-                FileType::Symlink
-            } else {
-                FileType::RegularFile
-            };
-
-            all_entries.push((entry.stats.ino as u64, kind, entry.name.as_str()));
-        }
-
-        for (i, entry) in all_entries.iter().enumerate().skip(offset as usize) {
-            if reply.add(entry.0, (i + 1) as i64, entry.1, entry.2) {
+        for (i, entry) in all_entries.iter().enumerate().skip(readdir_start(offset)) {
+            if reply.add(entry.attr.ino, (i + 1) as i64, entry.attr.kind, &entry.name) {
                 break;
             }
         }
@@ -584,7 +931,7 @@ impl Filesystem for AgentFSFuse {
     /// their attributes in a single call, reducing kernel/userspace round trips.
     /// Uses readdir_plus to fetch entries with stats in a single database query.
     fn readdirplus(
-        &mut self,
+        &self,
         _req: &Request,
         ino: u64,
         _fh: u64,
@@ -594,92 +941,37 @@ impl Filesystem for AgentFSFuse {
         agentfs_sdk::profiling::record_fuse_readdir_plus();
         tracing::debug!("FUSE::readdirplus: ino={}, offset={}", ino, offset);
 
-        let fs = self.fs.clone();
-        let entries_result = self
-            .runtime
-            .block_on(async move { fs.readdir_plus(ino as i64).await });
-
-        let entries = match entries_result {
-            Ok(Some(entries)) => entries,
-            Ok(None) => {
-                reply.error(libc::ENOENT);
-                return;
-            }
+        let (all_entries, stable, stable_epoch) = match self.cached_readdir_entries(ino) {
+            Ok(entries) => entries,
             Err(e) => {
                 reply.error(error_to_errno(&e));
                 return;
             }
         };
 
-        // Get current directory stats for "."
-        let fs = self.fs.clone();
-        let dir_stats = self
-            .runtime
-            .block_on(async move { fs.getattr(ino as i64).await })
-            .ok()
-            .flatten();
-
-        // Determine parent inode and stats for ".." entry
-        // In the inode-based API we don't track parent relationships directly.
-        // Use root's stats for ".." as a fallback - the kernel handles proper ".." resolution.
-        let (parent_ino, parent_stats) = if ino == 1 {
-            (1u64, dir_stats.clone()) // Root's parent is itself
-        } else {
-            // Use root inode as fallback for parent
-            let fs = self.fs.clone();
-            let parent_stats = self
-                .runtime
-                .block_on(async move { fs.getattr(1).await })
-                .ok()
-                .flatten();
-            (1u64, parent_stats)
-        };
-
-        // Build the entries list with full attributes
-        let mut offset_counter = 0i64;
-
-        // Add "." entry
-        if offset <= offset_counter {
-            if let Some(ref stats) = dir_stats {
-                let attr = fillattr(stats);
-                if reply.add(ino, offset_counter + 1, ".", &TTL, &attr, 0) {
-                    reply.ok();
-                    return;
-                }
+        let cache_reply = self.cache_reply_lock.try_lock();
+        let stable = stable && cache_reply.is_some() && !self.cache_epoch_changed(stable_epoch);
+        for (i, entry) in all_entries.iter().enumerate().skip(readdir_start(offset)) {
+            if reply.add_with_ttls(
+                entry.attr.ino,
+                (i + 1) as i64,
+                &entry.name,
+                if stable {
+                    &self.cache_config.entry_ttl
+                } else {
+                    &Duration::ZERO
+                },
+                if stable {
+                    &self.cache_config.attr_ttl
+                } else {
+                    &Duration::ZERO
+                },
+                &entry.attr,
+                0,
+            ) {
+                reply.ok();
+                return;
             }
-        }
-        offset_counter += 1;
-
-        // Add ".." entry
-        if offset <= offset_counter {
-            if let Some(ref stats) = parent_stats {
-                let attr = fillattr(stats);
-                if reply.add(parent_ino, offset_counter + 1, "..", &TTL, &attr, 0) {
-                    reply.ok();
-                    return;
-                }
-            }
-        }
-        offset_counter += 1;
-
-        // Add directory entries with their attributes
-        for entry in &entries {
-            if offset <= offset_counter {
-                let attr = fillattr(&entry.stats);
-
-                if reply.add(
-                    entry.stats.ino as u64,
-                    offset_counter + 1,
-                    &entry.name,
-                    &TTL,
-                    &attr,
-                    0,
-                ) {
-                    reply.ok();
-                    return;
-                }
-            }
-            offset_counter += 1;
         }
 
         reply.ok();
@@ -690,7 +982,7 @@ impl Filesystem for AgentFSFuse {
     /// Creates a file node at `name` under `parent` with the specified mode
     /// and device number, then stats it to return proper attributes.
     fn mknod(
-        &mut self,
+        &self,
         req: &Request,
         parent: u64,
         name: &OsStr,
@@ -706,6 +998,7 @@ impl Filesystem for AgentFSFuse {
             mode,
             rdev
         );
+        let audit = MutationAudit::new();
 
         let Some(name_str) = name.to_str() else {
             reply.error(libc::EINVAL);
@@ -723,8 +1016,11 @@ impl Filesystem for AgentFSFuse {
 
         match result {
             Ok(stats) => {
+                self.invalidate_inode_cache(req, parent);
+                self.invalidate_entry_cache(req, parent, name);
                 let attr = fillattr(&stats);
-                reply.entry(&TTL, &attr, 0);
+                audit.assert_invalidated("mknod");
+                reply.entry_with_ttls(&Duration::ZERO, &Duration::ZERO, &attr, 0);
             }
             Err(e) => {
                 reply.error(error_to_errno(&e));
@@ -737,7 +1033,7 @@ impl Filesystem for AgentFSFuse {
     /// Creates a directory at `name` under `parent`, then stats it to return
     /// proper attributes and cache the inode mapping.
     fn mkdir(
-        &mut self,
+        &self,
         req: &Request,
         parent: u64,
         name: &OsStr,
@@ -751,6 +1047,7 @@ impl Filesystem for AgentFSFuse {
             name,
             mode
         );
+        let audit = MutationAudit::new();
 
         let Some(name_str) = name.to_str() else {
             reply.error(libc::EINVAL);
@@ -767,8 +1064,11 @@ impl Filesystem for AgentFSFuse {
 
         match result {
             Ok(stats) => {
+                self.invalidate_inode_cache(req, parent);
+                self.invalidate_entry_cache(req, parent, name);
                 let attr = fillattr(&stats);
-                reply.entry(&TTL, &attr, 0);
+                audit.assert_invalidated("mkdir");
+                reply.entry_with_ttls(&Duration::ZERO, &Duration::ZERO, &attr, 0);
             }
             Err(e) => {
                 reply.error(error_to_errno(&e));
@@ -780,14 +1080,16 @@ impl Filesystem for AgentFSFuse {
     ///
     /// Verifies the target is a directory and is empty before removal.
     /// Returns `ENOTDIR` if not a directory, `ENOTEMPTY` if not empty.
-    fn rmdir(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn rmdir(&self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         tracing::debug!("FUSE::rmdir: parent={}, name={:?}", parent, name);
+        let audit = MutationAudit::new();
 
         let Some(name_str) = name.to_str() else {
             reply.error(libc::EINVAL);
             return;
         };
 
+        let removed_stats = self.lookup_child_for_invalidation(parent, name_str);
         let fs = self.fs.clone();
         let name_owned = name_str.to_string();
         let result = self
@@ -796,8 +1098,13 @@ impl Filesystem for AgentFSFuse {
 
         match result {
             Ok(()) => {
+                self.invalidate_inode_cache(req, parent);
+                if let Some(stats) = removed_stats {
+                    self.invalidate_inode_cache(req, stats.ino as u64);
+                }
+                self.invalidate_entry_cache(req, parent, name);
+                audit.assert_invalidated("rmdir");
                 reply.ok();
-                req.deferred_notifier().inval_entry(parent, name);
             }
             Err(e) => reply.error(error_to_errno(&e)),
         }
@@ -812,7 +1119,7 @@ impl Filesystem for AgentFSFuse {
     /// Creates an empty file at `name` under `parent`, allocates a file handle,
     /// and returns both the file attributes and handle for immediate use.
     fn create(
-        &mut self,
+        &self,
         req: &Request,
         parent: u64,
         name: &OsStr,
@@ -827,6 +1134,7 @@ impl Filesystem for AgentFSFuse {
             name,
             mode
         );
+        let audit = MutationAudit::new();
 
         let Some(name_str) = name.to_str() else {
             reply.error(libc::EINVAL);
@@ -845,6 +1153,8 @@ impl Filesystem for AgentFSFuse {
 
         match result {
             Ok((stats, file)) => {
+                self.invalidate_inode_cache(req, parent);
+                self.invalidate_entry_cache(req, parent, name);
                 let attr = fillattr(&stats);
 
                 let fh = self.alloc_fh();
@@ -852,7 +1162,8 @@ impl Filesystem for AgentFSFuse {
                     .lock()
                     .insert(fh, OpenFile::new(stats.ino as u64, file));
 
-                reply.created(&TTL, &attr, 0, fh, 0);
+                audit.assert_invalidated("create");
+                reply.created_with_ttls(&Duration::ZERO, &Duration::ZERO, &attr, 0, fh, 0);
             }
             Err(e) => {
                 reply.error(error_to_errno(&e));
@@ -864,7 +1175,7 @@ impl Filesystem for AgentFSFuse {
     ///
     /// Creates a symlink at `name` under `parent` pointing to `link`.
     fn symlink(
-        &mut self,
+        &self,
         req: &Request,
         parent: u64,
         link_name: &OsStr,
@@ -877,6 +1188,7 @@ impl Filesystem for AgentFSFuse {
             link_name,
             target
         );
+        let audit = MutationAudit::new();
 
         let Some(name_str) = link_name.to_str() else {
             reply.error(libc::EINVAL);
@@ -900,8 +1212,11 @@ impl Filesystem for AgentFSFuse {
 
         match result {
             Ok(stats) => {
+                self.invalidate_inode_cache(req, parent);
+                self.invalidate_entry_cache(req, parent, link_name);
                 let attr = fillattr(&stats);
-                reply.entry(&TTL, &attr, 0);
+                audit.assert_invalidated("symlink");
+                reply.entry_with_ttls(&Duration::ZERO, &Duration::ZERO, &attr, 0);
             }
             Err(e) => {
                 reply.error(error_to_errno(&e));
@@ -913,20 +1228,14 @@ impl Filesystem for AgentFSFuse {
     ///
     /// Creates a new directory entry `newname` under `newparent` that refers to the
     /// same inode as `ino`. The link count of the inode is incremented.
-    fn link(
-        &mut self,
-        _req: &Request,
-        ino: u64,
-        newparent: u64,
-        newname: &OsStr,
-        reply: ReplyEntry,
-    ) {
+    fn link(&self, req: &Request, ino: u64, newparent: u64, newname: &OsStr, reply: ReplyEntry) {
         tracing::debug!(
             "FUSE::link: ino={}, newparent={}, newname={:?}",
             ino,
             newparent,
             newname
         );
+        let audit = MutationAudit::new();
 
         let Some(name_str) = newname.to_str() else {
             reply.error(libc::EINVAL);
@@ -941,8 +1250,12 @@ impl Filesystem for AgentFSFuse {
 
         match result {
             Ok(stats) => {
+                self.invalidate_inode_cache(req, ino);
+                self.invalidate_inode_cache(req, newparent);
+                self.invalidate_entry_cache(req, newparent, newname);
                 let attr = fillattr(&stats);
-                reply.entry(&TTL, &attr, 0);
+                audit.assert_invalidated("link");
+                reply.entry_with_ttls(&Duration::ZERO, &Duration::ZERO, &attr, 0);
             }
             Err(e) => {
                 reply.error(error_to_errno(&e));
@@ -953,14 +1266,16 @@ impl Filesystem for AgentFSFuse {
     /// Removes a file (unlinks it from the directory).
     ///
     /// Gets the file's inode before removal to clean up the path cache.
-    fn unlink(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn unlink(&self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         tracing::debug!("FUSE::unlink: parent={}, name={:?}", parent, name);
+        let audit = MutationAudit::new();
 
         let Some(name_str) = name.to_str() else {
             reply.error(libc::EINVAL);
             return;
         };
 
+        let removed_stats = self.lookup_child_for_invalidation(parent, name_str);
         let fs = self.fs.clone();
         let name_owned = name_str.to_string();
         let result = self
@@ -969,8 +1284,13 @@ impl Filesystem for AgentFSFuse {
 
         match result {
             Ok(()) => {
+                self.invalidate_inode_cache(req, parent);
+                if let Some(stats) = removed_stats {
+                    self.invalidate_inode_cache(req, stats.ino as u64);
+                }
+                self.invalidate_entry_cache(req, parent, name);
+                audit.assert_invalidated("unlink");
                 reply.ok();
-                req.deferred_notifier().inval_entry(parent, name);
             }
             Err(e) => reply.error(error_to_errno(&e)),
         }
@@ -980,7 +1300,7 @@ impl Filesystem for AgentFSFuse {
     ///
     /// Moves `name` from `parent` to `newname` under `newparent`.
     fn rename(
-        &mut self,
+        &self,
         req: &Request,
         parent: u64,
         name: &OsStr,
@@ -996,6 +1316,7 @@ impl Filesystem for AgentFSFuse {
             newparent,
             newname
         );
+        let audit = MutationAudit::new();
 
         let Some(old_name_str) = name.to_str() else {
             reply.error(libc::EINVAL);
@@ -1007,6 +1328,8 @@ impl Filesystem for AgentFSFuse {
             return;
         };
 
+        let source_stats = self.lookup_child_for_invalidation(parent, old_name_str);
+        let replaced_stats = self.lookup_child_for_invalidation(newparent, new_name_str);
         let fs = self.fs.clone();
         let old_name_owned = old_name_str.to_string();
         let new_name_owned = new_name_str.to_string();
@@ -1022,10 +1345,20 @@ impl Filesystem for AgentFSFuse {
 
         match result {
             Ok(()) => {
+                self.invalidate_inode_cache(req, parent);
+                if newparent != parent {
+                    self.invalidate_inode_cache(req, newparent);
+                }
+                if let Some(stats) = source_stats {
+                    self.invalidate_inode_cache(req, stats.ino as u64);
+                }
+                if let Some(stats) = replaced_stats {
+                    self.invalidate_inode_cache(req, stats.ino as u64);
+                }
+                self.invalidate_entry_cache(req, parent, name);
+                self.invalidate_entry_cache(req, newparent, newname);
+                audit.assert_invalidated("rename");
                 reply.ok();
-                let dn = req.deferred_notifier();
-                dn.inval_entry(parent, name);
-                dn.inval_entry(newparent, newname);
             }
             Err(e) => reply.error(error_to_errno(&e)),
         }
@@ -1038,9 +1371,40 @@ impl Filesystem for AgentFSFuse {
     /// Opens a file for reading or writing.
     ///
     /// Allocates a file handle and opens the file in the filesystem layer.
-    fn open(&mut self, _req: &Request, ino: u64, flags: i32, reply: ReplyOpen) {
+    fn open(&self, req: &Request, ino: u64, flags: i32, reply: ReplyOpen) {
         agentfs_sdk::profiling::record_fuse_open();
         tracing::debug!("FUSE::open: ino={}, flags={}", ino, flags);
+
+        let mut keep_cache = false;
+        let mut keep_cache_fingerprint = None;
+        if fuse_write_open(flags) {
+            self.drop_keepcache_eligibility(ino);
+        } else if self.cache_config.keepcache_enabled && !self.has_pending_write_for_inode(ino) {
+            let fs = self.fs.clone();
+            let keep_cache_result = self.runtime.block_on(async move {
+                if !fs.keep_cache_for_read_open(ino as i64, flags).await? {
+                    return Ok(None);
+                }
+                let Some(stats) = fs.getattr(ino as i64).await? else {
+                    return Ok(None);
+                };
+                Ok::<_, SdkError>(Some(KeepCacheFingerprint::from_stats(&stats)))
+            });
+            match keep_cache_result {
+                Ok(Some(fingerprint)) if self.keepcache_allows(ino, &fingerprint) => {
+                    keep_cache = true;
+                    keep_cache_fingerprint = Some(fingerprint);
+                }
+                Ok(Some(_)) => {
+                    agentfs_sdk::profiling::record_base_fast_stale_rejection();
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    reply.error(error_to_errno(&e));
+                    return;
+                }
+            };
+        }
 
         let fs = self.fs.clone();
         let result = self
@@ -1049,9 +1413,30 @@ impl Filesystem for AgentFSFuse {
 
         match result {
             Ok(file) => {
+                let mut open_flags = 0;
+                keep_cache = keep_cache
+                    && keep_cache_fingerprint
+                        .as_ref()
+                        .map(|fingerprint| self.keepcache_allows(ino, fingerprint))
+                        .unwrap_or(false)
+                    && !self.has_pending_write_for_inode(ino);
+                if keep_cache {
+                    open_flags |= FOPEN_KEEP_CACHE;
+                    self.mark_keepcache_eligible(
+                        ino,
+                        keep_cache_fingerprint.expect("checked before enabling keep-cache"),
+                    );
+                    agentfs_sdk::profiling::record_base_fast_open_eligible();
+                    agentfs_sdk::profiling::record_base_fast_open_keep_cache();
+                } else {
+                    agentfs_sdk::profiling::record_base_fast_open_rejected();
+                }
+                if fuse_write_open(flags) {
+                    self.invalidate_inode_cache(req, ino);
+                }
                 let fh = self.alloc_fh();
                 self.open_files.lock().insert(fh, OpenFile::new(ino, file));
-                reply.opened(fh, 0);
+                reply.opened(fh, open_flags);
             }
             Err(e) => reply.error(error_to_errno(&e)),
         }
@@ -1059,7 +1444,7 @@ impl Filesystem for AgentFSFuse {
 
     /// Reads data using the file handle.
     fn read(
-        &mut self,
+        &self,
         _req: &Request,
         ino: u64,
         fh: u64,
@@ -1102,8 +1487,8 @@ impl Filesystem for AgentFSFuse {
 
     /// Writes data using the file handle.
     fn write(
-        &mut self,
-        _req: &Request,
+        &self,
+        req: &Request,
         ino: u64,
         fh: u64,
         offset: i64,
@@ -1119,6 +1504,7 @@ impl Filesystem for AgentFSFuse {
             offset,
             data.len()
         );
+        let audit = MutationAudit::new();
 
         if offset < 0 {
             reply.error(libc::EINVAL);
@@ -1132,71 +1518,57 @@ impl Filesystem for AgentFSFuse {
             return;
         }
 
-        let result = {
-            let mut open_files = self.open_files.lock();
-            let Some(open_file) = open_files.get_mut(&fh) else {
+        let file = {
+            let open_files = self.open_files.lock();
+            let Some(open_file) = open_files.get(&fh) else {
                 reply.error(libc::EBADF);
                 return;
             };
-
-            if data_len > MAX_PENDING_WRITE_BYTES {
-                let file = open_file.file.clone();
-                if let Err(e) = open_file.flush_pending(&self.runtime) {
-                    reply.error(error_to_errno(&e));
-                    return;
-                }
-                return match self
-                    .runtime
-                    .block_on(async move { file.pwrite(offset as u64, data).await })
-                {
-                    Ok(()) => {
-                        reply.written(data_len as u32);
-                    }
-                    Err(e) => {
-                        reply.error(error_to_errno(&e));
-                    }
-                };
-            }
-
-            if open_file.pending_bytes().saturating_add(data_len) > MAX_PENDING_WRITE_BYTES {
-                if let Err(e) = open_file.flush_pending(&self.runtime) {
-                    reply.error(error_to_errno(&e));
-                    return;
-                }
-            }
-
-            if let Err(errno) = open_file.buffer_write(offset as u64, data) {
-                reply.error(errno);
-                return;
-            }
-
-            if open_file.pending_bytes() > MAX_PENDING_WRITE_BYTES {
-                open_file.flush_pending(&self.runtime)
-            } else {
-                Ok(())
-            }
+            open_file.file.clone()
         };
+        let data = data.to_vec();
+        let writeback_enabled = self.writeback_enabled;
+        let result = self.runtime.block_on(async move {
+            let ranges = vec![WriteRange {
+                offset: offset as u64,
+                data,
+            }];
+            if writeback_enabled {
+                file.pwrite_ranges_batched(ranges).await
+            } else {
+                file.pwrite_ranges(ranges).await
+            }
+        });
 
         match result {
-            Ok(()) => reply.written(data_len as u32),
+            Ok(()) => {
+                self.invalidate_inode_cache(req, ino);
+                audit.assert_invalidated("write");
+                reply.written(data_len as u32);
+            }
             Err(e) => reply.error(error_to_errno(&e)),
         }
     }
 
     /// Flushes buffered data to the backend storage.
-    fn flush(&mut self, _req: &Request, _ino: u64, fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
+    fn flush(&self, req: &Request, ino: u64, fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
         tracing::debug!("FUSE::flush: fh={}", fh);
+        let audit = MutationAudit::new();
         let result = {
             let mut open_files = self.open_files.lock();
             let Some(open_file) = open_files.get_mut(&fh) else {
                 reply.error(libc::EBADF);
                 return;
             };
-            open_file.flush_pending(&self.runtime)
+            open_file.flush_pending_and_drain(&self.runtime)
         };
 
         match result {
-            Ok(()) => reply.ok(),
+            Ok(()) => {
+                self.invalidate_inode_cache(req, ino);
+                audit.assert_invalidated("flush");
+                reply.ok();
+            }
             Err(e) => reply.error(error_to_errno(&e)),
         }
     }
@@ -1205,7 +1577,7 @@ impl Filesystem for AgentFSFuse {
     ///
     /// This now uses the file handle's fsync which knows which layer(s) the
     /// file exists in, avoiding errors when a file only exists in one layer.
-    fn fsync(&mut self, _req: &Request, ino: u64, fh: u64, _datasync: bool, reply: ReplyEmpty) {
+    fn fsync(&self, _req: &Request, ino: u64, fh: u64, _datasync: bool, reply: ReplyEmpty) {
         tracing::debug!("FUSE::fsync: fh={}", fh);
         let file = {
             let open_files = self.open_files.lock();
@@ -1233,7 +1605,7 @@ impl Filesystem for AgentFSFuse {
     ///
     /// Flushes pending writes and removes the file handle from the open files table.
     fn release(
-        &mut self,
+        &self,
         _req: &Request,
         _ino: u64,
         fh: u64,
@@ -1250,7 +1622,7 @@ impl Filesystem for AgentFSFuse {
                 reply.error(libc::EBADF);
                 return;
             };
-            open_file.flush_pending(&self.runtime)
+            open_file.flush_pending_and_drain(&self.runtime)
         };
 
         match result {
@@ -1265,7 +1637,7 @@ impl Filesystem for AgentFSFuse {
     /// Returns filesystem statistics.
     ///
     /// Queries actual usage from the SDK and reports it to tools like `df`.
-    fn statfs(&mut self, _req: &Request, _ino: u64, reply: ReplyStatfs) {
+    fn statfs(&self, _req: &Request, _ino: u64, reply: ReplyStatfs) {
         tracing::debug!("FUSE::statfs");
         const BLOCK_SIZE: u64 = 4096;
         const TOTAL_INODES: u64 = 1_000_000; // Virtual limit
@@ -1308,10 +1680,17 @@ impl Filesystem for AgentFSFuse {
     /// Called when the kernel removes an inode from its cache. For passthrough
     /// filesystems (like HostFS), this allows releasing O_PATH file descriptors
     /// that were cached for the inode, preventing file descriptor exhaustion.
-    fn forget(&mut self, _req: &Request, ino: u64, nlookup: u64) {
+    fn forget(&self, _req: &Request, ino: u64, nlookup: u64) {
         tracing::debug!("FUSE::forget: ino={}, nlookup={}", ino, nlookup);
         let fs = self.fs.clone();
         self.runtime.block_on(async move {
+            if let Err(error) = fs.drain_inode_writes(ino as i64).await {
+                tracing::warn!(
+                    "FUSE::forget failed to drain batched writes for inode {}: {}",
+                    ino,
+                    error
+                );
+            }
             fs.forget(ino as i64, nlookup).await;
         });
     }
@@ -1319,25 +1698,52 @@ impl Filesystem for AgentFSFuse {
     /// Batch forget multiple inodes at once.
     ///
     /// This is an optimization over calling forget() individually for each inode.
-    fn batch_forget(&mut self, _req: &Request, nodes: &[fuse_forget_one]) {
+    fn batch_forget(&self, _req: &Request, nodes: &[fuse_forget_one]) {
         tracing::debug!("FUSE::batch_forget: {} nodes", nodes.len());
         let fs = self.fs.clone();
         let nodes_vec: Vec<(i64, u64)> =
             nodes.iter().map(|n| (n.nodeid as i64, n.nlookup)).collect();
         self.runtime.block_on(async move {
             for (ino, nlookup) in nodes_vec {
+                if let Err(error) = fs.drain_inode_writes(ino).await {
+                    tracing::warn!(
+                        "FUSE::batch_forget failed to drain batched writes for inode {}: {}",
+                        ino,
+                        error
+                    );
+                }
                 fs.forget(ino, nlookup).await;
             }
         });
     }
 }
 
+impl Drop for AgentFSFuse {
+    fn drop(&mut self) {
+        if let Err(e) = self.flush_all_pending() {
+            tracing::warn!("FUSE drop failed to flush pending writes: {}", e);
+        }
+        if let Err(e) = self.finalize_filesystem() {
+            tracing::warn!("FUSE drop failed to finalize filesystem: {}", e);
+        }
+    }
+}
+
 impl AgentFSFuse {
     fn flush_pending_inode(&self, ino: u64) -> Result<(), SdkError> {
-        self.flush_pending_inode_except(ino, 0)
+        self.flush_open_file_pending_inode_except(ino, 0)?;
+        self.drain_inode_writes(ino)
     }
 
     fn flush_pending_inode_except(&self, ino: u64, except_fh: u64) -> Result<(), SdkError> {
+        self.flush_open_file_pending_inode_except(ino, except_fh)
+    }
+
+    fn flush_open_file_pending_inode_except(
+        &self,
+        ino: u64,
+        except_fh: u64,
+    ) -> Result<(), SdkError> {
         let mut open_files = self.open_files.lock();
         for (fh, open_file) in open_files.iter_mut() {
             if *fh == except_fh || open_file.ino != ino {
@@ -1356,19 +1762,310 @@ impl AgentFSFuse {
         Ok(())
     }
 
+    fn cache_epoch(&self) -> u64 {
+        self.cache_epoch.load(Ordering::Acquire)
+    }
+
+    fn cache_epoch_changed(&self, epoch: u64) -> bool {
+        self.cache_epoch.load(Ordering::Acquire) != epoch
+    }
+
+    fn bump_cache_epoch(&self) {
+        self.cache_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn reply_negative_entry(&self, reply: ReplyEntry) {
+        if self.cache_config.neg_ttl.is_zero() {
+            reply.error(libc::ENOENT);
+        } else {
+            reply.negative(&self.cache_config.neg_ttl);
+        }
+    }
+
+    fn reply_negative_entry_with_ttl(&self, reply: ReplyEntry, stable: bool) {
+        if stable {
+            self.reply_negative_entry(reply);
+        } else {
+            reply.error(libc::ENOENT);
+        }
+    }
+
+    fn has_pending_write_for_inode(&self, ino: u64) -> bool {
+        self.open_files
+            .lock()
+            .values()
+            .any(|open_file| open_file.ino == ino && !open_file.pending.is_empty())
+    }
+
+    fn keepcache_allows(&self, ino: u64, fingerprint: &KeepCacheFingerprint) -> bool {
+        self.keepcache_drift_guard.lock().allows(ino, fingerprint)
+    }
+
+    fn mark_keepcache_eligible(&self, ino: u64, fingerprint: KeepCacheFingerprint) {
+        self.keepcache_drift_guard
+            .lock()
+            .mark_eligible(ino, fingerprint);
+    }
+
+    fn drop_keepcache_eligibility(&self, ino: u64) {
+        if self.keepcache_drift_guard.lock().drop_eligibility(ino) {
+            agentfs_sdk::profiling::record_fuse_keepcache_eligibility_drop();
+        }
+    }
+
+    fn drain_inode_writes(&self, ino: u64) -> Result<(), SdkError> {
+        let fs = self.fs.clone();
+        self.runtime
+            .block_on(async move { fs.drain_inode_writes(ino as i64).await })
+    }
+
+    fn finalize_filesystem(&self) -> Result<(), SdkError> {
+        let fs = self.fs.clone();
+        self.runtime.block_on(async move { fs.finalize().await })
+    }
+
+    fn invalidate_inode_cache(&self, req: &Request, ino: u64) {
+        let _cache_reply = self.cache_reply_lock.lock();
+        self.bump_cache_epoch();
+        self.drop_keepcache_eligibility(ino);
+        self.invalidate_cached_inode(ino);
+        self.notify_inval_inode(req, ino, 0, i64::MAX);
+        agentfs_sdk::profiling::record_base_fast_inode_invalidation();
+        record_mutation_invalidation();
+    }
+
+    fn invalidate_entry_cache(&self, req: &Request, parent: u64, name: &OsStr) {
+        let _cache_reply = self.cache_reply_lock.lock();
+        self.bump_cache_epoch();
+        if let Some(name) = name.to_str() {
+            self.invalidate_cached_entry(parent, name);
+        }
+        self.notify_inval_entry(req, parent, name);
+        record_mutation_invalidation();
+    }
+
+    fn notify_inval_inode(&self, req: &Request, ino: u64, offset: i64, len: i64) {
+        if !self.sync_inval {
+            req.deferred_notifier().inval_inode(ino, offset, len);
+            return;
+        }
+
+        let start = Instant::now();
+        let result = req.notifier().inval_inode(ino, offset, len);
+        agentfs_sdk::profiling::record_fuse_sync_inval_latency(start.elapsed());
+
+        match result {
+            Ok(()) => agentfs_sdk::profiling::record_fuse_sync_inval_inode_ok(),
+            Err(e) => {
+                tracing::warn!(
+                    "synchronous FUSE inval_inode failed ino={}, offset={}, len={}: {}",
+                    ino,
+                    offset,
+                    len,
+                    e
+                );
+                agentfs_sdk::profiling::record_fuse_sync_inval_inode_err();
+            }
+        }
+    }
+
+    fn notify_inval_entry(&self, req: &Request, parent: u64, name: &OsStr) {
+        if !self.sync_inval {
+            req.deferred_notifier().inval_entry(parent, name);
+            return;
+        }
+
+        let start = Instant::now();
+        let result = req.notifier().inval_entry(parent, name);
+        agentfs_sdk::profiling::record_fuse_sync_inval_latency(start.elapsed());
+
+        match result {
+            Ok(()) => agentfs_sdk::profiling::record_fuse_sync_inval_entry_ok(),
+            Err(e) => {
+                tracing::warn!(
+                    "synchronous FUSE inval_entry failed parent={}, name={:?}: {}",
+                    parent,
+                    name,
+                    e
+                );
+                agentfs_sdk::profiling::record_fuse_sync_inval_entry_err();
+            }
+        }
+    }
+
+    fn invalidate_cached_inode(&self, ino: u64) {
+        self.attr_cache.lock().remove(&ino);
+        self.entry_cache
+            .lock()
+            .retain(|_, stats| stats.ino as u64 != ino);
+        self.dir_entries_cache.lock().retain(|dir_ino, entries| {
+            *dir_ino != ino && !entries.iter().any(|entry| entry.attr.ino == ino)
+        });
+    }
+
+    fn invalidate_cached_entry(&self, parent: u64, name: &str) {
+        let key = (parent, name.to_string());
+        self.entry_cache.lock().remove(&key);
+        if self.negative_entry_cache.lock().remove(&key).is_some() {
+            agentfs_sdk::profiling::record_negative_cache_invalidation();
+        }
+    }
+
+    fn cache_negative_entry(&self, parent: u64, name: &str) {
+        let key = (parent, name.to_string());
+        self.entry_cache.lock().remove(&key);
+        self.negative_entry_cache.lock().insert(key, ());
+    }
+
+    fn lookup_child_for_invalidation(&self, parent: u64, name: &str) -> Option<Stats> {
+        if let Some(stats) = self
+            .entry_cache
+            .lock()
+            .get(&(parent, name.to_string()))
+            .cloned()
+        {
+            return Some(stats);
+        }
+
+        let fs = self.fs.clone();
+        self.runtime
+            .block_on(async move { fs.lookup(parent as i64, name).await })
+            .ok()
+            .flatten()
+    }
+
+    fn cache_attr(&self, stats: &Stats) {
+        self.attr_cache
+            .lock()
+            .insert(stats.ino as u64, stats.clone());
+    }
+
+    fn cache_entry(&self, parent: u64, name: &str, stats: &Stats) {
+        self.cache_attr(stats);
+        self.invalidate_cached_entry(parent, name);
+        self.entry_cache
+            .lock()
+            .insert((parent, name.to_string()), stats.clone());
+    }
+
+    fn cached_attr(&self, ino: u64) -> Result<Option<Stats>, SdkError> {
+        let cache_epoch = self.cache_epoch();
+        if let Some(stats) = self.attr_cache.lock().get(&ino).cloned() {
+            let cache_reply = self.cache_reply_lock.try_lock();
+            if cache_reply.is_some() && !self.cache_epoch_changed(cache_epoch) {
+                return Ok(Some(stats));
+            }
+        }
+
+        let cache_epoch = self.cache_epoch();
+        let fs = self.fs.clone();
+        let stats = self
+            .runtime
+            .block_on(async move { fs.getattr(ino as i64).await })?;
+
+        let cache_reply = self.cache_reply_lock.try_lock();
+        if let Some(ref stats) = stats {
+            if cache_reply.is_some() && !self.cache_epoch_changed(cache_epoch) {
+                self.cache_attr(stats);
+            }
+        }
+
+        Ok(stats)
+    }
+
+    fn cached_readdir_entries(
+        &self,
+        ino: u64,
+    ) -> Result<(Arc<Vec<CachedDirEntry>>, bool, u64), SdkError> {
+        let cache_epoch = self.cache_epoch();
+        if let Some(entries) = self.dir_entries_cache.lock().get(&ino).cloned() {
+            let cache_reply = self.cache_reply_lock.try_lock();
+            if cache_reply.is_some() && !self.cache_epoch_changed(cache_epoch) {
+                return Ok((entries, true, cache_epoch));
+            }
+        }
+
+        let mut stable = false;
+        let mut stable_epoch = 0;
+        let mut entries_result = None;
+        for _ in 0..2 {
+            let epoch = self.cache_epoch();
+            let fs = self.fs.clone();
+            let result = self
+                .runtime
+                .block_on(async move { fs.readdir_plus(ino as i64).await });
+            stable = !self.cache_epoch_changed(epoch);
+            stable_epoch = epoch;
+            entries_result = Some(result);
+            if stable {
+                break;
+            }
+        }
+        let entries_result = entries_result.expect("readdir loop always runs");
+
+        let entries = match entries_result {
+            Ok(Some(entries)) => entries,
+            Ok(None) => return Err(FsError::NotFound.into()),
+            Err(e) => return Err(e),
+        };
+
+        let dir_stats = self
+            .cached_attr(ino)?
+            .ok_or_else(|| SdkError::from(FsError::NotFound))?;
+
+        // In the inode-based API we do not track parent relationships directly.
+        // Use root's stats for non-root ".." entries as the existing fallback;
+        // the kernel handles proper path resolution for parent traversal.
+        let parent_stats = if ino == 1 {
+            dir_stats.clone()
+        } else {
+            self.cached_attr(1)?
+                .ok_or_else(|| SdkError::from(FsError::NotFound))?
+        };
+        let cache_reply = self.cache_reply_lock.try_lock();
+        stable = stable && cache_reply.is_some() && !self.cache_epoch_changed(stable_epoch);
+
+        if stable {
+            for entry in &entries {
+                self.cache_entry(ino, &entry.name, &entry.stats);
+            }
+        }
+
+        let all_entries = build_cached_readdir_entries(&dir_stats, &parent_stats, entries);
+        let entries = Arc::new(all_entries);
+        if stable {
+            self.dir_entries_cache.lock().insert(ino, entries.clone());
+        }
+        Ok((entries, stable, stable_epoch))
+    }
+
     /// Create a new FUSE filesystem adapter wrapping a FileSystem instance.
     ///
     /// The provided Tokio runtime is used to execute async FileSystem operations
     /// from within synchronous FUSE callbacks via `block_on`.
     fn new(fs: Arc<dyn FileSystem>, runtime: Runtime) -> Self {
+        let sync_inval = fuse_sync_inval_enabled_from_env();
+        let cache_config = FuseKernelCacheConfig::from_env();
+        cache_config.record_profile();
+        let writeback_enabled = cache_config.writeback_cache_enabled;
         Self {
             fs,
             runtime,
+            cache_config,
             open_files: Arc::new(Mutex::new(HashMap::new())),
+            dir_entries_cache: Arc::new(Mutex::new(HashMap::new())),
+            attr_cache: Arc::new(Mutex::new(HashMap::new())),
+            entry_cache: Arc::new(Mutex::new(HashMap::new())),
+            negative_entry_cache: Arc::new(Mutex::new(HashMap::new())),
+            keepcache_drift_guard: Arc::new(Mutex::new(KeepCacheDriftGuard::default())),
+            cache_reply_lock: Arc::new(Mutex::new(())),
+            cache_epoch: AtomicU64::new(0),
             next_fh: AtomicU64::new(1),
+            sync_inval,
             _profile_report: Arc::new(agentfs_sdk::profiling::ProfileReportGuard::new(
                 "fuse_session",
             )),
+            writeback_enabled,
         }
     }
 
@@ -1378,6 +2075,232 @@ impl AgentFSFuse {
     /// handle that identifies an open file throughout its lifetime.
     fn alloc_fh(&self) -> u64 {
         self.next_fh.fetch_add(1, Ordering::SeqCst)
+    }
+}
+
+fn readdir_start(offset: i64) -> usize {
+    usize::try_from(offset).unwrap_or(0)
+}
+
+fn fuse_write_open(flags: i32) -> bool {
+    (flags & libc::O_ACCMODE) != libc::O_RDONLY || (flags & libc::O_TRUNC) != 0
+}
+
+fn env_bool(value: &str) -> Option<bool> {
+    match value.trim() {
+        "1" => Some(true),
+        "0" => Some(false),
+        value
+            if value.eq_ignore_ascii_case("true")
+                || value.eq_ignore_ascii_case("yes")
+                || value.eq_ignore_ascii_case("on") =>
+        {
+            Some(true)
+        }
+        value
+            if value.eq_ignore_ascii_case("false")
+                || value.eq_ignore_ascii_case("no")
+                || value.eq_ignore_ascii_case("off") =>
+        {
+            Some(false)
+        }
+        _ => None,
+    }
+}
+
+fn env_duration_ms(name: &str, default: u64) -> u64 {
+    match std::env::var(name) {
+        Ok(value) => match value.parse::<u64>() {
+            Ok(ms) => ms,
+            Err(_) => {
+                tracing::warn!(
+                    "Ignoring invalid {}={} for FUSE TTL; using {}ms",
+                    name,
+                    value,
+                    default
+                );
+                default
+            }
+        },
+        Err(_) => default,
+    }
+}
+
+fn env_flag_default(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(value) => env_bool(&value).unwrap_or_else(|| {
+            tracing::warn!(
+                "Ignoring invalid {}={} for FUSE kernel cache flag; using default {}",
+                name,
+                value,
+                default
+            );
+            default
+        }),
+        Err(_) => default,
+    }
+}
+
+fn fuse_workers_serial_from_env() -> bool {
+    std::env::var("AGENTFS_FUSE_WORKERS")
+        .map(|value| {
+            let value = value.trim();
+            value.eq_ignore_ascii_case("serial") || value == "0"
+        })
+        // Default (unset): parallel dispatch so kernel cache invariants hold.
+        // Pair with the matching default in cli/src/fuser/session.rs::FuseDispatchMode::from_env.
+        .unwrap_or(false)
+}
+
+fn fuse_workers_not_serial_from_env() -> bool {
+    !fuse_workers_serial_from_env()
+}
+
+fn fuse_sync_inval_enabled_from_env() -> bool {
+    let workers_serial = fuse_workers_serial_from_env();
+    let sync_requested = match std::env::var("AGENTFS_FUSE_SYNC_INVAL") {
+        Ok(value) => match env_bool(&value) {
+            Some(enabled) => enabled,
+            None => {
+                tracing::warn!(
+                    "Ignoring invalid AGENTFS_FUSE_SYNC_INVAL={:?}; expected 0/1/true/false",
+                    value
+                );
+                // Fall back to deferred invalidation (the safe default).
+                false
+            }
+        },
+        // Default (unset): use deferred invalidation. Synchronous writev of
+        // FUSE_NOTIFY_INVAL_* from a request handler can deadlock with the
+        // kernel: the notify triggers d_invalidate -> iput -> FUSE_FORGET, and
+        // the kernel may block the writev call until that FORGET is delivered.
+        // In parallel mode this surfaces under git workloads (clone, checkout)
+        // when the session thread is blocked on a full worker queue and cannot
+        // read the pending FORGET. The DeferredNotifier thread is the only
+        // path that's safe in both serial and parallel modes, so it is the
+        // default. Users who explicitly opt into AGENTFS_FUSE_SYNC_INVAL=1
+        // accept the deadlock risk in exchange for tighter cache coherency.
+        Err(_) => false,
+    };
+
+    if workers_serial && sync_requested {
+        tracing::info!(
+            "AGENTFS_FUSE_SYNC_INVAL requested with AGENTFS_FUSE_WORKERS=serial; using deferred invalidation to avoid notify/reply deadlock"
+        );
+        false
+    } else {
+        sync_requested
+    }
+}
+
+fn readdirplus_mode_from_env() -> ReaddirPlusMode {
+    match std::env::var("AGENTFS_FUSE_READDIRPLUS") {
+        Ok(value)
+            if value.eq_ignore_ascii_case("off")
+                || value.eq_ignore_ascii_case("false")
+                || value.eq_ignore_ascii_case("no")
+                || value == "0" =>
+        {
+            ReaddirPlusMode::Off
+        }
+        Ok(value) if value.eq_ignore_ascii_case("auto") => ReaddirPlusMode::Auto,
+        Ok(value)
+            if value.eq_ignore_ascii_case("always")
+                || value.eq_ignore_ascii_case("on")
+                || value.eq_ignore_ascii_case("true")
+                || value.eq_ignore_ascii_case("yes")
+                || value == "1" =>
+        {
+            ReaddirPlusMode::Always
+        }
+        Ok(value) => {
+            tracing::warn!(
+                "Ignoring invalid AGENTFS_FUSE_READDIRPLUS={}; disabling readdirplus",
+                value
+            );
+            ReaddirPlusMode::Off
+        }
+        Err(_) => ReaddirPlusMode::Auto,
+    }
+}
+
+impl ReaddirPlusMode {
+    fn profile_value(self) -> u64 {
+        match self {
+            ReaddirPlusMode::Off => READDIRPLUS_MODE_OFF,
+            ReaddirPlusMode::Auto => READDIRPLUS_MODE_AUTO,
+            ReaddirPlusMode::Always => READDIRPLUS_MODE_ALWAYS,
+        }
+    }
+}
+
+fn configure_writeback_cache(config: &mut KernelConfig, enabled: bool) {
+    if !enabled {
+        agentfs_sdk::profiling::set_fuse_writeback_cache_enabled(false);
+        return;
+    }
+
+    match config.add_capabilities(FUSE_WRITEBACK_CACHE) {
+        Ok(()) => agentfs_sdk::profiling::set_fuse_writeback_cache_enabled(true),
+        Err(_) => {
+            tracing::warn!("Kernel does not support FUSE_WRITEBACK_CACHE; leaving it disabled");
+            agentfs_sdk::profiling::set_fuse_writeback_cache_enabled(false);
+        }
+    }
+}
+
+fn configure_readdirplus(config: &mut KernelConfig, mode: ReaddirPlusMode) {
+    agentfs_sdk::profiling::set_fuse_readdirplus_mode(mode.profile_value());
+    match mode {
+        ReaddirPlusMode::Off => {}
+        ReaddirPlusMode::Auto => {
+            agentfs_sdk::profiling::record_fuse_readdirplus_auto_requested();
+            match config.add_capabilities(FUSE_DO_READDIRPLUS) {
+                Ok(()) => agentfs_sdk::profiling::record_fuse_readdirplus_do_enabled(),
+                Err(_) => {
+                    tracing::warn!("Kernel does not support FUSE_DO_READDIRPLUS");
+                    agentfs_sdk::profiling::record_fuse_readdirplus_unsupported();
+                }
+            }
+            match config.add_capabilities(FUSE_READDIRPLUS_AUTO) {
+                Ok(()) => agentfs_sdk::profiling::record_fuse_readdirplus_auto_enabled(),
+                Err(_) => {
+                    tracing::warn!("Kernel does not support FUSE_READDIRPLUS_AUTO");
+                    agentfs_sdk::profiling::record_fuse_readdirplus_unsupported();
+                }
+            }
+        }
+        ReaddirPlusMode::Always => {
+            agentfs_sdk::profiling::record_fuse_readdirplus_do_requested();
+            match config.add_capabilities(FUSE_DO_READDIRPLUS) {
+                Ok(()) => agentfs_sdk::profiling::record_fuse_readdirplus_do_enabled(),
+                Err(_) => agentfs_sdk::profiling::record_fuse_readdirplus_unsupported(),
+            }
+        }
+    }
+}
+
+fn build_cached_readdir_entries(
+    dir_stats: &Stats,
+    parent_stats: &Stats,
+    entries: Vec<DirEntry>,
+) -> Vec<CachedDirEntry> {
+    let mut all_entries = Vec::with_capacity(entries.len() + 2);
+
+    all_entries.push(cached_dir_entry(".", dir_stats));
+    all_entries.push(cached_dir_entry("..", parent_stats));
+
+    for entry in entries {
+        all_entries.push(cached_dir_entry(entry.name, &entry.stats));
+    }
+
+    all_entries
+}
+
+fn cached_dir_entry(name: impl Into<String>, stats: &Stats) -> CachedDirEntry {
+    CachedDirEntry {
+        name: name.into(),
+        attr: fillattr(stats),
     }
 }
 
@@ -1500,10 +2423,130 @@ pub fn mount(
 
 #[cfg(test)]
 mod tests {
-    use super::WriteBuffer;
+    use super::{
+        build_cached_readdir_entries, fuse_write_open, readdir_start, OpenFile, WriteBuffer,
+    };
+    use agentfs_sdk::filesystem::{DirEntry, Stats, WriteRange, S_IFDIR, S_IFLNK, S_IFREG};
+    use agentfs_sdk::{BoxedFile, File};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
+    use tokio::runtime::Runtime;
 
     fn ranges(buffer: &WriteBuffer) -> Vec<(u64, Vec<u8>)> {
-        buffer.ranges_for_flush()
+        buffer
+            .ranges_for_flush()
+            .into_iter()
+            .map(|range| (range.offset, range.data))
+            .collect()
+    }
+
+    #[derive(Default)]
+    struct RecordingFile {
+        pwrite_calls: AtomicUsize,
+        pwrite_ranges_calls: AtomicUsize,
+        ranges: Mutex<Vec<WriteRange>>,
+    }
+
+    #[async_trait::async_trait]
+    impl File for RecordingFile {
+        async fn pread(&self, _offset: u64, _size: u64) -> agentfs_sdk::error::Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+
+        async fn pwrite(&self, _offset: u64, _data: &[u8]) -> agentfs_sdk::error::Result<()> {
+            self.pwrite_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn pwrite_ranges(&self, ranges: Vec<WriteRange>) -> agentfs_sdk::error::Result<()> {
+            self.pwrite_ranges_calls.fetch_add(1, Ordering::SeqCst);
+            *self.ranges.lock().unwrap() = ranges;
+            Ok(())
+        }
+
+        async fn truncate(&self, _size: u64) -> agentfs_sdk::error::Result<()> {
+            Ok(())
+        }
+
+        async fn fsync(&self) -> agentfs_sdk::error::Result<()> {
+            Ok(())
+        }
+
+        async fn fstat(&self) -> agentfs_sdk::error::Result<Stats> {
+            Ok(stats(1, S_IFREG | 0o644))
+        }
+    }
+
+    fn stats(ino: i64, mode: u32) -> Stats {
+        Stats {
+            ino,
+            mode,
+            nlink: 1,
+            uid: 1000,
+            gid: 1000,
+            size: 123,
+            atime: 1,
+            mtime: 2,
+            ctime: 3,
+            atime_nsec: 4,
+            mtime_nsec: 5,
+            ctime_nsec: 6,
+            rdev: 0,
+        }
+    }
+
+    #[test]
+    fn readdir_start_clamps_negative_offsets_to_beginning() {
+        assert_eq!(readdir_start(-1), 0);
+        assert_eq!(readdir_start(0), 0);
+        assert_eq!(readdir_start(2), 2);
+    }
+
+    #[test]
+    fn fuse_write_open_detects_mutating_flags() {
+        assert!(!fuse_write_open(libc::O_RDONLY));
+        assert!(fuse_write_open(libc::O_WRONLY));
+        assert!(fuse_write_open(libc::O_RDWR));
+        assert!(fuse_write_open(libc::O_RDONLY | libc::O_TRUNC));
+    }
+
+    #[test]
+    fn cached_readdir_entries_include_attrs_for_dot_dotdot_and_children() {
+        let dir = stats(10, S_IFDIR | 0o755);
+        let parent = stats(1, S_IFDIR | 0o755);
+        let child = stats(11, S_IFREG | 0o644);
+        let symlink = stats(12, S_IFLNK | 0o777);
+
+        let entries = build_cached_readdir_entries(
+            &dir,
+            &parent,
+            vec![
+                DirEntry {
+                    name: "file.txt".to_string(),
+                    stats: child,
+                },
+                DirEntry {
+                    name: "link".to_string(),
+                    stats: symlink,
+                },
+            ],
+        );
+
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0].name, ".");
+        assert_eq!(entries[0].attr.ino, 10);
+        assert_eq!(entries[0].attr.kind, crate::fuser::FileType::Directory);
+        assert_eq!(entries[1].name, "..");
+        assert_eq!(entries[1].attr.ino, 1);
+        assert_eq!(entries[1].attr.kind, crate::fuser::FileType::Directory);
+        assert_eq!(entries[2].name, "file.txt");
+        assert_eq!(entries[2].attr.ino, 11);
+        assert_eq!(entries[2].attr.kind, crate::fuser::FileType::RegularFile);
+        assert_eq!(entries[3].name, "link");
+        assert_eq!(entries[3].attr.ino, 12);
+        assert_eq!(entries[3].attr.kind, crate::fuser::FileType::Symlink);
     }
 
     #[test]
@@ -1571,5 +2614,34 @@ mod tests {
 
         assert_eq!(buffer.write(u64::MAX, b"x"), Err(libc::EINVAL));
         assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn open_file_flushes_pending_writes_with_batch_api() {
+        let runtime = Runtime::new().unwrap();
+        let recorder = Arc::new(RecordingFile::default());
+        let file: BoxedFile = recorder.clone();
+        let mut open_file = OpenFile::new(1, file);
+
+        open_file.buffer_write(0, b"head").unwrap();
+        open_file.buffer_write(10, b"tail").unwrap();
+        open_file.flush_pending(&runtime).unwrap();
+
+        assert_eq!(recorder.pwrite_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(recorder.pwrite_ranges_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *recorder.ranges.lock().unwrap(),
+            vec![
+                WriteRange {
+                    offset: 0,
+                    data: b"head".to_vec(),
+                },
+                WriteRange {
+                    offset: 10,
+                    data: b"tail".to_vec(),
+                },
+            ]
+        );
+        assert!(open_file.pending.is_empty());
     }
 }

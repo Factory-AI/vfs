@@ -2,6 +2,7 @@
 //!
 //! The `run` command is not supported on Windows.
 
+use agentfs_sdk::PartialOriginPolicy;
 use anyhow::{bail, Result};
 use std::path::PathBuf;
 
@@ -15,6 +16,7 @@ pub async fn run(
     _session: Option<String>,
     _system: bool,
     _encryption: Option<(String, String)>,
+    _partial_origin_policy: Option<PartialOriginPolicy>,
     _command: PathBuf,
     _args: Vec<String>,
 ) -> Result<()> {

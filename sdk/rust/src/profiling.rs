@@ -29,6 +29,9 @@ pub struct ProfileSnapshot {
     pub path_cache_hits: u64,
     pub path_cache_misses: u64,
     pub negative_lookup_count: u64,
+    pub negative_cache_hits: u64,
+    pub negative_cache_misses: u64,
+    pub negative_cache_invalidations: u64,
     pub attr_cache_hits: u64,
     pub attr_cache_misses: u64,
     pub dentry_cache_hits: u64,
@@ -36,6 +39,13 @@ pub struct ProfileSnapshot {
     pub chunk_read_queries: u64,
     pub chunk_read_chunks: u64,
     pub chunk_write_chunks: u64,
+    pub agentfs_batcher_enqueues: u64,
+    pub agentfs_batcher_drains_timer: u64,
+    pub agentfs_batcher_drains_bytes: u64,
+    pub agentfs_batcher_drains_explicit: u64,
+    pub agentfs_batcher_pending_max_bytes: u64,
+    pub agentfs_batcher_coalesced_ranges: u64,
+    pub agentfs_batcher_commit_latency_ns_total: u64,
     pub wal_checkpoint_count: u64,
     pub wal_checkpoint_nanos: u64,
     pub fuse_callback_count: u64,
@@ -51,6 +61,46 @@ pub struct ProfileSnapshot {
     pub fuse_flush_count: u64,
     pub fuse_flush_ranges: u64,
     pub fuse_flush_bytes: u64,
+    pub fuse_sync_inval_inode_ok: u64,
+    pub fuse_sync_inval_inode_err: u64,
+    pub fuse_sync_inval_entry_ok: u64,
+    pub fuse_sync_inval_entry_err: u64,
+    pub fuse_sync_inval_latency_ns_total: u64,
+    pub fuse_dispatch_wait_count: u64,
+    pub fuse_dispatch_wait_nanos: u64,
+    pub fuse_adapter_lock_wait_count: u64,
+    pub fuse_adapter_lock_wait_nanos: u64,
+    pub fuse_read_lane_wait_count: u64,
+    pub fuse_read_lane_wait_nanos: u64,
+    pub fuse_write_lane_wait_count: u64,
+    pub fuse_write_lane_wait_nanos: u64,
+    pub fuse_read_lane_max_concurrent: u64,
+    pub fuse_exclusive_fallback_count: u64,
+    pub fuse_workers_configured: u64,
+    pub fuse_worker_queue_depth_peak: u64,
+    pub fuse_dispatch_inline_fallback: u64,
+    pub fuse_dispatch_parallel_tasks: u64,
+    pub fuse_dispatch_max_concurrent: u64,
+    pub fuse_readdirplus_auto_requested: u64,
+    pub fuse_readdirplus_auto_enabled: u64,
+    pub fuse_readdirplus_do_requested: u64,
+    pub fuse_readdirplus_do_enabled: u64,
+    pub fuse_readdirplus_unsupported: u64,
+    pub fuse_readdirplus_mode: u64,
+    pub fuse_ttl_entry_ms: u64,
+    pub fuse_ttl_attr_ms: u64,
+    pub fuse_ttl_neg_ms: u64,
+    pub fuse_writeback_cache_enabled: u64,
+    pub fuse_keepcache_enabled: u64,
+    pub fuse_keepcache_eligibility_drops: u64,
+    pub base_fast_open_eligible: u64,
+    pub base_fast_open_keep_cache: u64,
+    pub base_fast_open_passthrough_attempted: u64,
+    pub base_fast_open_passthrough_succeeded: u64,
+    pub base_fast_open_passthrough_fallback: u64,
+    pub base_fast_open_rejected: u64,
+    pub base_fast_inode_invalidations: u64,
+    pub base_fast_stale_rejections: u64,
 }
 
 /// Atomic profiling counters.
@@ -72,6 +122,9 @@ pub struct ProfileCounters {
     path_cache_hits: AtomicU64,
     path_cache_misses: AtomicU64,
     negative_lookup_count: AtomicU64,
+    negative_cache_hits: AtomicU64,
+    negative_cache_misses: AtomicU64,
+    negative_cache_invalidations: AtomicU64,
     attr_cache_hits: AtomicU64,
     attr_cache_misses: AtomicU64,
     dentry_cache_hits: AtomicU64,
@@ -79,6 +132,13 @@ pub struct ProfileCounters {
     chunk_read_queries: AtomicU64,
     chunk_read_chunks: AtomicU64,
     chunk_write_chunks: AtomicU64,
+    agentfs_batcher_enqueues: AtomicU64,
+    agentfs_batcher_drains_timer: AtomicU64,
+    agentfs_batcher_drains_bytes: AtomicU64,
+    agentfs_batcher_drains_explicit: AtomicU64,
+    agentfs_batcher_pending_max_bytes: AtomicU64,
+    agentfs_batcher_coalesced_ranges: AtomicU64,
+    agentfs_batcher_commit_latency_ns_total: AtomicU64,
     wal_checkpoint_count: AtomicU64,
     wal_checkpoint_nanos: AtomicU64,
     fuse_callback_count: AtomicU64,
@@ -94,6 +154,46 @@ pub struct ProfileCounters {
     fuse_flush_count: AtomicU64,
     fuse_flush_ranges: AtomicU64,
     fuse_flush_bytes: AtomicU64,
+    fuse_sync_inval_inode_ok: AtomicU64,
+    fuse_sync_inval_inode_err: AtomicU64,
+    fuse_sync_inval_entry_ok: AtomicU64,
+    fuse_sync_inval_entry_err: AtomicU64,
+    fuse_sync_inval_latency_ns_total: AtomicU64,
+    fuse_dispatch_wait_count: AtomicU64,
+    fuse_dispatch_wait_nanos: AtomicU64,
+    fuse_adapter_lock_wait_count: AtomicU64,
+    fuse_adapter_lock_wait_nanos: AtomicU64,
+    fuse_read_lane_wait_count: AtomicU64,
+    fuse_read_lane_wait_nanos: AtomicU64,
+    fuse_write_lane_wait_count: AtomicU64,
+    fuse_write_lane_wait_nanos: AtomicU64,
+    fuse_read_lane_max_concurrent: AtomicU64,
+    fuse_exclusive_fallback_count: AtomicU64,
+    fuse_workers_configured: AtomicU64,
+    fuse_worker_queue_depth_peak: AtomicU64,
+    fuse_dispatch_inline_fallback: AtomicU64,
+    fuse_dispatch_parallel_tasks: AtomicU64,
+    fuse_dispatch_max_concurrent: AtomicU64,
+    fuse_readdirplus_auto_requested: AtomicU64,
+    fuse_readdirplus_auto_enabled: AtomicU64,
+    fuse_readdirplus_do_requested: AtomicU64,
+    fuse_readdirplus_do_enabled: AtomicU64,
+    fuse_readdirplus_unsupported: AtomicU64,
+    fuse_readdirplus_mode: AtomicU64,
+    fuse_ttl_entry_ms: AtomicU64,
+    fuse_ttl_attr_ms: AtomicU64,
+    fuse_ttl_neg_ms: AtomicU64,
+    fuse_writeback_cache_enabled: AtomicU64,
+    fuse_keepcache_enabled: AtomicU64,
+    fuse_keepcache_eligibility_drops: AtomicU64,
+    base_fast_open_eligible: AtomicU64,
+    base_fast_open_keep_cache: AtomicU64,
+    base_fast_open_passthrough_attempted: AtomicU64,
+    base_fast_open_passthrough_succeeded: AtomicU64,
+    base_fast_open_passthrough_fallback: AtomicU64,
+    base_fast_open_rejected: AtomicU64,
+    base_fast_inode_invalidations: AtomicU64,
+    base_fast_stale_rejections: AtomicU64,
 }
 
 impl ProfileCounters {
@@ -115,6 +215,9 @@ impl ProfileCounters {
             path_cache_hits: AtomicU64::new(0),
             path_cache_misses: AtomicU64::new(0),
             negative_lookup_count: AtomicU64::new(0),
+            negative_cache_hits: AtomicU64::new(0),
+            negative_cache_misses: AtomicU64::new(0),
+            negative_cache_invalidations: AtomicU64::new(0),
             attr_cache_hits: AtomicU64::new(0),
             attr_cache_misses: AtomicU64::new(0),
             dentry_cache_hits: AtomicU64::new(0),
@@ -122,6 +225,13 @@ impl ProfileCounters {
             chunk_read_queries: AtomicU64::new(0),
             chunk_read_chunks: AtomicU64::new(0),
             chunk_write_chunks: AtomicU64::new(0),
+            agentfs_batcher_enqueues: AtomicU64::new(0),
+            agentfs_batcher_drains_timer: AtomicU64::new(0),
+            agentfs_batcher_drains_bytes: AtomicU64::new(0),
+            agentfs_batcher_drains_explicit: AtomicU64::new(0),
+            agentfs_batcher_pending_max_bytes: AtomicU64::new(0),
+            agentfs_batcher_coalesced_ranges: AtomicU64::new(0),
+            agentfs_batcher_commit_latency_ns_total: AtomicU64::new(0),
             wal_checkpoint_count: AtomicU64::new(0),
             wal_checkpoint_nanos: AtomicU64::new(0),
             fuse_callback_count: AtomicU64::new(0),
@@ -137,6 +247,46 @@ impl ProfileCounters {
             fuse_flush_count: AtomicU64::new(0),
             fuse_flush_ranges: AtomicU64::new(0),
             fuse_flush_bytes: AtomicU64::new(0),
+            fuse_sync_inval_inode_ok: AtomicU64::new(0),
+            fuse_sync_inval_inode_err: AtomicU64::new(0),
+            fuse_sync_inval_entry_ok: AtomicU64::new(0),
+            fuse_sync_inval_entry_err: AtomicU64::new(0),
+            fuse_sync_inval_latency_ns_total: AtomicU64::new(0),
+            fuse_dispatch_wait_count: AtomicU64::new(0),
+            fuse_dispatch_wait_nanos: AtomicU64::new(0),
+            fuse_adapter_lock_wait_count: AtomicU64::new(0),
+            fuse_adapter_lock_wait_nanos: AtomicU64::new(0),
+            fuse_read_lane_wait_count: AtomicU64::new(0),
+            fuse_read_lane_wait_nanos: AtomicU64::new(0),
+            fuse_write_lane_wait_count: AtomicU64::new(0),
+            fuse_write_lane_wait_nanos: AtomicU64::new(0),
+            fuse_read_lane_max_concurrent: AtomicU64::new(0),
+            fuse_exclusive_fallback_count: AtomicU64::new(0),
+            fuse_workers_configured: AtomicU64::new(0),
+            fuse_worker_queue_depth_peak: AtomicU64::new(0),
+            fuse_dispatch_inline_fallback: AtomicU64::new(0),
+            fuse_dispatch_parallel_tasks: AtomicU64::new(0),
+            fuse_dispatch_max_concurrent: AtomicU64::new(0),
+            fuse_readdirplus_auto_requested: AtomicU64::new(0),
+            fuse_readdirplus_auto_enabled: AtomicU64::new(0),
+            fuse_readdirplus_do_requested: AtomicU64::new(0),
+            fuse_readdirplus_do_enabled: AtomicU64::new(0),
+            fuse_readdirplus_unsupported: AtomicU64::new(0),
+            fuse_readdirplus_mode: AtomicU64::new(0),
+            fuse_ttl_entry_ms: AtomicU64::new(0),
+            fuse_ttl_attr_ms: AtomicU64::new(0),
+            fuse_ttl_neg_ms: AtomicU64::new(0),
+            fuse_writeback_cache_enabled: AtomicU64::new(0),
+            fuse_keepcache_enabled: AtomicU64::new(0),
+            fuse_keepcache_eligibility_drops: AtomicU64::new(0),
+            base_fast_open_eligible: AtomicU64::new(0),
+            base_fast_open_keep_cache: AtomicU64::new(0),
+            base_fast_open_passthrough_attempted: AtomicU64::new(0),
+            base_fast_open_passthrough_succeeded: AtomicU64::new(0),
+            base_fast_open_passthrough_fallback: AtomicU64::new(0),
+            base_fast_open_rejected: AtomicU64::new(0),
+            base_fast_inode_invalidations: AtomicU64::new(0),
+            base_fast_stale_rejections: AtomicU64::new(0),
         }
     }
 
@@ -200,6 +350,19 @@ impl ProfileCounters {
         self.negative_lookup_count.fetch_add(1, Ordering::Relaxed);
     }
 
+    fn add_negative_cache_hit(&self) {
+        self.negative_cache_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_negative_cache_miss(&self) {
+        self.negative_cache_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_negative_cache_invalidation(&self) {
+        self.negative_cache_invalidations
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     fn add_attr_cache_hit(&self) {
         self.attr_cache_hits.fetch_add(1, Ordering::Relaxed);
     }
@@ -226,6 +389,51 @@ impl ProfileCounters {
 
     fn add_chunk_write_chunks(&self, chunks: u64) {
         self.chunk_write_chunks.fetch_add(chunks, Ordering::Relaxed);
+    }
+
+    fn add_agentfs_batcher_enqueue(&self) {
+        self.agentfs_batcher_enqueues
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_agentfs_batcher_drain_timer(&self) {
+        self.agentfs_batcher_drains_timer
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_agentfs_batcher_drain_bytes(&self) {
+        self.agentfs_batcher_drains_bytes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_agentfs_batcher_drain_explicit(&self) {
+        self.agentfs_batcher_drains_explicit
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn update_agentfs_batcher_pending_max_bytes(&self, pending_bytes: u64) {
+        let mut current = self
+            .agentfs_batcher_pending_max_bytes
+            .load(Ordering::Relaxed);
+        while pending_bytes > current {
+            match self
+                .agentfs_batcher_pending_max_bytes
+                .compare_exchange_weak(current, pending_bytes, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn add_agentfs_batcher_coalesced_ranges(&self, ranges: u64) {
+        self.agentfs_batcher_coalesced_ranges
+            .fetch_add(ranges, Ordering::Relaxed);
+    }
+
+    fn add_agentfs_batcher_commit_latency(&self, duration: Duration) {
+        self.agentfs_batcher_commit_latency_ns_total
+            .fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
     }
 
     fn add_wal_checkpoint(&self, duration: Duration) {
@@ -280,10 +488,215 @@ impl ProfileCounters {
     }
 
     fn add_fuse_flush(&self, ranges: u64, bytes: u64) {
-        self.add_fuse_callback();
         self.fuse_flush_count.fetch_add(1, Ordering::Relaxed);
         self.fuse_flush_ranges.fetch_add(ranges, Ordering::Relaxed);
         self.fuse_flush_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn add_fuse_sync_inval_inode_ok(&self) {
+        self.fuse_sync_inval_inode_ok
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_fuse_sync_inval_inode_err(&self) {
+        self.fuse_sync_inval_inode_err
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_fuse_sync_inval_entry_ok(&self) {
+        self.fuse_sync_inval_entry_ok
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_fuse_sync_inval_entry_err(&self) {
+        self.fuse_sync_inval_entry_err
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_fuse_sync_inval_latency(&self, duration: Duration) {
+        self.fuse_sync_inval_latency_ns_total
+            .fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn add_fuse_dispatch_wait(&self, duration: Duration) {
+        self.fuse_dispatch_wait_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.fuse_dispatch_wait_nanos
+            .fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn add_fuse_adapter_lock_wait(&self, duration: Duration) {
+        self.fuse_adapter_lock_wait_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.fuse_adapter_lock_wait_nanos
+            .fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn add_fuse_read_lane_wait(&self, duration: Duration) {
+        self.fuse_read_lane_wait_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.fuse_read_lane_wait_nanos
+            .fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn add_fuse_write_lane_wait(&self, duration: Duration) {
+        self.fuse_write_lane_wait_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.fuse_write_lane_wait_nanos
+            .fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn update_fuse_read_lane_max_concurrent(&self, concurrent: u64) {
+        let mut current = self.fuse_read_lane_max_concurrent.load(Ordering::Relaxed);
+        while concurrent > current {
+            match self.fuse_read_lane_max_concurrent.compare_exchange_weak(
+                current,
+                concurrent,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn add_fuse_exclusive_fallback(&self) {
+        self.fuse_exclusive_fallback_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn set_fuse_workers_configured(&self, workers: u64) {
+        self.fuse_workers_configured
+            .store(workers, Ordering::Relaxed);
+    }
+
+    fn update_fuse_worker_queue_depth_peak(&self, depth: u64) {
+        let mut current = self.fuse_worker_queue_depth_peak.load(Ordering::Relaxed);
+        while depth > current {
+            match self.fuse_worker_queue_depth_peak.compare_exchange_weak(
+                current,
+                depth,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn add_fuse_dispatch_inline_fallback(&self) {
+        self.fuse_dispatch_inline_fallback
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_fuse_dispatch_parallel_task(&self) {
+        self.fuse_dispatch_parallel_tasks
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn update_fuse_dispatch_max_concurrent(&self, concurrent: u64) {
+        let mut current = self.fuse_dispatch_max_concurrent.load(Ordering::Relaxed);
+        while concurrent > current {
+            match self.fuse_dispatch_max_concurrent.compare_exchange_weak(
+                current,
+                concurrent,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn add_fuse_readdirplus_auto_requested(&self) {
+        self.fuse_readdirplus_auto_requested
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_fuse_readdirplus_auto_enabled(&self) {
+        self.fuse_readdirplus_auto_enabled
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_fuse_readdirplus_do_requested(&self) {
+        self.fuse_readdirplus_do_requested
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_fuse_readdirplus_do_enabled(&self) {
+        self.fuse_readdirplus_do_enabled
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_fuse_readdirplus_unsupported(&self) {
+        self.fuse_readdirplus_unsupported
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn set_fuse_readdirplus_mode(&self, mode: u64) {
+        self.fuse_readdirplus_mode.store(mode, Ordering::Relaxed);
+    }
+
+    fn set_fuse_ttl_ms(&self, entry_ms: u64, attr_ms: u64, neg_ms: u64) {
+        self.fuse_ttl_entry_ms.store(entry_ms, Ordering::Relaxed);
+        self.fuse_ttl_attr_ms.store(attr_ms, Ordering::Relaxed);
+        self.fuse_ttl_neg_ms.store(neg_ms, Ordering::Relaxed);
+    }
+
+    fn set_fuse_writeback_cache_enabled(&self, enabled: bool) {
+        self.fuse_writeback_cache_enabled
+            .store(u64::from(enabled), Ordering::Relaxed);
+    }
+
+    fn set_fuse_keepcache_enabled(&self, enabled: bool) {
+        self.fuse_keepcache_enabled
+            .store(u64::from(enabled), Ordering::Relaxed);
+    }
+
+    fn add_fuse_keepcache_eligibility_drop(&self) {
+        self.fuse_keepcache_eligibility_drops
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_base_fast_open_eligible(&self) {
+        self.base_fast_open_eligible.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_base_fast_open_keep_cache(&self) {
+        self.base_fast_open_keep_cache
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_base_fast_open_passthrough_attempted(&self) {
+        self.base_fast_open_passthrough_attempted
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_base_fast_open_passthrough_succeeded(&self) {
+        self.base_fast_open_passthrough_succeeded
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_base_fast_open_passthrough_fallback(&self) {
+        self.base_fast_open_passthrough_fallback
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_base_fast_open_rejected(&self) {
+        self.base_fast_open_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_base_fast_inode_invalidation(&self) {
+        self.base_fast_inode_invalidations
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_base_fast_stale_rejection(&self) {
+        self.base_fast_stale_rejections
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn snapshot(&self) -> ProfileSnapshot {
@@ -304,6 +717,9 @@ impl ProfileCounters {
             path_cache_hits: self.path_cache_hits.load(Ordering::Relaxed),
             path_cache_misses: self.path_cache_misses.load(Ordering::Relaxed),
             negative_lookup_count: self.negative_lookup_count.load(Ordering::Relaxed),
+            negative_cache_hits: self.negative_cache_hits.load(Ordering::Relaxed),
+            negative_cache_misses: self.negative_cache_misses.load(Ordering::Relaxed),
+            negative_cache_invalidations: self.negative_cache_invalidations.load(Ordering::Relaxed),
             attr_cache_hits: self.attr_cache_hits.load(Ordering::Relaxed),
             attr_cache_misses: self.attr_cache_misses.load(Ordering::Relaxed),
             dentry_cache_hits: self.dentry_cache_hits.load(Ordering::Relaxed),
@@ -311,6 +727,21 @@ impl ProfileCounters {
             chunk_read_queries: self.chunk_read_queries.load(Ordering::Relaxed),
             chunk_read_chunks: self.chunk_read_chunks.load(Ordering::Relaxed),
             chunk_write_chunks: self.chunk_write_chunks.load(Ordering::Relaxed),
+            agentfs_batcher_enqueues: self.agentfs_batcher_enqueues.load(Ordering::Relaxed),
+            agentfs_batcher_drains_timer: self.agentfs_batcher_drains_timer.load(Ordering::Relaxed),
+            agentfs_batcher_drains_bytes: self.agentfs_batcher_drains_bytes.load(Ordering::Relaxed),
+            agentfs_batcher_drains_explicit: self
+                .agentfs_batcher_drains_explicit
+                .load(Ordering::Relaxed),
+            agentfs_batcher_pending_max_bytes: self
+                .agentfs_batcher_pending_max_bytes
+                .load(Ordering::Relaxed),
+            agentfs_batcher_coalesced_ranges: self
+                .agentfs_batcher_coalesced_ranges
+                .load(Ordering::Relaxed),
+            agentfs_batcher_commit_latency_ns_total: self
+                .agentfs_batcher_commit_latency_ns_total
+                .load(Ordering::Relaxed),
             wal_checkpoint_count: self.wal_checkpoint_count.load(Ordering::Relaxed),
             wal_checkpoint_nanos: self.wal_checkpoint_nanos.load(Ordering::Relaxed),
             fuse_callback_count: self.fuse_callback_count.load(Ordering::Relaxed),
@@ -326,6 +757,70 @@ impl ProfileCounters {
             fuse_flush_count: self.fuse_flush_count.load(Ordering::Relaxed),
             fuse_flush_ranges: self.fuse_flush_ranges.load(Ordering::Relaxed),
             fuse_flush_bytes: self.fuse_flush_bytes.load(Ordering::Relaxed),
+            fuse_sync_inval_inode_ok: self.fuse_sync_inval_inode_ok.load(Ordering::Relaxed),
+            fuse_sync_inval_inode_err: self.fuse_sync_inval_inode_err.load(Ordering::Relaxed),
+            fuse_sync_inval_entry_ok: self.fuse_sync_inval_entry_ok.load(Ordering::Relaxed),
+            fuse_sync_inval_entry_err: self.fuse_sync_inval_entry_err.load(Ordering::Relaxed),
+            fuse_sync_inval_latency_ns_total: self
+                .fuse_sync_inval_latency_ns_total
+                .load(Ordering::Relaxed),
+            fuse_dispatch_wait_count: self.fuse_dispatch_wait_count.load(Ordering::Relaxed),
+            fuse_dispatch_wait_nanos: self.fuse_dispatch_wait_nanos.load(Ordering::Relaxed),
+            fuse_adapter_lock_wait_count: self.fuse_adapter_lock_wait_count.load(Ordering::Relaxed),
+            fuse_adapter_lock_wait_nanos: self.fuse_adapter_lock_wait_nanos.load(Ordering::Relaxed),
+            fuse_read_lane_wait_count: self.fuse_read_lane_wait_count.load(Ordering::Relaxed),
+            fuse_read_lane_wait_nanos: self.fuse_read_lane_wait_nanos.load(Ordering::Relaxed),
+            fuse_write_lane_wait_count: self.fuse_write_lane_wait_count.load(Ordering::Relaxed),
+            fuse_write_lane_wait_nanos: self.fuse_write_lane_wait_nanos.load(Ordering::Relaxed),
+            fuse_read_lane_max_concurrent: self
+                .fuse_read_lane_max_concurrent
+                .load(Ordering::Relaxed),
+            fuse_exclusive_fallback_count: self
+                .fuse_exclusive_fallback_count
+                .load(Ordering::Relaxed),
+            fuse_workers_configured: self.fuse_workers_configured.load(Ordering::Relaxed),
+            fuse_worker_queue_depth_peak: self.fuse_worker_queue_depth_peak.load(Ordering::Relaxed),
+            fuse_dispatch_inline_fallback: self
+                .fuse_dispatch_inline_fallback
+                .load(Ordering::Relaxed),
+            fuse_dispatch_parallel_tasks: self.fuse_dispatch_parallel_tasks.load(Ordering::Relaxed),
+            fuse_dispatch_max_concurrent: self.fuse_dispatch_max_concurrent.load(Ordering::Relaxed),
+            fuse_readdirplus_auto_requested: self
+                .fuse_readdirplus_auto_requested
+                .load(Ordering::Relaxed),
+            fuse_readdirplus_auto_enabled: self
+                .fuse_readdirplus_auto_enabled
+                .load(Ordering::Relaxed),
+            fuse_readdirplus_do_requested: self
+                .fuse_readdirplus_do_requested
+                .load(Ordering::Relaxed),
+            fuse_readdirplus_do_enabled: self.fuse_readdirplus_do_enabled.load(Ordering::Relaxed),
+            fuse_readdirplus_unsupported: self.fuse_readdirplus_unsupported.load(Ordering::Relaxed),
+            fuse_readdirplus_mode: self.fuse_readdirplus_mode.load(Ordering::Relaxed),
+            fuse_ttl_entry_ms: self.fuse_ttl_entry_ms.load(Ordering::Relaxed),
+            fuse_ttl_attr_ms: self.fuse_ttl_attr_ms.load(Ordering::Relaxed),
+            fuse_ttl_neg_ms: self.fuse_ttl_neg_ms.load(Ordering::Relaxed),
+            fuse_writeback_cache_enabled: self.fuse_writeback_cache_enabled.load(Ordering::Relaxed),
+            fuse_keepcache_enabled: self.fuse_keepcache_enabled.load(Ordering::Relaxed),
+            fuse_keepcache_eligibility_drops: self
+                .fuse_keepcache_eligibility_drops
+                .load(Ordering::Relaxed),
+            base_fast_open_eligible: self.base_fast_open_eligible.load(Ordering::Relaxed),
+            base_fast_open_keep_cache: self.base_fast_open_keep_cache.load(Ordering::Relaxed),
+            base_fast_open_passthrough_attempted: self
+                .base_fast_open_passthrough_attempted
+                .load(Ordering::Relaxed),
+            base_fast_open_passthrough_succeeded: self
+                .base_fast_open_passthrough_succeeded
+                .load(Ordering::Relaxed),
+            base_fast_open_passthrough_fallback: self
+                .base_fast_open_passthrough_fallback
+                .load(Ordering::Relaxed),
+            base_fast_open_rejected: self.base_fast_open_rejected.load(Ordering::Relaxed),
+            base_fast_inode_invalidations: self
+                .base_fast_inode_invalidations
+                .load(Ordering::Relaxed),
+            base_fast_stale_rejections: self.base_fast_stale_rejections.load(Ordering::Relaxed),
         }
     }
 }
@@ -429,6 +924,24 @@ pub fn record_negative_lookup() {
     }
 }
 
+pub fn record_negative_cache_hit() {
+    if is_enabled() {
+        COUNTERS.add_negative_cache_hit();
+    }
+}
+
+pub fn record_negative_cache_miss() {
+    if is_enabled() {
+        COUNTERS.add_negative_cache_miss();
+    }
+}
+
+pub fn record_negative_cache_invalidation() {
+    if is_enabled() {
+        COUNTERS.add_negative_cache_invalidation();
+    }
+}
+
 pub fn record_attr_cache_hit() {
     if is_enabled() {
         COUNTERS.add_attr_cache_hit();
@@ -468,6 +981,48 @@ pub fn record_chunk_read_chunks(chunks: u64) {
 pub fn record_chunk_write_chunks(chunks: u64) {
     if is_enabled() {
         COUNTERS.add_chunk_write_chunks(chunks);
+    }
+}
+
+pub fn record_agentfs_batcher_enqueue() {
+    if is_enabled() {
+        COUNTERS.add_agentfs_batcher_enqueue();
+    }
+}
+
+pub fn record_agentfs_batcher_drain_timer() {
+    if is_enabled() {
+        COUNTERS.add_agentfs_batcher_drain_timer();
+    }
+}
+
+pub fn record_agentfs_batcher_drain_bytes() {
+    if is_enabled() {
+        COUNTERS.add_agentfs_batcher_drain_bytes();
+    }
+}
+
+pub fn record_agentfs_batcher_drain_explicit() {
+    if is_enabled() {
+        COUNTERS.add_agentfs_batcher_drain_explicit();
+    }
+}
+
+pub fn record_agentfs_batcher_pending_bytes(pending_bytes: u64) {
+    if is_enabled() {
+        COUNTERS.update_agentfs_batcher_pending_max_bytes(pending_bytes);
+    }
+}
+
+pub fn record_agentfs_batcher_coalesced_ranges(ranges: u64) {
+    if is_enabled() && ranges > 0 {
+        COUNTERS.add_agentfs_batcher_coalesced_ranges(ranges);
+    }
+}
+
+pub fn record_agentfs_batcher_commit_latency(duration: Duration) {
+    if is_enabled() {
+        COUNTERS.add_agentfs_batcher_commit_latency(duration);
     }
 }
 
@@ -531,8 +1086,220 @@ pub fn record_fuse_flush(ranges: u64, bytes: u64) {
     }
 }
 
+pub fn record_fuse_sync_inval_inode_ok() {
+    if is_enabled() {
+        COUNTERS.add_fuse_sync_inval_inode_ok();
+    }
+}
+
+pub fn record_fuse_sync_inval_inode_err() {
+    if is_enabled() {
+        COUNTERS.add_fuse_sync_inval_inode_err();
+    }
+}
+
+pub fn record_fuse_sync_inval_entry_ok() {
+    if is_enabled() {
+        COUNTERS.add_fuse_sync_inval_entry_ok();
+    }
+}
+
+pub fn record_fuse_sync_inval_entry_err() {
+    if is_enabled() {
+        COUNTERS.add_fuse_sync_inval_entry_err();
+    }
+}
+
+pub fn record_fuse_sync_inval_latency(duration: Duration) {
+    if is_enabled() {
+        COUNTERS.add_fuse_sync_inval_latency(duration);
+    }
+}
+
+pub fn record_fuse_dispatch_wait(duration: Duration) {
+    if is_enabled() {
+        COUNTERS.add_fuse_dispatch_wait(duration);
+    }
+}
+
+pub fn record_fuse_adapter_lock_wait(duration: Duration) {
+    if is_enabled() {
+        COUNTERS.add_fuse_adapter_lock_wait(duration);
+    }
+}
+
+pub fn record_fuse_read_lane_wait(duration: Duration) {
+    if is_enabled() {
+        COUNTERS.add_fuse_read_lane_wait(duration);
+    }
+}
+
+pub fn record_fuse_write_lane_wait(duration: Duration) {
+    if is_enabled() {
+        COUNTERS.add_fuse_write_lane_wait(duration);
+    }
+}
+
+pub fn record_fuse_read_lane_concurrency(concurrent: u64) {
+    if is_enabled() {
+        COUNTERS.update_fuse_read_lane_max_concurrent(concurrent);
+    }
+}
+
+pub fn record_fuse_exclusive_fallback() {
+    if is_enabled() {
+        COUNTERS.add_fuse_exclusive_fallback();
+    }
+}
+
+pub fn set_fuse_workers_configured(workers: u64) {
+    if is_enabled() {
+        COUNTERS.set_fuse_workers_configured(workers);
+    }
+}
+
+pub fn record_fuse_worker_queue_depth(depth: u64) {
+    if is_enabled() {
+        COUNTERS.update_fuse_worker_queue_depth_peak(depth);
+    }
+}
+
+pub fn record_fuse_dispatch_inline_fallback() {
+    if is_enabled() {
+        COUNTERS.add_fuse_dispatch_inline_fallback();
+    }
+}
+
+pub fn record_fuse_dispatch_parallel_task() {
+    if is_enabled() {
+        COUNTERS.add_fuse_dispatch_parallel_task();
+    }
+}
+
+pub fn record_fuse_dispatch_concurrency(concurrent: u64) {
+    if is_enabled() {
+        COUNTERS.update_fuse_dispatch_max_concurrent(concurrent);
+    }
+}
+
+pub fn record_fuse_readdirplus_auto_requested() {
+    if is_enabled() {
+        COUNTERS.add_fuse_readdirplus_auto_requested();
+    }
+}
+
+pub fn record_fuse_readdirplus_auto_enabled() {
+    if is_enabled() {
+        COUNTERS.add_fuse_readdirplus_auto_enabled();
+    }
+}
+
+pub fn record_fuse_readdirplus_do_requested() {
+    if is_enabled() {
+        COUNTERS.add_fuse_readdirplus_do_requested();
+    }
+}
+
+pub fn record_fuse_readdirplus_do_enabled() {
+    if is_enabled() {
+        COUNTERS.add_fuse_readdirplus_do_enabled();
+    }
+}
+
+pub fn record_fuse_readdirplus_unsupported() {
+    if is_enabled() {
+        COUNTERS.add_fuse_readdirplus_unsupported();
+    }
+}
+
+pub fn set_fuse_readdirplus_mode(mode: u64) {
+    if is_enabled() {
+        COUNTERS.set_fuse_readdirplus_mode(mode);
+    }
+}
+
+pub fn set_fuse_ttl_ms(entry_ms: u64, attr_ms: u64, neg_ms: u64) {
+    if is_enabled() {
+        COUNTERS.set_fuse_ttl_ms(entry_ms, attr_ms, neg_ms);
+    }
+}
+
+pub fn set_fuse_writeback_cache_enabled(enabled: bool) {
+    if is_enabled() {
+        COUNTERS.set_fuse_writeback_cache_enabled(enabled);
+    }
+}
+
+pub fn set_fuse_keepcache_enabled(enabled: bool) {
+    if is_enabled() {
+        COUNTERS.set_fuse_keepcache_enabled(enabled);
+    }
+}
+
+pub fn record_fuse_keepcache_eligibility_drop() {
+    if is_enabled() {
+        COUNTERS.add_fuse_keepcache_eligibility_drop();
+    }
+}
+
+pub fn record_base_fast_open_eligible() {
+    if is_enabled() {
+        COUNTERS.add_base_fast_open_eligible();
+    }
+}
+
+pub fn record_base_fast_open_keep_cache() {
+    if is_enabled() {
+        COUNTERS.add_base_fast_open_keep_cache();
+    }
+}
+
+pub fn record_base_fast_open_passthrough_attempted() {
+    if is_enabled() {
+        COUNTERS.add_base_fast_open_passthrough_attempted();
+    }
+}
+
+pub fn record_base_fast_open_passthrough_succeeded() {
+    if is_enabled() {
+        COUNTERS.add_base_fast_open_passthrough_succeeded();
+    }
+}
+
+pub fn record_base_fast_open_passthrough_fallback() {
+    if is_enabled() {
+        COUNTERS.add_base_fast_open_passthrough_fallback();
+    }
+}
+
+pub fn record_base_fast_open_rejected() {
+    if is_enabled() {
+        COUNTERS.add_base_fast_open_rejected();
+    }
+}
+
+pub fn record_base_fast_inode_invalidation() {
+    if is_enabled() {
+        COUNTERS.add_base_fast_inode_invalidation();
+    }
+}
+
+pub fn record_base_fast_stale_rejection() {
+    if is_enabled() {
+        COUNTERS.add_base_fast_stale_rejection();
+    }
+}
+
 pub fn snapshot() -> ProfileSnapshot {
     COUNTERS.snapshot()
+}
+
+pub const fn passthrough_supported() -> bool {
+    false
+}
+
+pub const fn passthrough_fallback_read_path() -> &'static str {
+    "hostfs"
 }
 
 fn summary_json(source: &str, snapshot: &ProfileSnapshot) -> String {
@@ -540,6 +1307,8 @@ fn summary_json(source: &str, snapshot: &ProfileSnapshot) -> String {
         "event": "agentfs_profile_summary",
         "source": source,
         "counters": snapshot,
+        "passthrough_supported": passthrough_supported(),
+        "fallback_read_path": passthrough_fallback_read_path(),
     })
     .to_string()
 }
@@ -594,6 +1363,9 @@ mod tests {
         counters.add_path_cache_hit();
         counters.add_path_cache_miss();
         counters.add_negative_lookup();
+        counters.add_negative_cache_hit();
+        counters.add_negative_cache_miss();
+        counters.add_negative_cache_invalidation();
         counters.add_attr_cache_hit();
         counters.add_attr_cache_miss();
         counters.add_dentry_cache_hit();
@@ -601,6 +1373,14 @@ mod tests {
         counters.add_chunk_read_query();
         counters.add_chunk_read_chunks(3);
         counters.add_chunk_write_chunks(5);
+        counters.add_agentfs_batcher_enqueue();
+        counters.add_agentfs_batcher_drain_timer();
+        counters.add_agentfs_batcher_drain_bytes();
+        counters.add_agentfs_batcher_drain_explicit();
+        counters.update_agentfs_batcher_pending_max_bytes(64);
+        counters.update_agentfs_batcher_pending_max_bytes(32);
+        counters.add_agentfs_batcher_coalesced_ranges(2);
+        counters.add_agentfs_batcher_commit_latency(Duration::from_nanos(17));
         counters.add_wal_checkpoint(Duration::from_nanos(11));
         counters.add_fuse_lookup();
         counters.add_fuse_getattr();
@@ -611,6 +1391,41 @@ mod tests {
         counters.add_fuse_release();
         counters.add_fuse_write(13);
         counters.add_fuse_flush(2, 21);
+        counters.add_fuse_sync_inval_inode_ok();
+        counters.add_fuse_sync_inval_inode_err();
+        counters.add_fuse_sync_inval_entry_ok();
+        counters.add_fuse_sync_inval_entry_err();
+        counters.add_fuse_sync_inval_latency(Duration::from_nanos(29));
+        counters.add_fuse_dispatch_wait(Duration::from_nanos(31));
+        counters.add_fuse_adapter_lock_wait(Duration::from_nanos(37));
+        counters.add_fuse_read_lane_wait(Duration::from_nanos(41));
+        counters.add_fuse_write_lane_wait(Duration::from_nanos(43));
+        counters.update_fuse_read_lane_max_concurrent(2);
+        counters.update_fuse_read_lane_max_concurrent(5);
+        counters.update_fuse_read_lane_max_concurrent(3);
+        counters.add_fuse_exclusive_fallback();
+        counters.set_fuse_workers_configured(4);
+        counters.update_fuse_worker_queue_depth_peak(7);
+        counters.update_fuse_worker_queue_depth_peak(5);
+        counters.add_fuse_dispatch_inline_fallback();
+        counters.add_fuse_dispatch_parallel_task();
+        counters.add_fuse_dispatch_parallel_task();
+        counters.update_fuse_dispatch_max_concurrent(3);
+        counters.update_fuse_dispatch_max_concurrent(6);
+        counters.update_fuse_dispatch_max_concurrent(2);
+        counters.set_fuse_readdirplus_mode(1);
+        counters.set_fuse_ttl_ms(1000, 750, 250);
+        counters.set_fuse_writeback_cache_enabled(true);
+        counters.set_fuse_keepcache_enabled(true);
+        counters.add_fuse_keepcache_eligibility_drop();
+        counters.add_base_fast_open_eligible();
+        counters.add_base_fast_open_keep_cache();
+        counters.add_base_fast_open_passthrough_attempted();
+        counters.add_base_fast_open_passthrough_succeeded();
+        counters.add_base_fast_open_passthrough_fallback();
+        counters.add_base_fast_open_rejected();
+        counters.add_base_fast_inode_invalidation();
+        counters.add_base_fast_stale_rejection();
 
         let snapshot = counters.snapshot();
         assert_eq!(snapshot.connection_wait_count, 1);
@@ -629,6 +1444,9 @@ mod tests {
         assert_eq!(snapshot.path_cache_hits, 1);
         assert_eq!(snapshot.path_cache_misses, 1);
         assert_eq!(snapshot.negative_lookup_count, 1);
+        assert_eq!(snapshot.negative_cache_hits, 1);
+        assert_eq!(snapshot.negative_cache_misses, 1);
+        assert_eq!(snapshot.negative_cache_invalidations, 1);
         assert_eq!(snapshot.attr_cache_hits, 1);
         assert_eq!(snapshot.attr_cache_misses, 1);
         assert_eq!(snapshot.dentry_cache_hits, 1);
@@ -636,9 +1454,16 @@ mod tests {
         assert_eq!(snapshot.chunk_read_queries, 1);
         assert_eq!(snapshot.chunk_read_chunks, 3);
         assert_eq!(snapshot.chunk_write_chunks, 5);
+        assert_eq!(snapshot.agentfs_batcher_enqueues, 1);
+        assert_eq!(snapshot.agentfs_batcher_drains_timer, 1);
+        assert_eq!(snapshot.agentfs_batcher_drains_bytes, 1);
+        assert_eq!(snapshot.agentfs_batcher_drains_explicit, 1);
+        assert_eq!(snapshot.agentfs_batcher_pending_max_bytes, 64);
+        assert_eq!(snapshot.agentfs_batcher_coalesced_ranges, 2);
+        assert_eq!(snapshot.agentfs_batcher_commit_latency_ns_total, 17);
         assert_eq!(snapshot.wal_checkpoint_count, 1);
         assert_eq!(snapshot.wal_checkpoint_nanos, 11);
-        assert_eq!(snapshot.fuse_callback_count, 9);
+        assert_eq!(snapshot.fuse_callback_count, 8);
         assert_eq!(snapshot.fuse_lookup_count, 1);
         assert_eq!(snapshot.fuse_getattr_count, 1);
         assert_eq!(snapshot.fuse_readdir_count, 1);
@@ -651,6 +1476,41 @@ mod tests {
         assert_eq!(snapshot.fuse_flush_count, 1);
         assert_eq!(snapshot.fuse_flush_ranges, 2);
         assert_eq!(snapshot.fuse_flush_bytes, 21);
+        assert_eq!(snapshot.fuse_sync_inval_inode_ok, 1);
+        assert_eq!(snapshot.fuse_sync_inval_inode_err, 1);
+        assert_eq!(snapshot.fuse_sync_inval_entry_ok, 1);
+        assert_eq!(snapshot.fuse_sync_inval_entry_err, 1);
+        assert_eq!(snapshot.fuse_sync_inval_latency_ns_total, 29);
+        assert_eq!(snapshot.fuse_dispatch_wait_count, 1);
+        assert_eq!(snapshot.fuse_dispatch_wait_nanos, 31);
+        assert_eq!(snapshot.fuse_adapter_lock_wait_count, 1);
+        assert_eq!(snapshot.fuse_adapter_lock_wait_nanos, 37);
+        assert_eq!(snapshot.fuse_read_lane_wait_count, 1);
+        assert_eq!(snapshot.fuse_read_lane_wait_nanos, 41);
+        assert_eq!(snapshot.fuse_write_lane_wait_count, 1);
+        assert_eq!(snapshot.fuse_write_lane_wait_nanos, 43);
+        assert_eq!(snapshot.fuse_read_lane_max_concurrent, 5);
+        assert_eq!(snapshot.fuse_exclusive_fallback_count, 1);
+        assert_eq!(snapshot.fuse_workers_configured, 4);
+        assert_eq!(snapshot.fuse_worker_queue_depth_peak, 7);
+        assert_eq!(snapshot.fuse_dispatch_inline_fallback, 1);
+        assert_eq!(snapshot.fuse_dispatch_parallel_tasks, 2);
+        assert_eq!(snapshot.fuse_dispatch_max_concurrent, 6);
+        assert_eq!(snapshot.fuse_readdirplus_mode, 1);
+        assert_eq!(snapshot.fuse_ttl_entry_ms, 1000);
+        assert_eq!(snapshot.fuse_ttl_attr_ms, 750);
+        assert_eq!(snapshot.fuse_ttl_neg_ms, 250);
+        assert_eq!(snapshot.fuse_writeback_cache_enabled, 1);
+        assert_eq!(snapshot.fuse_keepcache_enabled, 1);
+        assert_eq!(snapshot.fuse_keepcache_eligibility_drops, 1);
+        assert_eq!(snapshot.base_fast_open_eligible, 1);
+        assert_eq!(snapshot.base_fast_open_keep_cache, 1);
+        assert_eq!(snapshot.base_fast_open_passthrough_attempted, 1);
+        assert_eq!(snapshot.base_fast_open_passthrough_succeeded, 1);
+        assert_eq!(snapshot.base_fast_open_passthrough_fallback, 1);
+        assert_eq!(snapshot.base_fast_open_rejected, 1);
+        assert_eq!(snapshot.base_fast_inode_invalidations, 1);
+        assert_eq!(snapshot.base_fast_stale_rejections, 1);
     }
 
     #[test]
@@ -664,5 +1524,67 @@ mod tests {
         assert_eq!(value["event"], "agentfs_profile_summary");
         assert_eq!(value["source"], "unit-test");
         assert_eq!(value["counters"]["chunk_read_queries"], 1);
+    }
+
+    #[test]
+    fn summary_json_includes_phase65_fast_path_counters() {
+        let counters = ProfileCounters::new();
+        counters.add_fuse_dispatch_wait(Duration::from_nanos(5));
+        counters.add_fuse_adapter_lock_wait(Duration::from_nanos(6));
+        counters.add_fuse_read_lane_wait(Duration::from_nanos(7));
+        counters.add_fuse_write_lane_wait(Duration::from_nanos(8));
+        counters.update_fuse_read_lane_max_concurrent(3);
+        counters.add_fuse_exclusive_fallback();
+        counters.set_fuse_workers_configured(4);
+        counters.update_fuse_worker_queue_depth_peak(9);
+        counters.add_fuse_dispatch_inline_fallback();
+        counters.add_fuse_dispatch_parallel_task();
+        counters.update_fuse_dispatch_max_concurrent(5);
+        counters.set_fuse_readdirplus_mode(2);
+        counters.set_fuse_ttl_ms(1000, 1000, 500);
+        counters.set_fuse_writeback_cache_enabled(true);
+        counters.set_fuse_keepcache_enabled(true);
+        counters.add_fuse_keepcache_eligibility_drop();
+        counters.add_base_fast_open_eligible();
+        counters.add_base_fast_open_keep_cache();
+        counters.add_base_fast_open_passthrough_fallback();
+        counters.add_base_fast_open_rejected();
+        counters.add_base_fast_inode_invalidation();
+        counters.add_base_fast_stale_rejection();
+
+        let value: Value = serde_json::from_str(&summary_json("unit-test", &counters.snapshot()))
+            .expect("summary JSON should parse");
+        let counters = &value["counters"];
+
+        assert_eq!(counters["fuse_dispatch_wait_count"], 1);
+        assert_eq!(counters["fuse_dispatch_wait_nanos"], 5);
+        assert_eq!(counters["fuse_adapter_lock_wait_count"], 1);
+        assert_eq!(counters["fuse_adapter_lock_wait_nanos"], 6);
+        assert_eq!(counters["fuse_read_lane_wait_count"], 1);
+        assert_eq!(counters["fuse_read_lane_wait_nanos"], 7);
+        assert_eq!(counters["fuse_write_lane_wait_count"], 1);
+        assert_eq!(counters["fuse_write_lane_wait_nanos"], 8);
+        assert_eq!(counters["fuse_read_lane_max_concurrent"], 3);
+        assert_eq!(counters["fuse_exclusive_fallback_count"], 1);
+        assert_eq!(counters["fuse_workers_configured"], 4);
+        assert_eq!(counters["fuse_worker_queue_depth_peak"], 9);
+        assert_eq!(counters["fuse_dispatch_inline_fallback"], 1);
+        assert_eq!(counters["fuse_dispatch_parallel_tasks"], 1);
+        assert_eq!(counters["fuse_dispatch_max_concurrent"], 5);
+        assert_eq!(counters["fuse_readdirplus_mode"], 2);
+        assert_eq!(counters["fuse_ttl_entry_ms"], 1000);
+        assert_eq!(counters["fuse_ttl_attr_ms"], 1000);
+        assert_eq!(counters["fuse_ttl_neg_ms"], 500);
+        assert_eq!(counters["fuse_writeback_cache_enabled"], 1);
+        assert_eq!(counters["fuse_keepcache_enabled"], 1);
+        assert_eq!(counters["fuse_keepcache_eligibility_drops"], 1);
+        assert_eq!(counters["base_fast_open_eligible"], 1);
+        assert_eq!(counters["base_fast_open_keep_cache"], 1);
+        assert_eq!(counters["base_fast_open_passthrough_attempted"], 0);
+        assert_eq!(counters["base_fast_open_passthrough_succeeded"], 0);
+        assert_eq!(counters["base_fast_open_passthrough_fallback"], 1);
+        assert_eq!(counters["base_fast_open_rejected"], 1);
+        assert_eq!(counters["base_fast_inode_invalidations"], 1);
+        assert_eq!(counters["base_fast_stale_rejections"], 1);
     }
 }

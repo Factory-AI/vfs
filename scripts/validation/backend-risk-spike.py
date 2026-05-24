@@ -341,6 +341,7 @@ def main(argv: list[str]) -> int:
         "recommended_validation_commands": [
             "cargo test --manifest-path sdk/rust/Cargo.toml",
             "cargo test --manifest-path cli/Cargo.toml",
+            "cargo test --manifest-path cli/Cargo.toml --no-default-features",
             "cli/tests/all.sh",
             "scripts/validation/phase0.sh",
             "scripts/validation/replay/replay_workload.py --agentfs-bin cli/target/debug/agentfs /path/to/replay.jsonl",

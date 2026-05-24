@@ -12,6 +12,33 @@ The Agent Filesystem Specification defines a SQLite schema for representing agen
 
 All timestamps in this specification use Unix epoch format (seconds since 1970-01-01 00:00:00 UTC) with optional nanosecond precision via separate `_nsec` columns.
 
+## Runtime Architecture and Safety Invariants
+
+The persistent AgentFS authority is the SQLite database described by this
+specification. Runtime mounts, caches, file handles, FUSE lookup references, and
+overlay inode maps are acceleration structures only; they MUST be reconstructible
+from the database plus the configured read-only base path and MUST NOT become
+the only source of virtual filesystem state.
+
+AgentFS sandboxing is built around two invariants:
+
+1. A portable AgentFS database contains all writable virtual filesystem state.
+   Clean shutdown SHOULD checkpoint transient SQLite sidecars so backups and
+   materialized copies can be represented as a single main database file.
+2. Copy-on-write sandbox writes MUST NOT modify the real filesystem. Overlay
+   backends MAY read from an explicitly scoped base directory, but file creates,
+   writes, truncates, chmod/chown/utimens, links, renames, and deletes are
+   represented in the AgentFS delta database and overlay metadata.
+
+Implementations MAY use kernel caches, positive/negative lookup caches,
+attribute caches, read-dir caches, and parallel FUSE dispatch, provided they
+preserve POSIX lookup reference accounting. In particular, any cached positive
+lookup reply that creates a kernel lookup reference MUST either reach the backing
+filesystem lookup path or explicitly retain the backing inode reference before
+replying; later `FORGET` requests must release the same reference count.
+Namespace mutations MUST invalidate affected cached dentries and attributes
+before the mutation is considered visible to the caller.
+
 ## Tool Calls
 
 The tool call tracking schema captures tool invocations for debugging, auditing, and analysis.

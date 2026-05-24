@@ -16,7 +16,9 @@ pub use agentfs::AgentFS;
 pub use hostfs_darwin::HostFS;
 #[cfg(target_os = "linux")]
 pub use hostfs_linux::HostFS;
-pub use overlayfs::OverlayFS;
+pub use overlayfs::{
+    OverlayFS, PartialOriginMode, PartialOriginPolicy, DEFAULT_PARTIAL_ORIGIN_THRESHOLD_BYTES,
+};
 
 /// Filesystem-specific errors with errno semantics
 #[derive(Debug, Error)]
@@ -138,6 +140,13 @@ pub struct DirEntry {
     pub stats: Stats,
 }
 
+/// A byte range to write at a fixed file offset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteRange {
+    pub offset: u64,
+    pub data: Vec<u8>,
+}
+
 impl Stats {
     pub fn is_file(&self) -> bool {
         (self.mode & S_IFMT) == S_IFREG
@@ -164,6 +173,34 @@ pub trait File: Send + Sync {
 
     /// Write to the file at the given offset (like POSIX pwrite).
     async fn pwrite(&self, offset: u64, data: &[u8]) -> Result<()>;
+
+    /// Write multiple byte ranges to the file.
+    ///
+    /// Implementations that can batch writes should apply all ranges atomically.
+    /// The default implementation preserves range order by issuing individual
+    /// `pwrite` calls.
+    async fn pwrite_ranges(&self, ranges: Vec<WriteRange>) -> Result<()> {
+        for range in ranges {
+            self.pwrite(range.offset, &range.data).await?;
+        }
+        Ok(())
+    }
+
+    /// Write multiple byte ranges through an implementation-owned write
+    /// batcher when one is enabled.
+    ///
+    /// The default preserves existing behavior exactly by applying the ranges
+    /// immediately via `pwrite_ranges`.
+    async fn pwrite_ranges_batched(&self, ranges: Vec<WriteRange>) -> Result<()> {
+        self.pwrite_ranges(ranges).await
+    }
+
+    /// Drain any pending batched writes for this open file handle.
+    ///
+    /// Implementations without a write batcher have no pending data to drain.
+    async fn drain_writes(&self) -> Result<()> {
+        Ok(())
+    }
 
     /// Truncate the file to the specified size.
     async fn truncate(&self, size: u64) -> Result<()>;
@@ -233,6 +270,16 @@ pub trait FileSystem: Send + Sync {
     /// `libc::O_RDWR`). Implementations should use these flags to open the file
     /// with the appropriate permissions.
     async fn open(&self, ino: i64, flags: i32) -> Result<BoxedFile>;
+
+    /// Return true when a FUSE adapter may keep the kernel page cache across
+    /// read-only opens for this inode.
+    ///
+    /// Implementations must only return true for immutable read-only handles
+    /// whose cached data cannot become stale without a later invalidating
+    /// mutation. The default is conservative and disables `FOPEN_KEEP_CACHE`.
+    async fn keep_cache_for_read_open(&self, _ino: i64, _flags: i32) -> Result<bool> {
+        Ok(false)
+    }
 
     /// Create a directory with the specified ownership.
     ///
@@ -306,6 +353,31 @@ pub trait FileSystem: Send + Sync {
 
     /// Get filesystem statistics.
     async fn statfs(&self) -> Result<FilesystemStats>;
+
+    /// Drain pending batched writes for an inode, if this filesystem batches writes.
+    async fn drain_inode_writes(&self, _ino: i64) -> Result<()> {
+        Ok(())
+    }
+
+    /// Drain all pending batched writes, if this filesystem batches writes.
+    async fn drain_all(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Finalize a clean shutdown by draining writes and making portable sidecars transient.
+    async fn finalize(&self) -> Result<()> {
+        self.drain_all().await
+    }
+
+    /// Retain an existing lookup reference without resolving a name again.
+    ///
+    /// FUSE positive LOOKUP cache hits still create kernel lookup references.
+    /// Passthrough filesystems that cache inode resources should increment the
+    /// same reference count they increment during `lookup` before such a cached
+    /// positive reply is sent.
+    async fn retain_lookup(&self, _ino: i64, _nlookup: u64) -> Result<()> {
+        Ok(())
+    }
 
     /// Forget about an inode (called when kernel drops inode from cache).
     ///

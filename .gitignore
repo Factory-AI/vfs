@@ -26,3 +26,9 @@ Temporary Items
 .apdisk
 
 .agentfs
+
+# Python bytecode cache
+__pycache__/
+
+# Large benchmark fixtures - regenerate via 'git clone --bare openai/codex'
+.agents/benchmarks/fixtures/

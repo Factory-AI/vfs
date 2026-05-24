@@ -1,15 +1,17 @@
 use crate::error::{Error, Result};
 use async_trait::async_trait;
 use lru::LruCache;
+use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroUsize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::Mutex as AsyncMutex;
 use turso::transaction::{Transaction, TransactionBehavior};
 use turso::{Builder, Connection, Value};
 
 use super::{
-    BoxedFile, DirEntry, File, FileSystem, FilesystemStats, FsError, Stats, TimeChange,
+    BoxedFile, DirEntry, File, FileSystem, FilesystemStats, FsError, Stats, TimeChange, WriteRange,
     DEFAULT_DIR_MODE, DEFAULT_FILE_MODE, MAX_NAME_LEN, S_IFLNK, S_IFMT, S_IFREG,
 };
 use crate::connection_pool::{ConnectionPool, ConnectionPoolOptions};
@@ -21,6 +23,7 @@ const DEFAULT_INLINE_THRESHOLD: usize = 4096;
 const STORAGE_CHUNKED: i64 = 0;
 const STORAGE_INLINE: i64 = 1;
 const DENTRY_CACHE_MAX_SIZE: usize = 10000;
+const NEGATIVE_DENTRY_CACHE_MAX_SIZE: usize = 10000;
 const FILE_BACKED_MAX_CONNECTIONS: usize = 8;
 const BUSY_TIMEOUT_SQL: &str = "PRAGMA busy_timeout = 5000";
 const WAL_MODE_SQL: &str = "PRAGMA journal_mode = WAL";
@@ -29,6 +32,11 @@ const DURABLE_SYNCHRONOUS_SQL: &str = "PRAGMA synchronous = FULL";
 const WAL_CHECKPOINT_SQL: &str = "PRAGMA wal_checkpoint(TRUNCATE)";
 const FILE_BACKED_SETUP_SQL: &[&str] = &[BUSY_TIMEOUT_SQL, WAL_MODE_SQL, BASELINE_SYNCHRONOUS_SQL];
 const ATTR_CACHE_MAX_SIZE: usize = 10000;
+const WRITE_BATCHER_ENABLE_ENV: &str = "AGENTFS_FUSE_WRITEBACK";
+const WRITE_BATCHER_MS_ENV: &str = "AGENTFS_BATCH_MS";
+const WRITE_BATCHER_BYTES_ENV: &str = "AGENTFS_BATCH_BYTES";
+const DEFAULT_WRITE_BATCH_MS: u64 = 5;
+const DEFAULT_WRITE_BATCH_BYTES: usize = 4 * 1024 * 1024;
 
 /// Production connection-pool options for local file-backed AgentFS databases.
 pub(crate) fn file_backed_connection_pool_options() -> ConnectionPoolOptions {
@@ -50,6 +58,52 @@ async fn checkpoint_wal(conn: &Connection) -> Result<()> {
         crate::profiling::record_wal_checkpoint(started.elapsed());
     }
     Ok(())
+}
+
+fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    PathBuf::from(format!("{}{}", path.display(), suffix))
+}
+
+fn remove_checkpointed_sidecars(path: &Path) -> Result<()> {
+    let wal = sqlite_sidecar_path(path, "-wal");
+    if let Ok(metadata) = std::fs::metadata(&wal) {
+        if metadata.len() == 0 {
+            std::fs::remove_file(&wal)?;
+        }
+    }
+
+    let shm = sqlite_sidecar_path(path, "-shm");
+    if shm.exists() {
+        std::fs::remove_file(&shm)?;
+    }
+    Ok(())
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn env_duration_millis(name: &str, default_ms: u64) -> Duration {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_millis(default_ms))
+}
+
+fn env_usize(name: &str, default_value: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default_value)
 }
 
 /// LRU cache for directory entry lookups.
@@ -106,6 +160,60 @@ impl DentryCache {
     }
 }
 
+/// LRU cache for safe negative directory entry lookups.
+///
+/// A negative entry means "this (parent, name) did not exist in the last
+/// serialized AgentFS view". Every namespace mutation invalidates exactly the
+/// affected key before the mutation reports success, so cached ENOENT results
+/// cannot hide later creates or renames made through this filesystem.
+struct NegativeDentryCache {
+    entries: Mutex<LruCache<(i64, String), ()>>,
+}
+
+impl NegativeDentryCache {
+    fn new(max_size: usize) -> Self {
+        Self {
+            entries: Mutex::new(LruCache::new(
+                NonZeroUsize::new(max_size).expect("cache size must be > 0"),
+            )),
+        }
+    }
+
+    fn contains(&self, parent_ino: i64, name: &str) -> bool {
+        let cached = self
+            .entries
+            .lock()
+            .unwrap()
+            .get(&(parent_ino, name.to_string()))
+            .is_some();
+        if cached {
+            crate::profiling::record_negative_cache_hit();
+        } else {
+            crate::profiling::record_negative_cache_miss();
+        }
+        cached
+    }
+
+    fn insert(&self, parent_ino: i64, name: &str) {
+        self.entries
+            .lock()
+            .unwrap()
+            .put((parent_ino, name.to_string()), ());
+    }
+
+    fn remove(&self, parent_ino: i64, name: &str) {
+        if self
+            .entries
+            .lock()
+            .unwrap()
+            .pop(&(parent_ino, name.to_string()))
+            .is_some()
+        {
+            crate::profiling::record_negative_cache_invalidation();
+        }
+    }
+}
+
 /// LRU cache for inode attributes.
 ///
 /// FUSE and SDK stat-heavy read paths often ask for the same inode metadata
@@ -144,16 +252,367 @@ impl AttrCache {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum AgentFSWriteBatchDrainReason {
+    Timer,
+    Bytes,
+    Explicit,
+}
+
+struct PendingInodeWrites {
+    ranges: Vec<WriteRange>,
+    pending_bytes: usize,
+    first_enqueue: Instant,
+    last_enqueue: Instant,
+    timer_scheduled: bool,
+}
+
+impl PendingInodeWrites {
+    fn new(now: Instant) -> Self {
+        Self {
+            ranges: Vec::new(),
+            pending_bytes: 0,
+            first_enqueue: now,
+            last_enqueue: now,
+            timer_scheduled: false,
+        }
+    }
+
+    fn push_ranges(
+        &mut self,
+        ranges: Vec<WriteRange>,
+        byte_count: usize,
+        now: Instant,
+    ) -> Result<()> {
+        self.pending_bytes = self
+            .pending_bytes
+            .checked_add(byte_count)
+            .ok_or_else(|| Error::Internal("batched write byte count overflow".to_string()))?;
+        self.last_enqueue = now;
+        self.ranges.extend(ranges);
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct AgentFSWriteBatcherState {
+    pending: HashMap<i64, PendingInodeWrites>,
+}
+
+/// In-memory write group-commit queue for FUSE writeback mode.
+///
+/// The batcher stores only transient `WriteRange` values and drains them into
+/// the canonical SQLite tables. It never creates sidecars and normal durability
+/// boundaries (`flush`, `fsync`, `release`, `destroy`) explicitly drain it.
+struct AgentFSWriteBatcher {
+    pool: ConnectionPool,
+    chunk_size: usize,
+    inline_threshold: usize,
+    attr_cache: Arc<AttrCache>,
+    batch_ms: Duration,
+    batch_bytes: usize,
+    state: AsyncMutex<AgentFSWriteBatcherState>,
+    commit_lock: AsyncMutex<()>,
+}
+
+impl AgentFSWriteBatcher {
+    fn from_env(
+        pool: ConnectionPool,
+        chunk_size: usize,
+        inline_threshold: usize,
+        attr_cache: Arc<AttrCache>,
+    ) -> Self {
+        Self {
+            pool,
+            chunk_size,
+            inline_threshold,
+            attr_cache,
+            batch_ms: env_duration_millis(WRITE_BATCHER_MS_ENV, DEFAULT_WRITE_BATCH_MS),
+            batch_bytes: env_usize(WRITE_BATCHER_BYTES_ENV, DEFAULT_WRITE_BATCH_BYTES),
+            state: AsyncMutex::new(AgentFSWriteBatcherState::default()),
+            commit_lock: AsyncMutex::new(()),
+        }
+    }
+
+    async fn enqueue(self: &Arc<Self>, ino: i64, ranges: Vec<WriteRange>) -> Result<()> {
+        let ranges: Vec<_> = ranges
+            .into_iter()
+            .filter(|range| !range.data.is_empty())
+            .collect();
+        if ranges.is_empty() {
+            return Ok(());
+        }
+
+        let byte_count = ranges.iter().try_fold(0usize, |acc, range| {
+            acc.checked_add(range.data.len())
+                .ok_or_else(|| Error::Internal("batched write byte count overflow".to_string()))
+        })?;
+        let now = Instant::now();
+        let drain_now;
+        let mut schedule_timer = false;
+
+        {
+            let mut state = self.state.lock().await;
+            drain_now = {
+                let entry = state
+                    .pending
+                    .entry(ino)
+                    .or_insert_with(|| PendingInodeWrites::new(now));
+                entry.push_ranges(ranges, byte_count, now)?;
+                crate::profiling::record_agentfs_batcher_enqueue();
+                crate::profiling::record_agentfs_batcher_pending_bytes(entry.pending_bytes as u64);
+
+                if entry.pending_bytes >= self.batch_bytes {
+                    true
+                } else {
+                    if !entry.timer_scheduled {
+                        entry.timer_scheduled = true;
+                        schedule_timer = true;
+                    }
+                    false
+                }
+            };
+        }
+
+        if schedule_timer {
+            self.schedule_timer_after(ino, self.batch_ms);
+        }
+
+        if drain_now {
+            self.drain_inode(ino, AgentFSWriteBatchDrainReason::Bytes)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn drain_inode(
+        self: &Arc<Self>,
+        ino: i64,
+        reason: AgentFSWriteBatchDrainReason,
+    ) -> Result<()> {
+        let _commit_guard = self.commit_lock.lock().await;
+        loop {
+            let batch = {
+                let mut state = self.state.lock().await;
+                Self::take_inode_locked(&mut state, ino)
+            };
+
+            let Some(batch) = batch else {
+                return Ok(());
+            };
+
+            self.commit_batch(ino, batch, reason).await?;
+        }
+    }
+
+    async fn drain_all(self: &Arc<Self>, reason: AgentFSWriteBatchDrainReason) -> Result<()> {
+        let _commit_guard = self.commit_lock.lock().await;
+        loop {
+            let batches = {
+                let mut state = self.state.lock().await;
+                std::mem::take(&mut state.pending)
+                    .into_iter()
+                    .map(|(ino, mut batch)| {
+                        batch.timer_scheduled = false;
+                        (ino, batch)
+                    })
+                    .collect::<Vec<_>>()
+            };
+
+            if batches.is_empty() {
+                return Ok(());
+            }
+
+            for (ino, batch) in batches {
+                self.commit_batch(ino, batch, reason).await?;
+            }
+        }
+    }
+
+    async fn drain_due_timer(self: Arc<Self>, ino: i64) -> Result<()> {
+        let _commit_guard = self.commit_lock.lock().await;
+        let mut reschedule_after = None;
+        let batch = {
+            let mut state = self.state.lock().await;
+            let Some(elapsed) = state
+                .pending
+                .get(&ino)
+                .map(|entry| entry.first_enqueue.elapsed())
+            else {
+                return Ok(());
+            };
+
+            if elapsed >= self.batch_ms {
+                Self::take_inode_locked(&mut state, ino)
+            } else {
+                if let Some(entry) = state.pending.get_mut(&ino) {
+                    entry.timer_scheduled = true;
+                }
+                reschedule_after = Some(self.batch_ms - elapsed);
+                None
+            }
+        };
+
+        if let Some(delay) = reschedule_after {
+            self.schedule_timer_after(ino, delay);
+        }
+
+        if let Some(batch) = batch {
+            self.commit_batch(ino, batch, AgentFSWriteBatchDrainReason::Timer)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    fn schedule_timer_after(self: &Arc<Self>, ino: i64, delay: Duration) {
+        let batcher = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            if let Err(error) = batcher.drain_due_timer(ino).await {
+                tracing::warn!(
+                    "AgentFS write batcher timer drain failed for inode {}: {}",
+                    ino,
+                    error
+                );
+            }
+        });
+    }
+
+    fn take_inode_locked(
+        state: &mut AgentFSWriteBatcherState,
+        ino: i64,
+    ) -> Option<PendingInodeWrites> {
+        state.pending.remove(&ino).map(|mut batch| {
+            batch.timer_scheduled = false;
+            batch
+        })
+    }
+
+    async fn restore_batch(self: &Arc<Self>, ino: i64, mut batch: PendingInodeWrites) {
+        let mut schedule_timer = false;
+        {
+            let mut state = self.state.lock().await;
+            if let Some(existing) = state.pending.remove(&ino) {
+                batch.pending_bytes = batch.pending_bytes.saturating_add(existing.pending_bytes);
+                batch.last_enqueue = existing.last_enqueue;
+                batch.ranges.extend(existing.ranges);
+                batch.timer_scheduled = existing.timer_scheduled;
+            }
+            if !batch.timer_scheduled {
+                batch.timer_scheduled = true;
+                schedule_timer = true;
+            }
+            state.pending.insert(ino, batch);
+        }
+
+        if schedule_timer {
+            self.schedule_timer_after(ino, self.batch_ms);
+        }
+    }
+
+    async fn commit_batch(
+        self: &Arc<Self>,
+        ino: i64,
+        batch: PendingInodeWrites,
+        reason: AgentFSWriteBatchDrainReason,
+    ) -> Result<()> {
+        if batch.ranges.is_empty() {
+            return Ok(());
+        }
+
+        match reason {
+            AgentFSWriteBatchDrainReason::Timer => {
+                crate::profiling::record_agentfs_batcher_drain_timer();
+            }
+            AgentFSWriteBatchDrainReason::Bytes => {
+                crate::profiling::record_agentfs_batcher_drain_bytes();
+            }
+            AgentFSWriteBatchDrainReason::Explicit => {
+                crate::profiling::record_agentfs_batcher_drain_explicit();
+            }
+        }
+
+        let result = self.commit_inode_ranges(ino, &batch.ranges).await;
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.restore_batch(ino, batch).await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn commit_inode_ranges(&self, ino: i64, ranges: &[WriteRange]) -> Result<()> {
+        let range_refs: Vec<_> = ranges
+            .iter()
+            .map(|range| WriteRangeRef {
+                offset: range.offset,
+                data: range.data.as_slice(),
+            })
+            .collect();
+        let normalized = normalize_write_ranges(&range_refs)?;
+        if normalized.is_empty() {
+            return Ok(());
+        }
+
+        crate::profiling::record_agentfs_batcher_coalesced_ranges(
+            ranges.len().saturating_sub(normalized.len()) as u64,
+        );
+
+        let started = Instant::now();
+        let conn = self.pool.get_connection().await?;
+        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+        let file = AgentFSFile {
+            pool: self.pool.clone(),
+            ino,
+            chunk_size: self.chunk_size,
+            inline_threshold: self.inline_threshold,
+            attr_cache: self.attr_cache.clone(),
+            write_batcher: None,
+        };
+        let normalized_refs: Vec<_> = normalized
+            .iter()
+            .map(|range| WriteRangeRef {
+                offset: range.offset,
+                data: range.data.as_slice(),
+            })
+            .collect();
+        let result = file
+            .pwrite_ranges_inode_with_conn(&conn, &normalized_refs)
+            .await;
+
+        match result {
+            Ok(()) => {
+                txn.commit().await?;
+                self.attr_cache.remove(ino);
+                crate::profiling::record_agentfs_batcher_commit_latency(started.elapsed());
+                Ok(())
+            }
+            Err(error) => {
+                let _ = txn.rollback().await;
+                Err(error)
+            }
+        }
+    }
+}
+
 /// A filesystem backed by SQLite
 #[derive(Clone)]
 pub struct AgentFS {
     pool: ConnectionPool,
+    db_path: Option<Arc<PathBuf>>,
     chunk_size: usize,
     inline_threshold: usize,
     /// Cache for directory entry lookups (shared across clones)
     dentry_cache: Arc<DentryCache>,
+    /// Cache for negative directory entry lookups (shared across clones)
+    negative_dentry_cache: Arc<NegativeDentryCache>,
     /// Cache for inode attributes (shared across clones)
     attr_cache: Arc<AttrCache>,
+    /// Optional write batcher used by FUSE writeback mode.
+    write_batcher: Option<Arc<AgentFSWriteBatcher>>,
     /// Emits a profiling summary when the final filesystem clone is dropped.
     _profile_report: Arc<crate::profiling::ProfileReportGuard>,
 }
@@ -168,6 +627,7 @@ pub struct AgentFSFile {
     chunk_size: usize,
     inline_threshold: usize,
     attr_cache: Arc<AttrCache>,
+    write_batcher: Option<Arc<AgentFSWriteBatcher>>,
 }
 
 struct FileStorage {
@@ -176,14 +636,134 @@ struct FileStorage {
     inline_data: Option<Vec<u8>>,
 }
 
+struct WriteRangeRef<'a> {
+    offset: u64,
+    data: &'a [u8],
+}
+
+#[derive(Clone)]
+struct NormalizedWriteRange {
+    offset: u64,
+    data: Vec<u8>,
+}
+
+impl NormalizedWriteRange {
+    fn end(&self) -> u64 {
+        self.offset + self.data.len() as u64
+    }
+}
+
 fn current_timestamp() -> Result<(i64, i64)> {
     let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
     Ok((dur.as_secs() as i64, dur.subsec_nanos() as i64))
 }
 
+fn normalize_write_ranges(ranges: &[WriteRangeRef<'_>]) -> Result<Vec<NormalizedWriteRange>> {
+    let mut merged_ranges: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+
+    for range in ranges {
+        if range.data.is_empty() {
+            continue;
+        }
+
+        let data_len = u64::try_from(range.data.len())
+            .map_err(|_| Error::Internal("file write length overflow".to_string()))?;
+        let write_start = range.offset;
+        let write_end = write_start
+            .checked_add(data_len)
+            .ok_or_else(|| Error::Internal("file write offset overflow".to_string()))?;
+        let mut start = write_start;
+        let mut end = write_end;
+        let mut existing_ranges = Vec::new();
+
+        if let Some((&prev_start, prev_data)) = merged_ranges.range(..=write_start).next_back() {
+            let prev_end = prev_start
+                .checked_add(prev_data.len() as u64)
+                .ok_or_else(|| Error::Internal("file write offset overflow".to_string()))?;
+
+            if prev_end >= write_start {
+                let prev_data = prev_data.clone();
+                merged_ranges.remove(&prev_start);
+
+                start = prev_start;
+                end = end.max(prev_end);
+                existing_ranges.push((prev_start, prev_data));
+            }
+        }
+
+        loop {
+            let next = merged_ranges
+                .range(start..)
+                .next()
+                .map(|(&next_start, next_data)| (next_start, next_data.clone()));
+
+            let Some((next_start, next_data)) = next else {
+                break;
+            };
+
+            if next_start > end {
+                break;
+            }
+
+            let next_end = next_start
+                .checked_add(next_data.len() as u64)
+                .ok_or_else(|| Error::Internal("file write offset overflow".to_string()))?;
+            merged_ranges.remove(&next_start);
+
+            end = end.max(next_end);
+            existing_ranges.push((next_start, next_data));
+        }
+
+        let merged_len = usize::try_from(end - start)
+            .map_err(|_| Error::Internal("file write range too large".to_string()))?;
+        let mut merged = vec![0; merged_len];
+        for (range_start, range_data) in existing_ranges {
+            let range_offset = usize::try_from(range_start - start)
+                .map_err(|_| Error::Internal("file write range too large".to_string()))?;
+            merged[range_offset..range_offset + range_data.len()].copy_from_slice(&range_data);
+        }
+
+        let write_offset = usize::try_from(write_start - start)
+            .map_err(|_| Error::Internal("file write range too large".to_string()))?;
+        merged[write_offset..write_offset + range.data.len()].copy_from_slice(range.data);
+
+        merged_ranges.insert(start, merged);
+    }
+
+    Ok(merged_ranges
+        .into_iter()
+        .map(|(offset, data)| NormalizedWriteRange { offset, data })
+        .collect())
+}
+
+fn dense_after_inline_write_batch(
+    current_size: u64,
+    new_size: u64,
+    ranges: &[NormalizedWriteRange],
+) -> bool {
+    let mut covered_end = current_size;
+
+    for range in ranges {
+        let range_end = range.end();
+        if range_end <= covered_end {
+            continue;
+        }
+        if range.offset > covered_end {
+            return false;
+        }
+        covered_end = range_end;
+        if covered_end >= new_size {
+            return true;
+        }
+    }
+
+    covered_end >= new_size
+}
+
 #[async_trait]
 impl File for AgentFSFile {
     async fn pread(&self, offset: u64, size: u64) -> Result<Vec<u8>> {
+        self.drain_writes().await?;
         let conn = self.pool.get_connection().await?;
         self.read_inode_with_conn(&conn, offset, size).await
     }
@@ -192,10 +772,12 @@ impl File for AgentFSFile {
         if data.is_empty() {
             return Ok(());
         }
+        self.drain_writes().await?;
 
         let conn = self.pool.get_connection().await?;
         let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
-        let result = self.pwrite_inode_with_conn(&conn, offset, data).await;
+        let ranges = [WriteRangeRef { offset, data }];
+        let result = self.pwrite_ranges_inode_with_conn(&conn, &ranges).await;
         match result {
             Ok(()) => {
                 txn.commit().await?;
@@ -209,7 +791,49 @@ impl File for AgentFSFile {
         }
     }
 
+    async fn pwrite_ranges(&self, ranges: Vec<WriteRange>) -> Result<()> {
+        if ranges.iter().all(|range| range.data.is_empty()) {
+            return Ok(());
+        }
+        self.drain_writes().await?;
+
+        let conn = self.pool.get_connection().await?;
+        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+        let range_refs: Vec<_> = ranges
+            .iter()
+            .map(|range| WriteRangeRef {
+                offset: range.offset,
+                data: range.data.as_slice(),
+            })
+            .collect();
+        let result = self.pwrite_ranges_inode_with_conn(&conn, &range_refs).await;
+        match result {
+            Ok(()) => {
+                txn.commit().await?;
+                self.attr_cache.remove(self.ino);
+                Ok(())
+            }
+            Err(e) => {
+                let _ = txn.rollback().await;
+                Err(e)
+            }
+        }
+    }
+
+    async fn pwrite_ranges_batched(&self, ranges: Vec<WriteRange>) -> Result<()> {
+        if ranges.iter().all(|range| range.data.is_empty()) {
+            return Ok(());
+        }
+
+        if let Some(batcher) = &self.write_batcher {
+            batcher.enqueue(self.ino, ranges).await
+        } else {
+            self.pwrite_ranges(ranges).await
+        }
+    }
+
     async fn truncate(&self, new_size: u64) -> Result<()> {
+        self.drain_writes().await?;
         let conn = self.pool.get_connection().await?;
         let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
         let result = self.truncate_inode_with_conn(&conn, new_size).await;
@@ -227,6 +851,7 @@ impl File for AgentFSFile {
     }
 
     async fn fsync(&self) -> Result<()> {
+        self.drain_writes().await?;
         let conn = self.pool.get_connection().await?;
         conn.prepare_cached(DURABLE_SYNCHRONOUS_SQL)
             .await?
@@ -241,6 +866,7 @@ impl File for AgentFSFile {
     }
 
     async fn fstat(&self) -> Result<Stats> {
+        self.drain_writes().await?;
         if let Some(stats) = self.attr_cache.get(self.ino) {
             return Ok(stats);
         }
@@ -258,6 +884,15 @@ impl File for AgentFSFile {
         } else {
             Err(FsError::NotFound.into())
         }
+    }
+
+    async fn drain_writes(&self) -> Result<()> {
+        if let Some(batcher) = &self.write_batcher {
+            batcher
+                .drain_inode(self.ino, AgentFSWriteBatchDrainReason::Explicit)
+                .await?;
+        }
+        Ok(())
     }
 }
 
@@ -375,39 +1010,48 @@ impl AgentFSFile {
         Ok(result)
     }
 
-    async fn pwrite_inode_with_conn(
+    async fn pwrite_ranges_inode_with_conn(
         &self,
         conn: &Connection,
-        offset: u64,
-        data: &[u8],
+        ranges: &[WriteRangeRef<'_>],
     ) -> Result<()> {
+        let ranges = normalize_write_ranges(ranges)?;
+        if ranges.is_empty() {
+            return Ok(());
+        }
+
         let metadata = self.file_storage_with_conn(conn).await?;
-        let write_end = offset
-            .checked_add(data.len() as u64)
-            .ok_or_else(|| Error::Internal("file write offset overflow".to_string()))?;
+        let write_end = ranges
+            .iter()
+            .map(NormalizedWriteRange::end)
+            .max()
+            .unwrap_or(metadata.size);
         let new_size = std::cmp::max(metadata.size, write_end);
-        let sparse_from_inline = offset > metadata.size;
 
         if metadata.storage_kind == STORAGE_INLINE
             && new_size <= self.inline_threshold as u64
-            && !sparse_from_inline
+            && dense_after_inline_write_batch(metadata.size, new_size, &ranges)
         {
             let mut inline_data = metadata.inline_data.unwrap_or_default();
             inline_data.resize(metadata.size as usize, 0);
             inline_data.resize(new_size as usize, 0);
-            let start = offset as usize;
-            inline_data[start..start + data.len()].copy_from_slice(data);
+            for range in &ranges {
+                let start = range.offset as usize;
+                inline_data[start..start + range.data.len()].copy_from_slice(&range.data);
+            }
 
             conn.execute("DELETE FROM fs_data WHERE ino = ?", (self.ino,))
                 .await?;
             let (now_secs, now_nsec) = current_timestamp()?;
             conn.execute(
-                "UPDATE fs_inode SET size = ?, data_inline = ?, storage_kind = ?, mtime = ?, mtime_nsec = ? WHERE ino = ?",
+                "UPDATE fs_inode SET size = ?, data_inline = ?, storage_kind = ?, mtime = ?, ctime = ?, mtime_nsec = ?, ctime_nsec = ? WHERE ino = ?",
                 (
                     new_size as i64,
                     Value::Blob(inline_data),
                     STORAGE_INLINE,
                     now_secs,
+                    now_secs,
+                    now_nsec,
                     now_nsec,
                     self.ino,
                 ),
@@ -416,11 +1060,18 @@ impl AgentFSFile {
             return Ok(());
         }
 
+        let mut chunked_ranges = Vec::new();
         if metadata.storage_kind == STORAGE_INLINE {
             let mut inline_data = metadata.inline_data.unwrap_or_default();
             inline_data.resize(metadata.size as usize, 0);
-            self.transition_inline_to_chunked_with_conn(conn, &inline_data)
+            conn.execute("DELETE FROM fs_data WHERE ino = ?", (self.ino,))
                 .await?;
+            if !inline_data.is_empty() {
+                chunked_ranges.push(NormalizedWriteRange {
+                    offset: 0,
+                    data: inline_data,
+                });
+            }
         } else {
             conn.execute(
                 "UPDATE fs_inode SET data_inline = NULL, storage_kind = ? WHERE ino = ?",
@@ -429,16 +1080,19 @@ impl AgentFSFile {
             .await?;
         }
 
-        self.write_data_at_offset_with_conn(conn, offset, data)
+        chunked_ranges.extend(ranges);
+        self.write_ranges_chunked_with_conn(conn, &chunked_ranges)
             .await?;
 
         let (now_secs, now_nsec) = current_timestamp()?;
         conn.execute(
-            "UPDATE fs_inode SET size = ?, data_inline = NULL, storage_kind = ?, mtime = ?, mtime_nsec = ? WHERE ino = ?",
+            "UPDATE fs_inode SET size = ?, data_inline = NULL, storage_kind = ?, mtime = ?, ctime = ?, mtime_nsec = ?, ctime_nsec = ? WHERE ino = ?",
             (
                 new_size as i64,
                 STORAGE_CHUNKED,
                 now_secs,
+                now_secs,
+                now_nsec,
                 now_nsec,
                 self.ino,
             ),
@@ -735,15 +1389,22 @@ impl AgentFSFile {
         offset: u64,
         data: &[u8],
     ) -> Result<()> {
-        let chunk_size = self.chunk_size as u64;
-        let mut written = 0usize;
-        let mut chunks_written = 0u64;
+        let ranges = [WriteRangeRef { offset, data }];
+        let ranges = normalize_write_ranges(&ranges)?;
+        self.write_ranges_chunked_with_conn(conn, &ranges).await
+    }
 
-        if data.is_empty() {
+    async fn write_ranges_chunked_with_conn(
+        &self,
+        conn: &Connection,
+        ranges: &[NormalizedWriteRange],
+    ) -> Result<()> {
+        let chunk_size = self.chunk_size as u64;
+
+        if ranges.is_empty() {
             return Ok(());
         }
 
-        // get statements only once (in order to avoid heavy clone on every while iteration)
         let mut select_stmt = conn
             .prepare_cached("SELECT data FROM fs_data WHERE ino = ? AND chunk_index = ?")
             .await?;
@@ -752,57 +1413,67 @@ impl AgentFSFile {
                 "INSERT OR REPLACE INTO fs_data (ino, chunk_index, data) VALUES (?, ?, ?)",
             )
             .await?;
-        while written < data.len() {
-            let current_offset = offset + written as u64;
-            let chunk_index = (current_offset / chunk_size) as i64;
-            let offset_in_chunk = (current_offset % chunk_size) as usize;
 
-            // How much can we write in this chunk?
-            let remaining_in_chunk = self.chunk_size - offset_in_chunk;
-            let remaining_data = data.len() - written;
-            let to_write = std::cmp::min(remaining_in_chunk, remaining_data);
+        let mut chunks: BTreeMap<i64, Vec<u8>> = BTreeMap::new();
 
-            let mut chunk_data;
-            if to_write != chunk_size as usize {
-                // Get existing chunk data (if any)
-                let mut rows = select_stmt.query((self.ino, chunk_index)).await?;
+        for range in ranges {
+            let mut written = 0usize;
+            while written < range.data.len() {
+                let current_offset = range.offset + written as u64;
+                let chunk_index = (current_offset / chunk_size) as i64;
+                let offset_in_chunk = (current_offset % chunk_size) as usize;
 
-                chunk_data = if let Some(row) = rows.next().await? {
-                    row.get_value(0)
-                        .ok()
-                        .and_then(|v| {
-                            if let Value::Blob(b) = v {
-                                Some(b)
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
-                select_stmt.reset()?;
+                let remaining_in_chunk = self.chunk_size - offset_in_chunk;
+                let remaining_data = range.data.len() - written;
+                let to_write = std::cmp::min(remaining_in_chunk, remaining_data);
+                let write_slice = &range.data[written..written + to_write];
 
-                // Extend chunk if needed
+                if offset_in_chunk == 0 && to_write == self.chunk_size {
+                    chunks.insert(chunk_index, write_slice.to_vec());
+                    written += to_write;
+                    continue;
+                }
+
+                if let std::collections::btree_map::Entry::Vacant(entry) = chunks.entry(chunk_index)
+                {
+                    let mut rows = select_stmt.query((self.ino, chunk_index)).await?;
+                    let chunk_data = if let Some(row) = rows.next().await? {
+                        row.get_value(0)
+                            .ok()
+                            .and_then(|v| {
+                                if let Value::Blob(b) = v {
+                                    Some(b)
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    select_stmt.reset()?;
+                    entry.insert(chunk_data);
+                }
+
+                let chunk_data = chunks
+                    .get_mut(&chunk_index)
+                    .expect("chunk must be loaded before partial write");
                 if chunk_data.len() < offset_in_chunk + to_write {
                     chunk_data.resize(offset_in_chunk + to_write, 0);
                 }
-
-                // Write data into chunk
                 chunk_data[offset_in_chunk..offset_in_chunk + to_write]
-                    .copy_from_slice(&data[written..written + to_write]);
-            } else {
-                chunk_data = data[written..written + to_write].to_vec();
-            }
+                    .copy_from_slice(write_slice);
 
-            // Save chunk
+                written += to_write;
+            }
+        }
+
+        let chunks_written = chunks.len() as u64;
+        for (chunk_index, chunk_data) in chunks {
             insert_stmt
                 .execute((self.ino, chunk_index, Value::Blob(chunk_data)))
                 .await?;
             insert_stmt.reset()?;
-            chunks_written += 1;
-
-            written += to_write;
         }
 
         crate::profiling::record_chunk_write_chunks(chunks_written);
@@ -819,11 +1490,23 @@ impl AgentFS {
         } else {
             ConnectionPool::with_options(db, file_backed_connection_pool_options())
         };
-        Self::from_pool(pool).await
+        let db_path = if db_path == ":memory:" {
+            None
+        } else {
+            Some(PathBuf::from(db_path))
+        };
+        Self::from_pool_with_path(pool, db_path).await
     }
 
     /// Create a filesystem from a connection pool
     pub async fn from_pool(pool: ConnectionPool) -> Result<Self> {
+        Self::from_pool_with_path(pool, None).await
+    }
+
+    pub(crate) async fn from_pool_with_path(
+        pool: ConnectionPool,
+        db_path: Option<PathBuf>,
+    ) -> Result<Self> {
         let conn = pool.get_connection().await?;
 
         // Refuse legacy schemas before initialization so v0.4 databases are not
@@ -837,12 +1520,29 @@ impl AgentFS {
         let chunk_size = Self::read_chunk_size(&conn).await?;
         let inline_threshold = Self::read_inline_threshold(&conn).await?;
 
+        let attr_cache = Arc::new(AttrCache::new(ATTR_CACHE_MAX_SIZE));
+        let write_batcher = if env_flag_enabled(WRITE_BATCHER_ENABLE_ENV) {
+            Some(Arc::new(AgentFSWriteBatcher::from_env(
+                pool.clone(),
+                chunk_size,
+                inline_threshold,
+                attr_cache.clone(),
+            )))
+        } else {
+            None
+        };
+
         let fs = Self {
             pool,
+            db_path: db_path.map(Arc::new),
             chunk_size,
             inline_threshold,
             dentry_cache: Arc::new(DentryCache::new(DENTRY_CACHE_MAX_SIZE)),
-            attr_cache: Arc::new(AttrCache::new(ATTR_CACHE_MAX_SIZE)),
+            negative_dentry_cache: Arc::new(NegativeDentryCache::new(
+                NEGATIVE_DENTRY_CACHE_MAX_SIZE,
+            )),
+            attr_cache,
+            write_batcher,
             _profile_report: Arc::new(crate::profiling::ProfileReportGuard::new("agentfs")),
         };
         Ok(fs)
@@ -1151,6 +1851,13 @@ impl AgentFS {
         parent_ino: i64,
         name: &str,
     ) -> Result<Option<i64>> {
+        if let Some(cached_ino) = self.dentry_cache.get(parent_ino, name) {
+            return Ok(Some(cached_ino));
+        }
+        if self.negative_dentry_cache.contains(parent_ino, name) {
+            return Ok(None);
+        }
+
         let mut stmt = conn
             .prepare_cached("SELECT ino FROM fs_dentry WHERE parent_ino = ? AND name = ?")
             .await?;
@@ -1168,6 +1875,12 @@ impl AgentFS {
             return Err(FsError::InvalidPath.into());
         }
 
+        if let Some(ino) = found_ino {
+            self.cache_dentry(parent_ino, name, ino);
+        } else {
+            self.cache_negative_dentry(parent_ino, name);
+        }
+
         Ok(found_ino)
     }
 
@@ -1179,12 +1892,54 @@ impl AgentFS {
         self.attr_cache.remove(ino);
     }
 
+    /// Drain pending batched writes for one inode.
+    pub async fn drain_inode_writes(&self, ino: i64) -> Result<()> {
+        if let Some(batcher) = &self.write_batcher {
+            batcher
+                .drain_inode(ino, AgentFSWriteBatchDrainReason::Explicit)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Drain all pending batched writes for this AgentFS instance.
+    pub async fn drain_all(&self) -> Result<()> {
+        if let Some(batcher) = &self.write_batcher {
+            batcher
+                .drain_all(AgentFSWriteBatchDrainReason::Explicit)
+                .await?;
+        }
+        let conn = self.pool.get_connection().await?;
+        checkpoint_wal(&conn).await?;
+        Ok(())
+    }
+
+    /// Drain all writes and leave the database in single-file journal mode for clean shutdown.
+    pub async fn finalize(&self) -> Result<()> {
+        self.drain_all().await?;
+        if let Some(path) = &self.db_path {
+            remove_checkpointed_sidecars(path.as_ref())?;
+        }
+        Ok(())
+    }
+
     fn invalidate_parent_attr(&self, parent_ino: i64) {
         self.invalidate_attr(parent_ino);
     }
 
     fn invalidate_dentry(&self, parent_ino: i64, name: &str) {
         self.dentry_cache.remove(parent_ino, name);
+        self.negative_dentry_cache.remove(parent_ino, name);
+    }
+
+    fn cache_dentry(&self, parent_ino: i64, name: &str, child_ino: i64) {
+        self.negative_dentry_cache.remove(parent_ino, name);
+        self.dentry_cache.insert(parent_ino, name, child_ino);
+    }
+
+    fn cache_negative_dentry(&self, parent_ino: i64, name: &str) {
+        self.dentry_cache.remove(parent_ino, name);
+        self.negative_dentry_cache.insert(parent_ino, name);
     }
 
     /// Get link count for an inode
@@ -1322,6 +2077,10 @@ impl AgentFS {
                 current_ino = cached_ino;
                 continue;
             }
+            if self.negative_dentry_cache.contains(current_ino, &component) {
+                crate::profiling::record_negative_lookup();
+                return Ok(None);
+            }
 
             // Cache miss - query database
             if let Some(statement) = &mut statement {
@@ -1357,10 +2116,11 @@ impl AgentFS {
                     .unwrap_or(0);
 
                 // Populate cache
-                self.dentry_cache.insert(current_ino, &component, child_ino);
+                self.cache_dentry(current_ino, &component, child_ino);
                 current_ino = child_ino;
             } else {
                 crate::profiling::record_negative_lookup();
+                self.cache_negative_dentry(current_ino, &component);
                 return Ok(None);
             }
         }
@@ -1377,6 +2137,7 @@ impl AgentFS {
             None => return Ok(None),
         };
 
+        self.drain_inode_writes(ino).await?;
         self.getattr_with_conn(&conn, ino).await
     }
 
@@ -1394,6 +2155,7 @@ impl AgentFS {
                 Some(ino) => ino,
                 None => return Ok(None),
             };
+            self.drain_inode_writes(ino).await?;
 
             if let Some(stats) = self.getattr_with_conn(&conn, ino).await? {
                 // Check if this is a symlink
@@ -1557,7 +2319,7 @@ impl AgentFS {
             .await?;
 
         // Populate dentry cache
-        self.dentry_cache.insert(parent_ino, name, ino);
+        self.cache_dentry(parent_ino, name, ino);
         self.invalidate_parent_attr(parent_ino);
 
         Ok(())
@@ -1635,7 +2397,7 @@ impl AgentFS {
         stmt.execute((ino,)).await?;
 
         // Populate dentry cache
-        self.dentry_cache.insert(parent_ino, name, ino);
+        self.cache_dentry(parent_ino, name, ino);
         self.invalidate_parent_attr(parent_ino);
 
         Ok(())
@@ -1723,7 +2485,7 @@ impl AgentFS {
 
         txn.commit().await?;
 
-        self.dentry_cache.insert(parent_ino, name, ino);
+        self.cache_dentry(parent_ino, name, ino);
         self.invalidate_parent_attr(parent_ino);
 
         let stats = Stats {
@@ -1749,6 +2511,7 @@ impl AgentFS {
             chunk_size: self.chunk_size,
             inline_threshold: self.inline_threshold,
             attr_cache: self.attr_cache.clone(),
+            write_batcher: self.write_batcher.clone(),
         });
 
         Ok((stats, file))
@@ -1761,6 +2524,9 @@ impl AgentFS {
             Some(ino) => ino,
             None => return Ok(None),
         };
+        drop(conn);
+        self.drain_inode_writes(ino).await?;
+        let conn = self.pool.get_connection().await?;
 
         let file = AgentFSFile {
             pool: self.pool.clone(),
@@ -1768,6 +2534,7 @@ impl AgentFS {
             chunk_size: self.chunk_size,
             inline_threshold: self.inline_threshold,
             attr_cache: self.attr_cache.clone(),
+            write_batcher: self.write_batcher.clone(),
         };
         Ok(Some(file.read_inode_with_conn(&conn, 0, u64::MAX).await?))
     }
@@ -1784,6 +2551,9 @@ impl AgentFS {
             Some(ino) => ino,
             None => return Ok(None),
         };
+        drop(conn);
+        self.drain_inode_writes(ino).await?;
+        let conn = self.pool.get_connection().await?;
 
         let file = AgentFSFile {
             pool: self.pool.clone(),
@@ -1791,6 +2561,7 @@ impl AgentFS {
             chunk_size: self.chunk_size,
             inline_threshold: self.inline_threshold,
             attr_cache: self.attr_cache.clone(),
+            write_batcher: self.write_batcher.clone(),
         };
         Ok(Some(file.read_inode_with_conn(&conn, offset, size).await?))
     }
@@ -1823,6 +2594,13 @@ impl AgentFS {
             .ok_or(FsError::NotFound)?;
 
         let name = components.last().unwrap();
+
+        let existing_ino = self.resolve_path_with_conn(&conn, &path).await?;
+        drop(conn);
+        if let Some(existing_ino) = existing_ino {
+            self.drain_inode_writes(existing_ino).await?;
+        }
+        let conn = self.pool.get_connection().await?;
 
         let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
 
@@ -1880,8 +2658,10 @@ impl AgentFS {
                 chunk_size: self.chunk_size,
                 inline_threshold: self.inline_threshold,
                 attr_cache: self.attr_cache.clone(),
+                write_batcher: self.write_batcher.clone(),
             };
-            file.pwrite_inode_with_conn(&conn, offset, data).await?;
+            let ranges = [WriteRangeRef { offset, data }];
+            file.pwrite_ranges_inode_with_conn(&conn, &ranges).await?;
 
             Ok((ino, created))
         }
@@ -1892,7 +2672,7 @@ impl AgentFS {
                 txn.commit().await?;
                 self.invalidate_attr(ino);
                 if created {
-                    self.dentry_cache.insert(parent_ino, name, ino);
+                    self.cache_dentry(parent_ino, name, ino);
                     self.invalidate_parent_attr(parent_ino);
                 }
                 Ok(())
@@ -1916,6 +2696,9 @@ impl AgentFS {
             .resolve_path_with_conn(&conn, &path)
             .await?
             .ok_or(FsError::NotFound)?;
+        drop(conn);
+        self.drain_inode_writes(ino).await?;
+        let conn = self.pool.get_connection().await?;
 
         let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
         let file = AgentFSFile {
@@ -1924,6 +2707,7 @@ impl AgentFS {
             chunk_size: self.chunk_size,
             inline_threshold: self.inline_threshold,
             attr_cache: self.attr_cache.clone(),
+            write_batcher: self.write_batcher.clone(),
         };
         let result = file.truncate_inode_with_conn(&conn, new_size).await;
 
@@ -2160,7 +2944,7 @@ impl AgentFS {
         .await?;
 
         // Populate dentry cache
-        self.dentry_cache.insert(parent_ino, name, ino);
+        self.cache_dentry(parent_ino, name, ino);
         self.invalidate_parent_attr(parent_ino);
 
         Ok(())
@@ -2240,7 +3024,7 @@ impl AgentFS {
         .await?;
 
         // Populate dentry cache
-        self.dentry_cache.insert(parent_ino, name, ino);
+        self.cache_dentry(parent_ino, name, ino);
         self.invalidate_parent_attr(parent_ino);
         self.invalidate_attr(ino);
 
@@ -2415,6 +3199,7 @@ impl AgentFS {
         self.invalidate_dentry(parent_ino, name);
         self.invalidate_parent_attr(parent_ino);
         self.invalidate_attr(ino);
+        self.cache_negative_dentry(parent_ino, name);
         Ok(())
     }
 
@@ -2658,8 +3443,11 @@ impl AgentFS {
                     self.invalidate_attr(dst_ino);
                 }
 
-                // Add new entry to cache (source inode is now at destination)
-                self.dentry_cache.insert(dst_parent_ino, &dst_name, src_ino);
+                // Add exact post-rename namespace state to the caches.
+                if src_parent_ino != dst_parent_ino || src_name != dst_name {
+                    self.cache_negative_dentry(src_parent_ino, &src_name);
+                }
+                self.cache_dentry(dst_parent_ino, &dst_name, src_ino);
 
                 Ok(())
             }
@@ -2674,6 +3462,7 @@ impl AgentFS {
     ///
     /// Returns the total number of inodes and bytes used by file contents.
     pub async fn statfs(&self) -> Result<FilesystemStats> {
+        self.drain_all().await?;
         let conn = self.pool.get_connection().await?;
         // Count total inodes
         let mut stmt = conn.prepare_cached("SELECT COUNT(*) FROM fs_inode").await?;
@@ -2714,6 +3503,7 @@ impl AgentFS {
     ///
     /// Note: The path parameter is ignored since all data is in a single database.
     pub async fn fsync(&self, _path: &str) -> Result<()> {
+        self.drain_all().await?;
         let conn = self.pool.get_connection().await?;
         conn.prepare_cached(DURABLE_SYNCHRONOUS_SQL)
             .await?
@@ -2741,6 +3531,7 @@ impl AgentFS {
             chunk_size: self.chunk_size,
             inline_threshold: self.inline_threshold,
             attr_cache: self.attr_cache.clone(),
+            write_batcher: self.write_batcher.clone(),
         }))
     }
 
@@ -2828,6 +3619,7 @@ impl FileSystem for AgentFS {
                 return Ok(None);
             }
         };
+        self.drain_inode_writes(child_ino).await?;
 
         // Get stats for the child inode
         let mut stmt = conn
@@ -2838,7 +3630,7 @@ impl FileSystem for AgentFS {
         if let Some(row) = rows.next().await? {
             let stats = Self::build_stats_from_row(&row)?;
             // Cache the lookup result
-            self.dentry_cache.insert(parent_ino, name, child_ino);
+            self.cache_dentry(parent_ino, name, child_ino);
             self.cache_attr(stats.clone());
             Ok(Some(stats))
         } else {
@@ -2848,7 +3640,7 @@ impl FileSystem for AgentFS {
 
     async fn getattr(&self, ino: i64) -> Result<Option<Stats>> {
         crate::profiling::record_getattr();
-        crate::profiling::record_attr_cache_miss();
+        self.drain_inode_writes(ino).await?;
         let conn = self.pool.get_connection().await?;
         self.getattr_with_conn(&conn, ino).await
     }
@@ -2949,6 +3741,7 @@ impl FileSystem for AgentFS {
 
     async fn readdir_plus(&self, ino: i64) -> Result<Option<Vec<DirEntry>>> {
         crate::profiling::record_readdir_plus();
+        self.drain_all().await?;
         let conn = self.pool.get_connection().await?;
 
         // Check if inode exists and is a directory
@@ -3075,6 +3868,7 @@ impl FileSystem for AgentFS {
     }
 
     async fn chmod(&self, ino: i64, mode: u32) -> Result<()> {
+        self.drain_inode_writes(ino).await?;
         let conn = self.pool.get_connection().await?;
 
         // Get current mode to preserve file type bits
@@ -3112,6 +3906,7 @@ impl FileSystem for AgentFS {
         if uid.is_none() && gid.is_none() {
             return Ok(());
         }
+        self.drain_inode_writes(ino).await?;
 
         let conn = self.pool.get_connection().await?;
 
@@ -3155,6 +3950,7 @@ impl FileSystem for AgentFS {
     }
 
     async fn utimens(&self, ino: i64, atime: TimeChange, mtime: TimeChange) -> Result<()> {
+        self.drain_inode_writes(ino).await?;
         let conn = self.pool.get_connection().await?;
 
         // Verify inode exists
@@ -3234,6 +4030,7 @@ impl FileSystem for AgentFS {
             chunk_size: self.chunk_size,
             inline_threshold: self.inline_threshold,
             attr_cache: self.attr_cache.clone(),
+            write_batcher: self.write_batcher.clone(),
         }))
     }
 
@@ -3308,7 +4105,7 @@ impl FileSystem for AgentFS {
             .await?;
 
         // Populate dentry cache
-        self.dentry_cache.insert(parent_ino, name, ino);
+        self.cache_dentry(parent_ino, name, ino);
         self.invalidate_parent_attr(parent_ino);
 
         let stats = Stats {
@@ -3399,7 +4196,7 @@ impl FileSystem for AgentFS {
 
         txn.commit().await?;
 
-        self.dentry_cache.insert(parent_ino, name, ino);
+        self.cache_dentry(parent_ino, name, ino);
         self.invalidate_parent_attr(parent_ino);
 
         let stats = Stats {
@@ -3425,6 +4222,7 @@ impl FileSystem for AgentFS {
             chunk_size: self.chunk_size,
             inline_threshold: self.inline_threshold,
             attr_cache: self.attr_cache.clone(),
+            write_batcher: self.write_batcher.clone(),
         });
 
         Ok((stats, file))
@@ -3500,7 +4298,7 @@ impl FileSystem for AgentFS {
             .await?;
 
         // Populate dentry cache
-        self.dentry_cache.insert(parent_ino, name, ino);
+        self.cache_dentry(parent_ino, name, ino);
         self.invalidate_parent_attr(parent_ino);
 
         let stats = Stats {
@@ -3594,7 +4392,7 @@ impl FileSystem for AgentFS {
         .await?;
 
         // Populate dentry cache
-        self.dentry_cache.insert(parent_ino, name, ino);
+        self.cache_dentry(parent_ino, name, ino);
         self.invalidate_parent_attr(parent_ino);
 
         let stats = Stats {
@@ -3700,6 +4498,7 @@ impl FileSystem for AgentFS {
         self.invalidate_dentry(parent_ino, name);
         self.invalidate_parent_attr(parent_ino);
         self.invalidate_attr(ino);
+        self.cache_negative_dentry(parent_ino, name);
         Ok(())
     }
 
@@ -3797,6 +4596,7 @@ impl FileSystem for AgentFS {
         self.invalidate_dentry(parent_ino, name);
         self.invalidate_parent_attr(parent_ino);
         self.invalidate_attr(ino);
+        self.cache_negative_dentry(parent_ino, name);
         Ok(())
     }
 
@@ -3860,7 +4660,7 @@ impl FileSystem for AgentFS {
         .await?;
 
         // Populate dentry cache
-        self.dentry_cache.insert(newparent_ino, newname, ino);
+        self.cache_dentry(newparent_ino, newname, ino);
         self.invalidate_parent_attr(newparent_ino);
         self.invalidate_attr(ino);
 
@@ -4038,8 +4838,11 @@ impl FileSystem for AgentFS {
                     self.invalidate_attr(dst_ino);
                 }
 
-                // Add new entry to cache (source inode is now at destination)
-                self.dentry_cache.insert(newparent_ino, newname, src_ino);
+                // Add exact post-rename namespace state to the caches.
+                if oldparent_ino != newparent_ino || oldname != newname {
+                    self.cache_negative_dentry(oldparent_ino, oldname);
+                }
+                self.cache_dentry(newparent_ino, newname, src_ino);
 
                 Ok(())
             }
@@ -4052,6 +4855,28 @@ impl FileSystem for AgentFS {
 
     async fn statfs(&self) -> Result<FilesystemStats> {
         AgentFS::statfs(self).await
+    }
+
+    async fn drain_inode_writes(&self, ino: i64) -> Result<()> {
+        AgentFS::drain_inode_writes(self, ino).await
+    }
+
+    async fn drain_all(&self) -> Result<()> {
+        AgentFS::drain_all(self).await
+    }
+
+    async fn finalize(&self) -> Result<()> {
+        AgentFS::finalize(self).await
+    }
+
+    async fn forget(&self, ino: i64, _nlookup: u64) {
+        if let Err(error) = AgentFS::drain_inode_writes(self, ino).await {
+            tracing::warn!(
+                "AgentFS write batcher forget drain failed for inode {}: {}",
+                ino,
+                error
+            );
+        }
     }
 }
 
@@ -4072,6 +4897,10 @@ mod tests {
 
     fn cached_attr(fs: &AgentFS, ino: i64) -> Option<Stats> {
         fs.attr_cache.get(ino)
+    }
+
+    fn negative_cached(fs: &AgentFS, parent_ino: i64, name: &str) -> bool {
+        fs.negative_dentry_cache.contains(parent_ino, name)
     }
 
     #[tokio::test]
@@ -4187,6 +5016,56 @@ mod tests {
         assert!(FileSystem::lookup(&fs, ROOT_INO, "renamed.txt")
             .await?
             .is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn negative_dentry_cache_invalidates_on_namespace_mutations() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+
+        assert!(FileSystem::lookup(&fs, ROOT_INO, "missing.txt")
+            .await?
+            .is_none());
+        assert!(negative_cached(&fs, ROOT_INO, "missing.txt"));
+
+        let (created, _file) =
+            FileSystem::create_file(&fs, ROOT_INO, "missing.txt", DEFAULT_FILE_MODE, 7, 9).await?;
+        assert!(!negative_cached(&fs, ROOT_INO, "missing.txt"));
+        assert_eq!(
+            FileSystem::lookup(&fs, ROOT_INO, "missing.txt")
+                .await?
+                .unwrap()
+                .ino,
+            created.ino
+        );
+
+        FileSystem::rename(&fs, ROOT_INO, "missing.txt", ROOT_INO, "renamed.txt").await?;
+        assert!(negative_cached(&fs, ROOT_INO, "missing.txt"));
+        assert!(!negative_cached(&fs, ROOT_INO, "renamed.txt"));
+        assert!(FileSystem::lookup(&fs, ROOT_INO, "missing.txt")
+            .await?
+            .is_none());
+        assert_eq!(
+            FileSystem::lookup(&fs, ROOT_INO, "renamed.txt")
+                .await?
+                .unwrap()
+                .ino,
+            created.ino
+        );
+
+        FileSystem::unlink(&fs, ROOT_INO, "renamed.txt").await?;
+        assert!(negative_cached(&fs, ROOT_INO, "renamed.txt"));
+        assert!(FileSystem::lookup(&fs, ROOT_INO, "renamed.txt")
+            .await?
+            .is_none());
+
+        assert!(FileSystem::lookup(&fs, ROOT_INO, "negdir").await?.is_none());
+        assert!(negative_cached(&fs, ROOT_INO, "negdir"));
+        FileSystem::mkdir(&fs, ROOT_INO, "negdir", 0o755, 7, 9).await?;
+        assert!(!negative_cached(&fs, ROOT_INO, "negdir"));
+        FileSystem::rmdir(&fs, ROOT_INO, "negdir").await?;
+        assert!(negative_cached(&fs, ROOT_INO, "negdir"));
 
         Ok(())
     }
@@ -5266,6 +6145,140 @@ mod tests {
                 .unwrap();
             assert_eq!(&result, expected);
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pwrite_ranges_preserves_order_and_inline_storage() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+
+        let (_, file) = fs
+            .create_file("/batch-inline.txt", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        file.pwrite_ranges(vec![
+            WriteRange {
+                offset: 0,
+                data: b"abcdef".to_vec(),
+            },
+            WriteRange {
+                offset: 2,
+                data: b"ZZ".to_vec(),
+            },
+            WriteRange {
+                offset: 6,
+                data: b"!".to_vec(),
+            },
+        ])
+        .await?;
+
+        let ino = fs.resolve_path("/batch-inline.txt").await?.unwrap();
+        assert_eq!(file.pread(0, 16).await?, b"abZZef!");
+        assert_eq!(fs.get_chunk_count(ino).await?, 0);
+        assert_eq!(
+            fs.get_storage_state(ino).await?,
+            (STORAGE_INLINE, Some(b"abZZef!".to_vec()))
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pwrite_ranges_disjoint_inplace_writes_stay_inline() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+
+        let initial: Vec<u8> = (0..128).collect();
+        let (_, file) = fs
+            .create_file("/batch-inplace.bin", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        file.pwrite(0, &initial).await?;
+
+        file.pwrite_ranges(vec![
+            WriteRange {
+                offset: 8,
+                data: b"ABCD".to_vec(),
+            },
+            WriteRange {
+                offset: 64,
+                data: b"WXYZ".to_vec(),
+            },
+        ])
+        .await?;
+
+        let mut expected = initial;
+        expected[8..12].copy_from_slice(b"ABCD");
+        expected[64..68].copy_from_slice(b"WXYZ");
+
+        let ino = fs.resolve_path("/batch-inplace.bin").await?.unwrap();
+        assert_eq!(file.pread(0, expected.len() as u64).await?, expected);
+        assert_eq!(fs.get_chunk_count(ino).await?, 0);
+        assert_eq!(fs.get_storage_state(ino).await?.0, STORAGE_INLINE);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pwrite_ranges_sparse_write_transitions_to_chunked() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+
+        let (_, file) = fs
+            .create_file("/batch-sparse.bin", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        file.pwrite_ranges(vec![
+            WriteRange {
+                offset: 0,
+                data: b"head".to_vec(),
+            },
+            WriteRange {
+                offset: fs.chunk_size() as u64 + 4,
+                data: b"tail".to_vec(),
+            },
+        ])
+        .await?;
+
+        let ino = fs.resolve_path("/batch-sparse.bin").await?.unwrap();
+        assert_eq!(fs.get_storage_state(ino).await?, (STORAGE_CHUNKED, None));
+        assert_eq!(fs.get_chunk_count(ino).await?, 2);
+
+        let mut expected = b"head".to_vec();
+        expected.resize(fs.chunk_size() + 4, 0);
+        expected.extend_from_slice(b"tail");
+        assert_eq!(file.pread(0, expected.len() as u64).await?, expected);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pwrite_ranges_batched_drains_explicitly() -> Result<()> {
+        std::env::set_var(WRITE_BATCHER_ENABLE_ENV, "1");
+        std::env::set_var(WRITE_BATCHER_MS_ENV, "60000");
+        std::env::set_var(WRITE_BATCHER_BYTES_ENV, "1048576");
+
+        let (fs, _dir) = create_test_fs().await?;
+        let (stats, file) = fs
+            .create_file("/batched.txt", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+
+        file.pwrite_ranges_batched(vec![
+            WriteRange {
+                offset: 0,
+                data: b"hello".to_vec(),
+            },
+            WriteRange {
+                offset: 5,
+                data: b" world".to_vec(),
+            },
+        ])
+        .await?;
+
+        let flushed_stats = FileSystem::getattr(&fs, stats.ino).await?.unwrap();
+        assert_eq!(
+            flushed_stats.size, 11,
+            "metadata reads should drain pending batched writes before reporting size"
+        );
+
+        file.drain_writes().await?;
+        assert_eq!(file.pread(0, 32).await?, b"hello world");
 
         Ok(())
     }

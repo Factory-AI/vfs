@@ -9,7 +9,6 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use turso::value::Value;
 
 use crate::cmd::init::open_agentfs;
@@ -38,7 +37,7 @@ pub async fn handle_exec_command(
     let agentfs = open_agentfs(opts).await?;
 
     // Check for overlay configuration
-    let fs: Arc<Mutex<dyn FileSystem + Send>> = {
+    let fs: Arc<dyn FileSystem> = {
         let conn = agentfs.get_connection().await?;
 
         // Check if fs_overlay_config table exists and has base_path
@@ -65,9 +64,9 @@ pub async fn handle_exec_command(
             let hostfs = HostFS::new(&base_path)?;
             let overlay = OverlayFS::new(Arc::new(hostfs), agentfs.fs);
             overlay.load().await?; // Load persisted whiteouts and origin mappings
-            Arc::new(Mutex::new(overlay)) as Arc<Mutex<dyn FileSystem + Send>>
+            Arc::new(overlay) as Arc<dyn FileSystem>
         } else {
-            Arc::new(Mutex::new(agentfs.fs)) as Arc<Mutex<dyn FileSystem + Send>>
+            Arc::new(agentfs.fs) as Arc<dyn FileSystem>
         }
     };
 

@@ -1,11 +1,12 @@
-use agentfs_sdk::{error::Error as SdkError, AgentFSOptions, FileSystem, HostFS, OverlayFS};
+use agentfs_sdk::{
+    error::Error as SdkError, AgentFSOptions, FileSystem, HostFS, OverlayFS, PartialOriginPolicy,
+};
 use anyhow::{Context, Result};
 use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
 };
-use tokio::sync::Mutex;
 use turso::value::Value;
 
 use crate::mount::{mount_fs, MountOpts};
@@ -51,6 +52,8 @@ pub struct MountArgs {
     pub gid: Option<u32>,
     /// The mount backend to use (fuse or nfs).
     pub backend: MountBackend,
+    /// Partial-origin policy for overlay copy-up.
+    pub partial_origin_policy: Option<PartialOriginPolicy>,
 }
 
 /// Mount the agent filesystem (Linux).
@@ -133,6 +136,8 @@ fn mount_fuse(args: MountArgs) -> Result<()> {
     };
 
     let id_or_path = args.id_or_path.clone();
+    let foreground = args.foreground;
+    let partial_origin_policy = args.partial_origin_policy;
     let mount = move || {
         let rt = crate::get_runtime();
         let agentfs = match rt.block_on(open_agentfs(opts)) {
@@ -172,7 +177,11 @@ fn mount_fuse(args: MountArgs) -> Result<()> {
                 eprintln!("Using overlay filesystem with base: {}", base_path);
                 let hostfs = HostFS::new(&base_path)?;
                 let hostfs = hostfs.with_fuse_mountpoint(mountpoint_ino);
-                let overlay = OverlayFS::new(Arc::new(hostfs), agentfs.fs);
+                let overlay = if let Some(policy) = partial_origin_policy {
+                    OverlayFS::new_with_partial_origin_policy(Arc::new(hostfs), agentfs.fs, policy)
+                } else {
+                    OverlayFS::new(Arc::new(hostfs), agentfs.fs)
+                };
                 overlay.load().await?; // Load persisted whiteouts and origin mappings
                 Ok::<Arc<dyn FileSystem>, anyhow::Error>(Arc::new(overlay))
             } else {
@@ -184,7 +193,7 @@ fn mount_fuse(args: MountArgs) -> Result<()> {
         crate::fuse::mount(fs, fuse_opts, rt)
     };
 
-    if args.foreground {
+    if foreground {
         mount()
     } else {
         crate::daemon::daemonize(
@@ -246,16 +255,20 @@ async fn mount_nfs_backend(args: MountArgs) -> Result<()> {
         }
     }; // conn is dropped here
 
-    let fs: Arc<Mutex<dyn FileSystem + Send>> = if let Some(base_path) = base_path {
+    let fs: Arc<dyn FileSystem> = if let Some(base_path) = base_path {
         // Create OverlayFS with HostFS base, loading existing whiteouts
         eprintln!("Using overlay filesystem with base: {}", base_path);
         let hostfs = HostFS::new(&base_path)?;
-        let overlay = OverlayFS::new(Arc::new(hostfs), agentfs.fs);
+        let overlay = if let Some(policy) = args.partial_origin_policy {
+            OverlayFS::new_with_partial_origin_policy(Arc::new(hostfs), agentfs.fs, policy)
+        } else {
+            OverlayFS::new(Arc::new(hostfs), agentfs.fs)
+        };
         overlay.load().await?; // Load persisted whiteouts and origin mappings
-        Arc::new(Mutex::new(overlay)) as Arc<Mutex<dyn FileSystem + Send>>
+        Arc::new(overlay) as Arc<dyn FileSystem>
     } else {
         // Plain AgentFS
-        Arc::new(Mutex::new(agentfs.fs)) as Arc<Mutex<dyn FileSystem + Send>>
+        Arc::new(agentfs.fs) as Arc<dyn FileSystem>
     };
 
     if args.foreground {
