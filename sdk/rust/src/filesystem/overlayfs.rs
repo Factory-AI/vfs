@@ -3448,6 +3448,9 @@ mod tests {
         let stats = overlay.lookup(ROOT_INO, "large.bin").await?.unwrap();
         let file = overlay.open(stats.ino, libc::O_RDWR).await?;
         file.pwrite(chunk_size as u64 + 123, b"Z").await?;
+        // Tier Four: pwrite is batched in the delta SDK now; flush so the
+        // fs_data row count below reflects the committed copy-up chunks.
+        file.fsync().await?;
 
         assert!(
             scalar_i64(&overlay, "SELECT COUNT(*) FROM fs_data").await? > 1,

@@ -386,6 +386,13 @@ impl AgentFSWriteBatcher {
             };
         }
 
+        // Tier Four: invalidate the attr cache as soon as a write is queued,
+        // not just when the batch commits to SQLite. getattr ORs in
+        // peek_pending_max_end so the size view stays correct, but other
+        // consumers (mtime/ctime, link count assumptions) must not see a
+        // cached pre-write attr after a successful pwrite returns.
+        self.attr_cache.remove(ino);
+
         if schedule_timer {
             self.schedule_timer_after(ino, self.batch_ms);
         }
@@ -769,6 +776,120 @@ impl AgentFSWriteBatcher {
             }
         }
     }
+
+    // ----- Tier Four: in-memory overlay read API -----
+    //
+    // These methods let `AgentFSFile::pread` / `getattr` / `truncate` consult
+    // the batcher's pending state directly, instead of forcing a synchronous
+    // SQLite drain for read-after-write consistency. The drain becomes a
+    // pure durability operation, only triggered by explicit `fsync` /
+    // destroy / timer / bytes triggers.
+
+    /// Snapshot pending writes for `ino` overlapping `[offset, offset+size)`.
+    /// Returned ranges are normalised (non-overlapping, sorted) and clipped
+    /// to the requested window. The batcher's pending state is not modified.
+    /// Callers merge the result over SQLite data with "pending wins"
+    /// semantics; see `AgentFSFile::pread`.
+    async fn peek_pending(&self, ino: i64, offset: u64, size: u64) -> Vec<NormalizedWriteRange> {
+        if size == 0 {
+            return Vec::new();
+        }
+        let read_end = match offset.checked_add(size) {
+            Some(end) => end,
+            None => return Vec::new(),
+        };
+        let state = self.state.lock().await;
+        let Some(batch) = state.pending.get(&ino) else {
+            return Vec::new();
+        };
+        if batch.ranges.is_empty() {
+            return Vec::new();
+        }
+        let refs: Vec<_> = batch
+            .ranges
+            .iter()
+            .map(|r| WriteRangeRef {
+                offset: r.offset,
+                data: r.data.as_slice(),
+            })
+            .collect();
+        let normalized = match normalize_write_ranges(&refs) {
+            Ok(n) => n,
+            Err(_) => return Vec::new(),
+        };
+        normalized
+            .into_iter()
+            .filter_map(|range| {
+                let r_end = range.offset + range.data.len() as u64;
+                if r_end <= offset || range.offset >= read_end {
+                    return None;
+                }
+                let clip_start = offset.max(range.offset);
+                let clip_end = read_end.min(r_end);
+                if clip_end <= clip_start {
+                    return None;
+                }
+                let skip = (clip_start - range.offset) as usize;
+                let take = (clip_end - clip_start) as usize;
+                Some(NormalizedWriteRange {
+                    offset: clip_start,
+                    data: range.data[skip..skip + take].to_vec(),
+                })
+            })
+            .collect()
+    }
+
+    /// Largest write end (offset + length) for `ino` across all pending
+    /// ranges. Returns `None` if no pending writes for this inode. Callers
+    /// OR this with the SQLite-stored `fs_inode.size` to compute the
+    /// file-size view exposed to readers (so a write that grows the file is
+    /// visible to subsequent `getattr` even before the timer drain commits
+    /// it to SQLite).
+    async fn peek_pending_max_end(&self, ino: i64) -> Option<u64> {
+        let state = self.state.lock().await;
+        let batch = state.pending.get(&ino)?;
+        batch
+            .ranges
+            .iter()
+            .map(|r| r.offset.saturating_add(r.data.len() as u64))
+            .max()
+    }
+
+    /// Drop any pending bytes beyond `new_size` and shrink ranges that span
+    /// the truncation boundary. Called by `AgentFSFile::truncate` so the
+    /// overlay agrees with the post-truncate file state without needing to
+    /// drain first.
+    async fn truncate_pending(&self, ino: i64, new_size: u64) {
+        let mut state = self.state.lock().await;
+        let Some(batch) = state.pending.get_mut(&ino) else {
+            return;
+        };
+        let mut new_bytes = 0usize;
+        batch.ranges.retain_mut(|range| {
+            let r_end = range.offset.saturating_add(range.data.len() as u64);
+            if range.offset >= new_size {
+                return false;
+            }
+            if r_end > new_size {
+                let keep = (new_size - range.offset) as usize;
+                range.data.truncate(keep);
+            }
+            new_bytes = new_bytes.saturating_add(range.data.len());
+            !range.data.is_empty()
+        });
+        batch.pending_bytes = new_bytes;
+        if batch.ranges.is_empty() {
+            state.pending.remove(&ino);
+        }
+    }
+
+    /// Discard every pending write for `ino`. Used by `AgentFS::unlink`
+    /// after the inode row is deleted, to avoid `fs_data` orphan rows when
+    /// the timer later tries to commit ranges for a no-longer-existent ino.
+    async fn discard_pending(&self, ino: i64) {
+        let mut state = self.state.lock().await;
+        state.pending.remove(&ino);
+    }
 }
 
 /// A filesystem backed by SQLite
@@ -936,17 +1057,93 @@ fn dense_after_inline_write_batch(
 #[async_trait]
 impl File for AgentFSFile {
     async fn pread(&self, offset: u64, size: u64) -> Result<Vec<u8>> {
-        self.drain_writes().await?;
+        // Tier Four: NO `drain_writes()` prelude. Read SQLite-resident bytes
+        // (committed state) and overlay pending writes from the in-memory
+        // batcher snapshot. Together they form a read-after-write consistent
+        // view without forcing a SQLite commit on the read path.
+        //
+        // Ordering matters: peek the batcher state BEFORE acquiring a pool
+        // connection, and release the connection BEFORE the splice loop. Long
+        // pread workloads (parallel git-grep) saturate the 8-slot pool, and
+        // holding a connection across `state.lock().await` starves the timer
+        // drain task that also needs a connection to commit.
+        if size == 0 {
+            return Ok(Vec::new());
+        }
+        let pending_max_end = match &self.write_batcher {
+            Some(batcher) => batcher.peek_pending_max_end(self.ino).await,
+            None => None,
+        };
+        let pending_ranges = match &self.write_batcher {
+            Some(batcher) => batcher.peek_pending(self.ino, offset, size).await,
+            None => Vec::new(),
+        };
+
         let conn = self.pool.get_connection().await?;
-        self.read_inode_with_conn(&conn, offset, size).await
+        let metadata = self.file_storage_with_conn(&conn).await?;
+        let effective_size = match pending_max_end {
+            Some(end) => metadata.size.max(end),
+            None => metadata.size,
+        };
+
+        if offset >= effective_size {
+            return Ok(Vec::new());
+        }
+        let read_size = size.min(effective_size - offset);
+
+        let base_window = if offset < metadata.size {
+            (metadata.size - offset).min(read_size)
+        } else {
+            0
+        };
+        let mut result = if base_window > 0 {
+            let mut buf = self
+                .read_inode_with_conn(&conn, offset, base_window)
+                .await?;
+            buf.resize(read_size as usize, 0);
+            buf
+        } else {
+            vec![0u8; read_size as usize]
+        };
+        drop(conn);
+
+        for range in pending_ranges {
+            if range.offset >= offset + read_size {
+                continue;
+            }
+            let dst_off = (range.offset - offset) as usize;
+            if dst_off >= result.len() {
+                continue;
+            }
+            let end = (dst_off + range.data.len()).min(result.len());
+            result[dst_off..end].copy_from_slice(&range.data[..end - dst_off]);
+        }
+
+        Ok(result)
     }
 
     async fn pwrite(&self, offset: u64, data: &[u8]) -> Result<()> {
         if data.is_empty() {
             return Ok(());
         }
+        // Tier Four: with the batcher wired, route through enqueue so the
+        // overlay holds the write and readers see it via `pread`'s
+        // peek_pending merge. Drain only on fsync/destroy/timer.
+        if let Some(batcher) = &self.write_batcher {
+            return batcher
+                .enqueue(
+                    self.ino,
+                    vec![WriteRange {
+                        offset,
+                        data: data.to_vec(),
+                    }],
+                )
+                .await;
+        }
+        // Fallback (no batcher): direct commit. drain_writes is a no-op
+        // when there's no batcher, but keeping the call here makes the
+        // contract explicit.
         self.drain_writes().await?;
-
         let conn = self.pool.get_connection().await?;
         let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
         let ranges = [WriteRangeRef { offset, data }];
@@ -967,6 +1164,12 @@ impl File for AgentFSFile {
     async fn pwrite_ranges(&self, ranges: Vec<WriteRange>) -> Result<()> {
         if ranges.iter().all(|range| range.data.is_empty()) {
             return Ok(());
+        }
+        // Tier Four: route through the batcher when available; otherwise
+        // commit immediately. The Tier Three peek_pending path lets readers
+        // observe pending bytes without forcing a drain here.
+        if let Some(batcher) = &self.write_batcher {
+            return batcher.enqueue(self.ino, ranges).await;
         }
         self.drain_writes().await?;
 
@@ -1006,6 +1209,17 @@ impl File for AgentFSFile {
     }
 
     async fn truncate(&self, new_size: u64) -> Result<()> {
+        // Tier Four: shrink the in-memory overlay BEFORE touching SQLite, so
+        // a concurrent reader doesn't observe pending bytes past the new EOF
+        // between the SQLite truncate and the batcher catching up.
+        if let Some(batcher) = &self.write_batcher {
+            batcher.truncate_pending(self.ino, new_size).await;
+        }
+        // Drain remaining pending so the SQLite truncate sees a consistent
+        // size. With truncate_pending called above, the only pending left is
+        // for offsets < new_size, which will be applied by the timer / next
+        // drain trigger. We still drain here so the SQLite size after this
+        // call exactly matches `new_size`.
         self.drain_writes().await?;
         let conn = self.pool.get_connection().await?;
         let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
@@ -1024,6 +1238,9 @@ impl File for AgentFSFile {
     }
 
     async fn fsync(&self) -> Result<()> {
+        // Tier Four: fsync remains the explicit durability barrier — drain the
+        // batcher so the WAL checkpoint that follows captures every pending
+        // write.
         self.drain_writes().await?;
         let conn = self.pool.get_connection().await?;
         conn.prepare_cached(DURABLE_SYNCHRONOUS_SQL)
@@ -2088,6 +2305,25 @@ impl AgentFS {
         Ok(())
     }
 
+    /// Tier Four helper: merge the batcher's pending max-end into `stats.size`
+    /// so callers that read fs_inode while holding a pool connection don't
+    /// need to drain (which would deadlock on single-conn pools). Mirrors the
+    /// OR logic in `AgentFS::getattr` and `AgentFSFile::pread`.
+    async fn merge_pending_size(&self, ino: i64, stats: Option<&mut Stats>) {
+        let Some(stats) = stats else {
+            return;
+        };
+        let Some(batcher) = &self.write_batcher else {
+            return;
+        };
+        if let Some(pending_end) = batcher.peek_pending_max_end(ino).await {
+            let pending_end_i64 = i64::try_from(pending_end).unwrap_or(i64::MAX);
+            if pending_end_i64 > stats.size {
+                stats.size = pending_end_i64;
+            }
+        }
+    }
+
     /// Drain all pending batched writes for this AgentFS instance.
     pub async fn drain_all(&self) -> Result<()> {
         if let Some(batcher) = &self.write_batcher {
@@ -2323,8 +2559,12 @@ impl AgentFS {
             None => return Ok(None),
         };
 
-        self.drain_inode_writes(ino).await?;
-        self.getattr_with_conn(&conn, ino).await
+        // Tier Four: don't drain while holding the conn (would deadlock on
+        // single-conn pools and starve under contention on larger pools).
+        // Read SQLite, then OR in pending writes' max-end.
+        let mut stats = self.getattr_with_conn(&conn, ino).await?;
+        self.merge_pending_size(ino, stats.as_mut()).await;
+        Ok(stats)
     }
 
     /// Get file statistics, following symlinks
@@ -2341,9 +2581,8 @@ impl AgentFS {
                 Some(ino) => ino,
                 None => return Ok(None),
             };
-            self.drain_inode_writes(ino).await?;
-
-            if let Some(stats) = self.getattr_with_conn(&conn, ino).await? {
+            // Tier Four: see lstat — no drain while holding conn.
+            if let Some(mut stats) = self.getattr_with_conn(&conn, ino).await? {
                 // Check if this is a symlink
                 if (stats.mode & S_IFMT) == S_IFLNK {
                     // Read the symlink target
@@ -2366,7 +2605,7 @@ impl AgentFS {
                     continue; // Follow the symlink
                 }
 
-                // Not a symlink, return the stats
+                self.merge_pending_size(ino, Some(&mut stats)).await;
                 return Ok(Some(stats));
             } else {
                 return Ok(None);
@@ -3362,6 +3601,11 @@ impl AgentFS {
         // Check if this was the last link to the inode
         let link_count = self.get_link_count(&conn, ino).await?;
         if link_count == 0 {
+            // Tier Four: drop any pending batched writes — see the matching
+            // hook in the trait-method `unlink` and in `rename` overwrite.
+            if let Some(batcher) = &self.write_batcher {
+                batcher.discard_pending(ino).await;
+            }
             // Manually handle cascading deletes since we don't use foreign keys
             // Delete data blocks
             let mut stmt = conn
@@ -3543,6 +3787,15 @@ impl AgentFS {
                 // Clean up destination inode if no more links
                 let link_count = self.get_link_count(&conn, dst_ino).await?;
                 if link_count == 0 {
+                    // Tier Four: drop pending batched writes for the
+                    // soon-to-be-deleted inode. Without this, a later
+                    // drain (Explicit drains run drain_pending_batched
+                    // which touches every pending inode in one txn) tries
+                    // to write into a missing fs_inode row and fails the
+                    // whole batch with NotFound.
+                    if let Some(batcher) = &self.write_batcher {
+                        batcher.discard_pending(dst_ino).await;
+                    }
                     let mut stmt = conn
                         .prepare_cached("DELETE FROM fs_data WHERE ino = ?")
                         .await?;
@@ -3721,9 +3974,13 @@ impl AgentFS {
         }))
     }
 
-    /// Get the number of chunks for a given inode (for testing)
+    /// Get the number of chunks for a given inode (for testing).
+    /// Drains any pending batched writes first so the returned count reflects
+    /// the full committed state — Tier 4 deferred SQLite commits until fsync
+    /// or timer, so tests that inspect `fs_data` directly need a sync point.
     #[cfg(test)]
     async fn get_chunk_count(&self, ino: i64) -> Result<i64> {
+        self.drain_inode_writes(ino).await?;
         let conn = self.pool.get_connection().await?;
         let mut rows = conn
             .query("SELECT COUNT(*) FROM fs_data WHERE ino = ?", (ino,))
@@ -3742,6 +3999,7 @@ impl AgentFS {
 
     #[cfg(test)]
     async fn get_storage_state(&self, ino: i64) -> Result<(i64, Option<Vec<u8>>)> {
+        self.drain_inode_writes(ino).await?;
         let conn = self.pool.get_connection().await?;
         let mut rows = conn
             .query(
@@ -3805,7 +4063,12 @@ impl FileSystem for AgentFS {
                 return Ok(None);
             }
         };
-        self.drain_inode_writes(child_ino).await?;
+        // Tier Four: do NOT call `drain_inode_writes` here. The single-
+        // connection ephemeral pool (and even the file-backed pool under
+        // contention) would deadlock — we already hold the only connection
+        // permit, and `drain_inode_writes` -> `drain_pending_batched` tries
+        // to acquire one. Read SQLite, then merge the batcher's pending
+        // max-end into the size field the same way `getattr` does.
 
         // Get stats for the child inode
         let mut stmt = conn
@@ -3814,7 +4077,15 @@ impl FileSystem for AgentFS {
         let mut rows = stmt.query((child_ino,)).await?;
 
         if let Some(row) = rows.next().await? {
-            let stats = Self::build_stats_from_row(&row)?;
+            let mut stats = Self::build_stats_from_row(&row)?;
+            if let Some(batcher) = &self.write_batcher {
+                if let Some(pending_end) = batcher.peek_pending_max_end(child_ino).await {
+                    let pending_end_i64 = i64::try_from(pending_end).unwrap_or(i64::MAX);
+                    if pending_end_i64 > stats.size {
+                        stats.size = pending_end_i64;
+                    }
+                }
+            }
             // Cache the lookup result
             self.cache_dentry(parent_ino, name, child_ino);
             self.cache_attr(stats.clone());
@@ -3826,9 +4097,23 @@ impl FileSystem for AgentFS {
 
     async fn getattr(&self, ino: i64) -> Result<Option<Stats>> {
         crate::profiling::record_getattr();
-        self.drain_inode_writes(ino).await?;
+        // Tier Four: don't drain — read SQLite metadata and OR in the
+        // batcher's peek_pending_max_end so the size view reflects pending
+        // writes that haven't been committed yet. Refresh the attr cache
+        // with the merged size so subsequent direct cache reads agree with
+        // what we just returned.
         let conn = self.pool.get_connection().await?;
-        self.getattr_with_conn(&conn, ino).await
+        let mut stats = self.getattr_with_conn(&conn, ino).await?;
+        if let (Some(stats), Some(batcher)) = (stats.as_mut(), &self.write_batcher) {
+            if let Some(pending_end) = batcher.peek_pending_max_end(ino).await {
+                let pending_end_i64 = i64::try_from(pending_end).unwrap_or(i64::MAX);
+                if pending_end_i64 > stats.size {
+                    stats.size = pending_end_i64;
+                    self.cache_attr(stats.clone());
+                }
+            }
+        }
+        Ok(stats)
     }
 
     async fn readlink(&self, ino: i64) -> Result<Option<String>> {
@@ -4662,6 +4947,16 @@ impl FileSystem for AgentFS {
         // Check if this was the last link to the inode
         let link_count = self.get_link_count(&conn, ino).await?;
         if link_count == 0 {
+            // Tier Four: discard any pending writes the batcher might still
+            // hold for this inode. Without this, a timer drain firing AFTER
+            // the inode row is deleted would INSERT orphan `fs_data` rows
+            // (no FK constraint to prevent it). discard_pending is the only
+            // way the post-unlink state stays clean now that release/forget
+            // no longer force a synchronous drain.
+            if let Some(batcher) = &self.write_batcher {
+                batcher.discard_pending(ino).await;
+            }
+
             // Delete data blocks
             let mut stmt = conn
                 .prepare_cached("DELETE FROM fs_data WHERE ino = ?")
@@ -4942,6 +5237,13 @@ impl FileSystem for AgentFS {
                 // Clean up destination inode if no more links
                 let link_count = self.get_link_count(&conn, dst_ino).await?;
                 if link_count == 0 {
+                    // Tier Four: see public `rename` for rationale — drop
+                    // pending batched writes for the deleted inode so a
+                    // subsequent batched drain doesn't INSERT into a
+                    // missing fs_inode row.
+                    if let Some(batcher) = &self.write_batcher {
+                        batcher.discard_pending(dst_ino).await;
+                    }
                     let mut stmt = conn
                         .prepare_cached("DELETE FROM fs_data WHERE ino = ?")
                         .await?;
@@ -5596,6 +5898,10 @@ mod tests {
             .create_file("/sparse-truncate.bin", DEFAULT_FILE_MODE, 0, 0)
             .await?;
         file.pwrite(fs.chunk_size() as u64 + 8, b"tail").await?;
+        // Tier Four: ensure the sparse write reaches SQLite as chunked
+        // storage before we truncate; otherwise truncate_pending strips it
+        // in memory and the file never transitions out of INLINE.
+        file.fsync().await?;
         file.truncate(4).await?;
 
         let ino = fs.resolve_path("/sparse-truncate.bin").await?.unwrap();
@@ -6002,6 +6308,9 @@ mod tests {
         file.pwrite(0, &data).await?;
 
         let ino = fs.resolve_path("/unique.txt").await?.unwrap();
+        // Tier Four: pwrite is async-batched; drain so fs_data is populated
+        // before we probe its primary-key constraint.
+        fs.drain_inode_writes(ino).await?;
 
         // Try to insert a duplicate chunk - should fail due to PRIMARY KEY constraint
         let conn = fs.pool.get_connection().await?;
@@ -6031,6 +6340,8 @@ mod tests {
         file.pwrite(0, &data).await?;
 
         let ino = fs.resolve_path("/ordered.bin").await?.unwrap();
+        // Tier Four: drain so fs_data rows are present for the SELECT below.
+        fs.drain_inode_writes(ino).await?;
 
         // Query chunks in order
         let conn = fs.pool.get_connection().await?;
@@ -6916,6 +7227,164 @@ mod tests {
         let stats = fs.lstat("/link.txt").await?.unwrap();
         assert!(stats.is_symlink(), "Should still be a symlink");
 
+        Ok(())
+    }
+
+    // ==================== Tier Four: Overlay Read-After-Write ====================
+    //
+    // These exercise the Tier 4 invariant that `pread` / `getattr` /
+    // `truncate` reflect pending batched writes BEFORE the SQLite drain
+    // commits them — i.e. the per-fd write-then-read story works without
+    // forcing a synchronous SQLite transaction on every read.
+
+    #[tokio::test]
+    async fn pread_after_uncommitted_pwrite_sees_pending() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        let (_, file) = fs
+            .create_file("/overlay.txt", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        file.pwrite(0, b"hello world").await?;
+        // No fsync — Tier 4 says the same fd must see its own writes via
+        // the in-memory overlay, regardless of whether SQLite has them yet.
+        assert_eq!(file.pread(0, 11).await?, b"hello world");
+        assert_eq!(file.pread(6, 5).await?, b"world");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pread_after_uncommitted_pwrite_partial_overlap() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        let (_, file) = fs.create_file("/over.txt", DEFAULT_FILE_MODE, 0, 0).await?;
+        file.pwrite(0, b"AAAAAAAAAA").await?;
+        file.fsync().await?;
+        file.pwrite(4, b"BBB").await?;
+        // Read spans SQLite-resident (A) and pending (B) regions.
+        assert_eq!(file.pread(2, 6).await?, b"AABBBA");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pread_in_unwritten_region_returns_sqlite() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        let (_, file) = fs.create_file("/hole.txt", DEFAULT_FILE_MODE, 0, 0).await?;
+        file.pwrite(0, &[0xCDu8; 64]).await?;
+        file.fsync().await?;
+        file.pwrite(80, b"tail").await?;
+        // Read [16, 32) — entirely SQLite, no pending overlap.
+        assert_eq!(file.pread(16, 16).await?, vec![0xCDu8; 16]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn truncate_drops_pending_beyond_new_size() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        let (_, file) = fs
+            .create_file("/trunc.txt", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        file.pwrite(0, b"abcdef").await?;
+        file.truncate(3).await?;
+        assert_eq!(file.pread(0, 16).await?, b"abc");
+        let attrs = FileSystem::getattr(&fs, fs.resolve_path("/trunc.txt").await?.unwrap())
+            .await?
+            .unwrap();
+        assert_eq!(attrs.size, 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn truncate_clips_range_spanning_boundary() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        let (_, file) = fs.create_file("/clip.txt", DEFAULT_FILE_MODE, 0, 0).await?;
+        file.pwrite(2, b"PPPPPP").await?;
+        // pending occupies [2, 8). Truncate to 5 should keep [2, 5).
+        file.truncate(5).await?;
+        assert_eq!(file.pread(0, 16).await?, vec![0, 0, b'P', b'P', b'P']);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn getattr_reflects_pending_size_growth() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        let (created, file) = fs.create_file("/grow.txt", DEFAULT_FILE_MODE, 0, 0).await?;
+        let pre = FileSystem::getattr(&fs, created.ino).await?.unwrap();
+        assert_eq!(pre.size, 0);
+        file.pwrite(0, b"abcdefghij").await?;
+        let post = FileSystem::getattr(&fs, created.ino).await?.unwrap();
+        assert_eq!(post.size, 10);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_writers_overlay_merge() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        let (_, fh_a) = fs
+            .create_file("/multi.txt", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        let ino = fs.resolve_path("/multi.txt").await?.unwrap();
+        let fh_b = fs.open("/multi.txt").await?;
+        fh_a.pwrite(0, b"AAAA").await?;
+        fh_b.pwrite(4, b"BBBB").await?;
+        // Either fd should see both writes merged via the overlay.
+        assert_eq!(fh_a.pread(0, 8).await?, b"AAAABBBB");
+        assert_eq!(fh_b.pread(0, 8).await?, b"AAAABBBB");
+        // And getattr reflects the combined size.
+        let attrs = FileSystem::getattr(&fs, ino).await?.unwrap();
+        assert_eq!(attrs.size, 8);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unlink_during_pending_writes_no_orphan() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        let (created, file) = fs
+            .create_file("/doomed.txt", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        file.pwrite(0, b"these bytes never reach SQLite").await?;
+        // Unlink before any drain. Tier 4 hooks discard_pending here.
+        fs.remove("/doomed.txt").await?;
+        // Force a batched drain. If pending was not discarded, we'd hit
+        // NotFound when commit_inode_ranges looks up fs_inode for the
+        // unlinked ino. The drain must therefore succeed.
+        fs.drain_all().await?;
+        // And the row truly is gone.
+        assert!(fs.stat("/doomed.txt").await?.is_none());
+        let conn = fs.pool.get_connection().await?;
+        let count: i64 = {
+            let mut rows = conn
+                .query("SELECT COUNT(*) FROM fs_data WHERE ino = ?", (created.ino,))
+                .await?;
+            rows.next()
+                .await?
+                .and_then(|r| r.get_value(0).ok().and_then(|v| v.as_integer().copied()))
+                .unwrap_or(-1)
+        };
+        assert_eq!(count, 0, "no orphan fs_data rows for unlinked ino");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fsync_drains_overlay_to_sqlite() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        let (created, file) = fs
+            .create_file("/durable.txt", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        file.pwrite(0, b"persist me").await?;
+        // Before fsync, the bytes are in the overlay; get_chunk_count drains
+        // them as part of the test helper (Tier 4 sync helper change).
+        // After fsync, the chunk count should be observable without any
+        // helper drain prelude.
+        file.fsync().await?;
+        let conn = fs.pool.get_connection().await?;
+        let count: i64 = {
+            let mut rows = conn
+                .query("SELECT size FROM fs_inode WHERE ino = ?", (created.ino,))
+                .await?;
+            rows.next()
+                .await?
+                .and_then(|r| r.get_value(0).ok().and_then(|v| v.as_integer().copied()))
+                .unwrap_or(-1)
+        };
+        assert_eq!(count, 10, "fsync committed pending size to fs_inode");
         Ok(())
     }
 }

@@ -1826,8 +1826,12 @@ impl Drop for AgentFSFuse {
 
 impl AgentFSFuse {
     fn flush_pending_inode(&self, ino: u64) -> Result<(), SdkError> {
-        self.flush_open_file_pending_inode_except(ino, 0)?;
-        self.drain_inode_writes(ino)
+        // Tier Four: only flush per-fh FUSE WriteBuffer state into the SDK
+        // batcher. Do NOT call drain_inode_writes here — the SDK now serves
+        // reads from the in-memory overlay (peek_pending merge), so a
+        // synchronous SQLite commit on every read is wasted work. Durability
+        // remains via fsync/destroy/timer.
+        self.flush_open_file_pending_inode_except(ino, 0)
     }
 
     fn flush_pending_inode_except(&self, ino: u64, except_fh: u64) -> Result<(), SdkError> {
@@ -1931,7 +1935,11 @@ impl AgentFSFuse {
         }
     }
 
+    #[allow(dead_code)]
     fn drain_inode_writes(&self, ino: u64) -> Result<(), SdkError> {
+        // Kept for emergency parity with pre-Tier-4 paths; not called on the
+        // hot read path because the SDK overlay handles read-after-write
+        // consistency without forcing a SQLite commit.
         let fs = self.fs.clone();
         self.runtime
             .block_on(async move { fs.drain_inode_writes(ino as i64).await })
