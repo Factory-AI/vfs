@@ -217,3 +217,26 @@ All 7 gates passed including the previously-noisy
 - `cargo clippy --manifest-path cli/Cargo.toml --all-targets -- -D warnings`: clean
 - `cargo clippy --manifest-path sdk/rust/Cargo.toml --lib --tests -- -D warnings`: clean
 - `cargo fmt --check` on both crates: clean
+
+---
+
+## 2026-05-24 — Retroactive correction (Tier Three due diligence)
+**Type**: surprise
+**Context**: Profiling the canonical workload with `AGENTFS_PROFILE=1` for Tier Three planning revealed that **Axis A1 (cross-inode batched commit) was dead in the default configuration** and **Axis C (HostFS passthrough) never fired** in the canonical mixed git workload. Counter evidence:
+
+- `agentfs_batcher_enqueues=0` under default config (vs 4759 when `AGENTFS_FUSE_WRITEBACK=1` was forced)
+- `base_fast_open_passthrough_attempted=0` for every run, including a control run with `AGENTFS_OVERLAY_PARTIAL_ORIGIN=1` set
+
+**Resolution**: Root cause of Finding 1 is an env-var-default mismatch: `cli/src/fuse.rs::FuseKernelCacheConfig::from_env` uses `env_flag_default("AGENTFS_FUSE_WRITEBACK", true)` (defaults TRUE when unset), but `sdk/rust/src/filesystem/agentfs.rs` uses `env_flag_enabled` for the SAME env var (defaults FALSE when unset). Tier Two's A1 batcher implementation was correct but inaccessible from the canonical benchmark. With `AGENTFS_FUSE_WRITEBACK=1` forced on a 5-iter / 2-warmup run, agentfs median drops to 2.29 s (from 2.51 s, -9%) — the A1 win that was sitting on the floor.
+
+Root cause of Finding 2: the canonical workload (codex bare→working clone) never modifies a base file; mirror.git is read-only from its perspective and the output tree is fresh delta. Partial copy-up therefore never triggers, so `partial_file_for_delta` is never called for any inode with a partial-origin mapping (because no such mappings exist for this workload). Axis C's value is real but narrow: it helps workloads that DO modify base files with `--partial-origin` enabled (agent chmod-then-read, sandboxes on a stable base).
+
+**What Tier Two actually delivered**, honestly:
+- A2 FUSE per-fh write coalescer: real (~11% flush-count reduction)
+- Lock-fix refactor: real (eliminated a pre-existing 2x checkout regression footgun)
+- Cleanups (release-first + readdirplus gate): real
+- A1 cross-inode batched commit: implementation correct, default-disabled by env var misalignment
+- Axis C HostFS passthrough: correct but inert for clone-heavy workloads
+- Diff −49% / status −33% / CoW −46%: per-iteration noise, not attributable to A1 or C
+
+The 2.97x ratio / 2.51 s absolute Tier Two ship number was dominated by A2 and the lock-fix, not A1 or C. Tier Three Axis D (env-var alignment) recovers the missing A1 win as its first move; full Tier Three retrospective and benchmarks live under `.agents/benchmarks/tier-three-post/`.

@@ -133,3 +133,63 @@ Net agentfs total wall: 2.91 s → 2.51 s (−14% vs Tier One).
 
 5-iter stdev was 0.91x (vs Tier One's 0.85x in 3-iter; variance is in the
 same range despite different iteration counts).
+
+---
+
+## 2026-05-24 — Retroactive correction (added during Tier Three due diligence)
+
+`AGENTFS_PROFILE=1` profiling of the canonical workload run on Tier Two HEAD
+revealed two of the three Tier Two axes were **dead code in the default
+configuration**:
+
+### Finding 1: Axis A1 (cross-inode batched commit) was off by default
+
+The cli defaults FUSE writeback to ON when the workers fast path is safe
+(`cli/src/fuse.rs` line 130: `env_flag_default("AGENTFS_FUSE_WRITEBACK", true)`),
+but the SDK gates the write batcher on `env_flag_enabled` which defaults to
+**FALSE** when the env var is unset. Same env var, two different defaults
+across the cli/SDK boundary. Profile counters from the default-config 3-iter
+canonical run:
+
+| Counter | Default config | `AGENTFS_FUSE_WRITEBACK=1` forced |
+| --- | ---: | ---: |
+| `agentfs_batcher_enqueues` | **0** | 4 759 |
+| `agentfs_batcher_drains_explicit` | 0 | 4 716 |
+| `agentfs_batcher_commit_latency_ns_total` | 0 | 322 M |
+
+With `AGENTFS_FUSE_WRITEBACK=1` forced on a 5-iter / 2-warmup run, the median
+agentfs absolute drops from 2.51 s → **2.29 s** (-9%). That's the size of the
+A1 win that was sitting on the floor for Tier Two. **The "−14% absolute / 2.97x
+ratio" Tier Two ship number was almost entirely A2 (FUSE coalescer) + the
+lock-fix refactor + run-to-run noise; A1 contributed roughly zero in default
+config.**
+
+### Finding 2: Axis C (HostFS passthrough) never fired
+
+`base_fast_open_passthrough_attempted=0` for every run, including a control
+run with `AGENTFS_OVERLAY_PARTIAL_ORIGIN=1` explicitly set. The canonical
+git-clone workload never writes to a base file (the mirror.git is read-only
+from the workload's perspective; the output tree is fresh delta), so partial
+copy-up never triggers and the partial-origin code path is genuinely unused.
+
+Axis C is **correct but narrow**: it helps workloads that DO modify base files
+(agent chmod-then-read patterns, dev sandboxes layering on a stable base) with
+`--partial-origin` enabled. It does NOT help the canonical mixed workload.
+
+### What Tier Two actually delivered (honest revision)
+
+| Claim in Tier Two notes | Reality |
+| --- | --- |
+| A1 cross-inode batched commits | Dead in default config; would have helped ~9% if enabled |
+| A2 FUSE per-fh write coalescer | Real; ~11% flush-count reduction (5358 writes → 4750 flushes) |
+| Lock-fix refactor (take_pending) | Real; eliminated a pre-existing 2x checkout regression footgun |
+| Axis C HostFS passthrough | Inert in canonical workload; correct for narrow agent use cases |
+| Diff phase −49% / status −33% / CoW −46% | All within per-iteration noise; not attributable to A1 or C |
+| Cleanups (release-first + readdirplus gate) | Real |
+
+The 2.97x → 2.51 s absolute improvement (vs Tier One's 2.91 s) was real, but
+the magnitude was dominated by A2 + noise, not by A1 or C as written.
+
+Tier Three's first move is **Axis D — align the SDK batcher default with the
+cli default**. That's the missing free win the env-var misalignment hid.
+
