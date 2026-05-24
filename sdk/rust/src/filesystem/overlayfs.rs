@@ -1175,6 +1175,36 @@ impl OverlayFS {
                 .ok_or(FsError::NotFound)?;
             self.validate_partial_origin(&origin, &base_stats)?;
             let base_file = self.base.open(base_stats.ino, libc::O_RDONLY).await?;
+
+            // Tier Two Axis C: HostFS passthrough for unmodified delta files.
+            //
+            // A partial-origin delta inode that has zero chunk overrides, zero
+            // full chunks, no inline override, and a size matching the base is
+            // byte-identical to the base file. In that case the
+            // OverlayPartialFile wrapper would do a chunk-merge that always
+            // hits the "no override; read from base" branch -- the SQLite
+            // round trip is pure overhead. Returning the HostFS fd directly
+            // sends pread() straight to the kernel VFS for every read on this
+            // handle, which is most of the cost on `git status` / `git diff`
+            // / agent stat-storms over a working tree that was copy-up'd but
+            // not modified.
+            //
+            // Restricted to read-only opens: a write open MUST go through the
+            // OverlayPartialFile wrapper so writes land as `fs_chunk_override`
+            // rows in the delta DB and never touch the real base file
+            // (no-real-write invariant from Tier One).
+            if !is_write_open(flags) {
+                crate::profiling::record_base_fast_open_passthrough_attempted();
+                if self
+                    .delta_has_no_content_overrides(delta_ino, base_stats.size)
+                    .await?
+                {
+                    crate::profiling::record_base_fast_open_passthrough_succeeded();
+                    return Ok(base_file);
+                }
+                crate::profiling::record_base_fast_open_passthrough_fallback();
+            }
+
             let file: BoxedFile = Arc::new(OverlayPartialFile {
                 delta: self.delta.clone(),
                 base: self.base.clone(),
@@ -1191,6 +1221,69 @@ impl OverlayFS {
         } else {
             FileSystem::open(&self.delta, delta_ino, flags).await
         }
+    }
+
+    /// Returns true if the delta inode has no content modifications: no chunk
+    /// overrides, no full chunks, no inline override, and size matches the
+    /// base. Such a delta is purely a metadata copy and reads can bypass the
+    /// `OverlayPartialFile` merge path entirely.
+    ///
+    /// This is the cheap "is this file unmodified?" check that Tier Two Axis
+    /// C uses to decide whether `partial_file_for_delta` can short-circuit to
+    /// a HostFS fd.
+    async fn delta_has_no_content_overrides(&self, delta_ino: i64, base_size: i64) -> Result<bool> {
+        let conn = self.delta.get_connection().await?;
+
+        // Any per-chunk override?
+        let mut rows = conn
+            .query(
+                "SELECT 1 FROM fs_chunk_override WHERE delta_ino = ? LIMIT 1",
+                (delta_ino,),
+            )
+            .await?;
+        if rows.next().await?.is_some() {
+            return Ok(false);
+        }
+
+        // Any full chunk in fs_data? (Should be implied by no overrides for
+        // partial-origin files, but check defensively in case of a
+        // partial-origin → fully-overridden transition.)
+        let mut rows = conn
+            .query("SELECT 1 FROM fs_data WHERE ino = ? LIMIT 1", (delta_ino,))
+            .await?;
+        if rows.next().await?.is_some() {
+            return Ok(false);
+        }
+
+        // Size match + no inline override?
+        let mut rows = conn
+            .query(
+                "SELECT size, data_inline FROM fs_inode WHERE ino = ?",
+                (delta_ino,),
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(false);
+        };
+        let delta_size: i64 = row
+            .get(0)
+            .map_err(|e| Error::Internal(format!("fs_inode.size read failed: {e}")))?;
+        if delta_size != base_size {
+            return Ok(false);
+        }
+        let inline_value = row
+            .get_value(1)
+            .map_err(|e| Error::Internal(format!("fs_inode.data_inline read failed: {e}")))?;
+        let inline_empty = match inline_value {
+            Value::Null => true,
+            Value::Blob(blob) => blob.is_empty(),
+            _ => true,
+        };
+        if !inline_empty {
+            return Ok(false);
+        }
+
+        Ok(true)
     }
 }
 

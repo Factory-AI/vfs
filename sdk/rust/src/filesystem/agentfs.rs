@@ -391,6 +391,26 @@ impl AgentFSWriteBatcher {
         ino: i64,
         reason: AgentFSWriteBatchDrainReason,
     ) -> Result<()> {
+        // Explicit drains (release / flush / fsync) happen on every file close
+        // during git-clone-style workloads. Each one used to take its own
+        // SQLite transaction; when many inodes are pending simultaneously,
+        // bundling them into a single BEGIN IMMEDIATE / COMMIT pair amortises
+        // the WAL fsync and write-lock acquisition across all pending inodes
+        // and is the single biggest lever on clone-phase wall time.
+        //
+        // The contract is preserved: when this function returns, all writes
+        // queued for `ino` have hit SQLite. Other inodes' writes might also
+        // get committed earlier than their timers would have fired — that is
+        // strictly safer (more-durable, not less) and is what every batched
+        // writeback cache does.
+        //
+        // Timer and Bytes drains keep their per-inode behaviour to avoid
+        // surprising the producer (Bytes) and to respect the per-inode ripe
+        // check (Timer).
+        if matches!(reason, AgentFSWriteBatchDrainReason::Explicit) {
+            return self.drain_pending_batched(reason, Some(ino)).await;
+        }
+
         let _commit_guard = self.commit_lock.lock().await;
         loop {
             let batch = {
@@ -407,26 +427,164 @@ impl AgentFSWriteBatcher {
     }
 
     async fn drain_all(self: &Arc<Self>, reason: AgentFSWriteBatchDrainReason) -> Result<()> {
-        let _commit_guard = self.commit_lock.lock().await;
+        // Always batch on full drain: destroy / finalize / public AgentFS::drain_all.
         loop {
-            let batches = {
-                let mut state = self.state.lock().await;
-                std::mem::take(&mut state.pending)
-                    .into_iter()
-                    .map(|(ino, mut batch)| {
-                        batch.timer_scheduled = false;
-                        (ino, batch)
-                    })
-                    .collect::<Vec<_>>()
+            self.drain_pending_batched(reason, None).await?;
+            let still_pending = {
+                let state = self.state.lock().await;
+                !state.pending.is_empty()
             };
-
-            if batches.is_empty() {
+            if !still_pending {
                 return Ok(());
             }
+        }
+    }
 
-            for (ino, batch) in batches {
-                self.commit_batch(ino, batch, reason).await?;
+    /// Drain every currently-pending inode batch inside a single SQLite
+    /// transaction. Holds one connection and one `BEGIN IMMEDIATE` / `COMMIT`
+    /// pair across all per-inode chunk writes, instead of paying one
+    /// transaction per inode like `commit_batch` does.
+    ///
+    /// `required_ino` lets `drain_inode(_, Explicit)` express its caller
+    /// contract: "the writes queued for this inode must be durable when this
+    /// returns". If the inode is not in pending when we take the snapshot, it
+    /// was committed by a concurrent drain and the contract is already met.
+    /// If it IS in the snapshot, we commit it as part of this batched txn.
+    async fn drain_pending_batched(
+        self: &Arc<Self>,
+        reason: AgentFSWriteBatchDrainReason,
+        required_ino: Option<i64>,
+    ) -> Result<()> {
+        let _commit_guard = self.commit_lock.lock().await;
+
+        let batches: Vec<(i64, PendingInodeWrites)> = {
+            let mut state = self.state.lock().await;
+            std::mem::take(&mut state.pending)
+                .into_iter()
+                .map(|(ino, mut batch)| {
+                    batch.timer_scheduled = false;
+                    (ino, batch)
+                })
+                .collect()
+        };
+
+        if batches.is_empty() {
+            return Ok(());
+        }
+
+        // Filter out empty-ranges entries up front so we don't open a txn for
+        // nothing.
+        let mut to_commit: Vec<(i64, PendingInodeWrites, Vec<NormalizedWriteRange>)> =
+            Vec::with_capacity(batches.len());
+        let mut empty_inos: Vec<i64> = Vec::new();
+        for (ino, batch) in batches {
+            if batch.ranges.is_empty() {
+                empty_inos.push(ino);
+                continue;
             }
+            let range_refs: Vec<_> = batch
+                .ranges
+                .iter()
+                .map(|range| WriteRangeRef {
+                    offset: range.offset,
+                    data: range.data.as_slice(),
+                })
+                .collect();
+            let normalized = match normalize_write_ranges(&range_refs) {
+                Ok(normalized) => normalized,
+                Err(error) => {
+                    self.restore_batches(to_commit).await;
+                    self.restore_batch(ino, batch).await;
+                    return Err(error);
+                }
+            };
+            if normalized.is_empty() {
+                empty_inos.push(ino);
+                continue;
+            }
+            crate::profiling::record_agentfs_batcher_coalesced_ranges(
+                batch.ranges.len().saturating_sub(normalized.len()) as u64,
+            );
+            to_commit.push((ino, batch, normalized));
+        }
+
+        // Per-inode drain accounting (one tick per inode that we actually
+        // committed, matching the old per-batch reporting cardinality).
+        for _ in &to_commit {
+            match reason {
+                AgentFSWriteBatchDrainReason::Timer => {
+                    crate::profiling::record_agentfs_batcher_drain_timer();
+                }
+                AgentFSWriteBatchDrainReason::Bytes => {
+                    crate::profiling::record_agentfs_batcher_drain_bytes();
+                }
+                AgentFSWriteBatchDrainReason::Explicit => {
+                    crate::profiling::record_agentfs_batcher_drain_explicit();
+                }
+            }
+        }
+
+        if to_commit.is_empty() {
+            for ino in empty_inos {
+                self.attr_cache.remove(ino);
+            }
+            // required_ino was satisfied either by a concurrent committer
+            // (not in our snapshot) or by being an empty-range entry (no
+            // writes to durably persist).
+            let _ = required_ino;
+            return Ok(());
+        }
+
+        let started = Instant::now();
+        let conn = self.pool.get_connection().await?;
+        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+
+        for (ino, _batch, normalized) in &to_commit {
+            let normalized_refs: Vec<_> = normalized
+                .iter()
+                .map(|range| WriteRangeRef {
+                    offset: range.offset,
+                    data: range.data.as_slice(),
+                })
+                .collect();
+            let file = AgentFSFile {
+                pool: self.pool.clone(),
+                ino: *ino,
+                chunk_size: self.chunk_size,
+                inline_threshold: self.inline_threshold,
+                attr_cache: self.attr_cache.clone(),
+                write_batcher: None,
+            };
+            if let Err(error) = file
+                .pwrite_ranges_inode_with_conn(&conn, &normalized_refs)
+                .await
+            {
+                let _ = txn.rollback().await;
+                self.restore_batches(to_commit).await;
+                return Err(error);
+            }
+        }
+
+        txn.commit().await?;
+
+        for (ino, _, _) in &to_commit {
+            self.attr_cache.remove(*ino);
+        }
+        for ino in empty_inos {
+            self.attr_cache.remove(ino);
+        }
+        crate::profiling::record_agentfs_batcher_commit_latency(started.elapsed());
+
+        let _ = required_ino;
+        Ok(())
+    }
+
+    async fn restore_batches(
+        self: &Arc<Self>,
+        batches: Vec<(i64, PendingInodeWrites, Vec<NormalizedWriteRange>)>,
+    ) {
+        for (ino, batch, _) in batches {
+            self.restore_batch(ino, batch).await;
         }
     }
 

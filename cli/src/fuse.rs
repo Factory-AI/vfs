@@ -260,6 +260,14 @@ pub struct FuseMountOptions {
     pub gid: Option<u32>,
 }
 
+/// Threshold at which the FUSE-layer per-fh write coalescer flushes its
+/// accumulated ranges down to the SDK. Picked at 4x the chunk size so a single
+/// flushed call covers a few SQLite chunks and the AsyncMutex acquisition in
+/// the SDK write batcher is amortised across many FUSE_WRITE requests for the
+/// same handle. Smaller writes (the common git-clone case) accumulate in this
+/// buffer until `flush` / `release` arrives and only then hit the SDK.
+const FUSE_COALESCE_FLUSH_BYTES: usize = 256 * 1024;
+
 /// Tracks an open file handle
 struct OpenFile {
     /// Inode associated with this FUSE file handle.
@@ -285,11 +293,25 @@ impl OpenFile {
         Ok(())
     }
 
-    fn flush_pending(&mut self, runtime: &Runtime) -> Result<(), SdkError> {
-        if self.pending.is_empty() {
-            return Ok(());
-        }
+    /// Coalesce a single FUSE write into the per-fh pending buffer. Returns
+    /// `true` if the cumulative buffer size has reached the flush threshold
+    /// and the caller should drain it before replying to the kernel.
+    fn buffer_fuse_write(&mut self, offset: u64, data: &[u8]) -> Result<bool, i32> {
+        self.pending.write(offset, data)?;
+        Ok(self.pending.bytes >= FUSE_COALESCE_FLUSH_BYTES)
+    }
 
+    /// Drain the per-fh pending buffer into a `(file, ranges, range_count,
+    /// byte_count)` tuple so the caller can release the surrounding
+    /// `open_files` lock before issuing the async `pwrite_ranges*` call. The
+    /// hot write path MUST NOT hold the parking_lot `open_files` mutex across
+    /// `runtime.block_on(...)`: doing so serializes every other FUSE handler
+    /// behind one fh's SQLite commit and was the source of a 2x checkout
+    /// regression observed in the first Tier Two benchmark pass.
+    fn take_pending(&mut self) -> Option<(BoxedFile, Vec<WriteRange>, u64, u64)> {
+        if self.pending.is_empty() {
+            return None;
+        }
         let file = self.file.clone();
         let ranges = self.pending.ranges_for_flush();
         let range_count = ranges.len() as u64;
@@ -297,23 +319,51 @@ impl OpenFile {
             .iter()
             .map(|range| range.data.len() as u64)
             .sum::<u64>();
+        self.pending.clear();
+        Some((file, ranges, range_count, byte_count))
+    }
+
+    /// Clone the file Arc for callers that need to issue an async op against
+    /// the file without holding the surrounding `open_files` lock.
+    fn file_handle(&self) -> BoxedFile {
+        self.file.clone()
+    }
+
+    /// Synchronous flush via the non-batched pwrite API. Production code uses
+    /// `take_pending` + `flush_pending_batched_out_of_lock` instead; this
+    /// remains as a test-only convenience so the OpenFile unit tests stay
+    /// readable.
+    #[cfg(test)]
+    fn flush_pending(&mut self, runtime: &Runtime) -> Result<(), SdkError> {
+        let Some((file, ranges, range_count, byte_count)) = self.take_pending() else {
+            return Ok(());
+        };
 
         runtime.block_on(async move { file.pwrite_ranges(ranges).await })?;
-
-        self.pending.clear();
         agentfs_sdk::profiling::record_fuse_flush(range_count, byte_count);
         Ok(())
     }
+}
 
-    fn drain_writes(&self, runtime: &Runtime) -> Result<(), SdkError> {
-        let file = self.file.clone();
-        runtime.block_on(async move { file.drain_writes().await })
-    }
+/// Flush a `(file, ranges, range_count, byte_count)` tuple produced by
+/// `OpenFile::take_pending()` via the SDK write batcher (so the coalesced
+/// ranges enter the cross-inode batched-commit path). Called by the FUSE
+/// write / flush / release handlers AFTER they have released the
+/// `open_files` parking_lot mutex.
+fn flush_pending_batched_out_of_lock(
+    runtime: &Runtime,
+    drain: (BoxedFile, Vec<WriteRange>, u64, u64),
+) -> Result<(), SdkError> {
+    let (file, ranges, range_count, byte_count) = drain;
+    runtime.block_on(async move { file.pwrite_ranges_batched(ranges).await })?;
+    agentfs_sdk::profiling::record_fuse_flush(range_count, byte_count);
+    Ok(())
+}
 
-    fn flush_pending_and_drain(&mut self, runtime: &Runtime) -> Result<(), SdkError> {
-        self.flush_pending(runtime)?;
-        self.drain_writes(runtime)
-    }
+/// Drain the SDK write batcher for a file handle. Caller must NOT hold the
+/// `open_files` parking_lot mutex (see comment on `OpenFile::take_pending`).
+fn drain_writes_out_of_lock(runtime: &Runtime, file: BoxedFile) -> Result<(), SdkError> {
+    runtime.block_on(async move { file.drain_writes().await })
 }
 
 /// Pending write ranges for one open FUSE file handle.
@@ -352,7 +402,6 @@ impl WriteBuffer {
             .collect()
     }
 
-    #[cfg(test)]
     fn write(&mut self, offset: u64, data: &[u8]) -> Result<(), i32> {
         if data.is_empty() {
             return Ok(());
@@ -1518,29 +1567,64 @@ impl Filesystem for AgentFSFuse {
             return;
         }
 
-        let file = {
-            let open_files = self.open_files.lock();
-            let Some(open_file) = open_files.get(&fh) else {
-                reply.error(libc::EBADF);
-                return;
-            };
-            open_file.file.clone()
-        };
-        let data = data.to_vec();
         let writeback_enabled = self.writeback_enabled;
-        let result = self.runtime.block_on(async move {
-            let ranges = vec![WriteRange {
-                offset: offset as u64,
-                data,
-            }];
-            if writeback_enabled {
-                file.pwrite_ranges_batched(ranges).await
-            } else {
-                file.pwrite_ranges(ranges).await
-            }
-        });
 
-        match result {
+        let flush_result = if writeback_enabled {
+            // Coalesce into the per-fh WriteBuffer. Sequential / adjacent
+            // FUSE_WRITEs for the same handle merge into one entry instead of
+            // taking the SDK batcher's AsyncMutex once per request. Flushing
+            // is deferred until either the buffer crosses
+            // FUSE_COALESCE_FLUSH_BYTES, or the kernel issues
+            // FLUSH / RELEASE / FSYNC for the handle.
+            //
+            // The take-then-block-on pattern is deliberate: we MUST NOT hold
+            // the parking_lot `open_files` lock across `runtime.block_on(...)`
+            // or every other FUSE handler serializes behind this fh's SQLite
+            // commit. An earlier draft of Axis A2 held the lock through the
+            // flush and regressed checkout by 2x.
+            let drain = {
+                let mut open_files = self.open_files.lock();
+                let Some(open_file) = open_files.get_mut(&fh) else {
+                    reply.error(libc::EBADF);
+                    return;
+                };
+                match open_file.buffer_fuse_write(offset as u64, data) {
+                    Ok(true) => open_file.take_pending(),
+                    Ok(false) => None,
+                    Err(errno) => {
+                        reply.error(errno);
+                        return;
+                    }
+                }
+            };
+            match drain {
+                Some(drain) => flush_pending_batched_out_of_lock(&self.runtime, drain),
+                None => Ok(()),
+            }
+        } else {
+            // Writeback disabled: keep the direct, immediate-commit path so
+            // each FUSE_WRITE lands in SQLite before we reply (preserves the
+            // pre-Tier-One synchronous-write semantics for users that opt out
+            // of writeback).
+            let file = {
+                let open_files = self.open_files.lock();
+                let Some(open_file) = open_files.get(&fh) else {
+                    reply.error(libc::EBADF);
+                    return;
+                };
+                open_file.file.clone()
+            };
+            let data = data.to_vec();
+            self.runtime.block_on(async move {
+                file.pwrite_ranges(vec![WriteRange {
+                    offset: offset as u64,
+                    data,
+                }])
+                .await
+            })
+        };
+
+        match flush_result {
             Ok(()) => {
                 self.invalidate_inode_cache(req, ino);
                 audit.assert_invalidated("write");
@@ -1554,14 +1638,23 @@ impl Filesystem for AgentFSFuse {
     fn flush(&self, req: &Request, ino: u64, fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
         tracing::debug!("FUSE::flush: fh={}", fh);
         let audit = MutationAudit::new();
-        let result = {
+        // See comment on `fn write`: take the FUSE-layer buffer + the file
+        // handle under the parking_lot lock, then release the lock BEFORE
+        // doing the async pwrite + drain.
+        let (drain, file) = {
             let mut open_files = self.open_files.lock();
             let Some(open_file) = open_files.get_mut(&fh) else {
                 reply.error(libc::EBADF);
                 return;
             };
-            open_file.flush_pending_and_drain(&self.runtime)
+            (open_file.take_pending(), open_file.file_handle())
         };
+        let result = (|| -> Result<(), SdkError> {
+            if let Some(drain) = drain {
+                flush_pending_batched_out_of_lock(&self.runtime, drain)?;
+            }
+            drain_writes_out_of_lock(&self.runtime, file)
+        })();
 
         match result {
             Ok(()) => {
@@ -1616,14 +1709,23 @@ impl Filesystem for AgentFSFuse {
     ) {
         agentfs_sdk::profiling::record_fuse_release();
         tracing::debug!("FUSE::release: fh={}", fh);
-        let result = {
+        // See comment on `fn write`: take the FUSE-layer buffer + the file
+        // handle under the parking_lot lock, then release the lock BEFORE
+        // doing the async pwrite + drain.
+        let (drain, file) = {
             let mut open_files = self.open_files.lock();
             let Some(open_file) = open_files.get_mut(&fh) else {
                 reply.error(libc::EBADF);
                 return;
             };
-            open_file.flush_pending_and_drain(&self.runtime)
+            (open_file.take_pending(), open_file.file_handle())
         };
+        let result = (|| -> Result<(), SdkError> {
+            if let Some(drain) = drain {
+                flush_pending_batched_out_of_lock(&self.runtime, drain)?;
+            }
+            drain_writes_out_of_lock(&self.runtime, file)
+        })();
 
         match result {
             Ok(()) => {
@@ -1744,20 +1846,43 @@ impl AgentFSFuse {
         ino: u64,
         except_fh: u64,
     ) -> Result<(), SdkError> {
-        let mut open_files = self.open_files.lock();
-        for (fh, open_file) in open_files.iter_mut() {
-            if *fh == except_fh || open_file.ino != ino {
-                continue;
+        // Collect pending buffers under the lock, then release the lock
+        // before issuing the async pwrites. See `OpenFile::take_pending` for
+        // why holding the parking_lot lock across `runtime.block_on(...)` is
+        // a hot-path foot-gun.
+        let drains = {
+            let mut open_files = self.open_files.lock();
+            let mut drains = Vec::new();
+            for (fh, open_file) in open_files.iter_mut() {
+                if *fh == except_fh || open_file.ino != ino {
+                    continue;
+                }
+                if let Some(drain) = open_file.take_pending() {
+                    drains.push(drain);
+                }
             }
-            open_file.flush_pending(&self.runtime)?;
+            drains
+        };
+        for drain in drains {
+            flush_pending_batched_out_of_lock(&self.runtime, drain)?;
         }
         Ok(())
     }
 
     fn flush_all_pending(&self) -> Result<(), SdkError> {
-        let mut open_files = self.open_files.lock();
-        for open_file in open_files.values_mut() {
-            open_file.flush_pending(&self.runtime)?;
+        // Same lock-release pattern as `flush_open_file_pending_inode_except`.
+        let drains = {
+            let mut open_files = self.open_files.lock();
+            let mut drains = Vec::new();
+            for open_file in open_files.values_mut() {
+                if let Some(drain) = open_file.take_pending() {
+                    drains.push(drain);
+                }
+            }
+            drains
+        };
+        for drain in drains {
+            flush_pending_batched_out_of_lock(&self.runtime, drain)?;
         }
         Ok(())
     }
@@ -2251,6 +2376,27 @@ fn configure_writeback_cache(config: &mut KernelConfig, enabled: bool) {
 
 fn configure_readdirplus(config: &mut KernelConfig, mode: ReaddirPlusMode) {
     agentfs_sdk::profiling::set_fuse_readdirplus_mode(mode.profile_value());
+
+    // FUSE_READDIRPLUS opcode 44 is decoded by the vendored fuser dispatcher
+    // only when the `abi-7-21` feature is enabled. If we advertised the
+    // capability without that feature, the kernel would send opcode 44 and the
+    // dispatcher would return ENOSYS, breaking readdir on the mount. Gating the
+    // capability negotiation here turns the mismatch into a compile-time
+    // expectation rather than a runtime kernel error.
+    #[cfg(not(feature = "abi-7-21"))]
+    {
+        if !matches!(mode, ReaddirPlusMode::Off) {
+            tracing::warn!(
+                ?mode,
+                "AGENTFS_FUSE_READDIRPLUS requested but cli compiled without abi-7-21 feature; \
+                 capability not advertised (kernel would send opcodes the dispatcher cannot decode)"
+            );
+        }
+        let _ = config;
+        return;
+    }
+
+    #[cfg(feature = "abi-7-21")]
     match mode {
         ReaddirPlusMode::Off => {}
         ReaddirPlusMode::Auto => {
