@@ -19,7 +19,16 @@ use crate::schema::{self, AGENTFS_SCHEMA_VERSION};
 
 const ROOT_INO: i64 = 1;
 const DEFAULT_CHUNK_SIZE: usize = 65536;
-const DEFAULT_INLINE_THRESHOLD: usize = 4096;
+/// Tier Three Axis I: raised from 4 KiB to 16 KiB so the (4, 16] KiB tail of
+/// codex working-tree files (which dominate at ~14 KiB median) avoids the
+/// chunked-storage path entirely. The fs_inode metadata SELECTs in
+/// `getattr`/`lookup` explicitly project named columns and do NOT pull
+/// `data_inline`, so the only cost of a larger inline blob is paid on actual
+/// reads of those specific files — which is more than offset by skipping the
+/// extra `fs_data` row and its SELECT+UPDATE-on-write cycle. The persisted
+/// `fs_config.inline_threshold` is per-DB so existing databases keep their
+/// 4 KiB threshold; only newly-initialised databases pick up the new default.
+const DEFAULT_INLINE_THRESHOLD: usize = 16384;
 const STORAGE_CHUNKED: i64 = 0;
 const STORAGE_INLINE: i64 = 1;
 const DENTRY_CACHE_MAX_SIZE: usize = 10000;
@@ -79,15 +88,18 @@ fn remove_checkpointed_sidecars(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn env_flag_enabled(name: &str) -> bool {
-    std::env::var(name)
-        .map(|value| {
-            matches!(
-                value.to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
+/// Returns the value of an env-var boolean flag, falling back to `default`
+/// when the variable is unset. Mirrors `env_flag_default` in `cli/src/fuse.rs`
+/// so the SDK can agree with the cli on shared env vars (notably
+/// `AGENTFS_FUSE_WRITEBACK`, which the cli defaults to TRUE).
+fn env_flag_default(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(value) => matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => default,
+    }
 }
 
 fn env_duration_millis(name: &str, default_ms: u64) -> Duration {
@@ -395,18 +407,10 @@ impl AgentFSWriteBatcher {
         // during git-clone-style workloads. Each one used to take its own
         // SQLite transaction; when many inodes are pending simultaneously,
         // bundling them into a single BEGIN IMMEDIATE / COMMIT pair amortises
-        // the WAL fsync and write-lock acquisition across all pending inodes
-        // and is the single biggest lever on clone-phase wall time.
-        //
-        // The contract is preserved: when this function returns, all writes
-        // queued for `ino` have hit SQLite. Other inodes' writes might also
-        // get committed earlier than their timers would have fired — that is
-        // strictly safer (more-durable, not less) and is what every batched
-        // writeback cache does.
-        //
+        // the WAL fsync and write-lock acquisition across all pending inodes.
         // Timer and Bytes drains keep their per-inode behaviour to avoid
         // surprising the producer (Bytes) and to respect the per-inode ripe
-        // check (Timer).
+        // check (Timer's batched path is handled inside `drain_due_timer`).
         if matches!(reason, AgentFSWriteBatchDrainReason::Explicit) {
             return self.drain_pending_batched(reason, Some(ino)).await;
         }
@@ -589,10 +593,18 @@ impl AgentFSWriteBatcher {
     }
 
     async fn drain_due_timer(self: Arc<Self>, ino: i64) -> Result<()> {
-        let _commit_guard = self.commit_lock.lock().await;
+        // Tier Three Axis E: when the per-inode timer fires for `ino` and the
+        // inode is ripe, route through `drain_pending_batched` to drain ALL
+        // currently-pending inodes in one SQLite transaction. Other pending
+        // inodes' timers were scheduled at roughly the same time (within a
+        // few ms during a clone burst), so they're already ripe or about to
+        // be — bundling them now avoids N back-to-back per-inode commits.
+        // This is the "real" cross-inode batching that release-time drains
+        // in Tier Two never delivered because `release` only had this fh's
+        // ino pending at the moment it fired.
         let mut reschedule_after = None;
-        let batch = {
-            let mut state = self.state.lock().await;
+        let ripe = {
+            let state = self.state.lock().await;
             let Some(elapsed) = state
                 .pending
                 .get(&ino)
@@ -600,28 +612,31 @@ impl AgentFSWriteBatcher {
             else {
                 return Ok(());
             };
-
             if elapsed >= self.batch_ms {
-                Self::take_inode_locked(&mut state, ino)
+                true
             } else {
-                if let Some(entry) = state.pending.get_mut(&ino) {
-                    entry.timer_scheduled = true;
-                }
                 reschedule_after = Some(self.batch_ms - elapsed);
-                None
+                false
             }
         };
 
-        if let Some(delay) = reschedule_after {
-            self.schedule_timer_after(ino, delay);
+        if !ripe {
+            // Mark timer_scheduled so we don't lose the entry, then reschedule.
+            {
+                let mut state = self.state.lock().await;
+                if let Some(entry) = state.pending.get_mut(&ino) {
+                    entry.timer_scheduled = true;
+                }
+            }
+            if let Some(delay) = reschedule_after {
+                self.schedule_timer_after(ino, delay);
+            }
+            return Ok(());
         }
 
-        if let Some(batch) = batch {
-            self.commit_batch(ino, batch, AgentFSWriteBatchDrainReason::Timer)
-                .await?;
-        }
-
-        Ok(())
+        // Ripe: batch-drain every pending inode in one txn.
+        self.drain_pending_batched(AgentFSWriteBatchDrainReason::Timer, Some(ino))
+            .await
     }
 
     fn schedule_timer_after(self: &Arc<Self>, ino: i64, delay: Duration) {
@@ -1627,6 +1642,13 @@ impl AgentFSFile {
         }
 
         let chunks_written = chunks.len() as u64;
+        // Tier Three Axis H investigation: tried a multi-row VALUES batch
+        // with up to 32 rows per execute() but measured slower wall-time in
+        // 5-iter runs, suggesting libSQL doesn't share the
+        // prepared-statement cost reduction across different VALUES
+        // arities or that the per-execute setup cost dwarfed any saved
+        // round-trips on our workload sizes. Reverted to the cached
+        // single-row prepared statement.
         for (chunk_index, chunk_data) in chunks {
             insert_stmt
                 .execute((self.ino, chunk_index, Value::Blob(chunk_data)))
@@ -1679,7 +1701,13 @@ impl AgentFS {
         let inline_threshold = Self::read_inline_threshold(&conn).await?;
 
         let attr_cache = Arc::new(AttrCache::new(ATTR_CACHE_MAX_SIZE));
-        let write_batcher = if env_flag_enabled(WRITE_BATCHER_ENABLE_ENV) {
+        // Tier Three Axis D: default the SDK write batcher to ON, matching
+        // the cli's `FuseKernelCacheConfig::from_env` which defaults
+        // `AGENTFS_FUSE_WRITEBACK` to TRUE when unset. Tier Two shipped the
+        // cross-inode batched commit path but the env var defaulted to FALSE
+        // on this side, making A1 dead code under the canonical workload
+        // (see tier-two-post/COMPARISON.md retroactive correction).
+        let write_batcher = if env_flag_default(WRITE_BATCHER_ENABLE_ENV, true) {
             Some(Arc::new(AgentFSWriteBatcher::from_env(
                 pool.clone(),
                 chunk_size,
@@ -5703,7 +5731,7 @@ mod tests {
         assert_eq!(fs.chunk_size(), DEFAULT_CHUNK_SIZE);
         assert_eq!(fs.chunk_size(), 65536);
         assert_eq!(fs.inline_threshold(), DEFAULT_INLINE_THRESHOLD);
-        assert_eq!(fs.inline_threshold(), 4096);
+        assert_eq!(fs.inline_threshold(), 16384);
 
         Ok(())
     }
@@ -5768,7 +5796,7 @@ mod tests {
             })
             .expect("inline_threshold should be a text value");
 
-        assert_eq!(value, "4096");
+        assert_eq!(value, "16384");
 
         let mut rows = conn
             .query(

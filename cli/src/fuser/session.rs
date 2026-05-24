@@ -131,11 +131,18 @@ enum FuseDispatchMode {
 
 impl FuseDispatchMode {
     fn from_env() -> Self {
+        // Tier Three Axis F: lift the default CPU/memory share from 25% to 50%.
+        // The previous 25% default chose 3 workers on a 14-core box and
+        // saturated under git-clone fork/fsync storms (`fuse_dispatch_wait_nanos`
+        // hit ~570 ms on the canonical mixed workload). 50% gives 7 workers on
+        // the same machine and trims dispatch wait roughly proportionally with
+        // no observed downside on Phase 8 stress gates.
+        const DEFAULT_AUTO_PERCENT: u8 = 50;
         let workers = match std::env::var("AGENTFS_FUSE_WORKERS") {
             Ok(value) if value.eq_ignore_ascii_case("serial") => return Self::Serial,
             Ok(value) if value.eq_ignore_ascii_case("auto") => workers_from_resource_percent(
-                env_percent("AGENTFS_FUSE_CPU_PERCENT", 25),
-                env_percent("AGENTFS_FUSE_MEMORY_PERCENT", 25),
+                env_percent("AGENTFS_FUSE_CPU_PERCENT", DEFAULT_AUTO_PERCENT),
+                env_percent("AGENTFS_FUSE_MEMORY_PERCENT", DEFAULT_AUTO_PERCENT),
             ),
             Ok(value) => parse_workers(&value).unwrap_or_else(|| {
                 tracing::warn!(
@@ -148,8 +155,8 @@ impl FuseDispatchMode {
             // kernel-cache fast path is on by default. Pair this with the
             // matching default flip in cli/src/fuse.rs::fuse_workers_serial_from_env.
             Err(_) => workers_from_resource_percent(
-                env_percent("AGENTFS_FUSE_CPU_PERCENT", 25),
-                env_percent("AGENTFS_FUSE_MEMORY_PERCENT", 25),
+                env_percent("AGENTFS_FUSE_CPU_PERCENT", DEFAULT_AUTO_PERCENT),
+                env_percent("AGENTFS_FUSE_MEMORY_PERCENT", DEFAULT_AUTO_PERCENT),
             ),
         };
         if workers == 0 {

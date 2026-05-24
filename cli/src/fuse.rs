@@ -323,12 +323,6 @@ impl OpenFile {
         Some((file, ranges, range_count, byte_count))
     }
 
-    /// Clone the file Arc for callers that need to issue an async op against
-    /// the file without holding the surrounding `open_files` lock.
-    fn file_handle(&self) -> BoxedFile {
-        self.file.clone()
-    }
-
     /// Synchronous flush via the non-batched pwrite API. Production code uses
     /// `take_pending` + `flush_pending_batched_out_of_lock` instead; this
     /// remains as a test-only convenience so the OpenFile unit tests stay
@@ -358,12 +352,6 @@ fn flush_pending_batched_out_of_lock(
     runtime.block_on(async move { file.pwrite_ranges_batched(ranges).await })?;
     agentfs_sdk::profiling::record_fuse_flush(range_count, byte_count);
     Ok(())
-}
-
-/// Drain the SDK write batcher for a file handle. Caller must NOT hold the
-/// `open_files` parking_lot mutex (see comment on `OpenFile::take_pending`).
-fn drain_writes_out_of_lock(runtime: &Runtime, file: BoxedFile) -> Result<(), SdkError> {
-    runtime.block_on(async move { file.drain_writes().await })
 }
 
 /// Pending write ranges for one open FUSE file handle.
@@ -1638,22 +1626,27 @@ impl Filesystem for AgentFSFuse {
     fn flush(&self, req: &Request, ino: u64, fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
         tracing::debug!("FUSE::flush: fh={}", fh);
         let audit = MutationAudit::new();
-        // See comment on `fn write`: take the FUSE-layer buffer + the file
-        // handle under the parking_lot lock, then release the lock BEFORE
-        // doing the async pwrite + drain.
+        // Tier Three Axis E attempt was reverted: deferring the SDK
+        // `drain_writes` here caused subsequent SDK-internal `pread`/`pwrite`
+        // entry points (which each prelude with `self.drain_writes()` for
+        // read-after-write consistency) to take the drain hit synchronously
+        // and serialised reads behind a much larger commit. Keep the
+        // restoration of synchronous drain on flush/release; FUSE
+        // close-time latency is bounded.
         let (drain, file) = {
             let mut open_files = self.open_files.lock();
             let Some(open_file) = open_files.get_mut(&fh) else {
                 reply.error(libc::EBADF);
                 return;
             };
-            (open_file.take_pending(), open_file.file_handle())
+            (open_file.take_pending(), open_file.file.clone())
         };
         let result = (|| -> Result<(), SdkError> {
             if let Some(drain) = drain {
                 flush_pending_batched_out_of_lock(&self.runtime, drain)?;
             }
-            drain_writes_out_of_lock(&self.runtime, file)
+            self.runtime
+                .block_on(async move { file.drain_writes().await })
         })();
 
         match result {
@@ -1709,22 +1702,22 @@ impl Filesystem for AgentFSFuse {
     ) {
         agentfs_sdk::profiling::record_fuse_release();
         tracing::debug!("FUSE::release: fh={}", fh);
-        // See comment on `fn write`: take the FUSE-layer buffer + the file
-        // handle under the parking_lot lock, then release the lock BEFORE
-        // doing the async pwrite + drain.
+        // Tier Three Axis E attempt reverted (see `fn flush`): keep
+        // synchronous drain on release.
         let (drain, file) = {
             let mut open_files = self.open_files.lock();
             let Some(open_file) = open_files.get_mut(&fh) else {
                 reply.error(libc::EBADF);
                 return;
             };
-            (open_file.take_pending(), open_file.file_handle())
+            (open_file.take_pending(), open_file.file.clone())
         };
         let result = (|| -> Result<(), SdkError> {
             if let Some(drain) = drain {
                 flush_pending_batched_out_of_lock(&self.runtime, drain)?;
             }
-            drain_writes_out_of_lock(&self.runtime, file)
+            self.runtime
+                .block_on(async move { file.drain_writes().await })
         })();
 
         match result {
