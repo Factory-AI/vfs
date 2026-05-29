@@ -45,8 +45,15 @@ const ATTR_CACHE_MAX_SIZE: usize = 10000;
 const WRITE_BATCHER_ENABLE_ENV: &str = "AGENTFS_FUSE_WRITEBACK";
 const WRITE_BATCHER_MS_ENV: &str = "AGENTFS_BATCH_MS";
 const WRITE_BATCHER_BYTES_ENV: &str = "AGENTFS_BATCH_BYTES";
+/// Global (cross-inode) ceiling on in-memory pending write bytes. When the sum
+/// of all pending inode batches reaches this, the enqueue path triggers a full
+/// batched drain. This bounds memory so the per-inode timer (`AGENTFS_BATCH_MS`)
+/// can be widened to coalesce many file closes into far fewer commits without
+/// risking unbounded RSS during a write burst (e.g. git clone).
+const WRITE_BATCHER_GLOBAL_BYTES_ENV: &str = "AGENTFS_BATCH_GLOBAL_BYTES";
 const DEFAULT_WRITE_BATCH_MS: u64 = 5;
 const DEFAULT_WRITE_BATCH_BYTES: usize = 4 * 1024 * 1024;
+const DEFAULT_WRITE_BATCH_GLOBAL_BYTES: usize = 64 * 1024 * 1024;
 /// Tier 4 escape hatch. When `AGENTFS_OVERLAY_READS=0`, the SDK reverts to
 /// Tier 3 semantics: `pwrite` drains before commit, `pread` drains before
 /// read, `merge_pending_size` is a no-op. Defaults to ON so a clean install
@@ -316,6 +323,27 @@ impl PendingInodeWrites {
 #[derive(Default)]
 struct AgentFSWriteBatcherState {
     pending: HashMap<i64, PendingInodeWrites>,
+    /// Running sum of `pending_bytes` across every inode in `pending`. Kept in
+    /// lock-step with the map so the enqueue path can enforce a global memory
+    /// cap in O(1) instead of summing the map on every write. Every site that
+    /// mutates a `PendingInodeWrites.pending_bytes` or inserts/removes an entry
+    /// must keep this consistent (see `debug_assert_total`).
+    total_pending_bytes: usize,
+}
+
+impl AgentFSWriteBatcherState {
+    #[cfg(debug_assertions)]
+    fn debug_assert_total(&self) {
+        let sum: usize = self.pending.values().map(|b| b.pending_bytes).sum();
+        debug_assert_eq!(
+            sum, self.total_pending_bytes,
+            "batcher total_pending_bytes drifted from sum of pending entries"
+        );
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[inline]
+    fn debug_assert_total(&self) {}
 }
 
 /// In-memory write group-commit queue for FUSE writeback mode.
@@ -330,6 +358,7 @@ struct AgentFSWriteBatcher {
     attr_cache: Arc<AttrCache>,
     batch_ms: Duration,
     batch_bytes: usize,
+    batch_global_bytes: usize,
     /// Tier 4 mitigation: parking_lot `RwLock` so `peek_pending` /
     /// `peek_pending_max_end` can acquire read-only access without contending
     /// with writers. The lock is never held across an `.await`, so a sync
@@ -354,6 +383,10 @@ impl AgentFSWriteBatcher {
             attr_cache,
             batch_ms: env_duration_millis(WRITE_BATCHER_MS_ENV, DEFAULT_WRITE_BATCH_MS),
             batch_bytes: env_usize(WRITE_BATCHER_BYTES_ENV, DEFAULT_WRITE_BATCH_BYTES),
+            batch_global_bytes: env_usize(
+                WRITE_BATCHER_GLOBAL_BYTES_ENV,
+                DEFAULT_WRITE_BATCH_GLOBAL_BYTES,
+            ),
             state: RwLock::new(AgentFSWriteBatcherState::default()),
             commit_lock: AsyncMutex::new(()),
         }
@@ -374,6 +407,7 @@ impl AgentFSWriteBatcher {
         })?;
         let now = Instant::now();
         let drain_now;
+        let mut drain_all_now = false;
         let mut schedule_timer = false;
 
         {
@@ -387,16 +421,21 @@ impl AgentFSWriteBatcher {
                 crate::profiling::record_agentfs_batcher_enqueue();
                 crate::profiling::record_agentfs_batcher_pending_bytes(entry.pending_bytes as u64);
 
-                if entry.pending_bytes >= self.batch_bytes {
-                    true
-                } else {
-                    if !entry.timer_scheduled {
-                        entry.timer_scheduled = true;
-                        schedule_timer = true;
-                    }
-                    false
+                let per_inode_full = entry.pending_bytes >= self.batch_bytes;
+                if !per_inode_full && !entry.timer_scheduled {
+                    entry.timer_scheduled = true;
+                    schedule_timer = true;
                 }
+                per_inode_full
             };
+            state.total_pending_bytes = state.total_pending_bytes.saturating_add(byte_count);
+            // Global memory ceiling: a single full batched drain is cheaper and
+            // frees more memory than draining just this inode, so it takes
+            // precedence over the per-inode trigger.
+            if state.total_pending_bytes >= self.batch_global_bytes {
+                drain_all_now = true;
+            }
+            state.debug_assert_total();
         }
 
         // Tier Four: invalidate the attr cache as soon as a write is queued,
@@ -410,7 +449,9 @@ impl AgentFSWriteBatcher {
             self.schedule_timer_after(ino, self.batch_ms);
         }
 
-        if drain_now {
+        if drain_all_now {
+            self.drain_all(AgentFSWriteBatchDrainReason::Bytes).await?;
+        } else if drain_now {
             self.drain_inode(ino, AgentFSWriteBatchDrainReason::Bytes)
                 .await?;
         }
@@ -483,13 +524,19 @@ impl AgentFSWriteBatcher {
 
         let batches: Vec<(i64, PendingInodeWrites)> = {
             let mut state = self.state.write();
-            std::mem::take(&mut state.pending)
+            let taken = std::mem::take(&mut state.pending)
                 .into_iter()
                 .map(|(ino, mut batch)| {
                     batch.timer_scheduled = false;
                     (ino, batch)
                 })
-                .collect()
+                .collect();
+            // Took every pending entry; the running total resets to zero.
+            // Any batch we fail to commit is re-added via `restore_batch`,
+            // which restores its contribution.
+            state.total_pending_bytes = 0;
+            state.debug_assert_total();
+            taken
         };
 
         if batches.is_empty() {
@@ -678,10 +725,17 @@ impl AgentFSWriteBatcher {
         state: &mut AgentFSWriteBatcherState,
         ino: i64,
     ) -> Option<PendingInodeWrites> {
-        state.pending.remove(&ino).map(|mut batch| {
+        let taken = state.pending.remove(&ino).map(|mut batch| {
             batch.timer_scheduled = false;
             batch
-        })
+        });
+        if let Some(batch) = &taken {
+            state.total_pending_bytes = state
+                .total_pending_bytes
+                .saturating_sub(batch.pending_bytes);
+            state.debug_assert_total();
+        }
+        taken
     }
 
     async fn restore_batch(self: &Arc<Self>, ino: i64, mut batch: PendingInodeWrites) {
@@ -689,6 +743,9 @@ impl AgentFSWriteBatcher {
         {
             let mut state = self.state.write();
             if let Some(existing) = state.pending.remove(&ino) {
+                state.total_pending_bytes = state
+                    .total_pending_bytes
+                    .saturating_sub(existing.pending_bytes);
                 batch.pending_bytes = batch.pending_bytes.saturating_add(existing.pending_bytes);
                 batch.last_enqueue = existing.last_enqueue;
                 batch.ranges.extend(existing.ranges);
@@ -698,7 +755,11 @@ impl AgentFSWriteBatcher {
                 batch.timer_scheduled = true;
                 schedule_timer = true;
             }
+            state.total_pending_bytes = state
+                .total_pending_bytes
+                .saturating_add(batch.pending_bytes);
             state.pending.insert(ino, batch);
+            state.debug_assert_total();
         }
 
         if schedule_timer {
@@ -892,26 +953,35 @@ impl AgentFSWriteBatcher {
     /// drain first.
     fn truncate_pending(&self, ino: i64, new_size: u64) {
         let mut state = self.state.write();
-        let Some(batch) = state.pending.get_mut(&ino) else {
-            return;
+        let (old_bytes, new_bytes, now_empty) = {
+            let Some(batch) = state.pending.get_mut(&ino) else {
+                return;
+            };
+            let old_bytes = batch.pending_bytes;
+            let mut new_bytes = 0usize;
+            batch.ranges.retain_mut(|range| {
+                let r_end = range.offset.saturating_add(range.data.len() as u64);
+                if range.offset >= new_size {
+                    return false;
+                }
+                if r_end > new_size {
+                    let keep = (new_size - range.offset) as usize;
+                    range.data.truncate(keep);
+                }
+                new_bytes = new_bytes.saturating_add(range.data.len());
+                !range.data.is_empty()
+            });
+            batch.pending_bytes = new_bytes;
+            (old_bytes, new_bytes, batch.ranges.is_empty())
         };
-        let mut new_bytes = 0usize;
-        batch.ranges.retain_mut(|range| {
-            let r_end = range.offset.saturating_add(range.data.len() as u64);
-            if range.offset >= new_size {
-                return false;
-            }
-            if r_end > new_size {
-                let keep = (new_size - range.offset) as usize;
-                range.data.truncate(keep);
-            }
-            new_bytes = new_bytes.saturating_add(range.data.len());
-            !range.data.is_empty()
-        });
-        batch.pending_bytes = new_bytes;
-        if batch.ranges.is_empty() {
+        state.total_pending_bytes = state
+            .total_pending_bytes
+            .saturating_sub(old_bytes)
+            .saturating_add(new_bytes);
+        if now_empty {
             state.pending.remove(&ino);
         }
+        state.debug_assert_total();
     }
 
     /// Discard every pending write for `ino`. Used by `AgentFS::unlink`
@@ -919,7 +989,12 @@ impl AgentFSWriteBatcher {
     /// the timer later tries to commit ranges for a no-longer-existent ino.
     fn discard_pending(&self, ino: i64) {
         let mut state = self.state.write();
-        state.pending.remove(&ino);
+        if let Some(batch) = state.pending.remove(&ino) {
+            state.total_pending_bytes = state
+                .total_pending_bytes
+                .saturating_sub(batch.pending_bytes);
+        }
+        state.debug_assert_total();
     }
 }
 
@@ -6845,6 +6920,113 @@ mod tests {
         file.drain_writes().await?;
         assert_eq!(file.pread(0, 32).await?, b"hello world");
 
+        Ok(())
+    }
+
+    // Build a batcher with an explicit config so the test is independent of the
+    // process-global AGENTFS_BATCH_* env vars (which other tests mutate
+    // concurrently). Reuses `fs`'s pool/attr cache so commits hit real inodes.
+    fn test_batcher(
+        fs: &AgentFS,
+        batch_ms_secs: u64,
+        batch_bytes: usize,
+        batch_global_bytes: usize,
+    ) -> Arc<AgentFSWriteBatcher> {
+        Arc::new(AgentFSWriteBatcher {
+            pool: fs.pool.clone(),
+            chunk_size: fs.chunk_size,
+            inline_threshold: fs.inline_threshold,
+            attr_cache: fs.attr_cache.clone(),
+            batch_ms: Duration::from_secs(batch_ms_secs),
+            batch_bytes,
+            batch_global_bytes,
+            state: RwLock::new(AgentFSWriteBatcherState::default()),
+            commit_lock: AsyncMutex::new(()),
+        })
+    }
+
+    #[tokio::test]
+    async fn test_batcher_global_cap_triggers_full_drain_and_tracks_total() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        let (sa, _fa) = fs.create_file("/a.bin", DEFAULT_FILE_MODE, 0, 0).await?;
+        let (sb, _fb) = fs.create_file("/b.bin", DEFAULT_FILE_MODE, 0, 0).await?;
+
+        // 10-minute timer and huge per-inode trigger so the ONLY drain path is
+        // the 64-byte global cross-inode cap.
+        let batcher = test_batcher(&fs, 600, 1 << 20, 64);
+
+        // Write below the cap to inode A: stays pending.
+        batcher
+            .enqueue(
+                sa.ino,
+                vec![WriteRange {
+                    offset: 0,
+                    data: vec![b'x'; 50],
+                }],
+            )
+            .await?;
+        assert_eq!(
+            batcher.state.read().total_pending_bytes,
+            50,
+            "write below the global cap must remain in the overlay"
+        );
+
+        // Truncating into the pending range shrinks the tracked total.
+        batcher.truncate_pending(sa.ino, 20);
+        assert_eq!(
+            batcher.state.read().total_pending_bytes,
+            20,
+            "truncate_pending must shrink the running total to the kept prefix"
+        );
+
+        // Write to inode B crosses the cap (20 + 50 >= 64): a full batched drain
+        // commits every pending inode and resets the running total to zero.
+        batcher
+            .enqueue(
+                sb.ino,
+                vec![WriteRange {
+                    offset: 0,
+                    data: vec![b'y'; 50],
+                }],
+            )
+            .await?;
+        assert_eq!(
+            batcher.state.read().total_pending_bytes,
+            0,
+            "crossing the global cap must drain all pending inodes"
+        );
+
+        // Committed data is intact and reflects the truncate.
+        assert_eq!(fs.read_file("/a.bin").await?.unwrap(), vec![b'x'; 20]);
+        assert_eq!(fs.read_file("/b.bin").await?.unwrap(), vec![b'y'; 50]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_batcher_discard_pending_updates_total() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        let (sa, _fa) = fs.create_file("/c.bin", DEFAULT_FILE_MODE, 0, 0).await?;
+
+        // No timer/bytes/global drain: writes accumulate so we can observe the
+        // total before discarding.
+        let batcher = test_batcher(&fs, 600, 1 << 20, 1 << 30);
+        batcher
+            .enqueue(
+                sa.ino,
+                vec![WriteRange {
+                    offset: 0,
+                    data: vec![b'z'; 100],
+                }],
+            )
+            .await?;
+        assert_eq!(batcher.state.read().total_pending_bytes, 100);
+
+        batcher.discard_pending(sa.ino);
+        assert_eq!(
+            batcher.state.read().total_pending_bytes,
+            0,
+            "discard_pending must subtract the discarded inode's bytes"
+        );
         Ok(())
     }
 

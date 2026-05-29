@@ -538,6 +538,13 @@ struct AgentFSFuse {
     next_fh: AtomicU64,
     /// Whether kernel cache invalidations are sent synchronously before replies.
     sync_inval: bool,
+    /// When true, force a synchronous SDK drain (SQLite commit) on flush/release.
+    /// Default false: under the Tier-4 overlay, reads are served from pending
+    /// writes, so close-time commits are unnecessary work that serialise the
+    /// clone critical path. Durability is preserved by fsync, the batcher
+    /// timer/bytes/global triggers, and finalize-on-unmount. Set
+    /// `AGENTFS_DRAIN_ON_RELEASE=1` to restore the legacy commit-on-close.
+    drain_on_release: bool,
     /// Emits a profiling summary when the FUSE session object is dropped.
     _profile_report: Arc<agentfs_sdk::profiling::ProfileReportGuard>,
     /// Whether FUSE writeback mode is enabled for this mount.
@@ -1649,12 +1656,20 @@ impl Filesystem for AgentFSFuse {
             };
             (open_file.take_pending(), open_file.file.clone())
         };
+        let drain_on_release = self.drain_on_release;
         let result = (|| -> Result<(), SdkError> {
+            // Always move the per-fh FUSE write buffer into the SDK batcher so
+            // the overlay reflects this handle's writes. Only force a SQLite
+            // commit when the legacy commit-on-close kill switch is set;
+            // otherwise durability is the batcher/fsync/finalize's job.
             if let Some(drain) = drain {
                 flush_pending_batched_out_of_lock(&self.runtime, drain)?;
             }
-            self.runtime
-                .block_on(async move { file.drain_writes().await })
+            if drain_on_release {
+                self.runtime
+                    .block_on(async move { file.drain_writes().await })?;
+            }
+            Ok(())
         })();
 
         match result {
@@ -1710,8 +1725,11 @@ impl Filesystem for AgentFSFuse {
     ) {
         agentfs_sdk::profiling::record_fuse_release();
         tracing::debug!("FUSE::release: fh={}", fh);
-        // Tier Three Axis E attempt reverted (see `fn flush`): keep
-        // synchronous drain on release.
+        // Deferred-drain default: move this handle's buffered writes into the
+        // SDK batcher overlay, but do NOT force a SQLite commit on close. The
+        // overlay keeps reads consistent and the batcher's timer/bytes/global
+        // triggers + finalize-on-unmount provide durability. Set
+        // AGENTFS_DRAIN_ON_RELEASE=1 to restore the legacy commit-on-close.
         let (drain, file) = {
             let mut open_files = self.open_files.lock();
             let Some(open_file) = open_files.get_mut(&fh) else {
@@ -1720,12 +1738,16 @@ impl Filesystem for AgentFSFuse {
             };
             (open_file.take_pending(), open_file.file.clone())
         };
+        let drain_on_release = self.drain_on_release;
         let result = (|| -> Result<(), SdkError> {
             if let Some(drain) = drain {
                 flush_pending_batched_out_of_lock(&self.runtime, drain)?;
             }
-            self.runtime
-                .block_on(async move { file.drain_writes().await })
+            if drain_on_release {
+                self.runtime
+                    .block_on(async move { file.drain_writes().await })?;
+            }
+            Ok(())
         })();
 
         match result {
@@ -2181,6 +2203,7 @@ impl AgentFSFuse {
     /// from within synchronous FUSE callbacks via `block_on`.
     fn new(fs: Arc<dyn FileSystem>, runtime: Runtime) -> Self {
         let sync_inval = fuse_sync_inval_enabled_from_env();
+        let drain_on_release = fuse_drain_on_release_from_env();
         let cache_config = FuseKernelCacheConfig::from_env();
         cache_config.record_profile();
         let writeback_enabled = cache_config.writeback_cache_enabled;
@@ -2198,6 +2221,7 @@ impl AgentFSFuse {
             cache_epoch: AtomicU64::new(0),
             next_fh: AtomicU64::new(1),
             sync_inval,
+            drain_on_release,
             _profile_report: Arc::new(agentfs_sdk::profiling::ProfileReportGuard::new(
                 "fuse_session",
             )),
@@ -2292,6 +2316,29 @@ fn fuse_workers_not_serial_from_env() -> bool {
     !fuse_workers_serial_from_env()
 }
 
+/// Whether flush/release should force a synchronous SDK drain (SQLite commit).
+///
+/// Default false: the Tier-4 overlay serves reads from pending writes, so a
+/// commit on every close is unnecessary and serialises the clone critical path.
+/// Durability is preserved by fsync, the batcher timer/bytes/global triggers,
+/// and finalize-on-unmount. `AGENTFS_DRAIN_ON_RELEASE=1` restores the legacy
+/// commit-on-close behaviour (a kill switch for the deferral).
+fn fuse_drain_on_release_from_env() -> bool {
+    match std::env::var("AGENTFS_DRAIN_ON_RELEASE") {
+        Ok(value) => match env_bool(&value) {
+            Some(enabled) => enabled,
+            None => {
+                tracing::warn!(
+                    "Ignoring invalid AGENTFS_DRAIN_ON_RELEASE={:?}; expected 0/1/true/false",
+                    value
+                );
+                false
+            }
+        },
+        Err(_) => false,
+    }
+}
+
 fn fuse_sync_inval_enabled_from_env() -> bool {
     let workers_serial = fuse_workers_serial_from_env();
     let sync_requested = match std::env::var("AGENTFS_FUSE_SYNC_INVAL") {
@@ -2356,7 +2403,11 @@ fn readdirplus_mode_from_env() -> ReaddirPlusMode {
             );
             ReaddirPlusMode::Off
         }
-        Err(_) => ReaddirPlusMode::Auto,
+        // Default ON: profiling shows `always` strictly reduces metadata
+        // round-trips (diff -34%, status -6.6%, checkout getattr -10.5%) with no
+        // regressions and identical invalidation safety. `auto`/`off` remain
+        // available as explicit rollbacks.
+        Err(_) => ReaddirPlusMode::Always,
     }
 }
 
@@ -2659,6 +2710,34 @@ mod tests {
         assert_eq!(readdir_start(-1), 0);
         assert_eq!(readdir_start(0), 0);
         assert_eq!(readdir_start(2), 2);
+    }
+
+    #[test]
+    fn readdirplus_mode_defaults_to_always_with_rollbacks() {
+        use super::{readdirplus_mode_from_env, ReaddirPlusMode};
+
+        let key = "AGENTFS_FUSE_READDIRPLUS";
+        let saved = std::env::var(key).ok();
+
+        std::env::remove_var(key);
+        assert_eq!(readdirplus_mode_from_env(), ReaddirPlusMode::Always);
+
+        std::env::set_var(key, "auto");
+        assert_eq!(readdirplus_mode_from_env(), ReaddirPlusMode::Auto);
+
+        std::env::set_var(key, "off");
+        assert_eq!(readdirplus_mode_from_env(), ReaddirPlusMode::Off);
+
+        std::env::set_var(key, "always");
+        assert_eq!(readdirplus_mode_from_env(), ReaddirPlusMode::Always);
+
+        std::env::set_var(key, "garbage");
+        assert_eq!(readdirplus_mode_from_env(), ReaddirPlusMode::Off);
+
+        match saved {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
     }
 
     #[test]
