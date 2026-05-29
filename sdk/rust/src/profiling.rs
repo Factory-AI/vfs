@@ -94,6 +94,14 @@ pub struct ProfileSnapshot {
     pub fuse_writeback_cache_enabled: u64,
     pub fuse_keepcache_enabled: u64,
     pub fuse_keepcache_eligibility_drops: u64,
+    pub fuse_adapter_entry_hits: u64,
+    pub fuse_adapter_entry_misses: u64,
+    pub fuse_adapter_attr_hits: u64,
+    pub fuse_adapter_attr_misses: u64,
+    pub fuse_adapter_negative_hits: u64,
+    pub fuse_adapter_negative_misses: u64,
+    pub fuse_adapter_inval_inode_notifications: u64,
+    pub fuse_adapter_inval_entry_notifications: u64,
     pub base_fast_open_eligible: u64,
     pub base_fast_open_keep_cache: u64,
     pub base_fast_open_passthrough_attempted: u64,
@@ -187,6 +195,14 @@ pub struct ProfileCounters {
     fuse_writeback_cache_enabled: AtomicU64,
     fuse_keepcache_enabled: AtomicU64,
     fuse_keepcache_eligibility_drops: AtomicU64,
+    fuse_adapter_entry_hits: AtomicU64,
+    fuse_adapter_entry_misses: AtomicU64,
+    fuse_adapter_attr_hits: AtomicU64,
+    fuse_adapter_attr_misses: AtomicU64,
+    fuse_adapter_negative_hits: AtomicU64,
+    fuse_adapter_negative_misses: AtomicU64,
+    fuse_adapter_inval_inode_notifications: AtomicU64,
+    fuse_adapter_inval_entry_notifications: AtomicU64,
     base_fast_open_eligible: AtomicU64,
     base_fast_open_keep_cache: AtomicU64,
     base_fast_open_passthrough_attempted: AtomicU64,
@@ -280,6 +296,14 @@ impl ProfileCounters {
             fuse_writeback_cache_enabled: AtomicU64::new(0),
             fuse_keepcache_enabled: AtomicU64::new(0),
             fuse_keepcache_eligibility_drops: AtomicU64::new(0),
+            fuse_adapter_entry_hits: AtomicU64::new(0),
+            fuse_adapter_entry_misses: AtomicU64::new(0),
+            fuse_adapter_attr_hits: AtomicU64::new(0),
+            fuse_adapter_attr_misses: AtomicU64::new(0),
+            fuse_adapter_negative_hits: AtomicU64::new(0),
+            fuse_adapter_negative_misses: AtomicU64::new(0),
+            fuse_adapter_inval_inode_notifications: AtomicU64::new(0),
+            fuse_adapter_inval_entry_notifications: AtomicU64::new(0),
             base_fast_open_eligible: AtomicU64::new(0),
             base_fast_open_keep_cache: AtomicU64::new(0),
             base_fast_open_passthrough_attempted: AtomicU64::new(0),
@@ -662,6 +686,44 @@ impl ProfileCounters {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    fn add_fuse_adapter_entry_hit(&self) {
+        self.fuse_adapter_entry_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_fuse_adapter_entry_miss(&self) {
+        self.fuse_adapter_entry_misses
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_fuse_adapter_attr_hit(&self) {
+        self.fuse_adapter_attr_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_fuse_adapter_attr_miss(&self) {
+        self.fuse_adapter_attr_misses
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_fuse_adapter_negative_hit(&self) {
+        self.fuse_adapter_negative_hits
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_fuse_adapter_negative_miss(&self) {
+        self.fuse_adapter_negative_misses
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_fuse_adapter_inval_inode_notification(&self) {
+        self.fuse_adapter_inval_inode_notifications
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_fuse_adapter_inval_entry_notification(&self) {
+        self.fuse_adapter_inval_entry_notifications
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     fn add_base_fast_open_eligible(&self) {
         self.base_fast_open_eligible.fetch_add(1, Ordering::Relaxed);
     }
@@ -805,6 +867,18 @@ impl ProfileCounters {
             fuse_keepcache_enabled: self.fuse_keepcache_enabled.load(Ordering::Relaxed),
             fuse_keepcache_eligibility_drops: self
                 .fuse_keepcache_eligibility_drops
+                .load(Ordering::Relaxed),
+            fuse_adapter_entry_hits: self.fuse_adapter_entry_hits.load(Ordering::Relaxed),
+            fuse_adapter_entry_misses: self.fuse_adapter_entry_misses.load(Ordering::Relaxed),
+            fuse_adapter_attr_hits: self.fuse_adapter_attr_hits.load(Ordering::Relaxed),
+            fuse_adapter_attr_misses: self.fuse_adapter_attr_misses.load(Ordering::Relaxed),
+            fuse_adapter_negative_hits: self.fuse_adapter_negative_hits.load(Ordering::Relaxed),
+            fuse_adapter_negative_misses: self.fuse_adapter_negative_misses.load(Ordering::Relaxed),
+            fuse_adapter_inval_inode_notifications: self
+                .fuse_adapter_inval_inode_notifications
+                .load(Ordering::Relaxed),
+            fuse_adapter_inval_entry_notifications: self
+                .fuse_adapter_inval_entry_notifications
                 .load(Ordering::Relaxed),
             base_fast_open_eligible: self.base_fast_open_eligible.load(Ordering::Relaxed),
             base_fast_open_keep_cache: self.base_fast_open_keep_cache.load(Ordering::Relaxed),
@@ -1252,6 +1326,54 @@ pub fn record_fuse_keepcache_eligibility_drop() {
     }
 }
 
+pub fn record_fuse_adapter_entry_hit() {
+    if is_enabled() {
+        COUNTERS.add_fuse_adapter_entry_hit();
+    }
+}
+
+pub fn record_fuse_adapter_entry_miss() {
+    if is_enabled() {
+        COUNTERS.add_fuse_adapter_entry_miss();
+    }
+}
+
+pub fn record_fuse_adapter_attr_hit() {
+    if is_enabled() {
+        COUNTERS.add_fuse_adapter_attr_hit();
+    }
+}
+
+pub fn record_fuse_adapter_attr_miss() {
+    if is_enabled() {
+        COUNTERS.add_fuse_adapter_attr_miss();
+    }
+}
+
+pub fn record_fuse_adapter_negative_hit() {
+    if is_enabled() {
+        COUNTERS.add_fuse_adapter_negative_hit();
+    }
+}
+
+pub fn record_fuse_adapter_negative_miss() {
+    if is_enabled() {
+        COUNTERS.add_fuse_adapter_negative_miss();
+    }
+}
+
+pub fn record_fuse_adapter_inval_inode_notification() {
+    if is_enabled() {
+        COUNTERS.add_fuse_adapter_inval_inode_notification();
+    }
+}
+
+pub fn record_fuse_adapter_inval_entry_notification() {
+    if is_enabled() {
+        COUNTERS.add_fuse_adapter_inval_entry_notification();
+    }
+}
+
 pub fn record_base_fast_open_eligible() {
     if is_enabled() {
         COUNTERS.add_base_fast_open_eligible();
@@ -1330,6 +1452,26 @@ pub fn report_summary(source: &str) {
     }
 
     eprintln!("{}", summary_json(source, &snapshot()));
+}
+
+/// Monotonic sequence for phase-boundary profile checkpoints.
+static CHECKPOINT_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Emit a cumulative profile summary tagged with a monotonic sequence number.
+///
+/// Used to attribute counters to workload phases: a consumer subtracts
+/// consecutive checkpoint snapshots to obtain per-phase deltas. The sequence
+/// number makes ordering unambiguous even if stderr lines interleave.
+pub fn report_checkpoint() {
+    if !is_enabled() {
+        return;
+    }
+
+    let seq = CHECKPOINT_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+    eprintln!(
+        "{}",
+        summary_json(&format!("phase-checkpoint-{seq}"), &snapshot())
+    );
 }
 
 /// Drop guard that emits the current profiling summary.
@@ -1428,6 +1570,14 @@ mod tests {
         counters.set_fuse_writeback_cache_enabled(true);
         counters.set_fuse_keepcache_enabled(true);
         counters.add_fuse_keepcache_eligibility_drop();
+        counters.add_fuse_adapter_entry_hit();
+        counters.add_fuse_adapter_entry_miss();
+        counters.add_fuse_adapter_attr_hit();
+        counters.add_fuse_adapter_attr_miss();
+        counters.add_fuse_adapter_negative_hit();
+        counters.add_fuse_adapter_negative_miss();
+        counters.add_fuse_adapter_inval_inode_notification();
+        counters.add_fuse_adapter_inval_entry_notification();
         counters.add_base_fast_open_eligible();
         counters.add_base_fast_open_keep_cache();
         counters.add_base_fast_open_passthrough_attempted();
@@ -1513,6 +1663,14 @@ mod tests {
         assert_eq!(snapshot.fuse_writeback_cache_enabled, 1);
         assert_eq!(snapshot.fuse_keepcache_enabled, 1);
         assert_eq!(snapshot.fuse_keepcache_eligibility_drops, 1);
+        assert_eq!(snapshot.fuse_adapter_entry_hits, 1);
+        assert_eq!(snapshot.fuse_adapter_entry_misses, 1);
+        assert_eq!(snapshot.fuse_adapter_attr_hits, 1);
+        assert_eq!(snapshot.fuse_adapter_attr_misses, 1);
+        assert_eq!(snapshot.fuse_adapter_negative_hits, 1);
+        assert_eq!(snapshot.fuse_adapter_negative_misses, 1);
+        assert_eq!(snapshot.fuse_adapter_inval_inode_notifications, 1);
+        assert_eq!(snapshot.fuse_adapter_inval_entry_notifications, 1);
         assert_eq!(snapshot.base_fast_open_eligible, 1);
         assert_eq!(snapshot.base_fast_open_keep_cache, 1);
         assert_eq!(snapshot.base_fast_open_passthrough_attempted, 1);

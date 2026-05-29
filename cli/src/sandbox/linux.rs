@@ -30,7 +30,7 @@ use std::{
     os::unix::io::AsRawFd,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicI32, Ordering},
+        atomic::{AtomicI32, AtomicU64, Ordering},
         Arc,
     },
 };
@@ -42,6 +42,12 @@ static CHILD_PID: AtomicI32 = AtomicI32::new(0);
 /// Counter for termination signals received.
 /// First signal forwards to child, second signal sends SIGKILL.
 static TERM_SIGNAL_COUNT: AtomicI32 = AtomicI32::new(0);
+
+/// Count of pending profiling checkpoint requests (SIGUSR1).
+/// Incremented in the async-signal-safe handler; drained in the wait loop where
+/// it is safe to serialize and emit a profile summary. Used by the benchmark
+/// harness to attribute counters to workload phases.
+static PROFILE_CHECKPOINT_PENDING: AtomicU64 = AtomicU64::new(0);
 
 use crate::mount::{is_mountpoint, mount_fs, MountBackend, MountHandle, MountOpts};
 
@@ -100,6 +106,28 @@ extern "C" fn forward_signal_to_child(sig: libc::c_int) {
     }
 }
 
+/// Signal handler that records a pending profiling checkpoint request.
+///
+/// The sandboxed workload sends SIGUSR1 at phase boundaries; we only flag the
+/// request here and let the wait loop emit the (async-signal-unsafe) summary.
+///
+/// SAFETY: This is a signal handler. It only performs an atomic increment, which
+/// is async-signal-safe.
+extern "C" fn request_profile_checkpoint(_sig: libc::c_int) {
+    PROFILE_CHECKPOINT_PENDING.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Emit one profile checkpoint per pending SIGUSR1, draining the counter.
+///
+/// Called from the wait loop in normal (non-handler) context, where serializing
+/// and writing the profile summary is safe.
+fn drain_profile_checkpoints() {
+    let pending = PROFILE_CHECKPOINT_PENDING.swap(0, Ordering::SeqCst);
+    for _ in 0..pending {
+        agentfs_sdk::profiling::report_checkpoint();
+    }
+}
+
 /// Install signal handlers to forward SIGTERM and SIGINT to the child process.
 ///
 /// This ensures that when the parent receives a termination signal, it forwards
@@ -107,6 +135,7 @@ extern "C" fn forward_signal_to_child(sig: libc::c_int) {
 fn install_signal_handlers() {
     // Reset the signal counter for fresh signal handling
     TERM_SIGNAL_COUNT.store(0, Ordering::SeqCst);
+    PROFILE_CHECKPOINT_PENDING.store(0, Ordering::SeqCst);
 
     // SAFETY: sigaction() and sigprocmask() with valid signal numbers are safe.
     // SA_RESTART ensures most syscalls restart after the handler returns.
@@ -132,6 +161,22 @@ fn install_signal_handlers() {
         if libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut()) != 0 {
             panic!(
                 "failed to install SIGINT handler: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+
+        // SIGUSR1 requests a profiling checkpoint. Install it WITHOUT SA_RESTART
+        // so the blocking waitpid in the wait loop returns EINTR, giving us a
+        // safe point to emit the (async-signal-unsafe) profile summary.
+        libc::sigaddset(&mut sigset, libc::SIGUSR1);
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &sigset, std::ptr::null_mut());
+        let mut usr_sa: libc::sigaction = std::mem::zeroed();
+        libc::sigemptyset(&mut usr_sa.sa_mask);
+        usr_sa.sa_sigaction = request_profile_checkpoint as *const () as usize;
+        usr_sa.sa_flags = 0;
+        if libc::sigaction(libc::SIGUSR1, &usr_sa, std::ptr::null_mut()) != 0 {
+            panic!(
+                "failed to install SIGUSR1 handler: {}",
                 std::io::Error::last_os_error()
             );
         }
@@ -1027,6 +1072,9 @@ fn wait_for_child(child_pid: libc::pid_t) -> i32 {
         if result == -1 {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EINTR) {
+                // Interrupted by signal. Emit any pending profile checkpoints
+                // (SIGUSR1) here, in a context where it is safe to do so.
+                drain_profile_checkpoints();
                 // Interrupted by signal, retry
                 continue;
             }

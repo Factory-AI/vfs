@@ -609,6 +609,7 @@ impl Filesystem for AgentFSFuse {
                 .is_ok();
             let cache_reply = self.cache_reply_lock.try_lock();
             if retained && cache_reply.is_some() && !self.cache_epoch_changed(cache_epoch) {
+                agentfs_sdk::profiling::record_fuse_adapter_entry_hit();
                 let attr = fillattr(&stats);
                 reply.entry_with_ttls(
                     &self.cache_config.entry_ttl,
@@ -635,11 +636,16 @@ impl Filesystem for AgentFSFuse {
             let cache_reply = self.cache_reply_lock.try_lock();
             if cache_reply.is_some() && !self.cache_epoch_changed(cache_epoch) {
                 agentfs_sdk::profiling::record_negative_cache_hit();
+                agentfs_sdk::profiling::record_fuse_adapter_negative_hit();
                 self.reply_negative_entry(reply);
                 return;
             }
         }
         agentfs_sdk::profiling::record_negative_cache_miss();
+        agentfs_sdk::profiling::record_fuse_adapter_negative_miss();
+        // Neither the positive entry cache nor the negative cache satisfied this
+        // lookup; the request falls through to the backend.
+        agentfs_sdk::profiling::record_fuse_adapter_entry_miss();
 
         let mut stable = false;
         let mut stable_epoch = 0;
@@ -710,10 +716,12 @@ impl Filesystem for AgentFSFuse {
         if let Some(stats) = self.attr_cache.lock().get(&ino).cloned() {
             let cache_reply = self.cache_reply_lock.try_lock();
             if cache_reply.is_some() && !self.cache_epoch_changed(cache_epoch) {
+                agentfs_sdk::profiling::record_fuse_adapter_attr_hit();
                 reply.attr(&self.cache_config.attr_ttl, &fillattr(&stats));
                 return;
             }
         }
+        agentfs_sdk::profiling::record_fuse_adapter_attr_miss();
 
         let mut stable = false;
         let mut stable_epoch = 0;
@@ -1971,6 +1979,7 @@ impl AgentFSFuse {
     }
 
     fn notify_inval_inode(&self, req: &Request, ino: u64, offset: i64, len: i64) {
+        agentfs_sdk::profiling::record_fuse_adapter_inval_inode_notification();
         if !self.sync_inval {
             req.deferred_notifier().inval_inode(ino, offset, len);
             return;
@@ -1996,6 +2005,7 @@ impl AgentFSFuse {
     }
 
     fn notify_inval_entry(&self, req: &Request, parent: u64, name: &OsStr) {
+        agentfs_sdk::profiling::record_fuse_adapter_inval_entry_notification();
         if !self.sync_inval {
             req.deferred_notifier().inval_entry(parent, name);
             return;

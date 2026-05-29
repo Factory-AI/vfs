@@ -29,13 +29,39 @@ import argparse
 import hashlib
 import json
 import os
-import subprocess
+import signal
 import sys
+import subprocess
 import time
 from pathlib import Path
 
 
 OUTPUT_TAIL_CHARS = 4000
+
+# Ordered phase labels emitted via profiling checkpoints (see profile_checkpoint).
+PROFILE_CHECKPOINTS = []
+
+
+def profile_checkpoint(label):
+    """Request an AgentFS profiling checkpoint at a phase boundary.
+
+    Only meaningful when running inside an AgentFS sandbox with profiling
+    enabled. We signal the parent `agentfs run` process (SIGUSR1), which emits a
+    cumulative, sequence-tagged profile summary to its stderr; the analyzer
+    subtracts consecutive checkpoints to obtain per-phase counter deltas. A small
+    sleep lets the parent flush before the next phase begins. Guarded on AGENTFS
+    so native runs never signal the benchmark harness.
+    """
+    PROFILE_CHECKPOINTS.append(label)
+    if os.environ.get("AGENTFS") != "1":
+        return
+    if os.environ.get("AGENTFS_PROFILE", "") not in {"1", "true", "TRUE", "yes", "on"}:
+        return
+    try:
+        os.kill(os.getppid(), signal.SIGUSR1)
+    except OSError:
+        return
+    time.sleep(0.1)
 
 
 def tail_text(value):
@@ -217,6 +243,7 @@ def main(argv):
     require_ok(clone, "clone")
     phase_seconds["clone"] = time.perf_counter() - started
     phase_runs["clone"] = {key: value for key, value in clone.items() if key != "stdout"}
+    profile_checkpoint("clone")
 
     started = time.perf_counter()
     checkout = run_git(["checkout", "-B", "agentfs-benchmark"], workdir)
@@ -225,6 +252,7 @@ def main(argv):
     require_ok(head, "rev-parse")
     phase_seconds["checkout"] = time.perf_counter() - started
     phase_runs["checkout"] = {key: value for key, value in checkout.items() if key != "stdout"}
+    profile_checkpoint("checkout")
 
     started = time.perf_counter()
     status_initial = run_git(["status", "--short"], workdir)
@@ -237,14 +265,19 @@ def main(argv):
         "branch": {key: value for key, value in branch_status.items() if key != "stdout"},
     }
 
+    profile_checkpoint("status")
+
     read_search = bounded_read_search(workdir, args.read_files, args.read_bytes, args.search_token)
     phase_seconds["read_search"] = read_search["duration_seconds"]
+    profile_checkpoint("read_search")
 
     edits = edit_files(workdir, read_search["all_files"], args.edit_files)
     phase_seconds["edit"] = edits["duration_seconds"]
+    profile_checkpoint("edit")
 
     diff = diff_summary(workdir)
     phase_seconds["diff"] = diff["duration_seconds"]
+    profile_checkpoint("diff")
 
     fsck = {"ran": False, "ok": None, "run": None}
     if not args.skip_fsck:
@@ -257,6 +290,7 @@ def main(argv):
             "run": {key: value for key, value in fsck_run.items() if key != "stdout"},
         }
         require_ok(fsck_run, "fsck")
+        profile_checkpoint("fsck")
     else:
         phase_seconds["fsck"] = 0.0
 
@@ -268,6 +302,7 @@ def main(argv):
                 "phase_seconds": phase_seconds,
                 "total_seconds": total_seconds,
                 "phase_runs": phase_runs,
+                "profile_checkpoints": PROFILE_CHECKPOINTS,
                 "initial_status": status_initial["stdout"],
                 "branch_status": branch_status["stdout"],
                 "read_search": {
@@ -439,6 +474,51 @@ def profile_counter_summary(summaries: list[dict[str, Any]]) -> dict[str, Any]:
             if isinstance(value, int):
                 max_counters[key] = max(max_counters.get(key, 0), value)
     return {"summary_count": len(summaries), "last_by_source": by_source, "max_counters": max_counters}
+
+
+def per_phase_profile_counters(
+    summaries: list[dict[str, Any]], phase_labels: list[str]
+) -> dict[str, Any]:
+    """Attribute counter deltas to workload phases from ordered checkpoints.
+
+    Each `phase-checkpoint-<seq>` summary is cumulative; subtracting consecutive
+    checkpoints (and the implicit all-zero start) yields the counters consumed by
+    each phase. Checkpoints are ordered by their monotonic sequence number and
+    zipped with the ordered phase labels emitted by the workload.
+    """
+    checkpoints: list[tuple[int, dict[str, Any]]] = []
+    for summary in summaries:
+        source = str(summary.get("source", ""))
+        if not source.startswith("phase-checkpoint-"):
+            continue
+        try:
+            seq = int(source.rsplit("-", 1)[1])
+        except (ValueError, IndexError):
+            continue
+        counters = summary.get("counters")
+        if isinstance(counters, dict):
+            checkpoints.append((seq, counters))
+    checkpoints.sort(key=lambda item: item[0])
+
+    phases: list[dict[str, Any]] = []
+    prev: dict[str, Any] = {}
+    for index, (seq, counters) in enumerate(checkpoints):
+        label = phase_labels[index] if index < len(phase_labels) else f"checkpoint-{seq}"
+        delta = {
+            key: value - int(prev.get(key, 0))
+            for key, value in counters.items()
+            if isinstance(value, int)
+        }
+        phases.append({"phase": label, "seq": seq, "counters": delta})
+        prev = counters
+
+    aligned = len(checkpoints) == len(phase_labels)
+    return {
+        "checkpoint_count": len(checkpoints),
+        "label_count": len(phase_labels),
+        "labels_aligned": aligned,
+        "phases": phases,
+    }
 
 
 def terminate_process_tree(proc: subprocess.Popen[str]) -> None:
@@ -1068,6 +1148,12 @@ def main(argv: list[str]) -> int:
         equivalent = equivalence(native_workload, agentfs_workload)
         profile_summaries = agentfs_run.get("profile_summaries", [])
         profile_counters = profile_counter_summary(profile_summaries)
+        phase_labels = (
+            agentfs_workload.get("profile_checkpoints", [])
+            if isinstance(agentfs_workload, dict)
+            else []
+        )
+        per_phase_counters = per_phase_profile_counters(profile_summaries, phase_labels)
         ratios = phase_ratios(native_workload, agentfs_workload)
         native_total = native_workload.get("total_seconds") if isinstance(native_workload, dict) else None
         agentfs_total = agentfs_workload.get("total_seconds") if isinstance(agentfs_workload, dict) else None
@@ -1175,6 +1261,7 @@ def main(argv: list[str]) -> int:
                 "profile_enabled": args.profile,
                 "profile_summary_count": profile_counters["summary_count"],
                 "profile_counters": profile_counters,
+                "per_phase_counters": per_phase_counters,
             },
             "summary": {
                 "native_seconds": native_total,
