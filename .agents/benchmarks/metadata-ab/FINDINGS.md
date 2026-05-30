@@ -67,3 +67,35 @@ cost, not a metadata-lookup or transport cost.
 round-trips, but it is a second-order win: the 1.5x target is gated entirely by
 the clone storage path, which neither readdirplus nor a transport (io_uring)
 change addresses.
+
+## CORRECTION (post-implementation, cleaner profiled runs)
+
+The earlier "clone is SQLite-commit-bound (4692 explicit drains, ~1593ms commit
+latency)" conclusion came from a single COLD profiled run and is wrong on the
+mechanism. Cleaner profiled runs show:
+
+- `agentfs_batcher_drains_explicit` = 4692 in BOTH deferred-release and legacy
+  commit-on-close modes — i.e. removing the flush/release drain did **not**
+  change the drain count. Those explicit drains come from **git's own fsync()
+  calls** (durability barriers) and truncate, routed through `File::fsync ->
+  drain_writes`, NOT from file close. They cannot be deferred without breaking
+  the fsync durability contract.
+- Clone commit latency is only ~0.7s and dispatch wait ~0.4s of a ~4-12s clone.
+  The dominant cost is **per-operation overhead across ~28,000 FUSE→SQLite
+  round-trips** (13.7k lookups + 9.8k getattrs + 4.9k writes), plus 63.7k
+  connection-pool acquisitions.
+
+Implication: the real clone lever is **per-operation cost** (FUSE transport
++ SQLite/connection overhead × op-count), i.e. the originally-planned io_uring
+transport spike and/or reducing per-op connection/query overhead — NOT commit
+batching. readdirplus=always (shipped, real callback win on diff/status/checkout)
+and the deferred-release change do not move clone.
+
+The deferred-release drain + global pending-bytes cap are kept because they are
+correct and safe (global cap bounds memory; deferral is neutral-to-win for
+non-fsync write bursts and a no-op under git's fsync-heavy clone), but they are
+NOT the clone speedup the pivot hoped for.
+
+NOTE: wall-clock medians during this session are unreliable (concurrent load on
+the host inflated clone to 9.9-12.4s with >1s stdev vs 3.8-5s unloaded). Counter
+deltas (deterministic) are the trustworthy signal here.

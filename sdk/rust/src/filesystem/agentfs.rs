@@ -4182,6 +4182,27 @@ impl FileSystem for AgentFS {
         if name.len() > MAX_NAME_LEN {
             return Err(FsError::NameTooLong.into());
         }
+
+        // Connection-free fast paths via the in-memory caches. These are the
+        // same caches (and invalidation semantics) that `lookup_child` already
+        // trusts; consulting them BEFORE acquiring a pool connection avoids a
+        // wasted acquire/release on every cache hit. This is the clone hot
+        // path: `OverlayFS::resolve_delta_parent` does O(depth) negative
+        // delta-parent probes per base-layer lookup, all of which are negative
+        // cache hits that previously each took a connection.
+        if name != ".." {
+            if self.negative_dentry_cache.contains(parent_ino, name) {
+                crate::profiling::record_negative_lookup();
+                return Ok(None);
+            }
+            if let Some(child_ino) = self.dentry_cache.get(parent_ino, name) {
+                if let Some(mut stats) = self.attr_cache.get(child_ino) {
+                    self.merge_pending_size(child_ino, Some(&mut stats));
+                    return Ok(Some(stats));
+                }
+            }
+        }
+
         let conn = self.pool.get_connection().await?;
 
         // Handle ".." by finding the parent of parent_ino
@@ -4240,6 +4261,16 @@ impl FileSystem for AgentFS {
 
     async fn getattr(&self, ino: i64) -> Result<Option<Stats>> {
         crate::profiling::record_getattr();
+        // Connection-free fast path: an attr-cache hit needs no pool connection.
+        // The cache is invalidated on every write (enqueue removes the entry),
+        // so a hit means there is no uncommitted pending write to merge; the
+        // merge below is therefore an idempotent no-op but is kept for safety.
+        // Same cache `getattr_with_conn` already trusts, consulted before the
+        // acquire.
+        if let Some(mut stats) = self.attr_cache.get(ino) {
+            self.merge_pending_size(ino, Some(&mut stats));
+            return Ok(Some(stats));
+        }
         // Tier Four: don't drain — read SQLite metadata and OR in the
         // batcher's peek_pending_max_end so the size view reflects pending
         // writes that haven't been committed yet. Refresh the attr cache
