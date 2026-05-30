@@ -294,7 +294,7 @@ impl Request {
                         .add_capabilities(abi::consts::FUSE_OVER_IO_URING)
                         .is_ok()
                 {
-                    let _ = config.set_max_write(super::uring::URING_MAX_WRITE);
+                    let _ = config.set_max_write(super::uring::uring_max_write());
                     shared.set_uring_negotiated(config.max_write());
                     debug!(
                         "FUSE-over-io_uring negotiated (max_write {})",

@@ -50,7 +50,17 @@ const DEFAULT_QUEUE_DEPTH: usize = 2;
 
 /// Per-entry payload buffer cap when io_uring is active. The INIT handshake caps
 /// `max_write` to this so the kernel never sends a write larger than the buffer.
-pub(crate) const URING_MAX_WRITE: u32 = 1 << 20;
+/// Tunable via `AGENTFS_FUSE_URING_MAX_WRITE_MB` (default 1 MiB). Memory is
+/// `nr_queues * depth * this`, so larger values trade RAM for fewer write round
+/// trips on big sequential writes (e.g. git packfiles).
+pub(crate) fn uring_max_write() -> u32 {
+    let mb = std::env::var("AGENTFS_FUSE_URING_MAX_WRITE_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|m| *m >= 1 && *m <= 16)
+        .unwrap_or(1);
+    mb << 20
+}
 
 const FUSE_IN_HEADER_SZ: usize = 40;
 const OP_IN_OFFSET: usize = abi::FUSE_URING_IN_OUT_HEADER_SZ; // 128
