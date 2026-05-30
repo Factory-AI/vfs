@@ -545,6 +545,13 @@ struct AgentFSFuse {
     /// timer/bytes/global triggers, and finalize-on-unmount. Set
     /// `AGENTFS_DRAIN_ON_RELEASE=1` to restore the legacy commit-on-close.
     drain_on_release: bool,
+    /// When true, force a synchronous SDK drain (SQLite commit) when the
+    /// kernel FORGETs an inode. Default false: a FORGET only drops the
+    /// kernel's reference — pending writes stay readable through the Tier-4
+    /// overlay and are committed by the batcher timer/bytes triggers, fsync,
+    /// and finalize-on-unmount. Set `AGENTFS_DRAIN_ON_FORGET=1` to restore
+    /// the legacy commit-on-forget.
+    drain_on_forget: bool,
     /// Emits a profiling summary when the FUSE session object is dropped.
     _profile_report: Arc<agentfs_sdk::profiling::ProfileReportGuard>,
     /// Whether FUSE writeback mode is enabled for this mount.
@@ -1808,13 +1815,22 @@ impl Filesystem for AgentFSFuse {
     fn forget(&self, _req: &Request, ino: u64, nlookup: u64) {
         tracing::debug!("FUSE::forget: ino={}, nlookup={}", ino, nlookup);
         let fs = self.fs.clone();
+        // Default: do NOT commit pending batched writes here. The kernel
+        // FORGETs every freshly-written file shortly after our post-write
+        // entry invalidation, so a drain here issues one serial SQLite commit
+        // per file and sits on the clone critical path. Pending writes remain
+        // readable via the Tier-4 overlay and are committed by the batcher
+        // timer/bytes triggers, fsync, or finalize-on-unmount.
+        let drain_on_forget = self.drain_on_forget;
         self.runtime.block_on(async move {
-            if let Err(error) = fs.drain_inode_writes(ino as i64).await {
-                tracing::warn!(
-                    "FUSE::forget failed to drain batched writes for inode {}: {}",
-                    ino,
-                    error
-                );
+            if drain_on_forget {
+                if let Err(error) = fs.drain_inode_writes(ino as i64).await {
+                    tracing::warn!(
+                        "FUSE::forget failed to drain batched writes for inode {}: {}",
+                        ino,
+                        error
+                    );
+                }
             }
             fs.forget(ino as i64, nlookup).await;
         });
@@ -1828,14 +1844,18 @@ impl Filesystem for AgentFSFuse {
         let fs = self.fs.clone();
         let nodes_vec: Vec<(i64, u64)> =
             nodes.iter().map(|n| (n.nodeid as i64, n.nlookup)).collect();
+        // See `forget`: no commit-on-forget by default.
+        let drain_on_forget = self.drain_on_forget;
         self.runtime.block_on(async move {
             for (ino, nlookup) in nodes_vec {
-                if let Err(error) = fs.drain_inode_writes(ino).await {
-                    tracing::warn!(
-                        "FUSE::batch_forget failed to drain batched writes for inode {}: {}",
-                        ino,
-                        error
-                    );
+                if drain_on_forget {
+                    if let Err(error) = fs.drain_inode_writes(ino).await {
+                        tracing::warn!(
+                            "FUSE::batch_forget failed to drain batched writes for inode {}: {}",
+                            ino,
+                            error
+                        );
+                    }
                 }
                 fs.forget(ino, nlookup).await;
             }
@@ -2204,6 +2224,7 @@ impl AgentFSFuse {
     fn new(fs: Arc<dyn FileSystem>, runtime: Runtime) -> Self {
         let sync_inval = fuse_sync_inval_enabled_from_env();
         let drain_on_release = fuse_drain_on_release_from_env();
+        let drain_on_forget = fuse_drain_on_forget_from_env();
         let cache_config = FuseKernelCacheConfig::from_env();
         cache_config.record_profile();
         let writeback_enabled = cache_config.writeback_cache_enabled;
@@ -2222,6 +2243,7 @@ impl AgentFSFuse {
             next_fh: AtomicU64::new(1),
             sync_inval,
             drain_on_release,
+            drain_on_forget,
             _profile_report: Arc::new(agentfs_sdk::profiling::ProfileReportGuard::new(
                 "fuse_session",
             )),
@@ -2330,6 +2352,33 @@ fn fuse_drain_on_release_from_env() -> bool {
             None => {
                 tracing::warn!(
                     "Ignoring invalid AGENTFS_DRAIN_ON_RELEASE={:?}; expected 0/1/true/false",
+                    value
+                );
+                false
+            }
+        },
+        Err(_) => false,
+    }
+}
+
+/// Whether FUSE forget/batch_forget should force a synchronous SDK drain
+/// (SQLite commit) for the forgotten inode.
+///
+/// Default false: a kernel FORGET only drops the kernel's reference to the
+/// inode — the SDK's pending batched writes stay readable through the Tier-4
+/// overlay and are committed by the batcher timer/bytes triggers, fsync, or
+/// finalize-on-unmount. Draining here used to issue one serial SQLite commit
+/// per written file during git-clone-style workloads (the kernel FORGETs each
+/// file shortly after our post-write entry invalidation), which sat on the
+/// clone critical path. `AGENTFS_DRAIN_ON_FORGET=1` restores the legacy
+/// commit-on-forget behaviour (a kill switch for the deferral).
+fn fuse_drain_on_forget_from_env() -> bool {
+    match std::env::var("AGENTFS_DRAIN_ON_FORGET") {
+        Ok(value) => match env_bool(&value) {
+            Some(enabled) => enabled,
+            None => {
+                tracing::warn!(
+                    "Ignoring invalid AGENTFS_DRAIN_ON_FORGET={:?}; expected 0/1/true/false",
                     value
                 );
                 false

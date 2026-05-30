@@ -5533,15 +5533,13 @@ impl FileSystem for AgentFS {
         AgentFS::finalize(self).await
     }
 
-    async fn forget(&self, ino: i64, _nlookup: u64) {
-        if let Err(error) = AgentFS::drain_inode_writes(self, ino).await {
-            tracing::warn!(
-                "AgentFS write batcher forget drain failed for inode {}: {}",
-                ino,
-                error
-            );
-        }
-    }
+    // `forget` deliberately uses the default no-op trait impl: a FORGET only
+    // drops the kernel's reference to the inode. Pending batched writes stay
+    // readable through the Tier-4 overlay and are committed by the batcher
+    // timer/bytes triggers, fsync, or finalize — committing them here issued
+    // one serial SQLite transaction per written file during clone workloads
+    // (the kernel FORGETs each file shortly after our post-write entry
+    // invalidation).
 }
 
 #[cfg(test)]
