@@ -55,10 +55,18 @@ pub const FUSE_KERNEL_MINOR_VERSION: u32 = 29;
 pub const FUSE_KERNEL_MINOR_VERSION: u32 = 30;
 #[cfg(all(feature = "abi-7-31", not(feature = "abi-7-36")))]
 pub const FUSE_KERNEL_MINOR_VERSION: u32 = 31;
-#[cfg(all(feature = "abi-7-36", not(feature = "abi-7-40")))]
+#[cfg(all(
+    feature = "abi-7-36",
+    not(feature = "abi-7-40"),
+    not(feature = "abi-7-41")
+))]
 pub const FUSE_KERNEL_MINOR_VERSION: u32 = 36;
-#[cfg(feature = "abi-7-40")]
+#[cfg(all(feature = "abi-7-40", not(feature = "abi-7-41")))]
 pub const FUSE_KERNEL_MINOR_VERSION: u32 = 40;
+#[cfg(all(feature = "abi-7-41", not(feature = "abi-7-42")))]
+pub const FUSE_KERNEL_MINOR_VERSION: u32 = 41;
+#[cfg(feature = "abi-7-42")]
+pub const FUSE_KERNEL_MINOR_VERSION: u32 = 42;
 
 pub const FUSE_ROOT_ID: u64 = 1;
 
@@ -179,6 +187,8 @@ pub mod consts {
     pub const FUSE_EXPLICIT_INVAL_DATA: u64 = 1 << 25; // only invalidate cached pages on explicit request
     pub const FUSE_INIT_EXT: u64 = 1 << 30; // extended fuse_init_in request
     pub const FUSE_INIT_RESERVED: u64 = 1 << 31; // reserved, do not use
+    #[cfg(feature = "abi-7-42")]
+    pub const FUSE_OVER_IO_URING: u64 = 1 << 41; // client supports fuse-over-io-uring
 
     // CUSE init request/reply flags
     pub const CUSE_UNRESTRICTED_IOCTL: u32 = 1 << 0; // use unrestricted ioctl
@@ -998,4 +1008,56 @@ pub struct fuse_copy_file_range_in {
     pub off_out: i64,
     pub len: u64,
     pub flags: u64,
+}
+
+// FUSE-over-io-uring (ABI 7.42). Mirrors the uapi in <linux/fuse.h>. The header
+// (in_out + op_in + ring_ent_in_out) lives in a page-aligned per-entry buffer
+// the kernel reads requests into / we write replies into; the variable payload
+// lives in a separate per-entry buffer. See cli/src/fuser/uring.rs.
+#[cfg(feature = "abi-7-42")]
+pub const FUSE_URING_IN_OUT_HEADER_SZ: usize = 128;
+#[cfg(feature = "abi-7-42")]
+pub const FUSE_URING_OP_IN_OUT_SZ: usize = 128;
+
+// Subcommands carried in the SQE cmd_op field.
+#[cfg(feature = "abi-7-42")]
+pub const FUSE_IO_URING_CMD_REGISTER: u32 = 1;
+#[cfg(feature = "abi-7-42")]
+pub const FUSE_IO_URING_CMD_COMMIT_AND_FETCH: u32 = 2;
+
+#[cfg(feature = "abi-7-42")]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
+pub struct fuse_uring_ent_in_out {
+    pub flags: u64,
+    /// commit ID to be used in a reply to a ring request
+    pub commit_id: u64,
+    /// size of user payload buffer
+    pub payload_sz: u32,
+    pub padding: u32,
+    pub reserved: u64,
+}
+
+#[cfg(feature = "abi-7-42")]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
+pub struct fuse_uring_req_header {
+    /// struct fuse_in_header / struct fuse_out_header
+    pub in_out: [u8; FUSE_URING_IN_OUT_HEADER_SZ],
+    /// per-opcode header
+    pub op_in: [u8; FUSE_URING_OP_IN_OUT_SZ],
+    pub ring_ent_in_out: fuse_uring_ent_in_out,
+}
+
+/// In the 80B command area of the SQE.
+#[cfg(feature = "abi-7-42")]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
+pub struct fuse_uring_cmd_req {
+    pub flags: u64,
+    /// entry identifier for commits
+    pub commit_id: u64,
+    /// queue the command is for (queue index)
+    pub qid: u16,
+    pub padding: [u8; 6],
 }

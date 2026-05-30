@@ -50,3 +50,38 @@ User comment: none
 **Fix**: moved the cache checks ahead of `get_connection` in both methods (same caches, same invalidation semantics the code already trusts — provably equivalent correctness, just no connection on a hit): negative-dentry hit → `Ok(None)` connection-free; dentry+attr hit → cached stats + in-memory pending merge connection-free; attr-cache hit in getattr → connection-free.
 **Measured (deterministic counters, reliable under host load)**: clone `connection_wait_count` 63,733 → 31,505 (**-50.6%**); total acquisitions -47.5%; `lookup_count`/`getattr_count` unchanged (same logical work). 161/161 SDK tests pass; mutation harness 20/20 (base untouched, remount reproduces all). Profile saved: `clone-profile-fastpath.json`.
 **Note**: wall-time benefit not validated this session (host loaded); the counter reduction is the trustworthy signal. Next: io_uring transport spike (PB).
+
+## 2026-05-29 — PB feasibility research: FUSE-over-io_uring (BLOCKER found before coding)
+**Status**: research complete, implementation NOT started — surfaced a hard prerequisite.
+
+### Confirmed feasible
+- Kernel: CONFIG_FUSE_IO_URING=y; `/sys/module/fuse/parameters/enable_uring` flipped to `Y` (user ran sudo). Runtime-only, resets on reboot.
+- Protocol (authoritative: libfuse `lib/fuse_uring.c` + kernel docs/fuse-io-uring.html):
+  - INIT stays on /dev/fuse; negotiate FUSE_OVER_IO_URING (bit 41, in init flags2).
+  - One ring per CPU core (qid = core). Each queue: N entries; per entry a page-aligned `fuse_uring_req_header` (in_out[128] + op_in[128] + ring_ent_in_out{flags,commit_id,payload_sz}) + an op_payload buffer (= bufsize - header).
+  - REGISTER: IORING_OP_URING_CMD, SQE128, cmd_op=1, 80B cmd = fuse_uring_cmd_req{flags,commit_id=0,qid}; sqe.addr = &iov[2]{header,payload}, sqe.len=2.
+  - On CQE: parse fuse_in_header from header.in_out, op_in = fixed op struct, op_payload[0..payload_sz] = variable data, save ent_in_out.commit_id.
+  - COMMIT_AND_FETCH: write out_header into header.in_out, reply payload into op_payload, set payload_sz, cmd_op=2, 80B cmd carries commit_id; submit. Deferred submit during cqe processing = natural batch.
+- io-uring crate v0.7.12 usable: `opcode::UringCmd80` builds an `Entry128` (SQE128) with fd (types::Fd, no fixed-file needed), cmd_op, 80B cmd. GAP: UringCmd80 does NOT set sqe.addr/len (needed for REGISTER). Fix: both Entry/Entry128 are #[repr(C)] over the stable-ABI kernel SQE, so view `&mut Entry128` as `&mut [u8;128]` and patch addr@16 (u64) + len@24 (u32). Offsets verified via offsetof on this kernel (sqe=64B, addr=16, len=24, user_data=32).
+- Request reconstruction is opcode-agnostic: contiguous = in_out[0..40] ++ op_in[0..fixed] ++ op_payload[0..payload_sz], where fixed = fuse_in_header.len - 40 - payload_sz. Feed to existing AlignedRequestBuf::copy_from + Request::new.
+- Integration approach: `Request` holds `ChannelSender` concretely (not generic ReplySender), so make `ChannelSender` an enum {Classic(Arc<File>), Uring(handle)}; only `send()` branches (writev vs COMMIT_AND_FETCH). Dispatch inline on each ring thread (matches libfuse per-core model). Notifications/interrupts stay on classic /dev/fuse path. Teardown via per-queue eventfd poll SQE.
+
+### BLOCKER — io_uring requires an 11-version ABI uplift first
+- Current build caps the vendored FUSE ABI at **7.31** (`fuse-modern` feature enables abi-7-19..abi-7-31). `FUSE_KERNEL_MINOR_VERSION` is per-abi-feature; highest enabled = 31, so the daemon negotiates 7.31.
+- FUSE_OVER_IO_URING lives in init **flags2**, which is only emitted/read under `abi-7-36`. The code HAS `cfg(feature="abi-7-36")` / `abi-7-40` branches, but those features are **not defined** in Cargo.toml -> dead branches -> flags2 is never sent today.
+- To negotiate uring: define + enable abi-7-32 .. abi-7-42, add FUSE_KERNEL_MINOR_VERSION constants for each, ensure every conditionally-compiled struct field (7.32–7.42) exists in the vendored abi, and confirm the dispatcher safely handles/ENOSYS-es opcodes 48+ (SETUPMAPPING/REMOVEMAPPING/SYNCFS/TMPFILE/STATX). Bumping the negotiated minor version changes kernel behavior broadly (new opcodes gated behind caps), so it must be verified independently (mutation harness + cli tests) before layering uring on top.
+
+### Honest cost estimate (revised up from the spec's "1-day spike")
+- (a) ABI 7.31 -> 7.42 uplift: contained but real; ~1 testable PR. Risk: ABI struct/layout mismatch = catastrophic mount corruption, so must be harness-verified.
+- (b) io_uring transport: ~500-700 LOC unsafe (per-core ring threads, entry buffers, REGISTER, CQE parse, ChannelSender enum, COMMIT_AND_FETCH, eventfd teardown, INIT negotiation, Session wiring).
+- Perf payoff UNMEASURABLE under current host load; a spike's GO/NO-GO needs a quiet host.
+- Recommendation: do (a) as its own harness-verified commit first; then (b). Do not blind-bump ABI + add unsafe transport in one unverifiable step.
+
+## 2026-05-29 — PB.1 DONE: vendored FUSE ABI uplift 7.31 -> 7.42 (harness-verified)
+**Decision**: user chose "staged" — land the ABI uplift as its own verified commit before the io_uring transport.
+**Changes**:
+- cli/Cargo.toml: define abi-7-36/40/41/42 features; `fuse-modern` now enables abi-7-36, abi-7-41, abi-7-42. Deliberately NOT abi-7-40 (it pulls in unfinished FUSE_PASSTHROUGH scaffolding: FOPEN_PASSTHROUGH / BackingId / open_backing / max_stack_depth). abi-7-41=["abi-7-36"], abi-7-42=["abi-7-41"].
+- fuse_abi.rs: version ladder advertises minor 42 on the 7.36 init layout (the 7.36 fuse_init_out is already a kernel-compatible 64 bytes — trailing reserved[7] = kernel max_stack_depth+request_timeout+unused, written as zero). Added FUSE_OVER_IO_URING (1<<41) + the 3 uring uapi structs (fuse_uring_ent_in_out / fuse_uring_req_header / fuse_uring_cmd_req) + cmd consts + header sizes, all gated abi-7-42 (for the upcoming transport).
+**Safety basis**: AnyRequest::try_from validates only the fuse_in_header, not the opcode; unknown opcodes (kernel may now send 48+) surface as ENOSYS in operation(), not a session kill. New caps are only sent by the kernel when we request them (config.requested), which we don't for unsupported features.
+**Verification**: `INIT response: ABI 7.42` confirmed against kernel ABI 7.45 (debug log); kernel caps 0x7ff73fffffb include bit 41 (FUSE_OVER_IO_URING). 161 SDK + 107 CLI tests, clippy, fmt all green; mutation harness 20/20 (base untouched, remount reproduces); git clone+reads+edits workload rc=0 over the mount.
+**Next (PB.2)**: io-uring dep + ChannelSender enum + uring.rs transport + add FUSE_OVER_IO_URING to config.requested when AGENTFS_FUSE_TRANSPORT=uring.

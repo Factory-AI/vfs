@@ -44,6 +44,9 @@ fuse-modern = [
     "abi-7-29",
     "abi-7-30",
     "abi-7-31",
+    "abi-7-36",
+    "abi-7-41",
+    "abi-7-42",
 ]
 abi-7-19 = []
 abi-7-20 = []
@@ -58,6 +61,18 @@ abi-7-28 = []
 abi-7-29 = []
 abi-7-30 = []
 abi-7-31 = []
+# ABI 7.36-7.42 uplift. The vendored fuser carries a distinct init-struct delta
+# only at 7.36 (adds flags2). 7.40 additionally pulls in FUSE_PASSTHROUGH
+# scaffolding (FOPEN_PASSTHROUGH / BackingId / open_backing) that is not
+# implemented here, so it is intentionally NOT enabled. 7.41/7.42 add no
+# init-struct fields — 7.42 only adds the FUSE_OVER_IO_URING capability bit — and
+# the 7.36 fuse_init_out is already a kernel-compatible 64 bytes (the trailing
+# reserved[7] covers max_stack_depth + request_timeout + unused), so minor 42 is
+# advertised on the 7.36 layout, skipping 7.40's passthrough.
+abi-7-36 = []
+abi-7-40 = ["abi-7-36"]
+abi-7-41 = ["abi-7-36"]
+abi-7-42 = ["abi-7-41"]
 
 [dependencies]
 agentfs-sdk = { path = "../sdk/rust" }
