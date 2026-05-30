@@ -85,6 +85,7 @@ dependencies = [
  "clap_complete",
  "dirs",
  "filetime",
+ "io-uring",
  "libc",
  "log",
  "memchr",

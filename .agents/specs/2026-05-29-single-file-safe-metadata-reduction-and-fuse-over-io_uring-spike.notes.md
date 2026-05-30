@@ -85,3 +85,18 @@ User comment: none
 **Safety basis**: AnyRequest::try_from validates only the fuse_in_header, not the opcode; unknown opcodes (kernel may now send 48+) surface as ENOSYS in operation(), not a session kill. New caps are only sent by the kernel when we request them (config.requested), which we don't for unsupported features.
 **Verification**: `INIT response: ABI 7.42` confirmed against kernel ABI 7.45 (debug log); kernel caps 0x7ff73fffffb include bit 41 (FUSE_OVER_IO_URING). 161 SDK + 107 CLI tests, clippy, fmt all green; mutation harness 20/20 (base untouched, remount reproduces); git clone+reads+edits workload rc=0 over the mount.
 **Next (PB.2)**: io-uring dep + ChannelSender enum + uring.rs transport + add FUSE_OVER_IO_URING to config.requested when AGENTFS_FUSE_TRANSPORT=uring.
+
+## 2026-05-29 — PB.2/PB.3 DONE: working FUSE-over-io_uring transport (opt-in, correctness-verified)
+**Result**: a functional FUSE-over-io_uring transport landed and verified end-to-end. Opt-in via `AGENTFS_FUSE_TRANSPORT=uring`; default stays classic /dev/fuse.
+**Files**:
+- cli/Cargo.toml: `io-uring = "0.7"`.
+- cli/src/fuser/channel.rs: `ChannelSender` is now an enum {Classic{device}, Uring(UringReplySender)}; `notify_sender()` always yields a classic sender (notifications never traverse the ring); `UringReplySender::commit_reply` writes the out-header into the entry header buffer (offset 0), concatenates reply payload into the payload buffer, and stamps ring_ent_in_out.payload_sz (offset 272).
+- cli/src/fuser/uring.rs (new, ~430 LOC): one CPU-pinned io_uring per core (nr_queues = _SC_NPROCESSORS_CONF, depth default 2 via AGENTFS_FUSE_URING_DEPTH). Per-entry page-aligned header buf (4096) + payload buf (= max_write). REGISTER via opcode::UringCmd80 (Entry128/SQE128) with addr/len byte-patched to the [header,payload] iovec (UringCmd80 leaves them zero); CQE -> reconstruct classic contiguous request (in_header ++ op_in[0..fixed] ++ payload, fixed = len-40-payload_sz) -> Request::new + dispatch inline -> COMMIT_AND_FETCH (commit_id in 80B cmd) re-arms the entry. Teardown: AtomicBool + submit_with_args timeout (200ms) so threads exit on UringRuntime drop.
+- session.rs: SessionShared gains uring_negotiated/uring_max_write; `run_uring()` keeps the classic serial /dev/fuse loop (FORGET/interrupts/INIT stay there — libfuse's fuse_reply_none does not commit, confirming reply-less ops are not ring-delivered) and starts the per-core queues immediately after INIT negotiates the cap.
+- request.rs: INIT adds FUSE_OVER_IO_URING to config.requested when requested AND kernel-advertised, caps max_write to 1 MiB, records negotiation.
+**Verification (correctness only; perf deferred)**:
+- Smoke mount: `FUSE-over-io_uring negotiated`, INIT reply flags 0x20001852021 (bit 41 set), `nr_queues=14 depth=2`, reads + ls served over the ring.
+- Mutation harness 20/20 with AGENTFS_FUSE_TRANSPORT=uring (writes/mkdir/rename/symlink/unlink over the ring; base untouched; remount reproduces).
+- git clone+reads+edits over uring: correctness_passed=True, agentfs_base_unchanged=True, integrity require-portable=True. performance_passed=False (expected: loaded host + un-tuned spike).
+- Default classic path: mutation harness 20/20 (no regression from the ChannelSender enum). 161 SDK + 107 CLI tests, clippy, fmt green.
+**Known spike limits / next**: depth=2 + inline per-queue dispatch (a slow op blocks its core's queue); no eventfd wakeup (200ms timeout poll on teardown only); payload cap 1 MiB (max_write reduced). PERF GO/NO-GO still requires a quiet host (P4): compare clone+reads+edits wall time uring vs classic and check fuse_dispatch_wait / connection counters.
