@@ -478,16 +478,43 @@ impl AgentFSWriteBatcher {
 
         let _commit_guard = self.commit_lock.lock().await;
         loop {
-            let batch = {
-                let mut state = self.state.write();
-                Self::take_inode_locked(&mut state, ino)
+            // Commit-then-remove (see drain_pending_batched): snapshot this
+            // inode's ranges by cloning WITHOUT removing them, so a concurrent
+            // reader never observes a gap where the write is in neither the
+            // overlay nor committed SQLite.
+            let snapshot = {
+                let state = self.state.read();
+                state
+                    .pending
+                    .get(&ino)
+                    .filter(|batch| !batch.ranges.is_empty())
+                    .map(|batch| batch.ranges.clone())
             };
 
-            let Some(batch) = batch else {
+            let Some(ranges) = snapshot else {
+                self.cleanup_empty_pending();
                 return Ok(());
             };
 
-            self.commit_batch(ino, batch, reason).await?;
+            match reason {
+                AgentFSWriteBatchDrainReason::Timer => {
+                    crate::profiling::record_agentfs_batcher_drain_timer();
+                }
+                AgentFSWriteBatchDrainReason::Bytes => {
+                    crate::profiling::record_agentfs_batcher_drain_bytes();
+                }
+                AgentFSWriteBatchDrainReason::Explicit => {
+                    crate::profiling::record_agentfs_batcher_drain_explicit();
+                }
+            }
+
+            // On error the overlay is intact (nothing removed) — retried later.
+            self.commit_inode_ranges(ino, &ranges).await?;
+
+            let need_timer = self.remove_committed_prefix(&[(ino, ranges.len())]);
+            for t in need_timer {
+                self.schedule_timer_after(t, self.batch_ms);
+            }
         }
     }
 
@@ -522,61 +549,52 @@ impl AgentFSWriteBatcher {
     ) -> Result<()> {
         let _commit_guard = self.commit_lock.lock().await;
 
-        let batches: Vec<(i64, PendingInodeWrites)> = {
-            let mut state = self.state.write();
-            let taken = std::mem::take(&mut state.pending)
-                .into_iter()
-                .map(|(ino, mut batch)| {
-                    batch.timer_scheduled = false;
-                    (ino, batch)
-                })
-                .collect();
-            // Took every pending entry; the running total resets to zero.
-            // Any batch we fail to commit is re-added via `restore_batch`,
-            // which restores its contribution.
-            state.total_pending_bytes = 0;
-            state.debug_assert_total();
-            taken
+        // Tier 4 corruption fix (commit-then-remove): SNAPSHOT pending ranges
+        // by cloning, WITHOUT removing them from the overlay. `pread`/`getattr`
+        // consult the overlay and then SQLite with no lock spanning the two; if
+        // we removed the ranges here (as the original `mem::take` did), a read
+        // landing between the take and `txn.commit` would find the write in
+        // NEITHER the overlay nor committed SQLite and return stale data
+        // (the intermittent git-clone corruption). Leaving the overlay
+        // populated until after the commit guarantees every write is always
+        // visible in the overlay OR in SQLite.
+        let snapshot: Vec<(i64, Vec<WriteRange>)> = {
+            let state = self.state.read();
+            state
+                .pending
+                .iter()
+                .filter(|(_, batch)| !batch.ranges.is_empty())
+                .map(|(ino, batch)| (*ino, batch.ranges.clone()))
+                .collect()
         };
 
-        if batches.is_empty() {
+        if snapshot.is_empty() {
+            self.cleanup_empty_pending();
+            let _ = required_ino;
             return Ok(());
         }
 
-        // Filter out empty-ranges entries up front so we don't open a txn for
-        // nothing.
-        let mut to_commit: Vec<(i64, PendingInodeWrites, Vec<NormalizedWriteRange>)> =
-            Vec::with_capacity(batches.len());
-        let mut empty_inos: Vec<i64> = Vec::new();
-        for (ino, batch) in batches {
-            if batch.ranges.is_empty() {
-                empty_inos.push(ino);
-                continue;
-            }
-            let range_refs: Vec<_> = batch
-                .ranges
+        // (ino, committed_raw_range_count, normalized ranges to write)
+        let mut to_commit: Vec<(i64, usize, Vec<NormalizedWriteRange>)> =
+            Vec::with_capacity(snapshot.len());
+        for (ino, ranges) in &snapshot {
+            let range_refs: Vec<_> = ranges
                 .iter()
                 .map(|range| WriteRangeRef {
                     offset: range.offset,
                     data: range.data.as_slice(),
                 })
                 .collect();
-            let normalized = match normalize_write_ranges(&range_refs) {
-                Ok(normalized) => normalized,
-                Err(error) => {
-                    self.restore_batches(to_commit).await;
-                    self.restore_batch(ino, batch).await;
-                    return Err(error);
-                }
-            };
+            // On normalize error the overlay is left intact (nothing removed),
+            // so the ranges are simply retried on the next drain.
+            let normalized = normalize_write_ranges(&range_refs)?;
             if normalized.is_empty() {
-                empty_inos.push(ino);
                 continue;
             }
             crate::profiling::record_agentfs_batcher_coalesced_ranges(
-                batch.ranges.len().saturating_sub(normalized.len()) as u64,
+                ranges.len().saturating_sub(normalized.len()) as u64,
             );
-            to_commit.push((ino, batch, normalized));
+            to_commit.push((*ino, ranges.len(), normalized));
         }
 
         // Per-inode drain accounting (one tick per inode that we actually
@@ -596,9 +614,7 @@ impl AgentFSWriteBatcher {
         }
 
         if to_commit.is_empty() {
-            for ino in empty_inos {
-                self.attr_cache.remove(ino);
-            }
+            self.cleanup_empty_pending();
             // required_ino was satisfied either by a concurrent committer
             // (not in our snapshot) or by being an empty-range entry (no
             // writes to durably persist).
@@ -610,7 +626,7 @@ impl AgentFSWriteBatcher {
         let conn = self.pool.get_connection().await?;
         let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
 
-        for (ino, _batch, normalized) in &to_commit {
+        for (ino, _count, normalized) in &to_commit {
             let normalized_refs: Vec<_> = normalized
                 .iter()
                 .map(|range| WriteRangeRef {
@@ -632,32 +648,32 @@ impl AgentFSWriteBatcher {
                 .await
             {
                 let _ = txn.rollback().await;
-                self.restore_batches(to_commit).await;
+                // Overlay was never modified; ranges remain pending and are
+                // retried on the next drain. No restore needed.
                 return Err(error);
             }
         }
 
         txn.commit().await?;
 
+        // Durable now: drop exactly the committed ranges from the overlay,
+        // preserving anything enqueued during the commit.
+        let committed_counts: Vec<(i64, usize)> = to_commit
+            .iter()
+            .map(|(ino, count, _)| (*ino, *count))
+            .collect();
+        let need_timer = self.remove_committed_prefix(&committed_counts);
         for (ino, _, _) in &to_commit {
             self.attr_cache.remove(*ino);
         }
-        for ino in empty_inos {
-            self.attr_cache.remove(ino);
+        self.cleanup_empty_pending();
+        for ino in need_timer {
+            self.schedule_timer_after(ino, self.batch_ms);
         }
         crate::profiling::record_agentfs_batcher_commit_latency(started.elapsed());
 
         let _ = required_ino;
         Ok(())
-    }
-
-    async fn restore_batches(
-        self: &Arc<Self>,
-        batches: Vec<(i64, PendingInodeWrites, Vec<NormalizedWriteRange>)>,
-    ) {
-        for (ino, batch, _) in batches {
-            self.restore_batch(ino, batch).await;
-        }
     }
 
     async fn drain_due_timer(self: Arc<Self>, ino: i64) -> Result<()> {
@@ -721,84 +737,6 @@ impl AgentFSWriteBatcher {
         });
     }
 
-    fn take_inode_locked(
-        state: &mut AgentFSWriteBatcherState,
-        ino: i64,
-    ) -> Option<PendingInodeWrites> {
-        let taken = state.pending.remove(&ino).map(|mut batch| {
-            batch.timer_scheduled = false;
-            batch
-        });
-        if let Some(batch) = &taken {
-            state.total_pending_bytes = state
-                .total_pending_bytes
-                .saturating_sub(batch.pending_bytes);
-            state.debug_assert_total();
-        }
-        taken
-    }
-
-    async fn restore_batch(self: &Arc<Self>, ino: i64, mut batch: PendingInodeWrites) {
-        let mut schedule_timer = false;
-        {
-            let mut state = self.state.write();
-            if let Some(existing) = state.pending.remove(&ino) {
-                state.total_pending_bytes = state
-                    .total_pending_bytes
-                    .saturating_sub(existing.pending_bytes);
-                batch.pending_bytes = batch.pending_bytes.saturating_add(existing.pending_bytes);
-                batch.last_enqueue = existing.last_enqueue;
-                batch.ranges.extend(existing.ranges);
-                batch.timer_scheduled = existing.timer_scheduled;
-            }
-            if !batch.timer_scheduled {
-                batch.timer_scheduled = true;
-                schedule_timer = true;
-            }
-            state.total_pending_bytes = state
-                .total_pending_bytes
-                .saturating_add(batch.pending_bytes);
-            state.pending.insert(ino, batch);
-            state.debug_assert_total();
-        }
-
-        if schedule_timer {
-            self.schedule_timer_after(ino, self.batch_ms);
-        }
-    }
-
-    async fn commit_batch(
-        self: &Arc<Self>,
-        ino: i64,
-        batch: PendingInodeWrites,
-        reason: AgentFSWriteBatchDrainReason,
-    ) -> Result<()> {
-        if batch.ranges.is_empty() {
-            return Ok(());
-        }
-
-        match reason {
-            AgentFSWriteBatchDrainReason::Timer => {
-                crate::profiling::record_agentfs_batcher_drain_timer();
-            }
-            AgentFSWriteBatchDrainReason::Bytes => {
-                crate::profiling::record_agentfs_batcher_drain_bytes();
-            }
-            AgentFSWriteBatchDrainReason::Explicit => {
-                crate::profiling::record_agentfs_batcher_drain_explicit();
-            }
-        }
-
-        let result = self.commit_inode_ranges(ino, &batch.ranges).await;
-        match result {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                self.restore_batch(ino, batch).await;
-                Err(error)
-            }
-        }
-    }
-
     async fn commit_inode_ranges(&self, ino: i64, ranges: &[WriteRange]) -> Result<()> {
         let range_refs: Vec<_> = ranges
             .iter()
@@ -850,6 +788,70 @@ impl AgentFSWriteBatcher {
                 let _ = txn.rollback().await;
                 Err(error)
             }
+        }
+    }
+
+    /// Tier 4 corruption fix: after a drain has durably committed a snapshot of
+    /// pending ranges to SQLite, drop exactly those ranges from the overlay.
+    /// Snapshots are taken from the front of each inode's append-only `ranges`
+    /// vec, and enqueues only ever append, so the committed ranges are the first
+    /// `count` entries; ranges appended during the commit are preserved. The
+    /// `.min(len)` guard tolerates a concurrent `truncate_pending`/`discard_pending`
+    /// having shrunk or removed the entry. Returns the inodes that still have
+    /// pending ranges and need a (re)scheduled timer drain.
+    fn remove_committed_prefix(&self, committed: &[(i64, usize)]) -> Vec<i64> {
+        let mut need_timer = Vec::new();
+        let mut state = self.state.write();
+        for &(ino, count) in committed {
+            let (removed_bytes, empty, schedule) = {
+                let Some(entry) = state.pending.get_mut(&ino) else {
+                    continue;
+                };
+                let n = count.min(entry.ranges.len());
+                let removed_bytes: usize = entry.ranges.drain(..n).map(|r| r.data.len()).sum();
+                entry.pending_bytes = entry.pending_bytes.saturating_sub(removed_bytes);
+                let empty = entry.ranges.is_empty();
+                let mut schedule = false;
+                if !empty && !entry.timer_scheduled {
+                    entry.timer_scheduled = true;
+                    schedule = true;
+                }
+                (removed_bytes, empty, schedule)
+            };
+            state.total_pending_bytes = state.total_pending_bytes.saturating_sub(removed_bytes);
+            if empty {
+                state.pending.remove(&ino);
+            }
+            if schedule {
+                need_timer.push(ino);
+            }
+        }
+        state.debug_assert_total();
+        need_timer
+    }
+
+    /// Remove pending entries whose range list is empty (left behind after a
+    /// drain consumed all their ranges). Clears their attr cache entry too.
+    fn cleanup_empty_pending(&self) {
+        let removed: Vec<i64> = {
+            let mut state = self.state.write();
+            let empties: Vec<i64> = state
+                .pending
+                .iter()
+                .filter(|(_, b)| b.ranges.is_empty())
+                .map(|(ino, _)| *ino)
+                .collect();
+            for ino in &empties {
+                if let Some(b) = state.pending.remove(ino) {
+                    state.total_pending_bytes =
+                        state.total_pending_bytes.saturating_sub(b.pending_bytes);
+                }
+            }
+            state.debug_assert_total();
+            empties
+        };
+        for ino in removed {
+            self.attr_cache.remove(ino);
         }
     }
 
