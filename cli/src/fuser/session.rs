@@ -83,13 +83,6 @@ pub(crate) struct SessionShared<FS: Filesystem> {
     initialized: AtomicBool,
     /// True if the filesystem was destroyed (destroy operation done).
     destroyed: AtomicBool,
-    /// True once INIT negotiated FUSE_OVER_IO_URING (transport=uring requested
-    /// AND kernel advertised the capability).
-    #[cfg(all(target_os = "linux", feature = "abi-7-42"))]
-    uring_negotiated: AtomicBool,
-    /// Negotiated max_write (== io_uring per-entry payload cap) once uring is on.
-    #[cfg(all(target_os = "linux", feature = "abi-7-42"))]
-    uring_max_write: AtomicU32,
 }
 
 impl<FS: Filesystem> SessionShared<FS> {
@@ -102,27 +95,7 @@ impl<FS: Filesystem> SessionShared<FS> {
             proto_minor: AtomicU32::new(0),
             initialized: AtomicBool::new(false),
             destroyed: AtomicBool::new(false),
-            #[cfg(all(target_os = "linux", feature = "abi-7-42"))]
-            uring_negotiated: AtomicBool::new(false),
-            #[cfg(all(target_os = "linux", feature = "abi-7-42"))]
-            uring_max_write: AtomicU32::new(0),
         }
-    }
-
-    #[cfg(all(target_os = "linux", feature = "abi-7-42"))]
-    pub(crate) fn set_uring_negotiated(&self, max_write: u32) {
-        self.uring_max_write.store(max_write, Ordering::Release);
-        self.uring_negotiated.store(true, Ordering::Release);
-    }
-
-    #[cfg(all(target_os = "linux", feature = "abi-7-42"))]
-    pub(crate) fn uring_negotiated(&self) -> bool {
-        self.uring_negotiated.load(Ordering::Acquire)
-    }
-
-    #[cfg(all(target_os = "linux", feature = "abi-7-42"))]
-    pub(crate) fn uring_max_write(&self) -> u32 {
-        self.uring_max_write.load(Ordering::Acquire)
     }
 
     pub(crate) fn set_proto_version(&self, major: u32, minor: u32) {
@@ -472,18 +445,6 @@ impl<FS: Filesystem> Session<FS> {
             self.notify_tx.as_ref().expect("notify_tx missing").clone(),
         ));
 
-        #[cfg(all(target_os = "linux", feature = "abi-7-42"))]
-        if super::uring::uring_requested() {
-            tracing::info!("resolved FUSE dispatch mode: io_uring (classic /dev/fuse retained for forgets/interrupts)");
-            let result = self.run_uring(deferred.clone());
-            drop(deferred);
-            self.notify_tx.take();
-            if let Err(e) = notify_handle.join() {
-                warn!("notify thread panicked: {e:?}");
-            }
-            return result;
-        }
-
         let dispatch_mode = FuseDispatchMode::from_env();
         let result = match dispatch_mode {
             FuseDispatchMode::Serial => {
@@ -513,46 +474,6 @@ impl<FS: Filesystem> Session<FS> {
             warn!("notify thread panicked: {e:?}");
         }
 
-        result
-    }
-
-    /// Run with the io_uring transport. The classic `/dev/fuse` loop is kept on
-    /// this thread (serial) to handle the requests io_uring does not carry —
-    /// FORGET, interrupts, and the INIT handshake itself. The per-core io_uring
-    /// queues are started immediately after INIT negotiates the capability.
-    #[cfg(all(target_os = "linux", feature = "abi-7-42"))]
-    fn run_uring(&self, deferred: Arc<DeferredNotifier>) -> io::Result<()> {
-        let shared = self.shared.clone();
-        let active_dispatches = AtomicU64::new(0);
-        let device = self.ch.device_arc();
-        let uring_deferred = deferred.clone();
-        let mut runtime: Option<super::uring::UringRuntime> = None;
-
-        agentfs_sdk::profiling::set_fuse_workers_configured(0);
-        let result = self.read_requests(
-            |request| {
-                dispatch_request(shared.as_ref(), &active_dispatches, request);
-                if runtime.is_none() && shared.uring_negotiated() {
-                    let payload_cap = shared.uring_max_write() as usize;
-                    match super::uring::start(
-                        device.clone(),
-                        shared.clone(),
-                        uring_deferred.clone(),
-                        payload_cap,
-                    ) {
-                        Ok(rt) => runtime = Some(rt),
-                        Err(e) => {
-                            warn!("failed to start io_uring transport: {e}");
-                        }
-                    }
-                }
-                Ok(())
-            },
-            deferred,
-        );
-
-        // Drop the runtime first to stop and join ring threads before returning.
-        drop(runtime);
         result
     }
 

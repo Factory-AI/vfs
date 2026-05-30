@@ -120,8 +120,6 @@ page_size = "0.6"
 smallvec = "1.6"
 zerocopy = { version = "0.8", features = ["derive"] }
 nix = { version = "0.29", features = ["fs", "user"] }
-# FUSE-over-io_uring transport (opt-in via AGENTFS_FUSE_TRANSPORT=uring)
-io-uring = "0.7"
 
 # macOS dependencies for NFS functionality (no FUSE - uses nfsserve instead)
 [target.'cfg(target_os = "macos")'.dependencies]

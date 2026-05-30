@@ -141,9 +141,7 @@ impl Request {
     }
 
     pub fn notifier(&self) -> Notifier {
-        // Notifications must never traverse the io_uring reply path; always use a
-        // classic /dev/fuse sender even for requests delivered over io_uring.
-        Notifier::new(self.ch.notify_sender())
+        Notifier::new(self.ch.clone())
     }
 
     pub(crate) fn schedule_class(&self) -> ScheduleClass {
@@ -284,23 +282,6 @@ impl Request {
                     .filesystem
                     .init(self, &mut config)
                     .map_err(Errno::from_i32)?;
-
-                // FUSE-over-io_uring: opt-in, only if the kernel advertised the
-                // capability. Cap max_write to the per-entry payload buffer so
-                // the kernel never sends a write larger than the ring buffer.
-                #[cfg(all(target_os = "linux", feature = "abi-7-42"))]
-                if super::uring::uring_requested()
-                    && config
-                        .add_capabilities(abi::consts::FUSE_OVER_IO_URING)
-                        .is_ok()
-                {
-                    let _ = config.set_max_write(super::uring::uring_max_write());
-                    shared.set_uring_negotiated(config.max_write());
-                    debug!(
-                        "FUSE-over-io_uring negotiated (max_write {})",
-                        config.max_write()
-                    );
-                }
 
                 // Reply with our desired version and settings. If the kernel supports a
                 // larger major version, it'll re-send a matching init message. If it
