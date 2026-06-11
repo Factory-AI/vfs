@@ -66,6 +66,8 @@ pub struct ProfileSnapshot {
     pub fuse_flush_count: u64,
     pub fuse_flush_ranges: u64,
     pub fuse_flush_bytes: u64,
+    pub fuse_noflush_enosys_replies: u64,
+    pub fuse_pending_tail_drains: u64,
     pub fuse_sync_inval_inode_ok: u64,
     pub fuse_sync_inval_inode_err: u64,
     pub fuse_sync_inval_entry_ok: u64,
@@ -212,6 +214,8 @@ pub struct ProfileCounters {
     fuse_flush_count: AtomicU64,
     fuse_flush_ranges: AtomicU64,
     fuse_flush_bytes: AtomicU64,
+    fuse_noflush_enosys_replies: AtomicU64,
+    fuse_pending_tail_drains: AtomicU64,
     fuse_sync_inval_inode_ok: AtomicU64,
     fuse_sync_inval_inode_err: AtomicU64,
     fuse_sync_inval_entry_ok: AtomicU64,
@@ -319,6 +323,8 @@ impl ProfileCounters {
             fuse_flush_count: AtomicU64::new(0),
             fuse_flush_ranges: AtomicU64::new(0),
             fuse_flush_bytes: AtomicU64::new(0),
+            fuse_noflush_enosys_replies: AtomicU64::new(0),
+            fuse_pending_tail_drains: AtomicU64::new(0),
             fuse_sync_inval_inode_ok: AtomicU64::new(0),
             fuse_sync_inval_inode_err: AtomicU64::new(0),
             fuse_sync_inval_entry_ok: AtomicU64::new(0),
@@ -603,6 +609,16 @@ impl ProfileCounters {
         self.fuse_flush_count.fetch_add(1, Ordering::Relaxed);
         self.fuse_flush_ranges.fetch_add(ranges, Ordering::Relaxed);
         self.fuse_flush_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn add_fuse_noflush_enosys_reply(&self) {
+        self.fuse_noflush_enosys_replies
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_fuse_pending_tail_drain(&self) {
+        self.fuse_pending_tail_drains
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     fn add_fuse_sync_inval_inode_ok(&self) {
@@ -915,6 +931,8 @@ impl ProfileCounters {
             fuse_flush_count: self.fuse_flush_count.load(Ordering::Relaxed),
             fuse_flush_ranges: self.fuse_flush_ranges.load(Ordering::Relaxed),
             fuse_flush_bytes: self.fuse_flush_bytes.load(Ordering::Relaxed),
+            fuse_noflush_enosys_replies: self.fuse_noflush_enosys_replies.load(Ordering::Relaxed),
+            fuse_pending_tail_drains: self.fuse_pending_tail_drains.load(Ordering::Relaxed),
             fuse_sync_inval_inode_ok: self.fuse_sync_inval_inode_ok.load(Ordering::Relaxed),
             fuse_sync_inval_inode_err: self.fuse_sync_inval_inode_err.load(Ordering::Relaxed),
             fuse_sync_inval_entry_ok: self.fuse_sync_inval_entry_ok.load(Ordering::Relaxed),
@@ -1297,6 +1315,18 @@ pub fn record_fuse_write(bytes: u64) {
 pub fn record_fuse_flush(ranges: u64, bytes: u64) {
     if is_enabled() {
         COUNTERS.add_fuse_flush(ranges, bytes);
+    }
+}
+
+pub fn record_fuse_noflush_enosys_reply() {
+    if is_enabled() {
+        COUNTERS.add_fuse_noflush_enosys_reply();
+    }
+}
+
+pub fn record_fuse_pending_tail_drain() {
+    if is_enabled() {
+        COUNTERS.add_fuse_pending_tail_drain();
     }
 }
 

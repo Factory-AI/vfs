@@ -19,7 +19,7 @@ use std::{
     ffi::OsStr,
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -619,6 +619,22 @@ struct AgentFSFuse {
     /// and finalize-on-unmount. Set `AGENTFS_DRAIN_ON_FORGET=1` to restore
     /// the legacy commit-on-forget.
     drain_on_forget: bool,
+    /// When true (default), the first FLUSH performs its normal drain work
+    /// and then replies ENOSYS, latching the kernel's connection-wide
+    /// `no_flush` so every later close() skips the FLUSH round trip entirely
+    /// (the kernel still pushes dirty writeback pages synchronously at close
+    /// via `write_inode_now` before checking `no_flush`; buffered tails are
+    /// picked up by the async RELEASE and the pending-tail drains on
+    /// attr-bearing paths). Halves the per-open/close round trips: measured
+    /// 61.7us -> 31.2us per open/read/close cycle. Forced off when
+    /// `drain_on_release` is set: legacy commit-on-close needs the FLUSH.
+    /// Set `AGENTFS_FUSE_NOFLUSH=0` to restore close-time FLUSH replies.
+    noflush: bool,
+    /// Number of open handles whose pending `WriteBuffer` is nonempty.
+    /// Attr-bearing read paths that must observe buffered tails (lookup,
+    /// readdirplus) check this before scanning `open_files`, keeping the hot
+    /// no-writes-in-flight case at a single atomic load.
+    pending_dirty_handles: AtomicUsize,
     /// Emits a profiling summary when the FUSE session object is dropped.
     _profile_report: Arc<agentfs_sdk::profiling::ProfileReportGuard>,
     /// Whether FUSE writeback mode is enabled for this mount.
@@ -775,6 +791,28 @@ impl Filesystem for AgentFSFuse {
 
         match result {
             Ok(Some(stats)) => {
+                let stats = match self.drain_pending_tail_for_attrs(stats.ino as u64) {
+                    Ok(false) => stats,
+                    Ok(true) => {
+                        let fs = self.fs.clone();
+                        let tail_ino = stats.ino;
+                        match self
+                            .runtime
+                            .block_on(async move { fs.getattr(tail_ino).await })
+                        {
+                            Ok(Some(fresh)) => fresh,
+                            Ok(None) => stats,
+                            Err(e) => {
+                                reply.error(error_to_errno(&e));
+                                return;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        reply.error(error_to_errno(&e));
+                        return;
+                    }
+                };
                 if stable {
                     self.cache_entry(parent, name_str, &stats);
                 }
@@ -931,11 +969,11 @@ impl Filesystem for AgentFSFuse {
         // mtime/ctime that writeback SETATTR just recorded, the group commit
         // re-stamps the times, and git's stat cache no longer matches the
         // filesystem (measured as a ~4,700-file re-read storm in checkout).
-        if mutated {
-            if let Err(e) = self.flush_pending_inode(ino) {
-                reply.error(error_to_errno(&e));
-                return;
-            }
+        // Non-mutating SETATTRs reply attrs too, so they drain as well (the
+        // reply must not carry a size that misses a buffered tail).
+        if let Err(e) = self.flush_pending_inode(ino) {
+            reply.error(error_to_errno(&e));
+            return;
         }
 
         // Handle chmod
@@ -1400,6 +1438,13 @@ impl Filesystem for AgentFSFuse {
             return;
         };
 
+        // The entry reply carries this inode's attrs; drain any buffered
+        // write tail first so the kernel doesn't cache a stale size.
+        if let Err(e) = self.drain_pending_tail_for_attrs(ino) {
+            reply.error(error_to_errno(&e));
+            return;
+        }
+
         let fs = self.fs.clone();
         let name_owned = name_str.to_string();
         let result = self
@@ -1709,9 +1754,21 @@ impl Filesystem for AgentFSFuse {
                     reply.error(libc::EBADF);
                     return;
                 };
+                let was_empty = open_file.pending.is_empty();
                 match open_file.buffer_fuse_write(offset as u64, data) {
-                    Ok(true) => open_file.take_pending(),
-                    Ok(false) => None,
+                    Ok(true) => {
+                        let drain = open_file.take_pending();
+                        if !was_empty {
+                            self.pending_dirty_handles.fetch_sub(1, Ordering::Release);
+                        }
+                        drain
+                    }
+                    Ok(false) => {
+                        if was_empty && !open_file.pending.is_empty() {
+                            self.pending_dirty_handles.fetch_add(1, Ordering::Release);
+                        }
+                        None
+                    }
                     Err(errno) => {
                         reply.error(errno);
                         return;
@@ -1772,7 +1829,11 @@ impl Filesystem for AgentFSFuse {
                 reply.error(libc::EBADF);
                 return;
             };
-            (open_file.take_pending(), open_file.file.clone())
+            let drain = open_file.take_pending();
+            if drain.is_some() {
+                self.pending_dirty_handles.fetch_sub(1, Ordering::Release);
+            }
+            (drain, open_file.file.clone())
         };
         let drain_on_release = self.drain_on_release;
         let had_pending_writes = drain.is_some();
@@ -1805,7 +1866,21 @@ impl Filesystem for AgentFSFuse {
                 } else {
                     audit.discard_no_mutation();
                 }
-                reply.ok();
+                if self.noflush {
+                    // The drain work above succeeded; replying ENOSYS now
+                    // latches the kernel's connection-wide `no_flush`, so
+                    // every later close() skips this round trip. Dirty
+                    // writeback pages still arrive synchronously at close
+                    // (the kernel runs `write_inode_now` before checking
+                    // `no_flush`); the buffered tail is picked up by RELEASE
+                    // or the pending-tail guards on attr-bearing paths. On
+                    // drain errors the real errno is replied instead, which
+                    // leaves FLUSH enabled and close() still reporting them.
+                    agentfs_sdk::profiling::record_fuse_noflush_enosys_reply();
+                    reply.error(libc::ENOSYS);
+                } else {
+                    reply.ok();
+                }
             }
             Err(e) => reply.error(error_to_errno(&e)),
         }
@@ -1865,7 +1940,11 @@ impl Filesystem for AgentFSFuse {
                 reply.error(libc::EBADF);
                 return;
             };
-            (open_file.take_pending(), open_file.file.clone())
+            let drain = open_file.take_pending();
+            if drain.is_some() {
+                self.pending_dirty_handles.fetch_sub(1, Ordering::Release);
+            }
+            (drain, open_file.file.clone())
         };
         let drain_on_release = self.drain_on_release;
         let result = (|| -> Result<(), SdkError> {
@@ -2030,6 +2109,10 @@ impl AgentFSFuse {
                     drains.push(drain);
                 }
             }
+            if !drains.is_empty() {
+                self.pending_dirty_handles
+                    .fetch_sub(drains.len(), Ordering::Release);
+            }
             drains
         };
         for drain in drains {
@@ -2047,6 +2130,10 @@ impl AgentFSFuse {
                 if let Some(drain) = open_file.take_pending() {
                     drains.push(drain);
                 }
+            }
+            if !drains.is_empty() {
+                self.pending_dirty_handles
+                    .fetch_sub(drains.len(), Ordering::Release);
             }
             drains
         };
@@ -2089,6 +2176,23 @@ impl AgentFSFuse {
             .lock()
             .values()
             .any(|open_file| open_file.ino == ino && !open_file.pending.is_empty())
+    }
+
+    /// Drains buffered write tails for `ino` before an attr-bearing reply
+    /// (lookup/readdirplus). A closed-but-unreleased handle (async RELEASE
+    /// still in flight) or an open handle mid-coalesce holds bytes the SDK
+    /// hasn't seen; replying SDK attrs would let the kernel cache a stale
+    /// size for the full attr TTL. Costs one atomic load when nothing is
+    /// buffered anywhere. Returns whether a drain happened.
+    fn drain_pending_tail_for_attrs(&self, ino: u64) -> Result<bool, SdkError> {
+        if self.pending_dirty_handles.load(Ordering::Acquire) == 0
+            || !self.has_pending_write_for_inode(ino)
+        {
+            return Ok(false);
+        }
+        self.flush_pending_inode(ino)?;
+        agentfs_sdk::profiling::record_fuse_pending_tail_drain();
+        Ok(true)
     }
 
     fn keepcache_allows(&self, ino: u64, fingerprint: &KeepCacheFingerprint) -> bool {
@@ -2361,6 +2465,46 @@ impl AgentFSFuse {
             Err(e) => return Err(e),
         };
 
+        // Buffered-tail coherence: any entry whose inode still has per-fh
+        // buffered writes (closed handle awaiting async RELEASE, or an open
+        // handle mid-coalesce) would reply a stale size that the kernel and
+        // the adapter entry caches then hold for the full TTL. Drain the
+        // affected inodes and refetch once.
+        let entries = if self.pending_dirty_handles.load(Ordering::Acquire) > 0 {
+            let affected: HashSet<u64> = {
+                let open_files = self.open_files.lock();
+                let pending: HashSet<u64> = open_files
+                    .values()
+                    .filter(|open_file| !open_file.pending.is_empty())
+                    .map(|open_file| open_file.ino)
+                    .collect();
+                entries
+                    .iter()
+                    .map(|entry| entry.stats.ino as u64)
+                    .filter(|entry_ino| pending.contains(entry_ino))
+                    .collect()
+            };
+            if affected.is_empty() {
+                entries
+            } else {
+                for tail_ino in affected {
+                    self.flush_pending_inode(tail_ino)?;
+                    agentfs_sdk::profiling::record_fuse_pending_tail_drain();
+                }
+                let fs = self.fs.clone();
+                match self
+                    .runtime
+                    .block_on(async move { fs.readdir_plus(ino as i64).await })
+                {
+                    Ok(Some(fresh)) => fresh,
+                    Ok(None) => return Err(FsError::NotFound.into()),
+                    Err(e) => return Err(e),
+                }
+            }
+        } else {
+            entries
+        };
+
         let dir_stats = self
             .cached_attr(ino)?
             .ok_or_else(|| SdkError::from(FsError::NotFound))?;
@@ -2401,6 +2545,12 @@ impl AgentFSFuse {
         let drain_on_release = fuse_drain_on_release_from_env();
         let drain_on_forget = fuse_drain_on_forget_from_env();
         let flush_inval_always = env_flag_default("AGENTFS_FUSE_FLUSH_INVAL", false);
+        let noflush = env_flag_default("AGENTFS_FUSE_NOFLUSH", true) && !drain_on_release;
+        if noflush != env_flag_default("AGENTFS_FUSE_NOFLUSH", true) {
+            tracing::warn!(
+                "AGENTFS_FUSE_NOFLUSH disabled: AGENTFS_DRAIN_ON_RELEASE needs the close-time FLUSH"
+            );
+        }
         let cache_config = FuseKernelCacheConfig::from_env();
         cache_config.record_profile();
         let cache_dir_enabled =
@@ -2426,6 +2576,8 @@ impl AgentFSFuse {
             drain_on_release,
             drain_on_forget,
             flush_inval_always,
+            noflush,
+            pending_dirty_handles: AtomicUsize::new(0),
             cache_dir_enabled,
             _profile_report: Arc::new(agentfs_sdk::profiling::ProfileReportGuard::new(
                 "fuse_session",
