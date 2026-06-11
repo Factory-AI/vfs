@@ -58,6 +58,7 @@ pub struct ProfileSnapshot {
     pub fuse_readdir_count: u64,
     pub fuse_readdir_plus_count: u64,
     pub fuse_open_count: u64,
+    pub fuse_uring_requests: u64,
     pub fuse_read_count: u64,
     pub fuse_release_count: u64,
     pub fuse_write_count: u64,
@@ -203,6 +204,7 @@ pub struct ProfileCounters {
     fuse_readdir_count: AtomicU64,
     fuse_readdir_plus_count: AtomicU64,
     fuse_open_count: AtomicU64,
+    fuse_uring_requests: AtomicU64,
     fuse_read_count: AtomicU64,
     fuse_release_count: AtomicU64,
     fuse_write_count: AtomicU64,
@@ -309,6 +311,7 @@ impl ProfileCounters {
             fuse_readdir_count: AtomicU64::new(0),
             fuse_readdir_plus_count: AtomicU64::new(0),
             fuse_open_count: AtomicU64::new(0),
+            fuse_uring_requests: AtomicU64::new(0),
             fuse_read_count: AtomicU64::new(0),
             fuse_release_count: AtomicU64::new(0),
             fuse_write_count: AtomicU64::new(0),
@@ -574,6 +577,10 @@ impl ProfileCounters {
     fn add_fuse_open(&self) {
         self.add_fuse_callback();
         self.fuse_open_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_fuse_uring_request(&self) {
+        self.fuse_uring_requests.fetch_add(1, Ordering::Relaxed);
     }
 
     fn add_fuse_read(&self) {
@@ -900,6 +907,7 @@ impl ProfileCounters {
             fuse_readdir_count: self.fuse_readdir_count.load(Ordering::Relaxed),
             fuse_readdir_plus_count: self.fuse_readdir_plus_count.load(Ordering::Relaxed),
             fuse_open_count: self.fuse_open_count.load(Ordering::Relaxed),
+            fuse_uring_requests: self.fuse_uring_requests.load(Ordering::Relaxed),
             fuse_read_count: self.fuse_read_count.load(Ordering::Relaxed),
             fuse_release_count: self.fuse_release_count.load(Ordering::Relaxed),
             fuse_write_count: self.fuse_write_count.load(Ordering::Relaxed),
@@ -1258,6 +1266,13 @@ pub fn record_fuse_readdir_plus() {
 pub fn record_fuse_open() {
     if is_enabled() {
         COUNTERS.add_fuse_open();
+    }
+}
+
+/// Count a FUSE request delivered via the fuse-over-io_uring transport.
+pub fn record_fuse_uring_request() {
+    if is_enabled() {
+        COUNTERS.add_fuse_uring_request();
     }
 }
 

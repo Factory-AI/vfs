@@ -1,8 +1,8 @@
 use crate::fuser::{
     consts::{
         FOPEN_CACHE_DIR, FOPEN_KEEP_CACHE, FUSE_ASYNC_READ, FUSE_CACHE_SYMLINKS,
-        FUSE_DO_READDIRPLUS, FUSE_NO_OPENDIR_SUPPORT, FUSE_PARALLEL_DIROPS, FUSE_READDIRPLUS_AUTO,
-        FUSE_WRITEBACK_CACHE,
+        FUSE_DO_READDIRPLUS, FUSE_NO_OPENDIR_SUPPORT, FUSE_OVER_IO_URING, FUSE_PARALLEL_DIROPS,
+        FUSE_READDIRPLUS_AUTO, FUSE_WRITEBACK_CACHE,
     },
     fuse_forget_one, FileAttr, FileType, Filesystem, KernelConfig, MountOption, ReplyAttr,
     ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen,
@@ -650,6 +650,25 @@ impl Filesystem for AgentFSFuse {
             capabilities |= FUSE_NO_OPENDIR_SUPPORT;
         }
         let _ = config.add_capabilities(capabilities);
+        // Opt-in fuse-over-io_uring (AGENTFS_FUSE_URING=1): only advertise
+        // when the kernel offered it and ring setup works, since the kernel
+        // stalls requests after INIT until the ring queues register. The
+        // max_write clamp keeps per-entry ring payload buffers at 1 MiB
+        // (the kernel caps single WRITEs at max_pages = 256 pages anyway,
+        // so >1 MiB writes never materialize on Linux).
+        if crate::fuser::uring::uring_enabled() {
+            if crate::fuser::uring::probe_ring_setup()
+                && config.add_capabilities(FUSE_OVER_IO_URING).is_ok()
+            {
+                let _ = config.set_max_write(crate::fuser::uring::URING_MAX_WRITE);
+                let _ = config.set_max_readahead(crate::fuser::uring::URING_MAX_WRITE);
+                tracing::info!("advertising FUSE_OVER_IO_URING (AGENTFS_FUSE_URING=1)");
+            } else {
+                tracing::warn!(
+                    "AGENTFS_FUSE_URING=1 but kernel/ring support missing; using legacy channel"
+                );
+            }
+        }
         configure_writeback_cache(config, self.cache_config.writeback_cache_enabled);
         configure_readdirplus(config, self.cache_config.readdirplus_mode);
         Ok(())

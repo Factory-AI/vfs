@@ -161,7 +161,7 @@ impl Request {
     }
 
     pub fn notifier(&self) -> Notifier {
-        Notifier::new(self.ch.clone())
+        Notifier::new(self.ch.for_notify())
     }
 
     pub(crate) fn schedule_class(&self) -> ScheduleClass {
@@ -669,7 +669,7 @@ impl Request {
                 );
             }
             ll::Operation::Poll(x) => {
-                let ph = PollHandle::new(self.ch.clone(), x.kernel_handle());
+                let ph = PollHandle::new(self.ch.for_notify(), x.kernel_handle());
 
                 shared.filesystem.poll(
                     self,

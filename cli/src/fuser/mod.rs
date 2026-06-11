@@ -62,6 +62,8 @@ mod reply;
 #[allow(unused_imports, unexpected_cfgs)]
 mod request;
 mod session;
+#[cfg(target_os = "linux")]
+pub(crate) mod uring;
 
 /// We generally support async reads (Linux)
 const INIT_FLAGS: u64 = FUSE_ASYNC_READ | FUSE_BIG_WRITES;

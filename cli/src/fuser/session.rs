@@ -445,6 +445,18 @@ impl<FS: Filesystem> Session<FS> {
             self.notify_tx.as_ref().expect("notify_tx missing").clone(),
         ));
 
+        // Optional fuse-over-io_uring transport: per-CPU ring queues serve
+        // regular requests; this legacy loop keeps running for INIT, FORGET,
+        // INTERRUPT and as fallback when the kernel rejects ring setup.
+        #[cfg(target_os = "linux")]
+        if super::uring::uring_enabled() {
+            super::uring::start_uring_queues(
+                self.shared.clone(),
+                deferred.clone(),
+                self.ch.device(),
+            );
+        }
+
         let dispatch_mode = FuseDispatchMode::from_env();
         let result = match dispatch_mode {
             FuseDispatchMode::Serial => {
