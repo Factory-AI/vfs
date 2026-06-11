@@ -72,7 +72,21 @@ fn maximize_fd_limit() {
     }
 }
 
-const DEFAULT_FUSE_TTL_MS: u64 = 1000;
+/// Default kernel TTLs for positive dentries and attributes. 10s lets a whole
+/// git-style workload (clone ≈3s + status/diff/fsck) reuse the dentries and
+/// attrs established by mutation replies instead of re-LOOKUP/GETATTR storms
+/// (warm steady-state reads measured 12.7x native at the old 1s default).
+/// Within one mount the kernel is coherent for its own operations regardless
+/// of TTL; the TTL only bounds staleness ACROSS concurrent mounts of the same
+/// session DB (`agentfs run --session` from another terminal), which now see
+/// attribute/namespace changes within 10s. Override with
+/// `AGENTFS_FUSE_ENTRY_TTL_MS` / `AGENTFS_FUSE_ATTR_TTL_MS`.
+const DEFAULT_FUSE_POSITIVE_TTL_MS: u64 = 10_000;
+/// Default kernel TTL for negative dentries. Kept at 1s: a file created by a
+/// second mount stays invisible to this mount for the negative TTL, and
+/// lookup-miss caching is the most surprising staleness to debug. Override
+/// with `AGENTFS_FUSE_NEG_TTL_MS`.
+const DEFAULT_FUSE_NEG_TTL_MS: u64 = 1000;
 const READDIRPLUS_MODE_OFF: u64 = 0;
 const READDIRPLUS_MODE_AUTO: u64 = 1;
 const READDIRPLUS_MODE_ALWAYS: u64 = 2;
@@ -93,9 +107,10 @@ struct FuseKernelCacheConfig {
 
 impl FuseKernelCacheConfig {
     fn from_env() -> Self {
-        let entry_ttl_ms = env_duration_ms("AGENTFS_FUSE_ENTRY_TTL_MS", DEFAULT_FUSE_TTL_MS);
-        let attr_ttl_ms = env_duration_ms("AGENTFS_FUSE_ATTR_TTL_MS", DEFAULT_FUSE_TTL_MS);
-        let neg_ttl_ms = env_duration_ms("AGENTFS_FUSE_NEG_TTL_MS", DEFAULT_FUSE_TTL_MS);
+        let entry_ttl_ms =
+            env_duration_ms("AGENTFS_FUSE_ENTRY_TTL_MS", DEFAULT_FUSE_POSITIVE_TTL_MS);
+        let attr_ttl_ms = env_duration_ms("AGENTFS_FUSE_ATTR_TTL_MS", DEFAULT_FUSE_POSITIVE_TTL_MS);
+        let neg_ttl_ms = env_duration_ms("AGENTFS_FUSE_NEG_TTL_MS", DEFAULT_FUSE_NEG_TTL_MS);
 
         // Kernel cache safety requires non-serial workers: we need a worker thread
         // distinct from the session loop to send FUSE_NOTIFY_INVAL_* without
