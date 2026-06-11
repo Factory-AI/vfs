@@ -113,11 +113,52 @@ pub struct ProfileSnapshot {
     pub base_fast_open_rejected: u64,
     pub base_fast_inode_invalidations: u64,
     pub base_fast_stale_rejections: u64,
+    /// Per-opcode dispatch latency, flattened as
+    /// `fuse_op_<name>_count` / `fuse_op_<name>_nanos` keys (zero slots
+    /// omitted) so generic counter tooling sees plain integers. Measured
+    /// around the whole dispatch: parse → handler → reply send.
+    #[serde(flatten)]
+    pub fuse_op_latency: std::collections::BTreeMap<String, u64>,
 }
+
+/// Dispatch-level FUSE opcode slots for per-op latency accounting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FuseOpSlot {
+    Lookup,
+    GetAttr,
+    SetAttr,
+    Open,
+    Create,
+    Read,
+    Write,
+    Flush,
+    Release,
+    ReadDirPlus,
+    Forget,
+    Other,
+}
+
+const FUSE_OP_SLOT_COUNT: usize = 12;
+const FUSE_OP_SLOT_NAMES: [&str; FUSE_OP_SLOT_COUNT] = [
+    "lookup",
+    "getattr",
+    "setattr",
+    "open",
+    "create",
+    "read",
+    "write",
+    "flush",
+    "release",
+    "readdirplus",
+    "forget",
+    "other",
+];
 
 /// Atomic profiling counters.
 #[derive(Debug)]
 pub struct ProfileCounters {
+    fuse_op_counts: [AtomicU64; FUSE_OP_SLOT_COUNT],
+    fuse_op_nanos: [AtomicU64; FUSE_OP_SLOT_COUNT],
     connection_wait_count: AtomicU64,
     connection_wait_nanos: AtomicU64,
     connection_create_count: AtomicU64,
@@ -222,6 +263,8 @@ pub struct ProfileCounters {
 impl ProfileCounters {
     pub const fn new() -> Self {
         Self {
+            fuse_op_counts: [const { AtomicU64::new(0) }; FUSE_OP_SLOT_COUNT],
+            fuse_op_nanos: [const { AtomicU64::new(0) }; FUSE_OP_SLOT_COUNT],
             connection_wait_count: AtomicU64::new(0),
             connection_wait_nanos: AtomicU64::new(0),
             connection_create_count: AtomicU64::new(0),
@@ -490,6 +533,12 @@ impl ProfileCounters {
                 Err(actual) => current = actual,
             }
         }
+    }
+
+    fn add_fuse_op(&self, slot: FuseOpSlot, duration: Duration) {
+        let idx = slot as usize;
+        self.fuse_op_counts[idx].fetch_add(1, Ordering::Relaxed);
+        self.fuse_op_nanos[idx].fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
     }
 
     fn add_wal_checkpoint(&self, duration: Duration) {
@@ -934,6 +983,20 @@ impl ProfileCounters {
                 .base_fast_inode_invalidations
                 .load(Ordering::Relaxed),
             base_fast_stale_rejections: self.base_fast_stale_rejections.load(Ordering::Relaxed),
+            fuse_op_latency: {
+                let mut map = std::collections::BTreeMap::new();
+                for (idx, name) in FUSE_OP_SLOT_NAMES.iter().enumerate() {
+                    let count = self.fuse_op_counts[idx].load(Ordering::Relaxed);
+                    if count > 0 {
+                        map.insert(format!("fuse_op_{name}_count"), count);
+                        map.insert(
+                            format!("fuse_op_{name}_nanos"),
+                            self.fuse_op_nanos[idx].load(Ordering::Relaxed),
+                        );
+                    }
+                }
+                map
+            },
         }
     }
 }
@@ -1152,6 +1215,13 @@ pub fn record_agentfs_batcher_commit_latency(duration: Duration) {
 pub fn record_agentfs_batcher_commit_txn(inodes: u64) {
     if is_enabled() {
         COUNTERS.add_agentfs_batcher_commit_txn(inodes);
+    }
+}
+
+/// Record one FUSE request's full dispatch latency (parse → handler → reply).
+pub fn record_fuse_op(slot: FuseOpSlot, duration: Duration) {
+    if is_enabled() {
+        COUNTERS.add_fuse_op(slot, duration);
     }
 }
 

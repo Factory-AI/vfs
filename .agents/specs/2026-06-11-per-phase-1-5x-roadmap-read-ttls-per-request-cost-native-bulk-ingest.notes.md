@@ -20,3 +20,13 @@ User comment: none
 **Type**: followup
 **Context**: phase8-validation perf-threshold gate fails (clone 164x vs thr 5.0, etc.) on its tiny synthetic fixture where native phases are sub-ms; last night's pre-WS1 run failed the same set worse (clone 413x). Correctness/durability/stress gates all pass.
 **Resolution**: Treated as pre-existing flake/stale baseline. Followup: re-baseline phase8 perf thresholds on an idle host or switch that gate to the codex fixture; not blocking WS1.
+
+## 2026-06-11T10:50-07:00 — WS2: dispatch-time ranking != critical-path ranking; deferred SETATTR stays opt-in
+**Type**: decision
+**Context**: New per-op dispatch latency counters (fuse_op_*_nanos) rank setattr #1 (857ms, 180us x 4.8k) and create #2 (680ms, 145us x 4.7k) on the codex workload. But a fresh deferred-vs-legacy A/B stacked on suppression+TTL10 is AGAIN parity (paired median 1.008): kernel writeback issues SETATTR asynchronously, so its cost never blocks git. Dispatch totals overstate ops that run off the critical path (setattr, release, most writes).
+**Resolution**: Deferred SETATTR remains opt-in permanently (two parity A/Bs). WS2 pivots to the synchronous, git-visible ops: create 680ms (open(O_CREAT) blocks), read 195ms, lookup 139ms, open 122ms, getattr 114ms, flush 77ms (~1.4s total). Create plan: quick wins first (drop pre-check SELECT in favor of dentry UNIQUE-constraint mapping; stash parent mtime/ctime into the batcher overlay instead of an in-txn UPDATE), then reassess whether full create-deferral (pending namespace) is still required.
+
+## 2026-06-11T11:05-07:00 — WS2 closed early: create-deferral and ~15µs/req target deferred behind WS3
+**Type**: deviation
+**Context**: Spec planned "fix top-3 measured offenders" toward ~15µs/req. Measurement shows: create quick wins landed (145→125µs; txn boundary ~115µs is the floor), and clone-phase sync dispatch totals only ~1.07s of the 2.84s clone overhead — the rest is queue wait, kernel round trips, and SQLite write-lock contention. Zeroing ALL sync dispatch still leaves FUSE clone ~5x.
+**Resolution**: Full create-deferral (pending namespace: pending creates must survive the tmp→rename git object flow) is high-complexity for at most ~0.5s of critical path, while WS3's `agentfs clone` bypasses per-file FUSE costs entirely and is the only route to clone ≤1.5x. WS2 banked as: per-op instrumentation + create fast path + critical-path model. Read-path per-request work (read 83µs/op) resumes after WS3 against the read-benchmark ≤1.5x target.

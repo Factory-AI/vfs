@@ -5390,10 +5390,11 @@ impl FileSystem for AgentFS {
         }
         let conn = self.pool.get_connection().await?;
 
-        // Check if already exists
-        if self.lookup_child(&conn, parent_ino, name).await?.is_some() {
-            return Err(FsError::AlreadyExists.into());
-        }
+        // No existence pre-check: fs_dentry's UNIQUE(parent_ino, name) makes
+        // the dentry INSERT below the authoritative collision detector (its
+        // Constraint error maps to AlreadyExists and the transaction drop
+        // rolls back the inode row). Saves one SELECT on the synchronous
+        // create path that every git-clone file pays.
 
         // Prepare statements before starting the transaction
         let mut inode_stmt = conn
@@ -5435,16 +5436,39 @@ impl FileSystem for AgentFS {
             .and_then(|v| v.as_integer().copied())
             .ok_or_else(|| Error::Internal("failed to get inode".to_string()))?;
 
-        dentry_stmt.execute((name, parent_ino, ino)).await?;
+        match dentry_stmt.execute((name, parent_ino, ino)).await {
+            Ok(_) => {}
+            Err(turso::Error::Constraint(_)) => return Err(FsError::AlreadyExists.into()),
+            Err(error) => return Err(error.into()),
+        }
 
-        // Update parent directory ctime and mtime
-        conn.execute(
-            "UPDATE fs_inode SET ctime = ?, mtime = ?, ctime_nsec = ?, mtime_nsec = ? WHERE ino = ?",
-            (now_secs, now_secs, now_nsec, now_nsec, parent_ino),
-        )
-        .await?;
+        // Parent mtime/ctime: stash into the batcher overlay (committed by the
+        // next group drain, served immediately via merge_pending_view) instead
+        // of paying an UPDATE on the synchronous create path. Falls back to
+        // the in-transaction UPDATE when the overlay cannot serve reads.
+        let stash_parent_times = self.overlay_reads && self.write_batcher.is_some();
+        if !stash_parent_times {
+            conn.execute(
+                "UPDATE fs_inode SET ctime = ?, mtime = ?, ctime_nsec = ?, mtime_nsec = ? WHERE ino = ?",
+                (now_secs, now_secs, now_nsec, now_nsec, parent_ino),
+            )
+            .await?;
+        }
 
         txn.commit().await?;
+
+        if stash_parent_times {
+            if let Some(batcher) = &self.write_batcher {
+                batcher.stash_pending_times(
+                    parent_ino,
+                    PendingTimeChange {
+                        atime: None,
+                        mtime: Some((now_secs, now_nsec)),
+                        ctime: Some((now_secs, now_nsec)),
+                    },
+                );
+            }
+        }
 
         self.cache_dentry(parent_ino, name, ino);
         self.invalidate_parent_attr(parent_ino);
