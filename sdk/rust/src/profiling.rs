@@ -47,6 +47,9 @@ pub struct ProfileSnapshot {
     pub agentfs_batcher_pending_max_bytes: u64,
     pub agentfs_batcher_coalesced_ranges: u64,
     pub agentfs_batcher_commit_latency_ns_total: u64,
+    pub agentfs_batcher_commit_txns: u64,
+    pub agentfs_batcher_txn_inodes_total: u64,
+    pub agentfs_batcher_txn_inodes_max: u64,
     pub wal_checkpoint_count: u64,
     pub wal_checkpoint_nanos: u64,
     pub fuse_callback_count: u64,
@@ -148,6 +151,9 @@ pub struct ProfileCounters {
     agentfs_batcher_pending_max_bytes: AtomicU64,
     agentfs_batcher_coalesced_ranges: AtomicU64,
     agentfs_batcher_commit_latency_ns_total: AtomicU64,
+    agentfs_batcher_commit_txns: AtomicU64,
+    agentfs_batcher_txn_inodes_total: AtomicU64,
+    agentfs_batcher_txn_inodes_max: AtomicU64,
     wal_checkpoint_count: AtomicU64,
     wal_checkpoint_nanos: AtomicU64,
     fuse_callback_count: AtomicU64,
@@ -249,6 +255,9 @@ impl ProfileCounters {
             agentfs_batcher_pending_max_bytes: AtomicU64::new(0),
             agentfs_batcher_coalesced_ranges: AtomicU64::new(0),
             agentfs_batcher_commit_latency_ns_total: AtomicU64::new(0),
+            agentfs_batcher_commit_txns: AtomicU64::new(0),
+            agentfs_batcher_txn_inodes_total: AtomicU64::new(0),
+            agentfs_batcher_txn_inodes_max: AtomicU64::new(0),
             wal_checkpoint_count: AtomicU64::new(0),
             wal_checkpoint_nanos: AtomicU64::new(0),
             fuse_callback_count: AtomicU64::new(0),
@@ -459,6 +468,28 @@ impl ProfileCounters {
     fn add_agentfs_batcher_commit_latency(&self, duration: Duration) {
         self.agentfs_batcher_commit_latency_ns_total
             .fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    /// One batcher SQLite commit transaction covering `inodes` inodes. Counts
+    /// actual `BEGIN IMMEDIATE`/`COMMIT` pairs (not per-inode drain ticks) so
+    /// the transaction shape of the write batcher is directly observable.
+    fn add_agentfs_batcher_commit_txn(&self, inodes: u64) {
+        self.agentfs_batcher_commit_txns
+            .fetch_add(1, Ordering::Relaxed);
+        self.agentfs_batcher_txn_inodes_total
+            .fetch_add(inodes, Ordering::Relaxed);
+        let mut current = self.agentfs_batcher_txn_inodes_max.load(Ordering::Relaxed);
+        while inodes > current {
+            match self.agentfs_batcher_txn_inodes_max.compare_exchange_weak(
+                current,
+                inodes,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     fn add_wal_checkpoint(&self, duration: Duration) {
@@ -805,6 +836,13 @@ impl ProfileCounters {
             agentfs_batcher_commit_latency_ns_total: self
                 .agentfs_batcher_commit_latency_ns_total
                 .load(Ordering::Relaxed),
+            agentfs_batcher_commit_txns: self.agentfs_batcher_commit_txns.load(Ordering::Relaxed),
+            agentfs_batcher_txn_inodes_total: self
+                .agentfs_batcher_txn_inodes_total
+                .load(Ordering::Relaxed),
+            agentfs_batcher_txn_inodes_max: self
+                .agentfs_batcher_txn_inodes_max
+                .load(Ordering::Relaxed),
             wal_checkpoint_count: self.wal_checkpoint_count.load(Ordering::Relaxed),
             wal_checkpoint_nanos: self.wal_checkpoint_nanos.load(Ordering::Relaxed),
             fuse_callback_count: self.fuse_callback_count.load(Ordering::Relaxed),
@@ -1107,6 +1145,13 @@ pub fn record_agentfs_batcher_coalesced_ranges(ranges: u64) {
 pub fn record_agentfs_batcher_commit_latency(duration: Duration) {
     if is_enabled() {
         COUNTERS.add_agentfs_batcher_commit_latency(duration);
+    }
+}
+
+/// Record one batcher SQLite commit transaction that covered `inodes` inodes.
+pub fn record_agentfs_batcher_commit_txn(inodes: u64) {
+    if is_enabled() {
+        COUNTERS.add_agentfs_batcher_commit_txn(inodes);
     }
 }
 
@@ -1533,6 +1578,8 @@ mod tests {
         counters.update_agentfs_batcher_pending_max_bytes(32);
         counters.add_agentfs_batcher_coalesced_ranges(2);
         counters.add_agentfs_batcher_commit_latency(Duration::from_nanos(17));
+        counters.add_agentfs_batcher_commit_txn(3);
+        counters.add_agentfs_batcher_commit_txn(9);
         counters.add_wal_checkpoint(Duration::from_nanos(11));
         counters.add_fuse_lookup();
         counters.add_fuse_getattr();
@@ -1621,6 +1668,9 @@ mod tests {
         assert_eq!(snapshot.agentfs_batcher_pending_max_bytes, 64);
         assert_eq!(snapshot.agentfs_batcher_coalesced_ranges, 2);
         assert_eq!(snapshot.agentfs_batcher_commit_latency_ns_total, 17);
+        assert_eq!(snapshot.agentfs_batcher_commit_txns, 2);
+        assert_eq!(snapshot.agentfs_batcher_txn_inodes_total, 12);
+        assert_eq!(snapshot.agentfs_batcher_txn_inodes_max, 9);
         assert_eq!(snapshot.wal_checkpoint_count, 1);
         assert_eq!(snapshot.wal_checkpoint_nanos, 11);
         assert_eq!(snapshot.fuse_callback_count, 8);

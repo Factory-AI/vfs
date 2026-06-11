@@ -140,3 +140,69 @@ Ran on an idle host (load ~3/14 cores), release binary at HEAD, canonical codex 
 - (2) turso reports autocommit-vs-txn write races as "database snapshot is stale" → EIO. Wrapping chmod/chown/utimens in BEGIN IMMEDIATE fixed those, but other autocommit metadata writers then surfaced (intermittent `unlink config.lock: EIO` 1/8 runs). A uniform discipline (txn-wrap or stale-snapshot retry at the connection layer) is prerequisite.
 - (3) `AGENTFS_OVERLAY_READS=0` needs the legacy drain kept (no pending-size merge there → stale st_size breaks git config reads).
 - Full WIP diff saved at `/tmp/wip_setattr_deferral.patch` (938 lines: preserve_times plumbing, txn-wrapped attr ops, NotFound-tolerant batched drain, AGENTFS_DRAIN_ON_SETATTR kill switch, error_to_errno debug tracing, 2 unit tests).
+
+## 2026-05-30 — Prior-art research: SQLite/turso group commit + FUSE small-file writes
+**Scope**: primary-source web research against the observed clone shape (~4,700 file drains/transactions, WAL + `synchronous=NORMAL`); no implementation change.
+
+### 1. SQLite many-small-transactions → group commit
+- SQLite's FAQ states the central result plainly: an average desktop can do “50,000 or more INSERT statements per second”, but only “a few dozen transactions per second”, because transaction completion is storage-wait bound; its remedy is many inserts inside one transaction. Source: https://sqlite.org/faq.html
+- WAL improves read/write overlap and sequentializes writes, but does not make thousands of transaction boundaries free. SQLite documents the default 1000-page auto-checkpoint and that the commit crossing the threshold may run checkpoint work; WAL `synchronous=NORMAL` changes sync placement, not per-transaction engine/lock/frame cost. Sources: https://sqlite.org/wal.html and https://sqlite.org/pragma.html
+- SQLite's favorable small-blob benchmark (10K blobs, average 10KB) measures WAL + `synchronous=NORMAL` writes through transaction commit but before checkpoint; it supports storing small files in SQLite, not committing every POSIX close separately. Source: https://sqlite.org/fasterthanfs.html
+- `BEGIN CONCURRENT` and `wal2` are branch features rather than ordinary WAL tuning: `BEGIN CONCURRENT` may fail COMMIT with `SQLITE_BUSY_SNAPSHOT` on page conflict and still serializes commits. They improve independent writers, not N-per-file commit amplification. Sources: https://sqlite.org/src/doc/begin-concurrent/doc/begin_concurrent.md and https://sqlite.org/src/doc/wal2/doc/wal2.md
+- `page_size`/`cache_size` and prepared-statement reuse (`sqlite3_reset()` prepares a statement to execute again) can reduce secondary page/cache/compile overhead; none reduces commit count. Sources: https://sqlite.org/pragma.html and https://sqlite.org/c3ref/reset.html
+- SQLite publishes no portable microsecond transaction floor: VFS/device/durability decide it. The realistic prediction for AgentFS is that an N-into-1 transaction avoids nearly N-1 commit boundaries, directly targeting its measured ~700–840ms commit aggregate.
+
+### 2. SQLite-backed filesystem/archive prior art
+- `libsqlfs`/`sqlfs` implements a POSIX-style filesystem in one SQLite/SQLCipher file and exposes FUSE, but its published repository/project page provide no reproducible git-clone or many-small-write performance numbers. Sources: https://github.com/guardianproject/libsqlfs and https://guardianproject.info/archive/libsqlfs/
+- SQLAR stores an archive as SQLite rows/BLOBs (optionally compressed): useful precedent for packing a tree in one transactional file, but not a mutable FUSE/POSIX writeback implementation. Source: https://sqlite.org/sqlar.html
+- AgentFS's public FUSE article confirms this same one-database/FUSE architecture but publishes no comparable small-file transaction benchmark. Source: https://turso.tech/blog/agentfs-fuse
+- Thus the closest directly measured primary prior art found is SQLite's packed small-BLOB benchmark, not a FUSE FS benchmark; it points to fewer/larger DB transactions rather than a cheap-close FUSE flag.
+
+### 3. Turso (formerly Limbo) concurrency implications
+- Turso's manual documents SQLite-style modes: `BEGIN IMMEDIATE` attempts the write lock at `BEGIN`, and `EXCLUSIVE` is its alias in WAL mode. One serialized group-drain writer is therefore the documented low-conflict shape for today's AgentFS path. Source: https://github.com/tursodatabase/turso/blob/main/docs/manual.md
+- Turso v0.5.0 announces concurrent writes as **beta**, using MVCC; its design post describes a `BEGIN CONCURRENT` mode. AgentFS cannot assume its embedded version/config enables this without a capability/correctness test. Sources: https://turso.tech/blog/turso-0.5.0 and https://turso.tech/blog/beyond-the-single-writer-limitation-with-tursos-concurrent-writes
+- Indexed public documentation did not surface the exact Limbo error text “database snapshot is stale, rollback and retry” or group-commit guidance. AgentFS's observed autocommit-vs-transaction failure is nevertheless consistent with conflicting snapshots: eliminate competing metadata writers first; evaluate MVCC/retry later.
+- A Turso `BEGIN CONCURRENT` request is provenance, not evidence that AgentFS's embedded build supports it. Source: https://github.com/tursodatabase/turso/issues/86
+
+### 4. FUSE writeback-cache and close-time metadata
+- Kernel docs say writeback-cache lets `write(2)` finish into cache; dirty pages are later written in background or explicitly on `close(2)`, `fsync(2)`, and last-reference release. It explains rather than eliminates git clone close/writeback traffic. Source: https://docs.kernel.org/filesystems/fuse/fuse-io.html
+- libfuse maintainers say writeback userspace is not initially authoritative for size/mtime and should eventually receive `setattr`; a trace reports kernel mtime/atime/ctime `setattr` after writeback. Sources: https://github.com/libfuse/libfuse/discussions/868 and https://github.com/libfuse/libfuse/issues/342
+- `FUSE_HANDLE_KILLPRIV_V2` governs setuid/setgid clearing on write/truncate, not mtime coalescing; attribute timeouts cache read answers, not required metadata persistence. Source: https://libfuse.github.io/doxygen/include_2fuse__common_8h.html
+- No libfuse flag found safely omits written-file SETATTR; the lever is internal staging/group commit while retaining genuine `fsync` and finalize barriers.
+
+### 5. Compatible practitioner pattern
+- SQLAR plus SQLite's BLOB benchmark validate packing content/tree records inside the DB file. An in-memory per-inode overlay with bounded cross-inode transactions fits AgentFS's single-file/no-host-writes rule; a durable queue-table insert on every close only recreates per-close transactions unless it is itself group-committed.
+
+### Known dead ends (from the field)
+- FUSE-over-io_uring already measured NO-GO here: it optimizes transport rather than DB transaction shape.
+- Deferring SETATTR/FORGET while per-inode timers still commit merely moves transactions and exposes Turso snapshot conflicts.
+- `BEGIN CONCURRENT`/WAL2 first: conflict/retry plus serialized COMMIT does not coalesce ~4,700 logical transactions.
+- `FUSE_HANDLE_KILLPRIV_V2`, attr timeouts, or writeback-cache toggles do not remove writeback metadata lifecycle.
+- A per-close durable queue row in the same DB remains a per-close transaction unless enqueue is grouped.
+
+### Ranked next experiments for AgentFS
+1. **Cross-inode group drain in one `BEGIN IMMEDIATE`**: drain eligible data and staged metadata in one bounded global timer/byte-triggered transaction; make `fsync` drain its barrier and finalize drain all. Highest expected payoff: reduce thousands of boundaries to O(windows), targeting the measured 700–840ms and resultant dispatch wait without host writes.
+2. **Stage writeback SETATTR into that group drain**: preserve overlay-visible size/times, remove its standalone/autocommit write, and use one-writer discipline. Expected payoff: prevent the per-inode timer-transaction replacement and the observed stale-snapshot races.
+3. **Then sweep WAL/cache/checkpoint knobs with barrier verification**: compare `wal_autocheckpoint` thresholds/manual-finalize checkpoint and bounded `cache_size`/page metrics; explicitly assert `fsync` durability. Expected modest payoff: avoid checkpoint burst spikes, not fix amplification alone.
+4. **Only if SQL/page work remains costly, prototype packed/chunked content rows**: SQLAR/BLOB precedent fits one-file storage and may reduce page churn, but it is a larger schema/read-path change than correcting transaction shape.
+
+## 2026-05-30 — Experiment 1+2: cross-inode group commit (results)
+**Code (uncommitted, on top of the setattr-deferral WIP):**
+- New profiling counters `agentfs_batcher_commit_txns` / `_txn_inodes_total` / `_txn_inodes_max` count actual batcher `BEGIN IMMEDIATE`/`COMMIT` pairs (the old `drains_*` are per-inode ticks, not txns).
+- Drain reshape: the per-inode timer storm is gone. One coalescing scheduler task is armed by the first pending write, sleeps `AGENTFS_BATCH_MS` (default 5 ms), then commits everything pending in bounded back-to-back txns (`AGENTFS_BATCH_TXN_INODES`=1024, `AGENTFS_BATCH_TXN_BYTES`=32 MiB), exits when nothing is pending. Bytes triggers, explicit drains (fsync/kill switches), finalize-on-unmount, commit-then-remove and times_explicit/preserve-times ordering all preserved.
+- SETATTR staging hardened: `stash_pending_times` now CREATES the pending entry when the inode has nothing pending, so a writeback SETATTR never pays a dedicated foreground txn (the old fallback per-file IMMEDIATE time-UPDATE was still firing for most files and was a major hidden cost); the stash is committed by the next group txn and overlaid by `merge_pending_view` until then.
+
+**Ground truth (clone phase, codex fixture, deferred default env):** WIP-as-found = 356 txns (4,682 inode-commits, max 224/txn, 748 ms commit total). Reshaped = 222–268 txns, max 131–255 inodes/txn. Legacy (DRAIN_ON_SETATTR=1, FORGET=1) = 4,698 txns of 1 inode, 402–589 ms commit, 563 ms dispatch wait. Reshaped deferred profile: commit 606 ms, dispatch wait 210 ms, connection wait 5.4 ms, drains_explicit 3.
+
+**A/B (8 alternating iters/mode after warmup, --read-files 64 --read-bytes 4096 --edit-files 8, all runs correctness+fsck clean):**
+- legacy:   total median 3.936 s (min 3.627), clone median 2.569 s (min 2.253)
+- deferred: total median 4.314 s (min 4.050), clone median 2.380 s (min 2.176)
+- delta: clone median **-7.4 %** (deferred wins; -3.4 % on min), total median **+9.6 %** (deferred loses; +11.7 % on min).
+- Per-phase: the entire loss is post-clone — checkout +157 % (0.235→0.606 s), status +128 % (0.142→0.324 s); diff/read/edit/fsck flat or better.
+- RCA of the post-clone loss: deferred commits (data + staged times) land AFTER git has written its index, so the FUSE adapter's deferred inode invalidations (~4.7k during checkout vs ~0.7k legacy) blow the kernel attr cache and the FS-served times no longer match what git recorded → `git checkout -B` re-reads ~4,700 files serially (fuse_open_count 4,701 vs 650 legacy) and status re-stats everything. Legacy avoids it because its per-setattr drains finish before the index write. Follow-up experiment: make deferred commits attribute-transparent (stashed kernel times always win; suppress inval notifications when a commit changes no kernel-visible attr).
+
+**fsck anomaly (GATE):** the historical 1/29 `git fsck --strict` failure did NOT reproduce post-reshape: 32/32 deferred-mode benchmark runs (16 idle + 16 under 12× `yes` CPU stress) passed fsck --strict, `git status`, base-tree-unchanged and full correctness; in total 58 deferred-mode runs this session were fsck-clean. No artifacts to preserve.
+
+**Validation gates (all green):** SDK fmt/clippy --lib 0 warnings/165 tests single-threaded; CLI fmt/clippy --release 0 warnings/107 tests/release build; metadata-mutation-no-real-write 20/20 passed; overlay-OFF clone (AGENTFS_OVERLAY_READS=0) correctness true; AGENTFS_DRAIN_ON_RELEASE=1 clone correctness true; high-load 8/8 default env and 8/8 legacy env (12× yes, timeout 75 s) all rc=0 + base unchanged.
+
+**Verdict:** transaction-shape goal met (4,698 → ~220–270 clone txns, low hundreds) and the fsck anomaly is cleared, but **NO-GO for default-on**: deferred wins the clone (≥5 % target met) yet loses the workload total (+9.6 %) to the post-clone kernel-cache/index re-read storm. Keep the work as an unshipped WIP (kill switches intact); next lever is attribute-transparent deferred commits + invalidation suppression, then re-run this A/B.

@@ -47,16 +47,25 @@ const WRITE_BATCHER_MS_ENV: &str = "AGENTFS_BATCH_MS";
 const WRITE_BATCHER_BYTES_ENV: &str = "AGENTFS_BATCH_BYTES";
 /// Global (cross-inode) ceiling on in-memory pending write bytes. When the sum
 /// of all pending inode batches reaches this, the enqueue path triggers a full
-/// batched drain. This bounds memory so the per-inode timer (`AGENTFS_BATCH_MS`)
-/// can be widened to coalesce many file closes into far fewer commits without
-/// risking unbounded RSS during a write burst (e.g. git clone).
+/// batched drain. This bounds memory so the group-commit window
+/// (`AGENTFS_BATCH_MS`) can coalesce many file closes into far fewer commits
+/// without risking unbounded RSS during a write burst (e.g. git clone).
 const WRITE_BATCHER_GLOBAL_BYTES_ENV: &str = "AGENTFS_BATCH_GLOBAL_BYTES";
+/// Per-transaction bounds for the coalescing drain scheduler: one batched
+/// drain transaction commits at most this many inodes / pending bytes. When a
+/// pass over the pending map exceeds the bound, the remainder is committed in
+/// immediately-following back-to-back transactions instead of one unbounded
+/// `BEGIN IMMEDIATE`.
+const WRITE_BATCHER_TXN_INODES_ENV: &str = "AGENTFS_BATCH_TXN_INODES";
+const WRITE_BATCHER_TXN_BYTES_ENV: &str = "AGENTFS_BATCH_TXN_BYTES";
 const DEFAULT_WRITE_BATCH_MS: u64 = 5;
 const DEFAULT_WRITE_BATCH_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_WRITE_BATCH_GLOBAL_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_WRITE_BATCH_TXN_INODES: usize = 1024;
+const DEFAULT_WRITE_BATCH_TXN_BYTES: usize = 32 * 1024 * 1024;
 /// Tier 4 escape hatch. When `AGENTFS_OVERLAY_READS=0`, the SDK reverts to
 /// Tier 3 semantics: `pwrite` drains before commit, `pread` drains before
-/// read, `merge_pending_size` is a no-op. Defaults to ON so a clean install
+/// read, `merge_pending_view` is a no-op. Defaults to ON so a clean install
 /// gets Tier 4 benefits, but operators can flip it OFF without rebuilding if
 /// a previously-unknown read-merge bug surfaces in production.
 const OVERLAY_READS_ENV: &str = "AGENTFS_OVERLAY_READS";
@@ -114,6 +123,24 @@ fn env_flag_default(name: &str, default: bool) -> bool {
         ),
         Err(_) => default,
     }
+}
+
+/// Whether chmod / chown / utimens should force a synchronous batcher drain
+/// (one SQLite commit per call) before applying the attribute change.
+///
+/// Default TRUE (legacy drain-before-setattr). The deferred path
+/// (`AGENTFS_DRAIN_ON_SETATTR=0`) stashes the kernel times via
+/// `mark_times_explicit` + `preserve_times` and lets the group commit apply
+/// them, which cut clone-phase transactions from ~4,700 to ~250 (clone median
+/// -7.4%). It is opt-in because the 2026-05-30 A/B measured a +9.6% workload
+/// total regression: deferred commits land after git writes its index, the
+/// FUSE adapter's buffered WRITE is enqueued after the SETATTR and clears the
+/// stashed mtime/ctime, and the resulting stat drift makes checkout/status
+/// re-read ~4,700 files. Flip the default only after deferred commits are
+/// attribute-transparent and that A/B goes green.
+fn drain_on_setattr() -> bool {
+    static DRAIN_ON_SETATTR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DRAIN_ON_SETATTR.get_or_init(|| env_flag_default("AGENTFS_DRAIN_ON_SETATTR", true))
 }
 
 fn env_duration_millis(name: &str, default_ms: u64) -> Duration {
@@ -285,36 +312,154 @@ enum AgentFSWriteBatchDrainReason {
     Explicit,
 }
 
-struct PendingInodeWrites {
-    ranges: Vec<WriteRange>,
-    pending_bytes: usize,
-    first_enqueue: Instant,
-    last_enqueue: Instant,
-    timer_scheduled: bool,
+/// Explicitly-set timestamps stashed by `utimens` while the inode still has
+/// pending batched writes. Instead of paying a dedicated SQLite transaction
+/// per SETATTR (the FUSE writeback cache sends one per written file during a
+/// clone), the values ride along in the pending entry and the batcher applies
+/// them inside the SAME drain transaction, right after the data UPDATE — so
+/// the explicitly-set times win over the commit-time stamp without an extra
+/// per-file transaction. `getattr`/`lookup` overlay these values onto the
+/// SQLite row (`merge_pending_view`) so the change is visible immediately.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PendingTimeChange {
+    /// (secs, nsec) for atime, when explicitly set.
+    atime: Option<(i64, i64)>,
+    /// (secs, nsec) for mtime, when explicitly set.
+    mtime: Option<(i64, i64)>,
+    /// (secs, nsec) for ctime (always bumped by the setattr that stashed).
+    ctime: Option<(i64, i64)>,
 }
 
-impl PendingInodeWrites {
-    fn new(now: Instant) -> Self {
-        Self {
-            ranges: Vec::new(),
-            pending_bytes: 0,
-            first_enqueue: now,
-            last_enqueue: now,
-            timer_scheduled: false,
+impl PendingTimeChange {
+    fn is_empty(&self) -> bool {
+        self.atime.is_none() && self.mtime.is_none() && self.ctime.is_none()
+    }
+
+    /// Per-field "newer wins" merge: fields set by `newer` override ours.
+    fn apply(&mut self, newer: &PendingTimeChange) {
+        if newer.atime.is_some() {
+            self.atime = newer.atime;
+        }
+        if newer.mtime.is_some() {
+            self.mtime = newer.mtime;
+        }
+        if newer.ctime.is_some() {
+            self.ctime = newer.ctime;
         }
     }
 
-    fn push_ranges(
-        &mut self,
-        ranges: Vec<WriteRange>,
-        byte_count: usize,
-        now: Instant,
-    ) -> Result<()> {
+    /// Drop the fields a buffered data write would re-stamp (mtime/ctime). A
+    /// write AFTER the explicit setattr means the file changed again, so the
+    /// eventual commit must stamp fresh modification times; an explicitly-set
+    /// atime is unaffected by writes and survives.
+    fn clear_write_stamped(&mut self) {
+        self.mtime = None;
+        self.ctime = None;
+    }
+
+    /// Overlay the stashed values onto a `Stats` row read from SQLite, so
+    /// `getattr`/`lookup` surface explicit `utimens` results immediately even
+    /// though the row UPDATE is deferred to the next batched drain.
+    fn merge_into(&self, stats: &mut Stats) {
+        if let Some((secs, nsec)) = self.atime {
+            stats.atime = secs;
+            stats.atime_nsec = nsec as u32;
+        }
+        if let Some((secs, nsec)) = self.mtime {
+            stats.mtime = secs;
+            stats.mtime_nsec = nsec as u32;
+        }
+        if let Some((secs, nsec)) = self.ctime {
+            stats.ctime = secs;
+            stats.ctime_nsec = nsec as u32;
+        }
+    }
+}
+
+/// Apply a stashed `PendingTimeChange` to fs_inode using the drain
+/// transaction's connection. Runs AFTER the data UPDATE inside the same
+/// `BEGIN IMMEDIATE` so the explicitly-set times override the commit-time
+/// stamp without a dedicated transaction. A deleted inode simply matches no
+/// row (the unlink already won).
+async fn apply_pending_times_with_conn(
+    conn: &Connection,
+    ino: i64,
+    times: &PendingTimeChange,
+) -> Result<()> {
+    let mut updates = Vec::new();
+    let mut values: Vec<Value> = Vec::new();
+    if let Some((secs, nsec)) = times.atime {
+        updates.push("atime = ?");
+        values.push(Value::Integer(secs));
+        updates.push("atime_nsec = ?");
+        values.push(Value::Integer(nsec));
+    }
+    if let Some((secs, nsec)) = times.mtime {
+        updates.push("mtime = ?");
+        values.push(Value::Integer(secs));
+        updates.push("mtime_nsec = ?");
+        values.push(Value::Integer(nsec));
+    }
+    if let Some((secs, nsec)) = times.ctime {
+        updates.push("ctime = ?");
+        values.push(Value::Integer(secs));
+        updates.push("ctime_nsec = ?");
+        values.push(Value::Integer(nsec));
+    }
+    if updates.is_empty() {
+        return Ok(());
+    }
+    values.push(Value::Integer(ino));
+    let sql = format!("UPDATE fs_inode SET {} WHERE ino = ?", updates.join(", "));
+    conn.execute(&sql, values).await?;
+    Ok(())
+}
+
+struct PendingInodeWrites {
+    ranges: Vec<WriteRange>,
+    pending_bytes: usize,
+    /// True when an explicit attribute change (chmod / chown / utimens) was
+    /// applied to fs_inode AFTER the most recent enqueue for this inode. The
+    /// deferred data commit normally stamps mtime/ctime with the commit time;
+    /// when this flag is set it must preserve the explicitly-set times instead
+    /// (the setattr logically happened after the buffered writes). Reset on
+    /// every enqueue: a write after the setattr should bump the times again.
+    times_explicit: bool,
+    /// Explicit `utimens` values waiting to be committed together with the
+    /// pending data (see `PendingTimeChange`). Cleared field-wise: a new
+    /// enqueue drops mtime/ctime (write re-stamps them), the drain clears the
+    /// values it actually committed.
+    pending_times: Option<PendingTimeChange>,
+}
+
+impl PendingInodeWrites {
+    fn new() -> Self {
+        Self {
+            ranges: Vec::new(),
+            pending_bytes: 0,
+            times_explicit: false,
+            pending_times: None,
+        }
+    }
+
+    /// True when nothing is left to commit for this inode (no data ranges and
+    /// no stashed explicit times) — only then may the entry be dropped.
+    fn is_drained(&self) -> bool {
+        self.ranges.is_empty() && self.pending_times.is_none()
+    }
+
+    fn push_ranges(&mut self, ranges: Vec<WriteRange>, byte_count: usize) -> Result<()> {
         self.pending_bytes = self
             .pending_bytes
             .checked_add(byte_count)
             .ok_or_else(|| Error::Internal("batched write byte count overflow".to_string()))?;
-        self.last_enqueue = now;
+        self.times_explicit = false;
+        if let Some(times) = &mut self.pending_times {
+            times.clear_write_stamped();
+            if times.is_empty() {
+                self.pending_times = None;
+            }
+        }
         self.ranges.extend(ranges);
         Ok(())
     }
@@ -329,6 +474,12 @@ struct AgentFSWriteBatcherState {
     /// mutates a `PendingInodeWrites.pending_bytes` or inserts/removes an entry
     /// must keep this consistent (see `debug_assert_total`).
     total_pending_bytes: usize,
+    /// True while the single coalescing drain scheduler task is armed (see
+    /// `run_drain_scheduler`). Set by the enqueue that arms it, cleared by the
+    /// scheduler itself under this same lock once nothing is pending — so an
+    /// enqueue either observes it set (the running scheduler will pick the new
+    /// write up) or arms a fresh scheduler. Pending work is never stranded.
+    drain_scheduled: bool,
 }
 
 impl AgentFSWriteBatcherState {
@@ -359,6 +510,12 @@ struct AgentFSWriteBatcher {
     batch_ms: Duration,
     batch_bytes: usize,
     batch_global_bytes: usize,
+    /// Per-transaction inode-count bound for batched drains
+    /// (`AGENTFS_BATCH_TXN_INODES`). See `drain_pending_batched`.
+    txn_max_inodes: usize,
+    /// Per-transaction pending-bytes bound for batched drains
+    /// (`AGENTFS_BATCH_TXN_BYTES`). See `drain_pending_batched`.
+    txn_max_bytes: usize,
     /// Tier 4 mitigation: parking_lot `RwLock` so `peek_pending` /
     /// `peek_pending_max_end` can acquire read-only access without contending
     /// with writers. The lock is never held across an `.await`, so a sync
@@ -387,6 +544,10 @@ impl AgentFSWriteBatcher {
                 WRITE_BATCHER_GLOBAL_BYTES_ENV,
                 DEFAULT_WRITE_BATCH_GLOBAL_BYTES,
             ),
+            txn_max_inodes: env_usize(WRITE_BATCHER_TXN_INODES_ENV, DEFAULT_WRITE_BATCH_TXN_INODES)
+                .max(1),
+            txn_max_bytes: env_usize(WRITE_BATCHER_TXN_BYTES_ENV, DEFAULT_WRITE_BATCH_TXN_BYTES)
+                .max(1),
             state: RwLock::new(AgentFSWriteBatcherState::default()),
             commit_lock: AsyncMutex::new(()),
         }
@@ -405,10 +566,9 @@ impl AgentFSWriteBatcher {
             acc.checked_add(range.data.len())
                 .ok_or_else(|| Error::Internal("batched write byte count overflow".to_string()))
         })?;
-        let now = Instant::now();
         let drain_now;
         let mut drain_all_now = false;
-        let mut schedule_timer = false;
+        let mut schedule_drain = false;
 
         {
             let mut state = self.state.write();
@@ -416,17 +576,12 @@ impl AgentFSWriteBatcher {
                 let entry = state
                     .pending
                     .entry(ino)
-                    .or_insert_with(|| PendingInodeWrites::new(now));
-                entry.push_ranges(ranges, byte_count, now)?;
+                    .or_insert_with(PendingInodeWrites::new);
+                entry.push_ranges(ranges, byte_count)?;
                 crate::profiling::record_agentfs_batcher_enqueue();
                 crate::profiling::record_agentfs_batcher_pending_bytes(entry.pending_bytes as u64);
 
-                let per_inode_full = entry.pending_bytes >= self.batch_bytes;
-                if !per_inode_full && !entry.timer_scheduled {
-                    entry.timer_scheduled = true;
-                    schedule_timer = true;
-                }
-                per_inode_full
+                entry.pending_bytes >= self.batch_bytes
             };
             state.total_pending_bytes = state.total_pending_bytes.saturating_add(byte_count);
             // Global memory ceiling: a single full batched drain is cheaper and
@@ -434,6 +589,14 @@ impl AgentFSWriteBatcher {
             // precedence over the per-inode trigger.
             if state.total_pending_bytes >= self.batch_global_bytes {
                 drain_all_now = true;
+            }
+            // Group commit: arm the single coalescing drain scheduler if it is
+            // not already running, instead of one timer task per inode (which
+            // degenerated into a storm of small serialized transactions during
+            // a clone burst).
+            if !state.drain_scheduled {
+                state.drain_scheduled = true;
+                schedule_drain = true;
             }
             state.debug_assert_total();
         }
@@ -445,8 +608,8 @@ impl AgentFSWriteBatcher {
         // cached pre-write attr after a successful pwrite returns.
         self.attr_cache.remove(ino);
 
-        if schedule_timer {
-            self.schedule_timer_after(ino, self.batch_ms);
+        if schedule_drain {
+            self.spawn_drain_scheduler();
         }
 
         if drain_all_now {
@@ -464,16 +627,20 @@ impl AgentFSWriteBatcher {
         ino: i64,
         reason: AgentFSWriteBatchDrainReason,
     ) -> Result<()> {
-        // Explicit drains (release / flush / fsync) happen on every file close
-        // during git-clone-style workloads. Each one used to take its own
-        // SQLite transaction; when many inodes are pending simultaneously,
-        // bundling them into a single BEGIN IMMEDIATE / COMMIT pair amortises
-        // the WAL fsync and write-lock acquisition across all pending inodes.
-        // Timer and Bytes drains keep their per-inode behaviour to avoid
-        // surprising the producer (Bytes) and to respect the per-inode ripe
-        // check (Timer's batched path is handled inside `drain_due_timer`).
+        // Explicit drains (fsync / kill-switch release/forget/setattr paths)
+        // happen on every file close during git-clone-style workloads when the
+        // legacy switches are enabled. Each one used to take its own SQLite
+        // transaction; when many inodes are pending simultaneously, bundling
+        // them into a single BEGIN IMMEDIATE / COMMIT pair amortises the
+        // write-lock acquisition across all pending inodes. The Bytes trigger
+        // keeps its per-inode behaviour (it fires when ONE inode's pending
+        // exceeds the per-inode cap); group commits are the scheduler's job
+        // (`run_drain_scheduler`).
         if matches!(reason, AgentFSWriteBatchDrainReason::Explicit) {
-            return self.drain_pending_batched(reason, Some(ino)).await;
+            return self
+                .drain_pending_batched(reason, Some(ino))
+                .await
+                .map(|_| ());
         }
 
         let _commit_guard = self.commit_lock.lock().await;
@@ -511,10 +678,10 @@ impl AgentFSWriteBatcher {
             // On error the overlay is intact (nothing removed) — retried later.
             self.commit_inode_ranges(ino, &ranges).await?;
 
-            let need_timer = self.remove_committed_prefix(&[(ino, ranges.len())]);
-            for t in need_timer {
-                self.schedule_timer_after(t, self.batch_ms);
-            }
+            self.remove_committed_prefix(&[(ino, ranges.len())]);
+            // Anything still pending (ranges enqueued during the commit, other
+            // inodes, stashed times) is the coalescing scheduler's job.
+            self.ensure_drain_scheduled();
         }
     }
 
@@ -532,21 +699,30 @@ impl AgentFSWriteBatcher {
         }
     }
 
-    /// Drain every currently-pending inode batch inside a single SQLite
+    /// Drain currently-pending inode batches inside a single SQLite
     /// transaction. Holds one connection and one `BEGIN IMMEDIATE` / `COMMIT`
     /// pair across all per-inode chunk writes, instead of paying one
     /// transaction per inode like `commit_batch` does.
+    ///
+    /// One transaction is bounded by `txn_max_inodes` / `txn_max_bytes`
+    /// (`AGENTFS_BATCH_TXN_INODES` / `AGENTFS_BATCH_TXN_BYTES`); when the
+    /// pending map exceeds the bound the call commits a bounded subset and
+    /// returns `Ok(true)` so the caller immediately drains again
+    /// (back-to-back transactions) instead of building one unbounded txn.
+    /// Returns `Ok(false)` when everything that was pending at snapshot time
+    /// has been committed.
     ///
     /// `required_ino` lets `drain_inode(_, Explicit)` express its caller
     /// contract: "the writes queued for this inode must be durable when this
     /// returns". If the inode is not in pending when we take the snapshot, it
     /// was committed by a concurrent drain and the contract is already met.
-    /// If it IS in the snapshot, we commit it as part of this batched txn.
+    /// If it IS pending, it is always selected into this transaction
+    /// regardless of the per-transaction bounds.
     async fn drain_pending_batched(
         self: &Arc<Self>,
         reason: AgentFSWriteBatchDrainReason,
         required_ino: Option<i64>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let _commit_guard = self.commit_lock.lock().await;
 
         // Tier 4 corruption fix (commit-then-remove): SNAPSHOT pending ranges
@@ -558,23 +734,53 @@ impl AgentFSWriteBatcher {
         // (the intermittent git-clone corruption). Leaving the overlay
         // populated until after the commit guarantees every write is always
         // visible in the overlay OR in SQLite.
-        let snapshot: Vec<(i64, Vec<WriteRange>)> = {
+        let (snapshot, more_pending): (Vec<(i64, Vec<WriteRange>)>, bool) = {
             let state = self.state.read();
-            state
-                .pending
-                .iter()
-                .filter(|(_, batch)| !batch.ranges.is_empty())
-                .map(|(ino, batch)| (*ino, batch.ranges.clone()))
-                .collect()
+            let mut selected: Vec<(i64, Vec<WriteRange>)> = Vec::new();
+            let mut selected_bytes = 0usize;
+            let mut truncated = false;
+            // The explicit-drain contract inode is always part of this
+            // transaction, independent of the bounds.
+            if let Some(req) = required_ino {
+                if let Some(batch) = state.pending.get(&req) {
+                    if !batch.ranges.is_empty() || batch.pending_times.is_some() {
+                        selected_bytes = selected_bytes.saturating_add(batch.pending_bytes);
+                        selected.push((req, batch.ranges.clone()));
+                    }
+                }
+            }
+            for (ino, batch) in state.pending.iter() {
+                if Some(*ino) == required_ino {
+                    continue;
+                }
+                if batch.ranges.is_empty() && batch.pending_times.is_none() {
+                    continue;
+                }
+                // Bound the transaction by inode count and pending bytes; the
+                // first selected inode is always admitted so progress is
+                // guaranteed even when a single inode exceeds the byte bound.
+                if selected.len() >= self.txn_max_inodes
+                    || (!selected.is_empty()
+                        && selected_bytes.saturating_add(batch.pending_bytes) > self.txn_max_bytes)
+                {
+                    truncated = true;
+                    break;
+                }
+                selected_bytes = selected_bytes.saturating_add(batch.pending_bytes);
+                selected.push((*ino, batch.ranges.clone()));
+            }
+            (selected, truncated)
         };
 
         if snapshot.is_empty() {
             self.cleanup_empty_pending();
-            let _ = required_ino;
-            return Ok(());
+            return Ok(false);
         }
 
-        // (ino, committed_raw_range_count, normalized ranges to write)
+        // (ino, committed_raw_range_count, normalized ranges to write).
+        // Entries with an empty range list are still included: they carry
+        // stashed explicit times (`pending_times`) that must be committed in
+        // this transaction even though there is no data to write.
         let mut to_commit: Vec<(i64, usize, Vec<NormalizedWriteRange>)> =
             Vec::with_capacity(snapshot.len());
         for (ino, ranges) in &snapshot {
@@ -588,153 +794,251 @@ impl AgentFSWriteBatcher {
             // On normalize error the overlay is left intact (nothing removed),
             // so the ranges are simply retried on the next drain.
             let normalized = normalize_write_ranges(&range_refs)?;
-            if normalized.is_empty() {
-                continue;
+            if !normalized.is_empty() {
+                crate::profiling::record_agentfs_batcher_coalesced_ranges(
+                    ranges.len().saturating_sub(normalized.len()) as u64,
+                );
+                // Per-inode drain accounting (one tick per inode whose DATA we
+                // actually commit, matching the old reporting cardinality —
+                // time-only commits are not counted as drains).
+                match reason {
+                    AgentFSWriteBatchDrainReason::Timer => {
+                        crate::profiling::record_agentfs_batcher_drain_timer();
+                    }
+                    AgentFSWriteBatchDrainReason::Bytes => {
+                        crate::profiling::record_agentfs_batcher_drain_bytes();
+                    }
+                    AgentFSWriteBatchDrainReason::Explicit => {
+                        crate::profiling::record_agentfs_batcher_drain_explicit();
+                    }
+                }
             }
-            crate::profiling::record_agentfs_batcher_coalesced_ranges(
-                ranges.len().saturating_sub(normalized.len()) as u64,
-            );
             to_commit.push((*ino, ranges.len(), normalized));
-        }
-
-        // Per-inode drain accounting (one tick per inode that we actually
-        // committed, matching the old per-batch reporting cardinality).
-        for _ in &to_commit {
-            match reason {
-                AgentFSWriteBatchDrainReason::Timer => {
-                    crate::profiling::record_agentfs_batcher_drain_timer();
-                }
-                AgentFSWriteBatchDrainReason::Bytes => {
-                    crate::profiling::record_agentfs_batcher_drain_bytes();
-                }
-                AgentFSWriteBatchDrainReason::Explicit => {
-                    crate::profiling::record_agentfs_batcher_drain_explicit();
-                }
-            }
         }
 
         if to_commit.is_empty() {
             self.cleanup_empty_pending();
-            // required_ino was satisfied either by a concurrent committer
-            // (not in our snapshot) or by being an empty-range entry (no
-            // writes to durably persist).
-            let _ = required_ino;
-            return Ok(());
+            return Ok(more_pending);
         }
 
         let started = Instant::now();
         let conn = self.pool.get_connection().await?;
         let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
 
-        for (ino, _count, normalized) in &to_commit {
-            let normalized_refs: Vec<_> = normalized
+        // Read times_explicit and the stashed explicit times only AFTER the
+        // IMMEDIATE transaction holds the SQLite write lock (see
+        // `commit_inode_ranges` for the interleaving argument): explicit
+        // chmod/chown/utimens that already landed marked the flag / stash
+        // before their effect, later ones are blocked behind us (or stay
+        // stashed for the next drain).
+        let (preserve_times, pending_times): (HashMap<i64, bool>, HashMap<i64, PendingTimeChange>) = {
+            let state = self.state.read();
+            let preserve = to_commit
                 .iter()
-                .map(|range| WriteRangeRef {
-                    offset: range.offset,
-                    data: range.data.as_slice(),
+                .map(|(ino, _, _)| {
+                    (
+                        *ino,
+                        state
+                            .pending
+                            .get(ino)
+                            .map(|batch| batch.times_explicit)
+                            .unwrap_or(false),
+                    )
                 })
                 .collect();
-            let file = AgentFSFile {
-                pool: self.pool.clone(),
-                ino: *ino,
-                chunk_size: self.chunk_size,
-                inline_threshold: self.inline_threshold,
-                attr_cache: self.attr_cache.clone(),
-                write_batcher: None,
-                overlay_reads: true,
-            };
-            if let Err(error) = file
-                .pwrite_ranges_inode_with_conn(&conn, &normalized_refs)
-                .await
-            {
-                let _ = txn.rollback().await;
-                // Overlay was never modified; ranges remain pending and are
-                // retried on the next drain. No restore needed.
-                return Err(error);
+            let times = to_commit
+                .iter()
+                .filter_map(|(ino, _, _)| {
+                    state
+                        .pending
+                        .get(ino)
+                        .and_then(|batch| batch.pending_times)
+                        .map(|t| (*ino, t))
+                })
+                .collect();
+            (preserve, times)
+        };
+
+        // Stashed times we actually applied inside this transaction; cleared
+        // from the pending entries only after the commit succeeds.
+        let mut applied_times: Vec<(i64, PendingTimeChange)> = Vec::new();
+
+        for (ino, _count, normalized) in &to_commit {
+            let mut inode_missing = false;
+            if !normalized.is_empty() {
+                let normalized_refs: Vec<_> = normalized
+                    .iter()
+                    .map(|range| WriteRangeRef {
+                        offset: range.offset,
+                        data: range.data.as_slice(),
+                    })
+                    .collect();
+                let file = AgentFSFile {
+                    pool: self.pool.clone(),
+                    ino: *ino,
+                    chunk_size: self.chunk_size,
+                    inline_threshold: self.inline_threshold,
+                    attr_cache: self.attr_cache.clone(),
+                    write_batcher: None,
+                    overlay_reads: true,
+                };
+                match file
+                    .pwrite_ranges_inode_with_conn(
+                        &conn,
+                        &normalized_refs,
+                        preserve_times.get(ino).copied().unwrap_or(false),
+                    )
+                    .await
+                {
+                    Ok(()) => {}
+                    // The file was unlinked / renamed-over while its writes were
+                    // still pending (git lock and temp files routinely live and
+                    // die within the batch window). Its data is moot: skip it and
+                    // let the post-commit cleanup drop the orphaned ranges
+                    // instead of aborting the whole multi-inode batch.
+                    Err(Error::Fs(FsError::NotFound)) => {
+                        tracing::debug!(
+                            "AgentFS write batcher: dropping pending writes for deleted inode {}",
+                            ino
+                        );
+                        inode_missing = true;
+                    }
+                    Err(error) => {
+                        let _ = txn.rollback().await;
+                        // Overlay was never modified; ranges remain pending and are
+                        // retried on the next drain. No restore needed.
+                        return Err(error);
+                    }
+                }
+            }
+
+            // Apply explicitly-set times in the SAME transaction, after the
+            // data UPDATE, so the explicit values win over the commit-time
+            // stamp without a dedicated per-file transaction.
+            if !inode_missing {
+                if let Some(times) = pending_times.get(ino) {
+                    if let Err(error) = apply_pending_times_with_conn(&conn, *ino, times).await {
+                        let _ = txn.rollback().await;
+                        return Err(error);
+                    }
+                    applied_times.push((*ino, *times));
+                }
             }
         }
 
         txn.commit().await?;
 
-        // Durable now: drop exactly the committed ranges from the overlay,
-        // preserving anything enqueued during the commit.
+        // Durable now: drop exactly the committed ranges and applied times
+        // from the overlay, preserving anything enqueued during the commit.
+        for (ino, times) in &applied_times {
+            self.clear_applied_times(*ino, times);
+        }
         let committed_counts: Vec<(i64, usize)> = to_commit
             .iter()
             .map(|(ino, count, _)| (*ino, *count))
             .collect();
-        let need_timer = self.remove_committed_prefix(&committed_counts);
+        self.remove_committed_prefix(&committed_counts);
         for (ino, _, _) in &to_commit {
             self.attr_cache.remove(*ino);
         }
         self.cleanup_empty_pending();
-        for ino in need_timer {
-            self.schedule_timer_after(ino, self.batch_ms);
-        }
+        // Anything still pending (ranges enqueued during the commit, inodes
+        // beyond the per-txn bound, stashed times that arrived mid-commit) is
+        // never stranded: the coalescing scheduler picks it up on its next
+        // pass. Arm it if it is not already running (e.g. explicit drains
+        // triggered by fsync / kill-switch paths outside the scheduler).
+        self.ensure_drain_scheduled();
         crate::profiling::record_agentfs_batcher_commit_latency(started.elapsed());
+        crate::profiling::record_agentfs_batcher_commit_txn(to_commit.len() as u64);
 
-        let _ = required_ino;
-        Ok(())
+        Ok(more_pending)
     }
 
-    async fn drain_due_timer(self: Arc<Self>, ino: i64) -> Result<()> {
-        // Tier Three Axis E: when the per-inode timer fires for `ino` and the
-        // inode is ripe, route through `drain_pending_batched` to drain ALL
-        // currently-pending inodes in one SQLite transaction. Other pending
-        // inodes' timers were scheduled at roughly the same time (within a
-        // few ms during a clone burst), so they're already ripe or about to
-        // be — bundling them now avoids N back-to-back per-inode commits.
-        // This is the "real" cross-inode batching that release-time drains
-        // in Tier Two never delivered because `release` only had this fh's
-        // ino pending at the moment it fired.
-        let mut reschedule_after = None;
-        let ripe = {
-            let state = self.state.read();
-            let Some(elapsed) = state
-                .pending
-                .get(&ino)
-                .map(|entry| entry.first_enqueue.elapsed())
-            else {
-                return Ok(());
-            };
-            if elapsed >= self.batch_ms {
+    /// Arm the single coalescing drain scheduler if it is not already armed
+    /// and there is pending work left. Cheap safety net used after drains so
+    /// residual pending state (ranges enqueued mid-commit, stashed times,
+    /// inodes beyond a bounded transaction) always has a scheduled commit.
+    fn ensure_drain_scheduled(self: &Arc<Self>) {
+        let arm = {
+            let mut state = self.state.write();
+            if !state.drain_scheduled && !state.pending.is_empty() {
+                state.drain_scheduled = true;
                 true
             } else {
-                reschedule_after = Some(self.batch_ms - elapsed);
                 false
             }
         };
-
-        if !ripe {
-            // Mark timer_scheduled so we don't lose the entry, then reschedule.
-            {
-                let mut state = self.state.write();
-                if let Some(entry) = state.pending.get_mut(&ino) {
-                    entry.timer_scheduled = true;
-                }
-            }
-            if let Some(delay) = reschedule_after {
-                self.schedule_timer_after(ino, delay);
-            }
-            return Ok(());
+        if arm {
+            self.spawn_drain_scheduler();
         }
-
-        // Ripe: batch-drain every pending inode in one txn.
-        self.drain_pending_batched(AgentFSWriteBatchDrainReason::Timer, Some(ino))
-            .await
     }
 
-    fn schedule_timer_after(self: &Arc<Self>, ino: i64, delay: Duration) {
+    /// Spawn the coalescing drain scheduler task. Exactly one instance runs
+    /// while `state.drain_scheduled` is true; it exits (and clears the flag)
+    /// only once nothing is pending.
+    fn spawn_drain_scheduler(self: &Arc<Self>) {
         let batcher = Arc::clone(self);
         tokio::spawn(async move {
-            tokio::time::sleep(delay).await;
-            if let Err(error) = batcher.drain_due_timer(ino).await {
-                tracing::warn!(
-                    "AgentFS write batcher timer drain failed for inode {}: {}",
-                    ino,
-                    error
-                );
-            }
+            batcher.run_drain_scheduler().await;
         });
+    }
+
+    /// Single coalescing drain scheduler (cross-inode group commit).
+    ///
+    /// Instead of one timer task per written inode — which degenerated into a
+    /// storm of small, serialized SQLite transactions during a git-clone burst
+    /// — ONE task is armed when the first pending write arrives. Each cycle it
+    /// sleeps `AGENTFS_BATCH_MS` so concurrent writers coalesce, then commits
+    /// everything that is pending at that instant in as few `BEGIN IMMEDIATE`
+    /// transactions as the per-transaction bounds allow
+    /// (`AGENTFS_BATCH_TXN_INODES` / `AGENTFS_BATCH_TXN_BYTES`), back-to-back.
+    /// Writes that arrive while a commit is in flight are picked up by the
+    /// next cycle. The task exits only when nothing is pending; an enqueue
+    /// that observes `drain_scheduled == false` arms a fresh one. Explicit
+    /// drains (fsync, finalize, kill-switch paths) and the Bytes triggers are
+    /// unaffected — they keep draining synchronously on their own call sites.
+    async fn run_drain_scheduler(self: Arc<Self>) {
+        loop {
+            tokio::time::sleep(self.batch_ms).await;
+
+            // One pass: commit everything pending at this instant, splitting
+            // into bounded back-to-back transactions when over the per-txn
+            // bounds. On error the overlay is left intact (commit-then-remove)
+            // and the pass is retried on the next cycle.
+            loop {
+                match self
+                    .drain_pending_batched(AgentFSWriteBatchDrainReason::Timer, None)
+                    .await
+                {
+                    Ok(true) => continue,
+                    Ok(false) => break,
+                    Err(error) => {
+                        tracing::warn!(
+                            "AgentFS write batcher: scheduled group drain failed (will retry): {}",
+                            error
+                        );
+                        break;
+                    }
+                }
+            }
+
+            // Exit only when nothing is pending. The flag is cleared under the
+            // same write lock that observes the empty map, so a concurrent
+            // enqueue either sees the flag still set (this loop continues and
+            // commits it) or sees it cleared and arms a fresh scheduler.
+            let exit = {
+                let mut state = self.state.write();
+                if state.pending.is_empty() {
+                    state.drain_scheduled = false;
+                    true
+                } else {
+                    false
+                }
+            };
+            if exit {
+                return;
+            }
+        }
     }
 
     async fn commit_inode_ranges(&self, ino: i64, ranges: &[WriteRange]) -> Result<()> {
@@ -757,6 +1061,21 @@ impl AgentFSWriteBatcher {
         let started = Instant::now();
         let conn = self.pool.get_connection().await?;
         let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+        // Read the times_explicit flag and the stashed explicit times only
+        // AFTER the IMMEDIATE transaction holds the SQLite write lock: any
+        // chmod/chown/utimens that already applied its effect marked the flag
+        // / stash before that, and any later one is now blocked behind this
+        // transaction (or stays stashed for the next drain). Reading here
+        // therefore gives the correct preserve-vs-stamp decision for every
+        // interleaving (see `mark_times_explicit` / `stash_pending_times`).
+        let (preserve_times, pending_times) = {
+            let state = self.state.read();
+            let entry = state.pending.get(&ino);
+            (
+                entry.map(|batch| batch.times_explicit).unwrap_or(false),
+                entry.and_then(|batch| batch.pending_times),
+            )
+        };
         let file = AgentFSFile {
             pool: self.pool.clone(),
             ino,
@@ -773,15 +1092,36 @@ impl AgentFSWriteBatcher {
                 data: range.data.as_slice(),
             })
             .collect();
-        let result = file
-            .pwrite_ranges_inode_with_conn(&conn, &normalized_refs)
+        let mut result = file
+            .pwrite_ranges_inode_with_conn(&conn, &normalized_refs, preserve_times)
             .await;
+        // Commit explicitly-set times in the SAME transaction, after the data
+        // UPDATE (see drain_pending_batched).
+        if result.is_ok() {
+            if let Some(times) = &pending_times {
+                result = apply_pending_times_with_conn(&conn, ino, times).await;
+            }
+        }
 
         match result {
             Ok(()) => {
                 txn.commit().await?;
+                if let Some(times) = &pending_times {
+                    self.clear_applied_times(ino, times);
+                }
                 self.attr_cache.remove(ino);
                 crate::profiling::record_agentfs_batcher_commit_latency(started.elapsed());
+                crate::profiling::record_agentfs_batcher_commit_txn(1);
+                Ok(())
+            }
+            // Deleted while pending (see drain_pending_batched): treat as
+            // committed so the caller drops the moot ranges from the overlay.
+            Err(Error::Fs(FsError::NotFound)) => {
+                let _ = txn.rollback().await;
+                tracing::debug!(
+                    "AgentFS write batcher: dropping pending writes for deleted inode {}",
+                    ino
+                );
                 Ok(())
             }
             Err(error) => {
@@ -797,48 +1137,40 @@ impl AgentFSWriteBatcher {
     /// vec, and enqueues only ever append, so the committed ranges are the first
     /// `count` entries; ranges appended during the commit are preserved. The
     /// `.min(len)` guard tolerates a concurrent `truncate_pending`/`discard_pending`
-    /// having shrunk or removed the entry. Returns the inodes that still have
-    /// pending ranges and need a (re)scheduled timer drain.
-    fn remove_committed_prefix(&self, committed: &[(i64, usize)]) -> Vec<i64> {
-        let mut need_timer = Vec::new();
+    /// having shrunk or removed the entry. Entries that still have ranges or
+    /// stashed explicit times are kept; the coalescing scheduler (or the
+    /// caller's `ensure_drain_scheduled`) commits them on a later pass.
+    fn remove_committed_prefix(&self, committed: &[(i64, usize)]) {
         let mut state = self.state.write();
         for &(ino, count) in committed {
-            let (removed_bytes, empty, schedule) = {
+            let (removed_bytes, empty) = {
                 let Some(entry) = state.pending.get_mut(&ino) else {
                     continue;
                 };
                 let n = count.min(entry.ranges.len());
                 let removed_bytes: usize = entry.ranges.drain(..n).map(|r| r.data.len()).sum();
                 entry.pending_bytes = entry.pending_bytes.saturating_sub(removed_bytes);
-                let empty = entry.ranges.is_empty();
-                let mut schedule = false;
-                if !empty && !entry.timer_scheduled {
-                    entry.timer_scheduled = true;
-                    schedule = true;
-                }
-                (removed_bytes, empty, schedule)
+                // An entry with stashed explicit times but no ranges is NOT
+                // drained yet — keep it so a later drain commits the times.
+                (removed_bytes, entry.is_drained())
             };
             state.total_pending_bytes = state.total_pending_bytes.saturating_sub(removed_bytes);
             if empty {
                 state.pending.remove(&ino);
             }
-            if schedule {
-                need_timer.push(ino);
-            }
         }
         state.debug_assert_total();
-        need_timer
     }
 
-    /// Remove pending entries whose range list is empty (left behind after a
-    /// drain consumed all their ranges). Clears their attr cache entry too.
+    /// Remove pending entries that have nothing left to commit (no ranges and
+    /// no stashed explicit times). Clears their attr cache entry too.
     fn cleanup_empty_pending(&self) {
         let removed: Vec<i64> = {
             let mut state = self.state.write();
             let empties: Vec<i64> = state
                 .pending
                 .iter()
-                .filter(|(_, b)| b.ranges.is_empty())
+                .filter(|(_, b)| b.is_drained())
                 .map(|(ino, _)| *ino)
                 .collect();
             for ino in &empties {
@@ -949,6 +1281,82 @@ impl AgentFSWriteBatcher {
             .max()
     }
 
+    /// Record that an explicit attribute change (chmod / chown / utimens) was
+    /// applied to fs_inode for `ino` after the writes currently pending for
+    /// it. The eventual data commit must then preserve mtime/ctime instead of
+    /// stamping the commit time (see `commit_inode_ranges`). No-op when the
+    /// inode has nothing pending — there is no deferred commit to clobber the
+    /// attributes in that case.
+    fn mark_times_explicit(&self, ino: i64) {
+        let mut state = self.state.write();
+        if let Some(batch) = state.pending.get_mut(&ino) {
+            batch.times_explicit = true;
+        }
+    }
+
+    /// Stash explicitly-set `utimens` values in the inode's pending entry so
+    /// the next batched drain commits them inside the SAME transaction as any
+    /// pending data (one extra UPDATE statement, zero dedicated foreground
+    /// transactions). The entry is created when the inode has nothing pending
+    /// yet: the kernel's writeback SETATTR routinely lands after the inode's
+    /// data already drained (or before its flush arrives), and creating the
+    /// entry both removes the per-file fallback transaction and guarantees a
+    /// scheduled drain applies the times. `merge_pending_view` keeps the
+    /// change visible to getattr/lookup immediately.
+    fn stash_pending_times(self: &Arc<Self>, ino: i64, change: PendingTimeChange) {
+        if change.is_empty() {
+            return;
+        }
+        {
+            let mut state = self.state.write();
+            state
+                .pending
+                .entry(ino)
+                .or_insert_with(PendingInodeWrites::new)
+                .pending_times
+                .get_or_insert_with(PendingTimeChange::default)
+                .apply(&change);
+        }
+        // A times-only entry still needs a scheduled drain to commit it.
+        self.ensure_drain_scheduled();
+    }
+
+    /// Snapshot the stashed explicit times for `ino` (if any) without removing
+    /// them. Drains read this AFTER their `BEGIN IMMEDIATE` holds the write
+    /// lock and clear exactly what they applied once the commit succeeds
+    /// (commit-then-remove, mirroring the data-range discipline). Readers use
+    /// it to overlay not-yet-committed times onto fs_inode rows.
+    fn peek_pending_times(&self, ino: i64) -> Option<PendingTimeChange> {
+        let state = self.state.read();
+        state.pending.get(&ino).and_then(|b| b.pending_times)
+    }
+
+    /// After a successful commit, drop the stashed time fields that were
+    /// actually applied. Field-wise equality keeps any NEWER stash that
+    /// arrived while the transaction was in flight (it will be committed by
+    /// the next drain instead of being silently lost).
+    fn clear_applied_times(&self, ino: i64, applied: &PendingTimeChange) {
+        let mut state = self.state.write();
+        let Some(batch) = state.pending.get_mut(&ino) else {
+            return;
+        };
+        let Some(times) = &mut batch.pending_times else {
+            return;
+        };
+        if times.atime == applied.atime {
+            times.atime = None;
+        }
+        if times.mtime == applied.mtime {
+            times.mtime = None;
+        }
+        if times.ctime == applied.ctime {
+            times.ctime = None;
+        }
+        if times.is_empty() {
+            batch.pending_times = None;
+        }
+    }
+
     /// Drop any pending bytes beyond `new_size` and shrink ranges that span
     /// the truncation boundary. Called by `AgentFSFile::truncate` so the
     /// overlay agrees with the post-truncate file state without needing to
@@ -1017,7 +1425,7 @@ pub struct AgentFS {
     write_batcher: Option<Arc<AgentFSWriteBatcher>>,
     /// Tier 4 escape hatch: when false (`AGENTFS_OVERLAY_READS=0`), the SDK
     /// behaves like Tier 3 — every pwrite drains, every pread drains,
-    /// `merge_pending_size` is a no-op. ON by default.
+    /// `merge_pending_view` is a no-op. ON by default.
     overlay_reads: bool,
     /// Emits a profiling summary when the final filesystem clone is dropped.
     _profile_report: Arc<crate::profiling::ProfileReportGuard>,
@@ -1278,7 +1686,9 @@ impl File for AgentFSFile {
         let conn = self.pool.get_connection().await?;
         let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
         let ranges = [WriteRangeRef { offset, data }];
-        let result = self.pwrite_ranges_inode_with_conn(&conn, &ranges).await;
+        let result = self
+            .pwrite_ranges_inode_with_conn(&conn, &ranges, false)
+            .await;
         match result {
             Ok(()) => {
                 txn.commit().await?;
@@ -1314,7 +1724,9 @@ impl File for AgentFSFile {
                 data: range.data.as_slice(),
             })
             .collect();
-        let result = self.pwrite_ranges_inode_with_conn(&conn, &range_refs).await;
+        let result = self
+            .pwrite_ranges_inode_with_conn(&conn, &range_refs, false)
+            .await;
         match result {
             Ok(()) => {
                 txn.commit().await?;
@@ -1532,10 +1944,15 @@ impl AgentFSFile {
         Ok(result)
     }
 
+    /// `preserve_times`: when true (deferred batcher commits racing an explicit
+    /// chmod/chown/utimens), leave mtime/ctime untouched instead of stamping
+    /// the commit time — the explicitly-set attributes logically happened
+    /// after these writes and must win.
     async fn pwrite_ranges_inode_with_conn(
         &self,
         conn: &Connection,
         ranges: &[WriteRangeRef<'_>],
+        preserve_times: bool,
     ) -> Result<()> {
         let ranges = normalize_write_ranges(ranges)?;
         if ranges.is_empty() {
@@ -1564,21 +1981,34 @@ impl AgentFSFile {
 
             conn.execute("DELETE FROM fs_data WHERE ino = ?", (self.ino,))
                 .await?;
-            let (now_secs, now_nsec) = current_timestamp()?;
-            conn.execute(
-                "UPDATE fs_inode SET size = ?, data_inline = ?, storage_kind = ?, mtime = ?, ctime = ?, mtime_nsec = ?, ctime_nsec = ? WHERE ino = ?",
-                (
-                    new_size as i64,
-                    Value::Blob(inline_data),
-                    STORAGE_INLINE,
-                    now_secs,
-                    now_secs,
-                    now_nsec,
-                    now_nsec,
-                    self.ino,
-                ),
-            )
-            .await?;
+            if preserve_times {
+                conn.execute(
+                    "UPDATE fs_inode SET size = ?, data_inline = ?, storage_kind = ? WHERE ino = ?",
+                    (
+                        new_size as i64,
+                        Value::Blob(inline_data),
+                        STORAGE_INLINE,
+                        self.ino,
+                    ),
+                )
+                .await?;
+            } else {
+                let (now_secs, now_nsec) = current_timestamp()?;
+                conn.execute(
+                    "UPDATE fs_inode SET size = ?, data_inline = ?, storage_kind = ?, mtime = ?, ctime = ?, mtime_nsec = ?, ctime_nsec = ? WHERE ino = ?",
+                    (
+                        new_size as i64,
+                        Value::Blob(inline_data),
+                        STORAGE_INLINE,
+                        now_secs,
+                        now_secs,
+                        now_nsec,
+                        now_nsec,
+                        self.ino,
+                    ),
+                )
+                .await?;
+            }
             return Ok(());
         }
 
@@ -1606,20 +2036,28 @@ impl AgentFSFile {
         self.write_ranges_chunked_with_conn(conn, &chunked_ranges)
             .await?;
 
-        let (now_secs, now_nsec) = current_timestamp()?;
-        conn.execute(
-            "UPDATE fs_inode SET size = ?, data_inline = NULL, storage_kind = ?, mtime = ?, ctime = ?, mtime_nsec = ?, ctime_nsec = ? WHERE ino = ?",
-            (
-                new_size as i64,
-                STORAGE_CHUNKED,
-                now_secs,
-                now_secs,
-                now_nsec,
-                now_nsec,
-                self.ino,
-            ),
-        )
-        .await?;
+        if preserve_times {
+            conn.execute(
+                "UPDATE fs_inode SET size = ?, data_inline = NULL, storage_kind = ? WHERE ino = ?",
+                (new_size as i64, STORAGE_CHUNKED, self.ino),
+            )
+            .await?;
+        } else {
+            let (now_secs, now_nsec) = current_timestamp()?;
+            conn.execute(
+                "UPDATE fs_inode SET size = ?, data_inline = NULL, storage_kind = ?, mtime = ?, ctime = ?, mtime_nsec = ?, ctime_nsec = ? WHERE ino = ?",
+                (
+                    new_size as i64,
+                    STORAGE_CHUNKED,
+                    now_secs,
+                    now_secs,
+                    now_nsec,
+                    now_nsec,
+                    self.ino,
+                ),
+            )
+            .await?;
+        }
 
         Ok(())
     }
@@ -2439,26 +2877,63 @@ impl AgentFS {
         Ok(())
     }
 
-    /// Tier Four helper: merge the batcher's pending max-end into `stats.size`
-    /// so callers that read fs_inode while holding a pool connection don't
-    /// need to drain (which would deadlock on single-conn pools). Mirrors the
-    /// OR logic in `AgentFS::getattr` and `AgentFSFile::pread`. Fast-paths
-    /// when the batcher has no pending writes for this inode (Tier 4 read
-    /// hot path: most reads see no pending and pay zero lock cost beyond
-    /// `has_pending`'s read-lock HashMap hit).
-    fn merge_pending_size(&self, ino: i64, stats: Option<&mut Stats>) {
+    /// Prelude shared by chmod / chown / utimens.
+    ///
+    /// Legacy behaviour (`AGENTFS_DRAIN_ON_SETATTR=1`): synchronously commit
+    /// the inode's pending batched writes so the deferred data commit can
+    /// never re-stamp mtime/ctime after the explicit attribute change. With
+    /// FUSE writeback caching the kernel issues one SETATTR per written file,
+    /// so that drain serialised a SQLite commit per file on the clone path.
+    ///
+    /// Default: skip the drain and instead mark the pending entry so the
+    /// eventual batched commit preserves mtime/ctime (`mark_times_explicit` /
+    /// `preserve_times`). The mark happens BEFORE the caller's fs_inode
+    /// UPDATE; combined with the commit path re-reading the flag after it
+    /// holds the SQLite write lock, the explicitly-set attributes win in every
+    /// interleaving.
+    ///
+    /// The deferral requires Tier-4 overlay reads: with
+    /// `AGENTFS_OVERLAY_READS=0`, getattr/size are served straight from
+    /// SQLite with no pending-size merge, so the legacy drain is kept to make
+    /// the just-written size visible at close time (git reads files by
+    /// `st_size`).
+    async fn prepare_attr_change(&self, ino: i64) -> Result<()> {
+        if drain_on_setattr() || !self.overlay_reads {
+            return self.drain_inode_writes(ino).await;
+        }
+        if let Some(batcher) = &self.write_batcher {
+            batcher.mark_times_explicit(ino);
+        }
+        Ok(())
+    }
+
+    /// Tier Four helper: merge the batcher's pending state into a `Stats` row
+    /// read from SQLite, so callers that hold a pool connection don't need to
+    /// drain (which would deadlock on single-conn pools):
+    /// - `size` is OR-ed with the pending max write end (mirrors the logic in
+    ///   `AgentFS::getattr` and `AgentFSFile::pread`);
+    /// - explicitly-set times stashed by `utimens` (`PendingTimeChange`) are
+    ///   overlaid so a deferred SETATTR is visible before its drain commits.
+    ///
+    /// Fast-paths when the batcher has nothing pending for this inode (Tier 4
+    /// read hot path: most reads pay zero cost beyond a read-lock HashMap hit).
+    fn merge_pending_view(&self, ino: i64, stats: Option<&mut Stats>) {
         let Some(stats) = stats else {
             return;
         };
         // Escape hatch: when overlay reads are disabled, callers' SQLite
         // size view is already authoritative because pwrites went straight
-        // to SQLite (see AgentFSFile::pwrite). No merge needed.
+        // to SQLite (see AgentFSFile::pwrite) and utimens never stashes.
+        // No merge needed.
         if !self.overlay_reads {
             return;
         }
         let Some(batcher) = &self.write_batcher else {
             return;
         };
+        if let Some(times) = batcher.peek_pending_times(ino) {
+            times.merge_into(stats);
+        }
         if !batcher.has_pending(ino) {
             return;
         }
@@ -2709,7 +3184,7 @@ impl AgentFS {
         // single-conn pools and starve under contention on larger pools).
         // Read SQLite, then OR in pending writes' max-end.
         let mut stats = self.getattr_with_conn(&conn, ino).await?;
-        self.merge_pending_size(ino, stats.as_mut());
+        self.merge_pending_view(ino, stats.as_mut());
         Ok(stats)
     }
 
@@ -2751,7 +3226,7 @@ impl AgentFS {
                     continue; // Follow the symlink
                 }
 
-                self.merge_pending_size(ino, Some(&mut stats));
+                self.merge_pending_view(ino, Some(&mut stats));
                 return Ok(Some(stats));
             } else {
                 return Ok(None);
@@ -3236,7 +3711,8 @@ impl AgentFS {
                 overlay_reads: self.overlay_reads,
             };
             let ranges = [WriteRangeRef { offset, data }];
-            file.pwrite_ranges_inode_with_conn(&conn, &ranges).await?;
+            file.pwrite_ranges_inode_with_conn(&conn, &ranges, false)
+                .await?;
 
             Ok((ino, created))
         }
@@ -4199,7 +4675,7 @@ impl FileSystem for AgentFS {
             }
             if let Some(child_ino) = self.dentry_cache.get(parent_ino, name) {
                 if let Some(mut stats) = self.attr_cache.get(child_ino) {
-                    self.merge_pending_size(child_ino, Some(&mut stats));
+                    self.merge_pending_view(child_ino, Some(&mut stats));
                     return Ok(Some(stats));
                 }
             }
@@ -4251,7 +4727,7 @@ impl FileSystem for AgentFS {
 
         if let Some(row) = rows.next().await? {
             let mut stats = Self::build_stats_from_row(&row)?;
-            self.merge_pending_size(child_ino, Some(&mut stats));
+            self.merge_pending_view(child_ino, Some(&mut stats));
             // Cache the lookup result
             self.cache_dentry(parent_ino, name, child_ino);
             self.cache_attr(stats.clone());
@@ -4270,7 +4746,7 @@ impl FileSystem for AgentFS {
         // Same cache `getattr_with_conn` already trusts, consulted before the
         // acquire.
         if let Some(mut stats) = self.attr_cache.get(ino) {
-            self.merge_pending_size(ino, Some(&mut stats));
+            self.merge_pending_view(ino, Some(&mut stats));
             return Ok(Some(stats));
         }
         // Tier Four: don't drain — read SQLite metadata and OR in the
@@ -4282,7 +4758,7 @@ impl FileSystem for AgentFS {
         let mut stats = self.getattr_with_conn(&conn, ino).await?;
         if let Some(s) = stats.as_mut() {
             let pre = s.size;
-            self.merge_pending_size(ino, Some(s));
+            self.merge_pending_view(ino, Some(s));
             if s.size != pre {
                 self.cache_attr(s.clone());
             }
@@ -4513,147 +4989,230 @@ impl FileSystem for AgentFS {
     }
 
     async fn chmod(&self, ino: i64, mode: u32) -> Result<()> {
-        self.drain_inode_writes(ino).await?;
+        self.prepare_attr_change(ino).await?;
         let conn = self.pool.get_connection().await?;
+        // BEGIN IMMEDIATE so this serialises with concurrent batcher drain
+        // transactions instead of racing them as an autocommit statement
+        // (turso reports such write/write races as "database snapshot is
+        // stale" instead of waiting on the write lock).
+        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+        let result: Result<()> = async {
+            // Get current mode to preserve file type bits
+            let mut stmt = conn
+                .prepare_cached("SELECT mode FROM fs_inode WHERE ino = ?")
+                .await?;
+            let mut rows = stmt.query((ino,)).await?;
 
-        // Get current mode to preserve file type bits
-        let mut stmt = conn
-            .prepare_cached("SELECT mode FROM fs_inode WHERE ino = ?")
-            .await?;
-        let mut rows = stmt.query((ino,)).await?;
+            let current_mode = if let Some(row) = rows.next().await? {
+                row.get_value(0)
+                    .ok()
+                    .and_then(|v| v.as_integer().copied())
+                    .unwrap_or(0) as u32
+            } else {
+                return Err(FsError::NotFound.into());
+            };
 
-        let current_mode = if let Some(row) = rows.next().await? {
-            row.get_value(0)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0) as u32
-        } else {
-            return Err(FsError::NotFound.into());
-        };
+            // Preserve file type bits (upper bits), replace permission bits (lower 12 bits)
+            let new_mode = (current_mode & S_IFMT) | (mode & 0o7777);
 
-        // Preserve file type bits (upper bits), replace permission bits (lower 12 bits)
-        let new_mode = (current_mode & S_IFMT) | (mode & 0o7777);
+            let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
+            let now_secs = dur.as_secs() as i64;
+            let now_nsec = dur.subsec_nanos() as i64;
+            let mut stmt = conn
+                .prepare_cached(
+                    "UPDATE fs_inode SET mode = ?, ctime = ?, ctime_nsec = ? WHERE ino = ?",
+                )
+                .await?;
+            stmt.execute((new_mode as i64, now_secs, now_nsec, ino))
+                .await?;
+            Ok(())
+        }
+        .await;
 
-        let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
-        let now_secs = dur.as_secs() as i64;
-        let now_nsec = dur.subsec_nanos() as i64;
-        let mut stmt = conn
-            .prepare_cached("UPDATE fs_inode SET mode = ?, ctime = ?, ctime_nsec = ? WHERE ino = ?")
-            .await?;
-        stmt.execute((new_mode as i64, now_secs, now_nsec, ino))
-            .await?;
-        self.invalidate_attr(ino);
-
-        Ok(())
+        match result {
+            Ok(()) => {
+                txn.commit().await?;
+                self.invalidate_attr(ino);
+                Ok(())
+            }
+            Err(error) => {
+                let _ = txn.rollback().await;
+                Err(error)
+            }
+        }
     }
 
     async fn chown(&self, ino: i64, uid: Option<u32>, gid: Option<u32>) -> Result<()> {
         if uid.is_none() && gid.is_none() {
             return Ok(());
         }
-        self.drain_inode_writes(ino).await?;
+        self.prepare_attr_change(ino).await?;
 
         let conn = self.pool.get_connection().await?;
+        // BEGIN IMMEDIATE: see `chmod` — avoid autocommit write/write races
+        // with concurrent batcher drain transactions.
+        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+        let result: Result<()> = async {
+            // Verify inode exists
+            let mut stmt = conn
+                .prepare_cached("SELECT ino FROM fs_inode WHERE ino = ?")
+                .await?;
+            let mut rows = stmt.query((ino,)).await?;
 
-        // Verify inode exists
-        let mut stmt = conn
-            .prepare_cached("SELECT ino FROM fs_inode WHERE ino = ?")
-            .await?;
-        let mut rows = stmt.query((ino,)).await?;
+            if rows.next().await?.is_none() {
+                return Err(FsError::NotFound.into());
+            }
 
-        if rows.next().await?.is_none() {
-            return Err(FsError::NotFound.into());
+            // Build the update query dynamically based on which values are provided
+            let mut updates = Vec::new();
+            let mut values: Vec<Value> = Vec::new();
+
+            if let Some(uid) = uid {
+                updates.push("uid = ?");
+                values.push(Value::Integer(uid as i64));
+            }
+            if let Some(gid) = gid {
+                updates.push("gid = ?");
+                values.push(Value::Integer(gid as i64));
+            }
+
+            let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
+            let now_secs = dur.as_secs() as i64;
+            let now_nsec = dur.subsec_nanos() as i64;
+            updates.push("ctime = ?");
+            values.push(Value::Integer(now_secs));
+            updates.push("ctime_nsec = ?");
+            values.push(Value::Integer(now_nsec));
+
+            values.push(Value::Integer(ino));
+            let sql = format!("UPDATE fs_inode SET {} WHERE ino = ?", updates.join(", "));
+            conn.execute(&sql, values).await?;
+            Ok(())
         }
+        .await;
 
-        // Build the update query dynamically based on which values are provided
-        let mut updates = Vec::new();
-        let mut values: Vec<Value> = Vec::new();
-
-        if let Some(uid) = uid {
-            updates.push("uid = ?");
-            values.push(Value::Integer(uid as i64));
+        match result {
+            Ok(()) => {
+                txn.commit().await?;
+                self.invalidate_attr(ino);
+                Ok(())
+            }
+            Err(error) => {
+                let _ = txn.rollback().await;
+                Err(error)
+            }
         }
-        if let Some(gid) = gid {
-            updates.push("gid = ?");
-            values.push(Value::Integer(gid as i64));
-        }
-
-        let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
-        let now_secs = dur.as_secs() as i64;
-        let now_nsec = dur.subsec_nanos() as i64;
-        updates.push("ctime = ?");
-        values.push(Value::Integer(now_secs));
-        updates.push("ctime_nsec = ?");
-        values.push(Value::Integer(now_nsec));
-
-        values.push(Value::Integer(ino));
-        let sql = format!("UPDATE fs_inode SET {} WHERE ino = ?", updates.join(", "));
-        conn.execute(&sql, values).await?;
-        self.invalidate_attr(ino);
-
-        Ok(())
     }
 
     async fn utimens(&self, ino: i64, atime: TimeChange, mtime: TimeChange) -> Result<()> {
-        self.drain_inode_writes(ino).await?;
-        let conn = self.pool.get_connection().await?;
-
-        // Verify inode exists
-        let mut stmt = conn
-            .prepare_cached("SELECT ino FROM fs_inode WHERE ino = ?")
-            .await?;
-        let mut rows = stmt.query((ino,)).await?;
-        if rows.next().await?.is_none() {
-            return Err(FsError::NotFound.into());
-        }
-
-        let mut updates = Vec::new();
-        let mut values: Vec<Value> = Vec::new();
-
-        let resolve = |tc: TimeChange| -> (i64, i64) {
-            match tc {
-                TimeChange::Set(secs, nsec) => (secs, nsec as i64),
-                TimeChange::Now => {
-                    let dur = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-                    (dur.as_secs() as i64, dur.subsec_nanos() as i64)
-                }
-                TimeChange::Omit => unreachable!(),
-            }
-        };
-
-        if !matches!(atime, TimeChange::Omit) {
-            let (secs, nsec) = resolve(atime);
-            updates.push("atime = ?");
-            values.push(Value::Integer(secs));
-            updates.push("atime_nsec = ?");
-            values.push(Value::Integer(nsec));
-        }
-
-        if !matches!(mtime, TimeChange::Omit) {
-            let (secs, nsec) = resolve(mtime);
-            updates.push("mtime = ?");
-            values.push(Value::Integer(secs));
-            updates.push("mtime_nsec = ?");
-            values.push(Value::Integer(nsec));
-        }
-
-        if updates.is_empty() {
+        if matches!(atime, TimeChange::Omit) && matches!(mtime, TimeChange::Omit) {
             return Ok(());
         }
 
-        // Also update ctime
-        let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
-        updates.push("ctime = ?");
-        values.push(Value::Integer(dur.as_secs() as i64));
-        updates.push("ctime_nsec = ?");
-        values.push(Value::Integer(dur.subsec_nanos() as i64));
+        // Group-commit fast path: with FUSE writeback caching the kernel sends
+        // one SETATTR (mtime) per freshly written file, usually while that
+        // file's data is pending in the write batcher (and sometimes after it
+        // already drained). Instead of paying a dedicated SQLite transaction
+        // per file for the time UPDATE, stash the resolved values in the
+        // inode's pending entry (created on demand) — the batcher commits them
+        // inside its next drain transaction (`apply_pending_times_with_conn`),
+        // and `merge_pending_view` overlays them onto getattr/lookup results so
+        // the change is visible immediately. Falls through to the direct
+        // (transaction-wrapped) UPDATE when overlay reads are disabled or the
+        // legacy drain is requested.
+        if !drain_on_setattr() && self.overlay_reads {
+            if let Some(batcher) = &self.write_batcher {
+                let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
+                let now = (dur.as_secs() as i64, dur.subsec_nanos() as i64);
+                let resolve = |tc: TimeChange| -> Option<(i64, i64)> {
+                    match tc {
+                        TimeChange::Set(secs, nsec) => Some((secs, nsec as i64)),
+                        TimeChange::Now => Some(now),
+                        TimeChange::Omit => None,
+                    }
+                };
+                let change = PendingTimeChange {
+                    atime: resolve(atime),
+                    mtime: resolve(mtime),
+                    // utimens always bumps ctime.
+                    ctime: Some(now),
+                };
+                batcher.stash_pending_times(ino, change);
+                self.invalidate_attr(ino);
+                return Ok(());
+            }
+        }
 
-        values.push(Value::Integer(ino));
-        let sql = format!("UPDATE fs_inode SET {} WHERE ino = ?", updates.join(", "));
-        conn.execute(&sql, values).await?;
-        self.invalidate_attr(ino);
+        self.prepare_attr_change(ino).await?;
+        let conn = self.pool.get_connection().await?;
+        // BEGIN IMMEDIATE: see `chmod` — avoid autocommit write/write races
+        // with concurrent batcher drain transactions.
+        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+        let result: Result<()> = async {
+            // Verify inode exists
+            let mut stmt = conn
+                .prepare_cached("SELECT ino FROM fs_inode WHERE ino = ?")
+                .await?;
+            let mut rows = stmt.query((ino,)).await?;
+            if rows.next().await?.is_none() {
+                return Err(FsError::NotFound.into());
+            }
 
-        Ok(())
+            let mut updates = Vec::new();
+            let mut values: Vec<Value> = Vec::new();
+
+            let resolve = |tc: TimeChange| -> (i64, i64) {
+                match tc {
+                    TimeChange::Set(secs, nsec) => (secs, nsec as i64),
+                    TimeChange::Now => {
+                        let dur = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+                        (dur.as_secs() as i64, dur.subsec_nanos() as i64)
+                    }
+                    TimeChange::Omit => unreachable!(),
+                }
+            };
+
+            if !matches!(atime, TimeChange::Omit) {
+                let (secs, nsec) = resolve(atime);
+                updates.push("atime = ?");
+                values.push(Value::Integer(secs));
+                updates.push("atime_nsec = ?");
+                values.push(Value::Integer(nsec));
+            }
+
+            if !matches!(mtime, TimeChange::Omit) {
+                let (secs, nsec) = resolve(mtime);
+                updates.push("mtime = ?");
+                values.push(Value::Integer(secs));
+                updates.push("mtime_nsec = ?");
+                values.push(Value::Integer(nsec));
+            }
+
+            // Also update ctime
+            let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
+            updates.push("ctime = ?");
+            values.push(Value::Integer(dur.as_secs() as i64));
+            updates.push("ctime_nsec = ?");
+            values.push(Value::Integer(dur.subsec_nanos() as i64));
+
+            values.push(Value::Integer(ino));
+            let sql = format!("UPDATE fs_inode SET {} WHERE ino = ?", updates.join(", "));
+            conn.execute(&sql, values).await?;
+            Ok(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                txn.commit().await?;
+                self.invalidate_attr(ino);
+                Ok(())
+            }
+            Err(error) => {
+                let _ = txn.rollback().await;
+                Err(error)
+            }
+        }
     }
 
     async fn open(&self, ino: i64, _flags: i32) -> Result<BoxedFile> {
@@ -4692,85 +5251,101 @@ impl FileSystem for AgentFS {
             return Err(FsError::NameTooLong.into());
         }
         let conn = self.pool.get_connection().await?;
+        // BEGIN IMMEDIATE: see `chmod` — multi-statement metadata mutations
+        // must not run as autocommit statements that race the write batcher's
+        // drain transactions (turso reports such write/write races as
+        // "database snapshot is stale" instead of waiting on the write lock).
+        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+        let result: Result<Stats> = async {
+            // Check if already exists
+            if self.lookup_child(&conn, parent_ino, name).await?.is_some() {
+                return Err(FsError::AlreadyExists.into());
+            }
 
-        // Check if already exists
-        if self.lookup_child(&conn, parent_ino, name).await?.is_some() {
-            return Err(FsError::AlreadyExists.into());
-        }
+            // Create inode
+            let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
+            let now_secs = dur.as_secs() as i64;
+            let now_nsec = dur.subsec_nanos() as i64;
+            let mut stmt = conn
+                .prepare_cached(
+                    "INSERT INTO fs_inode (mode, uid, gid, size, atime, mtime, ctime, atime_nsec, mtime_nsec, ctime_nsec)
+                    VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?) RETURNING ino",
+                )
+                .await?;
+            let dir_mode = super::S_IFDIR | (mode & 0o7777);
+            let row = stmt
+                .query_row((
+                    dir_mode as i64,
+                    uid,
+                    gid,
+                    now_secs,
+                    now_secs,
+                    now_secs,
+                    now_nsec,
+                    now_nsec,
+                    now_nsec,
+                ))
+                .await?;
 
-        // Create inode
-        let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
-        let now_secs = dur.as_secs() as i64;
-        let now_nsec = dur.subsec_nanos() as i64;
-        let mut stmt = conn
-            .prepare_cached(
-                "INSERT INTO fs_inode (mode, uid, gid, size, atime, mtime, ctime, atime_nsec, mtime_nsec, ctime_nsec)
-                VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?) RETURNING ino",
-            )
-            .await?;
-        let dir_mode = super::S_IFDIR | (mode & 0o7777);
-        let row = stmt
-            .query_row((
-                dir_mode as i64,
+            let ino = row
+                .get_value(0)
+                .ok()
+                .and_then(|v| v.as_integer().copied())
+                .ok_or_else(|| Error::Internal("failed to get inode".to_string()))?;
+
+            // Create directory entry
+            let mut stmt = conn
+                .prepare_cached("INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, ?, ?)")
+                .await?;
+            stmt.execute((name, parent_ino, ino)).await?;
+
+            // Set nlink to 2 for new directory (self "." + parent's dentry)
+            let mut stmt = conn
+                .prepare_cached("UPDATE fs_inode SET nlink = 2 WHERE ino = ?")
+                .await?;
+            stmt.execute((ino,)).await?;
+
+            // Increment parent nlink (new directory's ".." link) and update timestamps
+            let mut stmt = conn
+                .prepare_cached(
+                    "UPDATE fs_inode SET nlink = nlink + 1, ctime = ?, mtime = ?, ctime_nsec = ?, mtime_nsec = ? WHERE ino = ?",
+                )
+                .await?;
+            stmt.execute((now_secs, now_secs, now_nsec, now_nsec, parent_ino))
+                .await?;
+
+            Ok(Stats {
+                ino,
+                mode: dir_mode,
+                nlink: 2,
                 uid,
                 gid,
-                now_secs,
-                now_secs,
-                now_secs,
-                now_nsec,
-                now_nsec,
-                now_nsec,
-            ))
-            .await?;
+                size: 0,
+                atime: now_secs,
+                mtime: now_secs,
+                ctime: now_secs,
+                atime_nsec: now_nsec as u32,
+                mtime_nsec: now_nsec as u32,
+                ctime_nsec: now_nsec as u32,
+                rdev: 0,
+            })
+        }
+        .await;
 
-        let ino = row
-            .get_value(0)
-            .ok()
-            .and_then(|v| v.as_integer().copied())
-            .ok_or_else(|| Error::Internal("failed to get inode".to_string()))?;
-
-        // Create directory entry
-        let mut stmt = conn
-            .prepare_cached("INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, ?, ?)")
-            .await?;
-        stmt.execute((name, parent_ino, ino)).await?;
-
-        // Set nlink to 2 for new directory (self "." + parent's dentry)
-        let mut stmt = conn
-            .prepare_cached("UPDATE fs_inode SET nlink = 2 WHERE ino = ?")
-            .await?;
-        stmt.execute((ino,)).await?;
-
-        // Increment parent nlink (new directory's ".." link) and update timestamps
-        let mut stmt = conn
-            .prepare_cached(
-                "UPDATE fs_inode SET nlink = nlink + 1, ctime = ?, mtime = ?, ctime_nsec = ?, mtime_nsec = ? WHERE ino = ?",
-            )
-            .await?;
-        stmt.execute((now_secs, now_secs, now_nsec, now_nsec, parent_ino))
-            .await?;
-
-        // Populate dentry cache
-        self.cache_dentry(parent_ino, name, ino);
-        self.invalidate_parent_attr(parent_ino);
-
-        let stats = Stats {
-            ino,
-            mode: dir_mode,
-            nlink: 2,
-            uid,
-            gid,
-            size: 0,
-            atime: now_secs,
-            mtime: now_secs,
-            ctime: now_secs,
-            atime_nsec: now_nsec as u32,
-            mtime_nsec: now_nsec as u32,
-            ctime_nsec: now_nsec as u32,
-            rdev: 0,
-        };
-        self.cache_attr(stats.clone());
-        Ok(stats)
+        match result {
+            Ok(stats) => {
+                txn.commit().await?;
+                // Populate dentry cache only after the transaction is durable.
+                self.cache_dentry(parent_ino, name, stats.ino);
+                self.invalidate_parent_attr(parent_ino);
+                self.cache_attr(stats.clone());
+                Ok(stats)
+            }
+            Err(error) => {
+                let _ = txn.rollback().await;
+                Err(error)
+            }
+        }
     }
 
     async fn create_file(
@@ -4888,83 +5463,97 @@ impl FileSystem for AgentFS {
             return Err(FsError::NameTooLong.into());
         }
         let conn = self.pool.get_connection().await?;
+        // BEGIN IMMEDIATE: see `mkdir` — never race the batcher's drain
+        // transactions with autocommit metadata writes.
+        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+        let result: Result<Stats> = async {
+            // Check if already exists
+            if self.lookup_child(&conn, parent_ino, name).await?.is_some() {
+                return Err(FsError::AlreadyExists.into());
+            }
 
-        // Check if already exists
-        if self.lookup_child(&conn, parent_ino, name).await?.is_some() {
-            return Err(FsError::AlreadyExists.into());
-        }
+            // Create inode with mode and rdev
+            let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
+            let now_secs = dur.as_secs() as i64;
+            let now_nsec = dur.subsec_nanos() as i64;
+            let mut stmt = conn
+                .prepare_cached(
+                    "INSERT INTO fs_inode (mode, uid, gid, size, atime, mtime, ctime, rdev, atime_nsec, mtime_nsec, ctime_nsec)
+                    VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?) RETURNING ino",
+                )
+                .await?;
+            let row = stmt
+                .query_row((
+                    mode as i64,
+                    uid,
+                    gid,
+                    now_secs,
+                    now_secs,
+                    now_secs,
+                    rdev as i64,
+                    now_nsec,
+                    now_nsec,
+                    now_nsec,
+                ))
+                .await?;
 
-        // Create inode with mode and rdev
-        let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
-        let now_secs = dur.as_secs() as i64;
-        let now_nsec = dur.subsec_nanos() as i64;
-        let mut stmt = conn
-            .prepare_cached(
-                "INSERT INTO fs_inode (mode, uid, gid, size, atime, mtime, ctime, rdev, atime_nsec, mtime_nsec, ctime_nsec)
-                VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?) RETURNING ino",
-            )
-            .await?;
-        let row = stmt
-            .query_row((
-                mode as i64,
+            let ino = row
+                .get_value(0)
+                .ok()
+                .and_then(|v| v.as_integer().copied())
+                .ok_or_else(|| Error::Internal("failed to get inode".to_string()))?;
+
+            // Create directory entry
+            let mut stmt = conn
+                .prepare_cached("INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, ?, ?)")
+                .await?;
+            stmt.execute((name, parent_ino, ino)).await?;
+
+            // Increment link count
+            let mut stmt = conn
+                .prepare_cached("UPDATE fs_inode SET nlink = nlink + 1 WHERE ino = ?")
+                .await?;
+            stmt.execute((ino,)).await?;
+
+            // Update parent directory ctime and mtime
+            let mut stmt = conn
+                .prepare_cached("UPDATE fs_inode SET ctime = ?, mtime = ?, ctime_nsec = ?, mtime_nsec = ? WHERE ino = ?")
+                .await?;
+            stmt.execute((now_secs, now_secs, now_nsec, now_nsec, parent_ino))
+                .await?;
+
+            Ok(Stats {
+                ino,
+                mode,
+                nlink: 1,
                 uid,
                 gid,
-                now_secs,
-                now_secs,
-                now_secs,
-                rdev as i64,
-                now_nsec,
-                now_nsec,
-                now_nsec,
-            ))
-            .await?;
+                size: 0,
+                atime: now_secs,
+                mtime: now_secs,
+                ctime: now_secs,
+                atime_nsec: now_nsec as u32,
+                mtime_nsec: now_nsec as u32,
+                ctime_nsec: now_nsec as u32,
+                rdev,
+            })
+        }
+        .await;
 
-        let ino = row
-            .get_value(0)
-            .ok()
-            .and_then(|v| v.as_integer().copied())
-            .ok_or_else(|| Error::Internal("failed to get inode".to_string()))?;
-
-        // Create directory entry
-        let mut stmt = conn
-            .prepare_cached("INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, ?, ?)")
-            .await?;
-        stmt.execute((name, parent_ino, ino)).await?;
-
-        // Increment link count
-        let mut stmt = conn
-            .prepare_cached("UPDATE fs_inode SET nlink = nlink + 1 WHERE ino = ?")
-            .await?;
-        stmt.execute((ino,)).await?;
-
-        // Update parent directory ctime and mtime
-        let mut stmt = conn
-            .prepare_cached("UPDATE fs_inode SET ctime = ?, mtime = ?, ctime_nsec = ?, mtime_nsec = ? WHERE ino = ?")
-            .await?;
-        stmt.execute((now_secs, now_secs, now_nsec, now_nsec, parent_ino))
-            .await?;
-
-        // Populate dentry cache
-        self.cache_dentry(parent_ino, name, ino);
-        self.invalidate_parent_attr(parent_ino);
-
-        let stats = Stats {
-            ino,
-            mode,
-            nlink: 1,
-            uid,
-            gid,
-            size: 0,
-            atime: now_secs,
-            mtime: now_secs,
-            ctime: now_secs,
-            atime_nsec: now_nsec as u32,
-            mtime_nsec: now_nsec as u32,
-            ctime_nsec: now_nsec as u32,
-            rdev,
-        };
-        self.cache_attr(stats.clone());
-        Ok(stats)
+        match result {
+            Ok(stats) => {
+                txn.commit().await?;
+                // Populate dentry cache only after the transaction is durable.
+                self.cache_dentry(parent_ino, name, stats.ino);
+                self.invalidate_parent_attr(parent_ino);
+                self.cache_attr(stats.clone());
+                Ok(stats)
+            }
+            Err(error) => {
+                let _ = txn.rollback().await;
+                Err(error)
+            }
+        }
     }
 
     async fn symlink(
@@ -4979,86 +5568,101 @@ impl FileSystem for AgentFS {
             return Err(FsError::NameTooLong.into());
         }
         let conn = self.pool.get_connection().await?;
+        // BEGIN IMMEDIATE: see `mkdir` — never race the batcher's drain
+        // transactions with autocommit metadata writes.
+        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+        let result: Result<Stats> = async {
+            // Check if entry already exists
+            if self.lookup_child(&conn, parent_ino, name).await?.is_some() {
+                return Err(FsError::AlreadyExists.into());
+            }
 
-        // Check if entry already exists
-        if self.lookup_child(&conn, parent_ino, name).await?.is_some() {
-            return Err(FsError::AlreadyExists.into());
-        }
+            // Create inode for symlink
+            let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
+            let now_secs = dur.as_secs() as i64;
+            let now_nsec = dur.subsec_nanos() as i64;
+            let mode = S_IFLNK | 0o777; // Symlinks typically have 777 permissions
+            let size = target.len() as i64;
 
-        // Create inode for symlink
-        let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
-        let now_secs = dur.as_secs() as i64;
-        let now_nsec = dur.subsec_nanos() as i64;
-        let mode = S_IFLNK | 0o777; // Symlinks typically have 777 permissions
-        let size = target.len() as i64;
+            let mut stmt = conn
+                .prepare_cached(
+                    "INSERT INTO fs_inode (mode, uid, gid, size, atime, mtime, ctime, atime_nsec, mtime_nsec, ctime_nsec)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING ino",
+                )
+                .await?;
+            let row = stmt
+                .query_row((
+                    mode, uid, gid, size, now_secs, now_secs, now_secs, now_nsec, now_nsec,
+                    now_nsec,
+                ))
+                .await?;
 
-        let mut stmt = conn
-            .prepare_cached(
-                "INSERT INTO fs_inode (mode, uid, gid, size, atime, mtime, ctime, atime_nsec, mtime_nsec, ctime_nsec)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING ino",
+            let ino = row
+                .get_value(0)
+                .ok()
+                .and_then(|v| v.as_integer().copied())
+                .ok_or_else(|| Error::Internal("failed to get inode".to_string()))?;
+
+            // Store symlink target
+            conn.execute(
+                "INSERT INTO fs_symlink (ino, target) VALUES (?, ?)",
+                (ino, target),
             )
             .await?;
-        let row = stmt
-            .query_row((
-                mode, uid, gid, size, now_secs, now_secs, now_secs, now_nsec, now_nsec, now_nsec,
-            ))
+
+            // Create directory entry
+            conn.execute(
+                "INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, ?, ?)",
+                (name, parent_ino, ino),
+            )
             .await?;
 
-        let ino = row
-            .get_value(0)
-            .ok()
-            .and_then(|v| v.as_integer().copied())
-            .ok_or_else(|| Error::Internal("failed to get inode".to_string()))?;
+            // Increment link count
+            conn.execute(
+                "UPDATE fs_inode SET nlink = nlink + 1 WHERE ino = ?",
+                (ino,),
+            )
+            .await?;
 
-        // Store symlink target
-        conn.execute(
-            "INSERT INTO fs_symlink (ino, target) VALUES (?, ?)",
-            (ino, target),
-        )
-        .await?;
+            // Update parent directory ctime and mtime
+            conn.execute(
+                "UPDATE fs_inode SET ctime = ?, mtime = ?, ctime_nsec = ?, mtime_nsec = ? WHERE ino = ?",
+                (now_secs, now_secs, now_nsec, now_nsec, parent_ino),
+            )
+            .await?;
 
-        // Create directory entry
-        conn.execute(
-            "INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, ?, ?)",
-            (name, parent_ino, ino),
-        )
-        .await?;
+            Ok(Stats {
+                ino,
+                mode,
+                nlink: 1,
+                uid,
+                gid,
+                size,
+                atime: now_secs,
+                mtime: now_secs,
+                ctime: now_secs,
+                atime_nsec: now_nsec as u32,
+                mtime_nsec: now_nsec as u32,
+                ctime_nsec: now_nsec as u32,
+                rdev: 0,
+            })
+        }
+        .await;
 
-        // Increment link count
-        conn.execute(
-            "UPDATE fs_inode SET nlink = nlink + 1 WHERE ino = ?",
-            (ino,),
-        )
-        .await?;
-
-        // Update parent directory ctime and mtime
-        conn.execute(
-            "UPDATE fs_inode SET ctime = ?, mtime = ?, ctime_nsec = ?, mtime_nsec = ? WHERE ino = ?",
-            (now_secs, now_secs, now_nsec, now_nsec, parent_ino),
-        )
-        .await?;
-
-        // Populate dentry cache
-        self.cache_dentry(parent_ino, name, ino);
-        self.invalidate_parent_attr(parent_ino);
-
-        let stats = Stats {
-            ino,
-            mode,
-            nlink: 1,
-            uid,
-            gid,
-            size,
-            atime: now_secs,
-            mtime: now_secs,
-            ctime: now_secs,
-            atime_nsec: now_nsec as u32,
-            mtime_nsec: now_nsec as u32,
-            ctime_nsec: now_nsec as u32,
-            rdev: 0,
-        };
-        self.cache_attr(stats.clone());
-        Ok(stats)
+        match result {
+            Ok(stats) => {
+                txn.commit().await?;
+                // Populate dentry cache only after the transaction is durable.
+                self.cache_dentry(parent_ino, name, stats.ino);
+                self.invalidate_parent_attr(parent_ino);
+                self.cache_attr(stats.clone());
+                Ok(stats)
+            }
+            Err(error) => {
+                let _ = txn.rollback().await;
+                Err(error)
+            }
+        }
     }
 
     async fn unlink(&self, parent_ino: i64, name: &str) -> Result<()> {
@@ -5066,97 +5670,113 @@ impl FileSystem for AgentFS {
             return Err(FsError::NameTooLong.into());
         }
         let conn = self.pool.get_connection().await?;
+        // BEGIN IMMEDIATE: this is the path that intermittently failed with
+        // "database snapshot is stale" -> EIO when its autocommit statements
+        // raced the write batcher's drain transactions (git unlinking
+        // `.git/config.lock` during a clone). The transaction also makes the
+        // dentry/nlink/inode removal atomic.
+        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+        let result: Result<(i64, bool)> = async {
+            // Look up the child inode
+            let ino = self
+                .lookup_child(&conn, parent_ino, name)
+                .await?
+                .ok_or(FsError::NotFound)?;
 
-        // Look up the child inode
-        let ino = self
-            .lookup_child(&conn, parent_ino, name)
-            .await?
-            .ok_or(FsError::NotFound)?;
+            // Check if it's a directory (use rmdir for directories)
+            let mut stmt = conn
+                .prepare_cached("SELECT mode FROM fs_inode WHERE ino = ?")
+                .await?;
+            let mut rows = stmt.query((ino,)).await?;
 
-        // Check if it's a directory (use rmdir for directories)
-        let mut stmt = conn
-            .prepare_cached("SELECT mode FROM fs_inode WHERE ino = ?")
-            .await?;
-        let mut rows = stmt.query((ino,)).await?;
+            if let Some(row) = rows.next().await? {
+                let mode = row
+                    .get_value(0)
+                    .ok()
+                    .and_then(|v| v.as_integer().copied())
+                    .unwrap_or(0) as u32;
 
-        if let Some(row) = rows.next().await? {
-            let mode = row
-                .get_value(0)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0) as u32;
-
-            if (mode & S_IFMT) == super::S_IFDIR {
-                return Err(FsError::IsADirectory.into());
-            }
-        }
-
-        // Delete the directory entry
-        let mut stmt = conn
-            .prepare_cached("DELETE FROM fs_dentry WHERE parent_ino = ? AND name = ?")
-            .await?;
-        stmt.execute((parent_ino, name)).await?;
-
-        // Invalidate cache
-        self.invalidate_dentry(parent_ino, name);
-        self.invalidate_parent_attr(parent_ino);
-        self.invalidate_attr(ino);
-
-        // Update parent directory mtime and ctime
-        let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
-        let now_secs = dur.as_secs() as i64;
-        let now_nsec = dur.subsec_nanos() as i64;
-        let mut stmt = conn
-            .prepare_cached("UPDATE fs_inode SET mtime = ?, ctime = ?, mtime_nsec = ?, ctime_nsec = ? WHERE ino = ?")
-            .await?;
-        stmt.execute((now_secs, now_secs, now_nsec, now_nsec, parent_ino))
-            .await?;
-
-        // Decrement link count and update ctime
-        let mut stmt = conn
-            .prepare_cached(
-                "UPDATE fs_inode SET nlink = nlink - 1, ctime = ?, ctime_nsec = ? WHERE ino = ?",
-            )
-            .await?;
-        stmt.execute((now_secs, now_nsec, ino)).await?;
-
-        // Check if this was the last link to the inode
-        let link_count = self.get_link_count(&conn, ino).await?;
-        if link_count == 0 {
-            // Tier Four: discard any pending writes the batcher might still
-            // hold for this inode. Without this, a timer drain firing AFTER
-            // the inode row is deleted would INSERT orphan `fs_data` rows
-            // (no FK constraint to prevent it). discard_pending is the only
-            // way the post-unlink state stays clean now that release/forget
-            // no longer force a synchronous drain.
-            if let Some(batcher) = &self.write_batcher {
-                batcher.discard_pending(ino);
+                if (mode & S_IFMT) == super::S_IFDIR {
+                    return Err(FsError::IsADirectory.into());
+                }
             }
 
-            // Delete data blocks
+            // Delete the directory entry
             let mut stmt = conn
-                .prepare_cached("DELETE FROM fs_data WHERE ino = ?")
+                .prepare_cached("DELETE FROM fs_dentry WHERE parent_ino = ? AND name = ?")
                 .await?;
-            stmt.execute((ino,)).await?;
+            stmt.execute((parent_ino, name)).await?;
 
-            // Delete symlink if exists
+            // Update parent directory mtime and ctime
+            let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
+            let now_secs = dur.as_secs() as i64;
+            let now_nsec = dur.subsec_nanos() as i64;
             let mut stmt = conn
-                .prepare_cached("DELETE FROM fs_symlink WHERE ino = ?")
+                .prepare_cached("UPDATE fs_inode SET mtime = ?, ctime = ?, mtime_nsec = ?, ctime_nsec = ? WHERE ino = ?")
                 .await?;
-            stmt.execute((ino,)).await?;
+            stmt.execute((now_secs, now_secs, now_nsec, now_nsec, parent_ino))
+                .await?;
 
-            // Delete inode
+            // Decrement link count and update ctime
             let mut stmt = conn
-                .prepare_cached("DELETE FROM fs_inode WHERE ino = ?")
+                .prepare_cached(
+                    "UPDATE fs_inode SET nlink = nlink - 1, ctime = ?, ctime_nsec = ? WHERE ino = ?",
+                )
                 .await?;
-            stmt.execute((ino,)).await?;
+            stmt.execute((now_secs, now_nsec, ino)).await?;
+
+            // Check if this was the last link to the inode
+            let link_count = self.get_link_count(&conn, ino).await?;
+            let removed = link_count == 0;
+            if removed {
+                // Delete data blocks
+                let mut stmt = conn
+                    .prepare_cached("DELETE FROM fs_data WHERE ino = ?")
+                    .await?;
+                stmt.execute((ino,)).await?;
+
+                // Delete symlink if exists
+                let mut stmt = conn
+                    .prepare_cached("DELETE FROM fs_symlink WHERE ino = ?")
+                    .await?;
+                stmt.execute((ino,)).await?;
+
+                // Delete inode
+                let mut stmt = conn
+                    .prepare_cached("DELETE FROM fs_inode WHERE ino = ?")
+                    .await?;
+                stmt.execute((ino,)).await?;
+            }
+
+            Ok((ino, removed))
         }
+        .await;
 
-        self.invalidate_dentry(parent_ino, name);
-        self.invalidate_parent_attr(parent_ino);
-        self.invalidate_attr(ino);
-        self.cache_negative_dentry(parent_ino, name);
-        Ok(())
+        match result {
+            Ok((ino, removed)) => {
+                txn.commit().await?;
+                if removed {
+                    // Tier Four: discard any pending writes the batcher might
+                    // still hold for this inode. The drains tolerate a deleted
+                    // inode (NotFound is skipped, never inserted as orphan
+                    // `fs_data` rows), so dropping the moot ranges after the
+                    // commit keeps the overlay clean without risking data loss
+                    // on a rolled-back unlink.
+                    if let Some(batcher) = &self.write_batcher {
+                        batcher.discard_pending(ino);
+                    }
+                }
+                self.invalidate_dentry(parent_ino, name);
+                self.invalidate_parent_attr(parent_ino);
+                self.invalidate_attr(ino);
+                self.cache_negative_dentry(parent_ino, name);
+                Ok(())
+            }
+            Err(error) => {
+                let _ = txn.rollback().await;
+                Err(error)
+            }
+        }
     }
 
     async fn rmdir(&self, parent_ino: i64, name: &str) -> Result<()> {
@@ -5164,97 +5784,108 @@ impl FileSystem for AgentFS {
             return Err(FsError::NameTooLong.into());
         }
         let conn = self.pool.get_connection().await?;
+        // BEGIN IMMEDIATE: see `unlink` — never race the batcher's drain
+        // transactions with autocommit metadata writes.
+        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+        let result: Result<i64> = async {
+            // Look up the child inode
+            let ino = self
+                .lookup_child(&conn, parent_ino, name)
+                .await?
+                .ok_or(FsError::NotFound)?;
 
-        // Look up the child inode
-        let ino = self
-            .lookup_child(&conn, parent_ino, name)
-            .await?
-            .ok_or(FsError::NotFound)?;
-
-        if ino == ROOT_INO {
-            return Err(FsError::RootOperation.into());
-        }
-
-        // Check if it's a directory
-        let mut stmt = conn
-            .prepare_cached("SELECT mode FROM fs_inode WHERE ino = ?")
-            .await?;
-        let mut rows = stmt.query((ino,)).await?;
-
-        if let Some(row) = rows.next().await? {
-            let mode = row
-                .get_value(0)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0) as u32;
-
-            if (mode & S_IFMT) != super::S_IFDIR {
-                return Err(FsError::NotADirectory.into());
+            if ino == ROOT_INO {
+                return Err(FsError::RootOperation.into());
             }
-        } else {
-            return Err(FsError::NotFound.into());
-        }
 
-        // Check if directory is empty
-        let mut stmt = conn
-            .prepare_cached("SELECT COUNT(*) FROM fs_dentry WHERE parent_ino = ?")
-            .await?;
-        let mut rows = stmt.query((ino,)).await?;
-
-        if let Some(row) = rows.next().await? {
-            let count = row
-                .get_value(0)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0);
-            if count > 0 {
-                return Err(FsError::NotEmpty.into());
-            }
-        }
-
-        // Delete the directory entry
-        let mut stmt = conn
-            .prepare_cached("DELETE FROM fs_dentry WHERE parent_ino = ? AND name = ?")
-            .await?;
-        stmt.execute((parent_ino, name)).await?;
-
-        // Invalidate cache
-        self.invalidate_dentry(parent_ino, name);
-        self.invalidate_parent_attr(parent_ino);
-        self.invalidate_attr(ino);
-
-        // Decrement link count on removed directory
-        let mut stmt = conn
-            .prepare_cached("UPDATE fs_inode SET nlink = nlink - 1 WHERE ino = ?")
-            .await?;
-        stmt.execute((ino,)).await?;
-
-        // Decrement parent nlink (removed directory's ".." link) and update timestamps
-        let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
-        let now_secs = dur.as_secs() as i64;
-        let now_nsec = dur.subsec_nanos() as i64;
-        let mut stmt = conn
-            .prepare_cached(
-                "UPDATE fs_inode SET nlink = nlink - 1, ctime = ?, mtime = ?, ctime_nsec = ?, mtime_nsec = ? WHERE ino = ?",
-            )
-            .await?;
-        stmt.execute((now_secs, now_secs, now_nsec, now_nsec, parent_ino))
-            .await?;
-
-        // Delete inode if no more links
-        let link_count = self.get_link_count(&conn, ino).await?;
-        if link_count == 0 {
+            // Check if it's a directory
             let mut stmt = conn
-                .prepare_cached("DELETE FROM fs_inode WHERE ino = ?")
+                .prepare_cached("SELECT mode FROM fs_inode WHERE ino = ?")
+                .await?;
+            let mut rows = stmt.query((ino,)).await?;
+
+            if let Some(row) = rows.next().await? {
+                let mode = row
+                    .get_value(0)
+                    .ok()
+                    .and_then(|v| v.as_integer().copied())
+                    .unwrap_or(0) as u32;
+
+                if (mode & S_IFMT) != super::S_IFDIR {
+                    return Err(FsError::NotADirectory.into());
+                }
+            } else {
+                return Err(FsError::NotFound.into());
+            }
+
+            // Check if directory is empty
+            let mut stmt = conn
+                .prepare_cached("SELECT COUNT(*) FROM fs_dentry WHERE parent_ino = ?")
+                .await?;
+            let mut rows = stmt.query((ino,)).await?;
+
+            if let Some(row) = rows.next().await? {
+                let count = row
+                    .get_value(0)
+                    .ok()
+                    .and_then(|v| v.as_integer().copied())
+                    .unwrap_or(0);
+                if count > 0 {
+                    return Err(FsError::NotEmpty.into());
+                }
+            }
+
+            // Delete the directory entry
+            let mut stmt = conn
+                .prepare_cached("DELETE FROM fs_dentry WHERE parent_ino = ? AND name = ?")
+                .await?;
+            stmt.execute((parent_ino, name)).await?;
+
+            // Decrement link count on removed directory
+            let mut stmt = conn
+                .prepare_cached("UPDATE fs_inode SET nlink = nlink - 1 WHERE ino = ?")
                 .await?;
             stmt.execute((ino,)).await?;
-        }
 
-        self.invalidate_dentry(parent_ino, name);
-        self.invalidate_parent_attr(parent_ino);
-        self.invalidate_attr(ino);
-        self.cache_negative_dentry(parent_ino, name);
-        Ok(())
+            // Decrement parent nlink (removed directory's ".." link) and update timestamps
+            let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
+            let now_secs = dur.as_secs() as i64;
+            let now_nsec = dur.subsec_nanos() as i64;
+            let mut stmt = conn
+                .prepare_cached(
+                    "UPDATE fs_inode SET nlink = nlink - 1, ctime = ?, mtime = ?, ctime_nsec = ?, mtime_nsec = ? WHERE ino = ?",
+                )
+                .await?;
+            stmt.execute((now_secs, now_secs, now_nsec, now_nsec, parent_ino))
+                .await?;
+
+            // Delete inode if no more links
+            let link_count = self.get_link_count(&conn, ino).await?;
+            if link_count == 0 {
+                let mut stmt = conn
+                    .prepare_cached("DELETE FROM fs_inode WHERE ino = ?")
+                    .await?;
+                stmt.execute((ino,)).await?;
+            }
+
+            Ok(ino)
+        }
+        .await;
+
+        match result {
+            Ok(ino) => {
+                txn.commit().await?;
+                self.invalidate_dentry(parent_ino, name);
+                self.invalidate_parent_attr(parent_ino);
+                self.invalidate_attr(ino);
+                self.cache_negative_dentry(parent_ino, name);
+                Ok(())
+            }
+            Err(error) => {
+                let _ = txn.rollback().await;
+                Err(error)
+            }
+        }
     }
 
     async fn link(&self, ino: i64, newparent_ino: i64, newname: &str) -> Result<Stats> {
@@ -5262,69 +5893,87 @@ impl FileSystem for AgentFS {
             return Err(FsError::NameTooLong.into());
         }
         let conn = self.pool.get_connection().await?;
+        // BEGIN IMMEDIATE: see `unlink` — never race the batcher's drain
+        // transactions with autocommit metadata writes.
+        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+        let result: Result<Stats> = async {
+            // Check if source inode exists and is not a directory
+            let mut stmt = conn
+                .prepare_cached("SELECT mode FROM fs_inode WHERE ino = ?")
+                .await?;
+            let mut rows = stmt.query((ino,)).await?;
 
-        // Check if source inode exists and is not a directory
-        let mut stmt = conn
-            .prepare_cached("SELECT mode FROM fs_inode WHERE ino = ?")
-            .await?;
-        let mut rows = stmt.query((ino,)).await?;
+            if let Some(row) = rows.next().await? {
+                let mode = row
+                    .get_value(0)
+                    .ok()
+                    .and_then(|v| v.as_integer().copied())
+                    .unwrap_or(0) as u32;
 
-        if let Some(row) = rows.next().await? {
-            let mode = row
-                .get_value(0)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0) as u32;
-
-            if (mode & S_IFMT) == super::S_IFDIR {
-                return Err(FsError::IsADirectory.into());
+                if (mode & S_IFMT) == super::S_IFDIR {
+                    return Err(FsError::IsADirectory.into());
+                }
+            } else {
+                return Err(FsError::NotFound.into());
             }
-        } else {
-            return Err(FsError::NotFound.into());
+
+            // Check if destination already exists
+            if self
+                .lookup_child(&conn, newparent_ino, newname)
+                .await?
+                .is_some()
+            {
+                return Err(FsError::AlreadyExists.into());
+            }
+
+            // Create directory entry pointing to the same inode
+            conn.execute(
+                "INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, ?, ?)",
+                (newname, newparent_ino, ino),
+            )
+            .await?;
+
+            // Increment link count and update ctime
+            let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
+            let now_secs = dur.as_secs() as i64;
+            let now_nsec = dur.subsec_nanos() as i64;
+            conn.execute(
+                "UPDATE fs_inode SET nlink = nlink + 1, ctime = ?, ctime_nsec = ? WHERE ino = ?",
+                (now_secs, now_nsec, ino),
+            )
+            .await?;
+
+            // Update parent directory ctime and mtime
+            conn.execute(
+                "UPDATE fs_inode SET ctime = ?, mtime = ?, ctime_nsec = ?, mtime_nsec = ? WHERE ino = ?",
+                (now_secs, now_secs, now_nsec, now_nsec, newparent_ino),
+            )
+            .await?;
+
+            // Return updated stats (drop the cached pre-link attr so the read
+            // below reflects the nlink/ctime updates made in this transaction).
+            self.invalidate_attr(ino);
+            self.getattr_with_conn(&conn, ino)
+                .await?
+                .ok_or(FsError::NotFound.into())
         }
+        .await;
 
-        // Check if destination already exists
-        if self
-            .lookup_child(&conn, newparent_ino, newname)
-            .await?
-            .is_some()
-        {
-            return Err(FsError::AlreadyExists.into());
+        match result {
+            Ok(stats) => {
+                txn.commit().await?;
+                // Populate dentry cache only after the transaction is durable.
+                self.cache_dentry(newparent_ino, newname, ino);
+                self.invalidate_parent_attr(newparent_ino);
+                self.invalidate_attr(ino);
+                Ok(stats)
+            }
+            Err(error) => {
+                let _ = txn.rollback().await;
+                self.invalidate_attr(ino);
+                Err(error)
+            }
         }
-
-        // Create directory entry pointing to the same inode
-        conn.execute(
-            "INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, ?, ?)",
-            (newname, newparent_ino, ino),
-        )
-        .await?;
-
-        // Increment link count and update ctime
-        let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
-        let now_secs = dur.as_secs() as i64;
-        let now_nsec = dur.subsec_nanos() as i64;
-        conn.execute(
-            "UPDATE fs_inode SET nlink = nlink + 1, ctime = ?, ctime_nsec = ? WHERE ino = ?",
-            (now_secs, now_nsec, ino),
-        )
-        .await?;
-
-        // Update parent directory ctime and mtime
-        conn.execute(
-            "UPDATE fs_inode SET ctime = ?, mtime = ?, ctime_nsec = ?, mtime_nsec = ? WHERE ino = ?",
-            (now_secs, now_secs, now_nsec, now_nsec, newparent_ino),
-        )
-        .await?;
-
-        // Populate dentry cache
-        self.cache_dentry(newparent_ino, newname, ino);
-        self.invalidate_parent_attr(newparent_ino);
-        self.invalidate_attr(ino);
-
-        // Return updated stats
-        self.getattr_with_conn(&conn, ino)
-            .await?
-            .ok_or(FsError::NotFound.into())
     }
 
     async fn rename(
@@ -6954,6 +7603,212 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_setattr_after_batched_write_preserves_explicit_times() -> Result<()> {
+        std::env::set_var(WRITE_BATCHER_ENABLE_ENV, "1");
+        std::env::set_var(WRITE_BATCHER_MS_ENV, "60000");
+        std::env::set_var(WRITE_BATCHER_BYTES_ENV, "1048576");
+
+        let (fs, _dir) = create_test_fs().await?;
+        let (stats, file) = fs
+            .create_file("/setattr-after-write.txt", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+
+        // Buffered write stays in the overlay (long timer, no drain).
+        file.pwrite_ranges_batched(vec![WriteRange {
+            offset: 0,
+            data: b"deferred body".to_vec(),
+        }])
+        .await?;
+
+        // Explicit setattr (the kernel's writeback mtime update) lands while
+        // the data is still pending. No drain happens here by default.
+        let explicit_secs = 1_234_567_890;
+        let explicit_nsec = 42;
+        FileSystem::utimens(
+            &fs,
+            stats.ino,
+            TimeChange::Omit,
+            TimeChange::Set(explicit_secs, explicit_nsec as u32),
+        )
+        .await?;
+
+        // The deferred commit must NOT re-stamp mtime/ctime over the explicit
+        // value the setattr just wrote.
+        file.drain_writes().await?;
+
+        let after = FileSystem::getattr(&fs, stats.ino).await?.unwrap();
+        assert_eq!(
+            after.mtime, explicit_secs,
+            "explicit mtime must survive the deferred data commit"
+        );
+        assert_eq!(
+            after.mtime_nsec, explicit_nsec,
+            "explicit mtime_nsec must survive the deferred data commit"
+        );
+        assert_eq!(after.size, 13);
+        assert_eq!(file.pread(0, 32).await?, b"deferred body");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_write_after_setattr_restamps_times_on_commit() -> Result<()> {
+        std::env::set_var(WRITE_BATCHER_ENABLE_ENV, "1");
+        std::env::set_var(WRITE_BATCHER_MS_ENV, "60000");
+        std::env::set_var(WRITE_BATCHER_BYTES_ENV, "1048576");
+
+        let (fs, _dir) = create_test_fs().await?;
+        let (stats, file) = fs
+            .create_file("/write-after-setattr.txt", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+
+        file.pwrite_ranges_batched(vec![WriteRange {
+            offset: 0,
+            data: b"first".to_vec(),
+        }])
+        .await?;
+
+        let stale_secs = 1_111_111_111;
+        FileSystem::utimens(
+            &fs,
+            stats.ino,
+            TimeChange::Omit,
+            TimeChange::Set(stale_secs, 0),
+        )
+        .await?;
+
+        // A write AFTER the setattr means the file changed again: the commit
+        // must stamp fresh mtime/ctime, not preserve the stale explicit value.
+        file.pwrite_ranges_batched(vec![WriteRange {
+            offset: 5,
+            data: b" second".to_vec(),
+        }])
+        .await?;
+
+        file.drain_writes().await?;
+
+        let after = FileSystem::getattr(&fs, stats.ino).await?.unwrap();
+        assert!(
+            after.mtime > stale_secs,
+            "a write after the explicit setattr must bump mtime again (got {}, explicit was {})",
+            after.mtime,
+            stale_secs
+        );
+        assert_eq!(file.pread(0, 32).await?, b"first second");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_utimens_with_pending_writes_is_visible_and_committed_with_data() -> Result<()> {
+        std::env::set_var(WRITE_BATCHER_ENABLE_ENV, "1");
+        std::env::set_var(WRITE_BATCHER_MS_ENV, "60000");
+        std::env::set_var(WRITE_BATCHER_BYTES_ENV, "1048576");
+
+        let (fs, _dir) = create_test_fs().await?;
+        let (stats, file) = fs
+            .create_file("/stash-times.txt", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+
+        // Buffered write stays in the overlay (long timer, no drain).
+        file.pwrite_ranges_batched(vec![WriteRange {
+            offset: 0,
+            data: b"stash body".to_vec(),
+        }])
+        .await?;
+
+        // The explicit setattr is stashed in the pending entry instead of
+        // paying its own SQLite transaction.
+        let explicit_secs = 1_999_999_999;
+        let explicit_nsec: u32 = 7;
+        FileSystem::utimens(
+            &fs,
+            stats.ino,
+            TimeChange::Set(11, 13),
+            TimeChange::Set(explicit_secs, explicit_nsec),
+        )
+        .await?;
+
+        // Visible immediately, before any drain commits the row UPDATE.
+        let before = FileSystem::getattr(&fs, stats.ino).await?.unwrap();
+        assert_eq!(
+            before.mtime, explicit_secs,
+            "stashed mtime must be visible before the drain commits it"
+        );
+        assert_eq!(before.mtime_nsec, explicit_nsec);
+        assert_eq!(before.atime, 11);
+        assert_eq!(before.atime_nsec, 13);
+        assert_eq!(before.size, 10, "pending data size must still be merged");
+
+        // The drain commits the data and the stashed times in one transaction.
+        file.drain_writes().await?;
+
+        let after = FileSystem::getattr(&fs, stats.ino).await?.unwrap();
+        assert_eq!(
+            after.mtime, explicit_secs,
+            "explicit mtime must survive the deferred data commit"
+        );
+        assert_eq!(after.mtime_nsec, explicit_nsec);
+        assert_eq!(after.atime, 11);
+        assert_eq!(after.atime_nsec, 13);
+        assert_eq!(after.size, 10);
+        assert_eq!(file.pread(0, 32).await?, b"stash body");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_write_after_stashed_utimens_restamps_mtime_keeps_atime() -> Result<()> {
+        std::env::set_var(WRITE_BATCHER_ENABLE_ENV, "1");
+        std::env::set_var(WRITE_BATCHER_MS_ENV, "60000");
+        std::env::set_var(WRITE_BATCHER_BYTES_ENV, "1048576");
+
+        let (fs, _dir) = create_test_fs().await?;
+        let (stats, file) = fs
+            .create_file("/stash-then-write.txt", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+
+        file.pwrite_ranges_batched(vec![WriteRange {
+            offset: 0,
+            data: b"first".to_vec(),
+        }])
+        .await?;
+
+        let stale_secs = 1_222_222_222;
+        FileSystem::utimens(
+            &fs,
+            stats.ino,
+            TimeChange::Set(33, 44),
+            TimeChange::Set(stale_secs, 0),
+        )
+        .await?;
+
+        // A write AFTER the stashed setattr means the file changed again: the
+        // commit must stamp fresh mtime/ctime. The explicitly-set atime is not
+        // affected by writes and must survive.
+        file.pwrite_ranges_batched(vec![WriteRange {
+            offset: 5,
+            data: b" second".to_vec(),
+        }])
+        .await?;
+
+        file.drain_writes().await?;
+
+        let after = FileSystem::getattr(&fs, stats.ino).await?.unwrap();
+        assert!(
+            after.mtime > stale_secs,
+            "a write after the stashed setattr must bump mtime again (got {}, explicit was {})",
+            after.mtime,
+            stale_secs
+        );
+        assert_eq!(after.atime, 33, "explicit atime must survive a later write");
+        assert_eq!(after.atime_nsec, 44);
+        assert_eq!(file.pread(0, 32).await?, b"first second");
+
+        Ok(())
+    }
+
     // Build a batcher with an explicit config so the test is independent of the
     // process-global AGENTFS_BATCH_* env vars (which other tests mutate
     // concurrently). Reuses `fs`'s pool/attr cache so commits hit real inodes.
@@ -6971,6 +7826,8 @@ mod tests {
             batch_ms: Duration::from_secs(batch_ms_secs),
             batch_bytes,
             batch_global_bytes,
+            txn_max_inodes: DEFAULT_WRITE_BATCH_TXN_INODES,
+            txn_max_bytes: DEFAULT_WRITE_BATCH_TXN_BYTES,
             state: RwLock::new(AgentFSWriteBatcherState::default()),
             commit_lock: AsyncMutex::new(()),
         })

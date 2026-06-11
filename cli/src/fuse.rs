@@ -33,13 +33,15 @@ use tracing;
 /// connection pool timeouts return EAGAIN to signal the caller should retry.
 /// Otherwise falls back to EIO.
 fn error_to_errno(e: &SdkError) -> i32 {
-    match e {
+    let errno = match e {
         SdkError::Fs(fs_err) => fs_err.to_errno(),
         SdkError::Io(io_err) => io_err.raw_os_error().unwrap_or(libc::EIO),
         SdkError::Database(turso::Error::Busy(_)) => libc::EAGAIN,
         SdkError::ConnectionPoolTimeout => libc::EAGAIN,
         _ => libc::EIO,
-    }
+    };
+    tracing::debug!(target: "agentfs_errno", error = %e, errno, "FUSE error reply");
+    errno
 }
 
 /// Maximize the file descriptor limit by raising the soft limit to the hard limit.
