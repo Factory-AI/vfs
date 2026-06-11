@@ -6,6 +6,16 @@ User comment: none
 
 ---
 
+## 2026-06-11T13:00-07:00 — Sticky drift-guard drop relaxed; keep-cache extended to DB-backed files
+**Type**: decision
+**Context**: Upper/Delta (DB-backed) files never qualified for `FOPEN_KEEP_CACHE` (`Layer::Base`-only), and the drift guard's sticky `dropped` set meant any file ever written through the mount (i.e. every git-created file) lost eligibility for the life of the mount. Walked the state machine for both relaxations: kernel-originated writes keep the kernel's own pages coherent; adapter-notified invalidations purge pages before any re-grant; out-of-band SDK writers change mtime/ctime/size and fail the per-open fingerprint check — the same risk model the base layer always had for external host-file edits (content swap + timestamp restore defeats both, accepted).
+**Resolution**: Drop now just removes the stored fingerprint (re-grant revalidates); `AGENTFS_FUSE_STICKY_KEEPCACHE_DROP=1` restores old behaviour. `AgentFS::keep_cache_for_read_open` grants for regular files (`AGENTFS_KEEPCACHE_DELTA=0` kill switch); overlay delegates Delta inodes. Git workload: grants 20→1,694, READs −80%, paired wall 0.906, status 0.71x / diff sub-native. The overlay unit test asserting "delta must not keep" was updated to the new contract (eligible + fingerprint must move across copy-up).
+
+## 2026-06-11T13:05-07:00 — Remaining gap is the OPEN+FLUSH pair; passthrough deprioritized; radical options listed
+**Type**: followup
+**Context**: After WS4+WS5, the >1.5x stragglers (read_search 2.25x, read-path micro 3.35x) are bound by two synchronous FUSE round trips per open/close cycle, not by data movement or handler time. FUSE passthrough only accelerates read/write data and warm READs are already eliminated.
+**Resolution**: Logged for brainstorm: (1) FUSE-over-io_uring (kernel 6.14+; host runs 7.0) — cuts per-round-trip cost rather than round-trip count; (2) ENOSYS-on-FLUSH — removes one RT per close connection-wide, needs a pending-buffer guarantee on the getattr path to close the stat-after-close window; (3) open-by-handle batching is not a FUSE concept; nothing in the protocol elides OPEN.
+
 ## 2026-06-11T12:30-07:00 — Read-path 12.7x root cause: FLUSH on read-only fds permanently revoked keep-cache
 **Type**: surprise
 **Context**: Counters on the read profile showed `base_fast_open_keep_cache=64` vs `base_fast_open_rejected=1216` with `base_fast_inode_invalidations=1280` — one invalidation per close. Stepping the state machine: every close(2) sends FLUSH; the handler called `invalidate_inode_cache_self` unconditionally, which feeds the drift guard's STICKY `dropped` set, so the first close of a file revoked `FOPEN_KEEP_CACHE` eligibility forever. Each re-open of an unchanged base file then re-read everything through FUSE. The kernel page cache was being destroyed by the very flag machinery built to preserve it.
