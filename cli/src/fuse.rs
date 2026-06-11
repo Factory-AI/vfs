@@ -1,7 +1,8 @@
 use crate::fuser::{
     consts::{
-        FOPEN_KEEP_CACHE, FUSE_ASYNC_READ, FUSE_CACHE_SYMLINKS, FUSE_DO_READDIRPLUS,
-        FUSE_NO_OPENDIR_SUPPORT, FUSE_PARALLEL_DIROPS, FUSE_READDIRPLUS_AUTO, FUSE_WRITEBACK_CACHE,
+        FOPEN_CACHE_DIR, FOPEN_KEEP_CACHE, FUSE_ASYNC_READ, FUSE_CACHE_SYMLINKS,
+        FUSE_DO_READDIRPLUS, FUSE_NO_OPENDIR_SUPPORT, FUSE_PARALLEL_DIROPS, FUSE_READDIRPLUS_AUTO,
+        FUSE_WRITEBACK_CACHE,
     },
     fuse_forget_one, FileAttr, FileType, Filesystem, KernelConfig, MountOption, ReplyAttr,
     ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen,
@@ -512,6 +513,12 @@ impl MutationAudit {
         }
     }
 
+    /// Consumes the audit for a handler that turned out not to mutate
+    /// anything (e.g. a FLUSH with no buffered writes), so no invalidation
+    /// is required.
+    #[inline(always)]
+    fn discard_no_mutation(self) {}
+
     /// Asserts that the success branch of a mutation called
     /// `invalidate_inode_cache` or `invalidate_entry_cache` at least once.
     /// No-op in release; intentionally takes `self` so the audit can only be
@@ -574,6 +581,18 @@ struct AgentFSFuse {
     /// timer/bytes/global triggers, and finalize-on-unmount. Set
     /// `AGENTFS_DRAIN_ON_RELEASE=1` to restore the legacy commit-on-close.
     drain_on_release: bool,
+    /// When true, FLUSH invalidates the inode even when the handle had no
+    /// buffered writes. Default false: a read-only close mutates nothing, and
+    /// the unconditional invalidation permanently destroyed keep-cache
+    /// eligibility (the drift guard's `dropped` set is sticky), forcing every
+    /// re-open of an unchanged base file back into FUSE READ round trips.
+    /// Set `AGENTFS_FUSE_FLUSH_INVAL=1` to restore the old behaviour.
+    flush_inval_always: bool,
+    /// When true, `opendir` grants `FOPEN_CACHE_DIR | FOPEN_KEEP_CACHE` so
+    /// warm getdents are served from the kernel page cache. Requires the same
+    /// kernel-cache safety as keep-cache (non-serial workers for notify).
+    /// Set `AGENTFS_FUSE_CACHE_DIR=0` to disable.
+    cache_dir_enabled: bool,
     /// When true, force a synchronous SDK drain (SQLite commit) when the
     /// kernel FORGETs an inode. Default false: a FORGET only drops the
     /// kernel's reference — pending writes stay readable through the Tier-4
@@ -604,9 +623,14 @@ impl Filesystem for AgentFSFuse {
     fn init(&self, _req: &Request, config: &mut KernelConfig) -> Result<(), libc::c_int> {
         tracing::debug!("FUSE::init");
         self.cache_config.record_profile();
-        let _ = config.add_capabilities(
-            FUSE_ASYNC_READ | FUSE_PARALLEL_DIROPS | FUSE_CACHE_SYMLINKS | FUSE_NO_OPENDIR_SUPPORT,
-        );
+        // FUSE_NO_OPENDIR_SUPPORT skips the OPENDIR round trip, but granting
+        // FOPEN_CACHE_DIR requires replying to OPENDIR; one round trip per
+        // opendir(3) buys kernel-cached getdents for every warm re-listing.
+        let mut capabilities = FUSE_ASYNC_READ | FUSE_PARALLEL_DIROPS | FUSE_CACHE_SYMLINKS;
+        if !self.cache_dir_enabled {
+            capabilities |= FUSE_NO_OPENDIR_SUPPORT;
+        }
+        let _ = config.add_capabilities(capabilities);
         configure_writeback_cache(config, self.cache_config.writeback_cache_enabled);
         configure_readdirplus(config, self.cache_config.readdirplus_mode);
         Ok(())
@@ -1472,50 +1496,45 @@ impl Filesystem for AgentFSFuse {
         agentfs_sdk::profiling::record_fuse_open();
         tracing::debug!("FUSE::open: ino={}, flags={}", ino, flags);
 
-        let mut keep_cache = false;
-        let mut keep_cache_fingerprint = None;
-        if fuse_write_open(flags) {
+        let write_open = fuse_write_open(flags);
+        if write_open {
             self.drop_keepcache_eligibility(ino);
-        } else if self.cache_config.keepcache_enabled && !self.has_pending_write_for_inode(ino) {
-            let fs = self.fs.clone();
-            let keep_cache_result = self.runtime.block_on(async move {
-                if !fs.keep_cache_for_read_open(ino as i64, flags).await? {
-                    return Ok(None);
-                }
-                let Some(stats) = fs.getattr(ino as i64).await? else {
-                    return Ok(None);
-                };
-                Ok::<_, SdkError>(Some(KeepCacheFingerprint::from_stats(&stats)))
-            });
-            match keep_cache_result {
-                Ok(Some(fingerprint)) if self.keepcache_allows(ino, &fingerprint) => {
-                    keep_cache = true;
-                    keep_cache_fingerprint = Some(fingerprint);
-                }
-                Ok(Some(_)) => {
-                    agentfs_sdk::profiling::record_base_fast_stale_rejection();
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    reply.error(error_to_errno(&e));
-                    return;
-                }
-            };
         }
+        let check_keep_cache = !write_open
+            && self.cache_config.keepcache_enabled
+            && !self.has_pending_write_for_inode(ino);
 
+        // One runtime hop for the keep-cache probe, fingerprint getattr and
+        // the open itself: this handler runs ~1x per open(2) on the warm read
+        // path, so the extra block_on round trips were pure dispatch cost.
         let fs = self.fs.clone();
-        let result = self
-            .runtime
-            .block_on(async move { fs.open(ino as i64, flags).await });
+        let result = self.runtime.block_on(async move {
+            let fingerprint =
+                if check_keep_cache && fs.keep_cache_for_read_open(ino as i64, flags).await? {
+                    fs.getattr(ino as i64)
+                        .await?
+                        .map(|stats| KeepCacheFingerprint::from_stats(&stats))
+                } else {
+                    None
+                };
+            let file = fs.open(ino as i64, flags).await?;
+            Ok::<_, SdkError>((file, fingerprint))
+        });
 
         match result {
-            Ok(file) => {
+            Ok((file, keep_cache_fingerprint)) => {
                 let mut open_flags = 0;
-                keep_cache = keep_cache
-                    && keep_cache_fingerprint
-                        .as_ref()
-                        .map(|fingerprint| self.keepcache_allows(ino, fingerprint))
-                        .unwrap_or(false)
+                let keep_cache = keep_cache_fingerprint
+                    .as_ref()
+                    .map(|fingerprint| {
+                        if self.keepcache_allows(ino, fingerprint) {
+                            true
+                        } else {
+                            agentfs_sdk::profiling::record_base_fast_stale_rejection();
+                            false
+                        }
+                    })
+                    .unwrap_or(false)
                     && !self.has_pending_write_for_inode(ino);
                 if keep_cache {
                     open_flags |= FOPEN_KEEP_CACHE;
@@ -1528,7 +1547,7 @@ impl Filesystem for AgentFSFuse {
                 } else {
                     agentfs_sdk::profiling::record_base_fast_open_rejected();
                 }
-                if fuse_write_open(flags) {
+                if write_open {
                     self.invalidate_inode_cache_self(req, ino);
                 }
                 let fh = self.alloc_fh();
@@ -1537,6 +1556,22 @@ impl Filesystem for AgentFSFuse {
             }
             Err(e) => reply.error(error_to_errno(&e)),
         }
+    }
+
+    /// Opens a directory. Grants `FOPEN_CACHE_DIR | FOPEN_KEEP_CACHE` so the
+    /// kernel may serve repeated getdents from its page cache instead of a
+    /// READDIRPLUS round trip per scandir. Coherency: mutations through this
+    /// mount invalidate the parent via `invalidate_inode_cache` (kernel
+    /// notification drops the dir pages), and cross-mount divergence is
+    /// bounded by the entry/attr TTLs exactly like file attributes.
+    /// `AGENTFS_FUSE_CACHE_DIR=0` is the kill switch.
+    fn opendir(&self, _req: &Request, _ino: u64, _flags: i32, reply: ReplyOpen) {
+        let open_flags = if self.cache_dir_enabled {
+            FOPEN_CACHE_DIR | FOPEN_KEEP_CACHE
+        } else {
+            0
+        };
+        reply.opened(0, open_flags);
     }
 
     /// Reads data using the file handle.
@@ -1702,6 +1737,7 @@ impl Filesystem for AgentFSFuse {
             (open_file.take_pending(), open_file.file.clone())
         };
         let drain_on_release = self.drain_on_release;
+        let had_pending_writes = drain.is_some();
         let result = (|| -> Result<(), SdkError> {
             // Always move the per-fh FUSE write buffer into the SDK batcher so
             // the overlay reflects this handle's writes. Only force a SQLite
@@ -1719,8 +1755,18 @@ impl Filesystem for AgentFSFuse {
 
         match result {
             Ok(()) => {
-                self.invalidate_inode_cache_self(req, ino);
-                audit.assert_invalidated("flush");
+                // A FLUSH that moved no writes mutated nothing: invalidating
+                // here would permanently revoke keep-cache eligibility for
+                // every file ever closed (the drift guard's `dropped` set is
+                // sticky), turning each re-open of an unchanged base file
+                // back into FUSE READ round trips. Each FUSE_WRITE already
+                // invalidates on its own path.
+                if had_pending_writes || self.flush_inval_always {
+                    self.invalidate_inode_cache_self(req, ino);
+                    audit.assert_invalidated("flush");
+                } else {
+                    audit.discard_no_mutation();
+                }
                 reply.ok();
             }
             Err(e) => reply.error(error_to_errno(&e)),
@@ -2316,8 +2362,11 @@ impl AgentFSFuse {
         let self_inval = env_flag_default("AGENTFS_FUSE_SELF_INVAL", false);
         let drain_on_release = fuse_drain_on_release_from_env();
         let drain_on_forget = fuse_drain_on_forget_from_env();
+        let flush_inval_always = env_flag_default("AGENTFS_FUSE_FLUSH_INVAL", false);
         let cache_config = FuseKernelCacheConfig::from_env();
         cache_config.record_profile();
+        let cache_dir_enabled =
+            env_flag_default("AGENTFS_FUSE_CACHE_DIR", true) && cache_config.keepcache_enabled;
         let writeback_enabled = cache_config.writeback_cache_enabled;
         Self {
             fs,
@@ -2336,6 +2385,8 @@ impl AgentFSFuse {
             self_inval,
             drain_on_release,
             drain_on_forget,
+            flush_inval_always,
+            cache_dir_enabled,
             _profile_report: Arc::new(agentfs_sdk::profiling::ProfileReportGuard::new(
                 "fuse_session",
             )),
