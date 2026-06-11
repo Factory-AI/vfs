@@ -540,6 +540,18 @@ struct AgentFSFuse {
     next_fh: AtomicU64,
     /// Whether kernel cache invalidations are sent synchronously before replies.
     sync_inval: bool,
+    /// Whether kernel-cache notifications are sent even for mutations the
+    /// kernel itself initiated and whose FUSE reply already carries the fresh
+    /// state (setattr's attr reply, create/mknod/mkdir/symlink/link's entry
+    /// reply). Default false: the kernel's own caches are coherent for its own
+    /// mutations, and notifying purges the just-established dentry, attrs and
+    /// page cache, forcing re-LOOKUP/GETATTR/READ storms (~19.9k notifications
+    /// per codex clone). Server-initiated divergence (deferred commits) stays
+    /// bounded by the entry/attr TTLs exactly as deferred notification latency
+    /// already was. Set `AGENTFS_FUSE_SELF_INVAL=1` to restore the old
+    /// notify-on-every-mutation behaviour. Adapter-internal caches (epoch,
+    /// attr/entry/dir maps) are invalidated regardless.
+    self_inval: bool,
     /// When true, force a synchronous SDK drain (SQLite commit) on flush/release.
     /// Default false: under the Tier-4 overlay, reads are served from pending
     /// writes, so close-time commits are unnecessary work that serialise the
@@ -860,7 +872,7 @@ impl Filesystem for AgentFSFuse {
                 reply.error(error_to_errno(&e));
                 return;
             }
-            self.invalidate_inode_cache(req, ino);
+            self.invalidate_inode_cache_self(req, ino);
         }
 
         // Handle chown
@@ -874,7 +886,7 @@ impl Filesystem for AgentFSFuse {
                 reply.error(error_to_errno(&e));
                 return;
             }
-            self.invalidate_inode_cache(req, ino);
+            self.invalidate_inode_cache_self(req, ino);
         }
 
         // Handle truncate
@@ -906,7 +918,7 @@ impl Filesystem for AgentFSFuse {
                 reply.error(error_to_errno(&e));
                 return;
             }
-            self.invalidate_inode_cache(req, ino);
+            self.invalidate_inode_cache_self(req, ino);
         }
 
         // Handle atime/mtime changes (utimensat)
@@ -935,7 +947,7 @@ impl Filesystem for AgentFSFuse {
                 reply.error(error_to_errno(&e));
                 return;
             }
-            self.invalidate_inode_cache(req, ino);
+            self.invalidate_inode_cache_self(req, ino);
         }
 
         // Return updated attributes
@@ -1082,10 +1094,11 @@ impl Filesystem for AgentFSFuse {
         match result {
             Ok(stats) => {
                 self.invalidate_inode_cache(req, parent);
-                self.invalidate_entry_cache(req, parent, name);
+                self.invalidate_entry_cache_self(req, parent, name);
                 let attr = fillattr(&stats);
                 audit.assert_invalidated("mknod");
-                reply.entry_with_ttls(&Duration::ZERO, &Duration::ZERO, &attr, 0);
+                let (entry_ttl, attr_ttl) = self.mutation_reply_ttls();
+                reply.entry_with_ttls(&entry_ttl, &attr_ttl, &attr, 0);
             }
             Err(e) => {
                 reply.error(error_to_errno(&e));
@@ -1130,10 +1143,11 @@ impl Filesystem for AgentFSFuse {
         match result {
             Ok(stats) => {
                 self.invalidate_inode_cache(req, parent);
-                self.invalidate_entry_cache(req, parent, name);
+                self.invalidate_entry_cache_self(req, parent, name);
                 let attr = fillattr(&stats);
                 audit.assert_invalidated("mkdir");
-                reply.entry_with_ttls(&Duration::ZERO, &Duration::ZERO, &attr, 0);
+                let (entry_ttl, attr_ttl) = self.mutation_reply_ttls();
+                reply.entry_with_ttls(&entry_ttl, &attr_ttl, &attr, 0);
             }
             Err(e) => {
                 reply.error(error_to_errno(&e));
@@ -1219,7 +1233,7 @@ impl Filesystem for AgentFSFuse {
         match result {
             Ok((stats, file)) => {
                 self.invalidate_inode_cache(req, parent);
-                self.invalidate_entry_cache(req, parent, name);
+                self.invalidate_entry_cache_self(req, parent, name);
                 let attr = fillattr(&stats);
 
                 let fh = self.alloc_fh();
@@ -1228,7 +1242,8 @@ impl Filesystem for AgentFSFuse {
                     .insert(fh, OpenFile::new(stats.ino as u64, file));
 
                 audit.assert_invalidated("create");
-                reply.created_with_ttls(&Duration::ZERO, &Duration::ZERO, &attr, 0, fh, 0);
+                let (entry_ttl, attr_ttl) = self.mutation_reply_ttls();
+                reply.created_with_ttls(&entry_ttl, &attr_ttl, &attr, 0, fh, 0);
             }
             Err(e) => {
                 reply.error(error_to_errno(&e));
@@ -1278,10 +1293,11 @@ impl Filesystem for AgentFSFuse {
         match result {
             Ok(stats) => {
                 self.invalidate_inode_cache(req, parent);
-                self.invalidate_entry_cache(req, parent, link_name);
+                self.invalidate_entry_cache_self(req, parent, link_name);
                 let attr = fillattr(&stats);
                 audit.assert_invalidated("symlink");
-                reply.entry_with_ttls(&Duration::ZERO, &Duration::ZERO, &attr, 0);
+                let (entry_ttl, attr_ttl) = self.mutation_reply_ttls();
+                reply.entry_with_ttls(&entry_ttl, &attr_ttl, &attr, 0);
             }
             Err(e) => {
                 reply.error(error_to_errno(&e));
@@ -1315,12 +1331,13 @@ impl Filesystem for AgentFSFuse {
 
         match result {
             Ok(stats) => {
-                self.invalidate_inode_cache(req, ino);
+                self.invalidate_inode_cache_self(req, ino);
                 self.invalidate_inode_cache(req, newparent);
-                self.invalidate_entry_cache(req, newparent, newname);
+                self.invalidate_entry_cache_self(req, newparent, newname);
                 let attr = fillattr(&stats);
                 audit.assert_invalidated("link");
-                reply.entry_with_ttls(&Duration::ZERO, &Duration::ZERO, &attr, 0);
+                let (entry_ttl, attr_ttl) = self.mutation_reply_ttls();
+                reply.entry_with_ttls(&entry_ttl, &attr_ttl, &attr, 0);
             }
             Err(e) => {
                 reply.error(error_to_errno(&e));
@@ -1497,7 +1514,7 @@ impl Filesystem for AgentFSFuse {
                     agentfs_sdk::profiling::record_base_fast_open_rejected();
                 }
                 if fuse_write_open(flags) {
-                    self.invalidate_inode_cache(req, ino);
+                    self.invalidate_inode_cache_self(req, ino);
                 }
                 let fh = self.alloc_fh();
                 self.open_files.lock().insert(fh, OpenFile::new(ino, file));
@@ -1642,7 +1659,7 @@ impl Filesystem for AgentFSFuse {
 
         match flush_result {
             Ok(()) => {
-                self.invalidate_inode_cache(req, ino);
+                self.invalidate_inode_cache_self(req, ino);
                 audit.assert_invalidated("write");
                 reply.written(data_len as u32);
             }
@@ -1687,7 +1704,7 @@ impl Filesystem for AgentFSFuse {
 
         match result {
             Ok(()) => {
-                self.invalidate_inode_cache(req, ino);
+                self.invalidate_inode_cache_self(req, ino);
                 audit.assert_invalidated("flush");
                 reply.ok();
             }
@@ -2026,6 +2043,58 @@ impl AgentFSFuse {
         record_mutation_invalidation();
     }
 
+    /// Invalidation for a kernel-initiated mutation whose FUSE reply already
+    /// carries the fresh attributes for `ino` (setattr's attr reply, link's
+    /// entry reply): adapter-internal caches are always invalidated, but the
+    /// kernel notification is skipped unless `AGENTFS_FUSE_SELF_INVAL=1` —
+    /// the kernel's own caches are coherent for its own mutations, and the
+    /// notification would purge the attrs and page cache the reply just
+    /// established (see the `self_inval` field).
+    fn invalidate_inode_cache_self(&self, req: &Request, ino: u64) {
+        if self.self_inval {
+            self.invalidate_inode_cache(req, ino);
+            return;
+        }
+        let _cache_reply = self.cache_reply_lock.lock();
+        self.bump_cache_epoch();
+        self.drop_keepcache_eligibility(ino);
+        self.invalidate_cached_inode(ino);
+        agentfs_sdk::profiling::record_base_fast_inode_invalidation();
+        record_mutation_invalidation();
+    }
+
+    /// Entry/attr TTLs for mutation replies (create/mknod/mkdir/symlink/link).
+    /// Historically pinned to zero because the per-mutation kernel
+    /// invalidations would purge them anyway; with self-invalidation
+    /// suppressed the reply-established dentry+attrs are allowed to live the
+    /// standard TTLs, so the freshly created file's first lstat/open is served
+    /// from the kernel cache instead of a LOOKUP+GETATTR round trip.
+    fn mutation_reply_ttls(&self) -> (Duration, Duration) {
+        if self.self_inval {
+            (Duration::ZERO, Duration::ZERO)
+        } else {
+            (self.cache_config.entry_ttl, self.cache_config.attr_ttl)
+        }
+    }
+
+    /// Entry-cache counterpart of `invalidate_inode_cache_self` for a name the
+    /// kernel just created via this reply (create/mknod/mkdir/symlink/link):
+    /// the entry reply establishes the dentry, so the kernel notification is
+    /// skipped unless `AGENTFS_FUSE_SELF_INVAL=1`. Adapter entry/negative
+    /// caches are always invalidated.
+    fn invalidate_entry_cache_self(&self, req: &Request, parent: u64, name: &OsStr) {
+        if self.self_inval {
+            self.invalidate_entry_cache(req, parent, name);
+            return;
+        }
+        let _cache_reply = self.cache_reply_lock.lock();
+        self.bump_cache_epoch();
+        if let Some(name) = name.to_str() {
+            self.invalidate_cached_entry(parent, name);
+        }
+        record_mutation_invalidation();
+    }
+
     fn notify_inval_inode(&self, req: &Request, ino: u64, offset: i64, len: i64) {
         agentfs_sdk::profiling::record_fuse_adapter_inval_inode_notification();
         if !self.sync_inval {
@@ -2229,6 +2298,7 @@ impl AgentFSFuse {
     /// from within synchronous FUSE callbacks via `block_on`.
     fn new(fs: Arc<dyn FileSystem>, runtime: Runtime) -> Self {
         let sync_inval = fuse_sync_inval_enabled_from_env();
+        let self_inval = env_flag_default("AGENTFS_FUSE_SELF_INVAL", false);
         let drain_on_release = fuse_drain_on_release_from_env();
         let drain_on_forget = fuse_drain_on_forget_from_env();
         let cache_config = FuseKernelCacheConfig::from_env();
@@ -2248,6 +2318,7 @@ impl AgentFSFuse {
             cache_epoch: AtomicU64::new(0),
             next_fh: AtomicU64::new(1),
             sync_inval,
+            self_inval,
             drain_on_release,
             drain_on_forget,
             _profile_report: Arc::new(agentfs_sdk::profiling::ProfileReportGuard::new(
