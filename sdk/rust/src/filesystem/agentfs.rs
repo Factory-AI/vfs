@@ -143,6 +143,14 @@ fn drain_on_setattr() -> bool {
     *DRAIN_ON_SETATTR.get_or_init(|| env_flag_default("AGENTFS_DRAIN_ON_SETATTR", true))
 }
 
+/// Whether DB-backed regular files may keep the kernel page cache across
+/// read-only opens (`FOPEN_KEEP_CACHE`). Default true; the FUSE adapter's
+/// fingerprint guard revalidates stats at each open.
+fn keepcache_delta_enabled() -> bool {
+    static KEEPCACHE_DELTA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *KEEPCACHE_DELTA.get_or_init(|| env_flag_default("AGENTFS_KEEPCACHE_DELTA", true))
+}
+
 fn env_duration_millis(name: &str, default_ms: u64) -> Duration {
     std::env::var(name)
         .ok()
@@ -5039,6 +5047,26 @@ impl FileSystem for AgentFS {
             }
         }
         Ok(stats)
+    }
+
+    /// DB-backed regular files qualify for `FOPEN_KEEP_CACHE`: every mutation
+    /// path through a mount is kernel-originated (the kernel's pages stay
+    /// coherent for its own writes) and the adapter's fingerprint guard
+    /// revalidates mtime/ctime/size at each open, so out-of-band SDK writers
+    /// are caught exactly like external edits to host-backed base files.
+    /// Kill switch: `AGENTFS_KEEPCACHE_DELTA=0` restores the old policy
+    /// where only host-backed base-layer files were eligible.
+    async fn keep_cache_for_read_open(&self, ino: i64, flags: i32) -> Result<bool> {
+        if (flags & libc::O_ACCMODE) != libc::O_RDONLY || (flags & libc::O_TRUNC) != 0 {
+            return Ok(false);
+        }
+        if !keepcache_delta_enabled() {
+            return Ok(false);
+        }
+        let Some(stats) = FileSystem::getattr(self, ino).await? else {
+            return Ok(false);
+        };
+        Ok(stats.is_file())
     }
 
     async fn readlink(&self, ino: i64) -> Result<Option<String>> {

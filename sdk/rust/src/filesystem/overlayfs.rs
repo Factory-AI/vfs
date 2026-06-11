@@ -2052,15 +2052,22 @@ impl FileSystem for OverlayFS {
         }
 
         let info = self.get_inode_info(ino).ok_or(FsError::NotFound)?;
-        if info.layer != Layer::Base || self.is_whiteout(&info.path) {
-            return Ok(false);
+        match info.layer {
+            Layer::Base => {
+                if self.is_whiteout(&info.path) {
+                    return Ok(false);
+                }
+                let Some(stats) = self.base.getattr(info.underlying_ino).await? else {
+                    return Ok(false);
+                };
+                Ok(stats.is_file())
+            }
+            // Delta (DB-backed) files inherit the AgentFS keep-cache policy:
+            // the adapter fingerprint guard revalidates per open.
+            Layer::Delta => {
+                FileSystem::keep_cache_for_read_open(&self.delta, info.underlying_ino, flags).await
+            }
         }
-
-        let Some(stats) = self.base.getattr(info.underlying_ino).await? else {
-            return Ok(false);
-        };
-
-        Ok(stats.is_file())
     }
 
     async fn open(&self, ino: i64, flags: i32) -> Result<BoxedFile> {
@@ -2631,10 +2638,19 @@ mod tests {
         let file = overlay.open(stats.ino, libc::O_RDWR).await?;
         file.pwrite(0, b"modified content").await?;
         assert!(
-            !overlay
+            overlay
                 .keep_cache_for_read_open(stats.ino, libc::O_RDONLY)
                 .await?,
-            "after copy-up, the inode is delta-backed and must not keep stale base data"
+            "delta-backed files stay keep-cache eligible; staleness is the \
+             adapter fingerprint guard's job"
+        );
+        // The fingerprint inputs must have moved across the copy-up + write so
+        // the adapter rejects any pages cached against the base version.
+        let after = overlay.getattr(stats.ino).await?.unwrap();
+        assert!(
+            (after.size, after.mtime, after.mtime_nsec, after.ctime)
+                != (stats.size, stats.mtime, stats.mtime_nsec, stats.ctime),
+            "copy-up + write must change the stats fingerprint"
         );
 
         Ok(())

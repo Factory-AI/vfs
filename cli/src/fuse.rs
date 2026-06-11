@@ -193,9 +193,20 @@ impl FuseKernelCacheConfig {
     }
 }
 
+/// Guards `FOPEN_KEEP_CACHE` grants against serving stale kernel pages.
+///
+/// Non-sticky (default): a mutation drops the stored fingerprint and the next
+/// read-only open revalidates against fresh stats. This is sound because
+/// every mutation path is kernel-originated — the kernel's own pages stay
+/// coherent for its own writes, and adapter-notified invalidations purge them
+/// — so a fingerprint match at open time means the pages the kernel kept are
+/// current. Non-kernel divergence (direct SDK writers, other mounts) changes
+/// mtime/ctime/size and fails the fingerprint check, same as the host-file
+/// model. `AGENTFS_FUSE_STICKY_KEEPCACHE_DROP=1` restores the old sticky
+/// behaviour where any mutation permanently revokes eligibility per mount.
 #[derive(Debug, Default)]
 struct KeepCacheDriftGuard {
-    eligible: HashSet<u64>,
+    sticky: bool,
     dropped: HashSet<u64>,
     fingerprints: HashMap<u64, KeepCacheFingerprint>,
 }
@@ -226,6 +237,13 @@ impl KeepCacheFingerprint {
 }
 
 impl KeepCacheDriftGuard {
+    fn new(sticky: bool) -> Self {
+        Self {
+            sticky,
+            ..Self::default()
+        }
+    }
+
     fn allows(&self, ino: u64, fingerprint: &KeepCacheFingerprint) -> bool {
         !self.dropped.contains(&ino)
             && self
@@ -237,16 +255,17 @@ impl KeepCacheDriftGuard {
 
     fn mark_eligible(&mut self, ino: u64, fingerprint: KeepCacheFingerprint) {
         if !self.dropped.contains(&ino) {
-            self.eligible.insert(ino);
             self.fingerprints.insert(ino, fingerprint);
         }
     }
 
     fn drop_eligibility(&mut self, ino: u64) -> bool {
-        let was_eligible = self.eligible.remove(&ino);
-        self.fingerprints.remove(&ino);
-        let newly_dropped = self.dropped.insert(ino);
-        was_eligible || newly_dropped
+        let had_fingerprint = self.fingerprints.remove(&ino).is_some();
+        if self.sticky {
+            self.dropped.insert(ino) || had_fingerprint
+        } else {
+            had_fingerprint
+        }
     }
 }
 
@@ -2377,7 +2396,9 @@ impl AgentFSFuse {
             attr_cache: Arc::new(Mutex::new(HashMap::new())),
             entry_cache: Arc::new(Mutex::new(HashMap::new())),
             negative_entry_cache: Arc::new(Mutex::new(HashMap::new())),
-            keepcache_drift_guard: Arc::new(Mutex::new(KeepCacheDriftGuard::default())),
+            keepcache_drift_guard: Arc::new(Mutex::new(KeepCacheDriftGuard::new(
+                env_flag_default("AGENTFS_FUSE_STICKY_KEEPCACHE_DROP", false),
+            ))),
             cache_reply_lock: Arc::new(Mutex::new(())),
             cache_epoch: AtomicU64::new(0),
             next_fh: AtomicU64::new(1),
