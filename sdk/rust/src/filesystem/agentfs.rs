@@ -376,11 +376,53 @@ impl PendingTimeChange {
     }
 }
 
+/// Build the time-column SET fragments for a batched data-commit UPDATE so
+/// stashed explicit times ride the same statement as size/storage/data
+/// (one UPDATE per inode instead of two; ~4,700 extra UPDATEs per clone
+/// otherwise). Precedence per column: a stashed explicit value wins; without
+/// one, mtime/ctime are stamped with the commit time unless `preserve_times`
+/// (an explicit setattr landed after the writes and its values must not be
+/// clobbered); atime is only ever written explicitly.
+fn write_commit_time_sets(
+    preserve_times: bool,
+    explicit_times: Option<&PendingTimeChange>,
+) -> Result<(Vec<&'static str>, Vec<Value>)> {
+    let explicit_atime = explicit_times.and_then(|t| t.atime);
+    let explicit_mtime = explicit_times.and_then(|t| t.mtime);
+    let explicit_ctime = explicit_times.and_then(|t| t.ctime);
+    let stamp = if !preserve_times && (explicit_mtime.is_none() || explicit_ctime.is_none()) {
+        Some(current_timestamp()?)
+    } else {
+        None
+    };
+    let mut sets = Vec::new();
+    let mut values = Vec::new();
+    if let Some((secs, nsec)) = explicit_atime {
+        sets.push("atime = ?");
+        values.push(Value::Integer(secs));
+        sets.push("atime_nsec = ?");
+        values.push(Value::Integer(nsec));
+    }
+    if let Some((secs, nsec)) = explicit_mtime.or(stamp) {
+        sets.push("mtime = ?");
+        values.push(Value::Integer(secs));
+        sets.push("mtime_nsec = ?");
+        values.push(Value::Integer(nsec));
+    }
+    if let Some((secs, nsec)) = explicit_ctime.or(stamp) {
+        sets.push("ctime = ?");
+        values.push(Value::Integer(secs));
+        sets.push("ctime_nsec = ?");
+        values.push(Value::Integer(nsec));
+    }
+    Ok((sets, values))
+}
+
 /// Apply a stashed `PendingTimeChange` to fs_inode using the drain
-/// transaction's connection. Runs AFTER the data UPDATE inside the same
-/// `BEGIN IMMEDIATE` so the explicitly-set times override the commit-time
-/// stamp without a dedicated transaction. A deleted inode simply matches no
-/// row (the unlink already won).
+/// transaction's connection. Used for time-only pending entries (no data
+/// ranges to commit, so there is no data UPDATE to fold the times into);
+/// runs inside the drain's `BEGIN IMMEDIATE`. A deleted inode simply matches
+/// no row (the unlink already won).
 async fn apply_pending_times_with_conn(
     conn: &Connection,
     ino: i64,
@@ -887,6 +929,7 @@ impl AgentFSWriteBatcher {
                         &conn,
                         &normalized_refs,
                         preserve_times.get(ino).copied().unwrap_or(false),
+                        pending_times.get(ino),
                     )
                     .await
                 {
@@ -912,14 +955,18 @@ impl AgentFSWriteBatcher {
                 }
             }
 
-            // Apply explicitly-set times in the SAME transaction, after the
-            // data UPDATE, so the explicit values win over the commit-time
-            // stamp without a dedicated per-file transaction.
+            // Stashed explicit times ride the data UPDATE above
+            // (`write_commit_time_sets`); a time-only entry has no data UPDATE
+            // to fold into, so it pays one standalone UPDATE inside this same
+            // transaction.
             if !inode_missing {
                 if let Some(times) = pending_times.get(ino) {
-                    if let Err(error) = apply_pending_times_with_conn(&conn, *ino, times).await {
-                        let _ = txn.rollback().await;
-                        return Err(error);
+                    if normalized.is_empty() {
+                        if let Err(error) = apply_pending_times_with_conn(&conn, *ino, times).await
+                        {
+                            let _ = txn.rollback().await;
+                            return Err(error);
+                        }
                     }
                     applied_times.push((*ino, *times));
                 }
@@ -1093,11 +1140,17 @@ impl AgentFSWriteBatcher {
             })
             .collect();
         let mut result = file
-            .pwrite_ranges_inode_with_conn(&conn, &normalized_refs, preserve_times)
+            .pwrite_ranges_inode_with_conn(
+                &conn,
+                &normalized_refs,
+                preserve_times,
+                pending_times.as_ref(),
+            )
             .await;
-        // Commit explicitly-set times in the SAME transaction, after the data
-        // UPDATE (see drain_pending_batched).
-        if result.is_ok() {
+        // Stashed explicit times ride the data UPDATE (`write_commit_time_sets`);
+        // only a time-only commit (no data ranges) needs a standalone UPDATE in
+        // this same transaction.
+        if result.is_ok() && normalized_refs.is_empty() {
             if let Some(times) = &pending_times {
                 result = apply_pending_times_with_conn(&conn, ino, times).await;
             }
@@ -1687,7 +1740,7 @@ impl File for AgentFSFile {
         let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
         let ranges = [WriteRangeRef { offset, data }];
         let result = self
-            .pwrite_ranges_inode_with_conn(&conn, &ranges, false)
+            .pwrite_ranges_inode_with_conn(&conn, &ranges, false, None)
             .await;
         match result {
             Ok(()) => {
@@ -1725,7 +1778,7 @@ impl File for AgentFSFile {
             })
             .collect();
         let result = self
-            .pwrite_ranges_inode_with_conn(&conn, &range_refs, false)
+            .pwrite_ranges_inode_with_conn(&conn, &range_refs, false, None)
             .await;
         match result {
             Ok(()) => {
@@ -1947,12 +2000,15 @@ impl AgentFSFile {
     /// `preserve_times`: when true (deferred batcher commits racing an explicit
     /// chmod/chown/utimens), leave mtime/ctime untouched instead of stamping
     /// the commit time — the explicitly-set attributes logically happened
-    /// after these writes and must win.
+    /// after these writes and must win. `explicit_times`: stashed setattr
+    /// values folded into the inode UPDATE itself (see
+    /// `write_commit_time_sets`).
     async fn pwrite_ranges_inode_with_conn(
         &self,
         conn: &Connection,
         ranges: &[WriteRangeRef<'_>],
         preserve_times: bool,
+        explicit_times: Option<&PendingTimeChange>,
     ) -> Result<()> {
         let ranges = normalize_write_ranges(ranges)?;
         if ranges.is_empty() {
@@ -1981,34 +2037,18 @@ impl AgentFSFile {
 
             conn.execute("DELETE FROM fs_data WHERE ino = ?", (self.ino,))
                 .await?;
-            if preserve_times {
-                conn.execute(
-                    "UPDATE fs_inode SET size = ?, data_inline = ?, storage_kind = ? WHERE ino = ?",
-                    (
-                        new_size as i64,
-                        Value::Blob(inline_data),
-                        STORAGE_INLINE,
-                        self.ino,
-                    ),
-                )
-                .await?;
-            } else {
-                let (now_secs, now_nsec) = current_timestamp()?;
-                conn.execute(
-                    "UPDATE fs_inode SET size = ?, data_inline = ?, storage_kind = ?, mtime = ?, ctime = ?, mtime_nsec = ?, ctime_nsec = ? WHERE ino = ?",
-                    (
-                        new_size as i64,
-                        Value::Blob(inline_data),
-                        STORAGE_INLINE,
-                        now_secs,
-                        now_secs,
-                        now_nsec,
-                        now_nsec,
-                        self.ino,
-                    ),
-                )
-                .await?;
-            }
+            let mut sets = vec!["size = ?", "data_inline = ?", "storage_kind = ?"];
+            let mut values: Vec<Value> = vec![
+                Value::Integer(new_size as i64),
+                Value::Blob(inline_data),
+                Value::Integer(STORAGE_INLINE),
+            ];
+            let (time_sets, time_values) = write_commit_time_sets(preserve_times, explicit_times)?;
+            sets.extend(time_sets);
+            values.extend(time_values);
+            values.push(Value::Integer(self.ino));
+            let sql = format!("UPDATE fs_inode SET {} WHERE ino = ?", sets.join(", "));
+            conn.execute(&sql, values).await?;
             return Ok(());
         }
 
@@ -2036,28 +2076,17 @@ impl AgentFSFile {
         self.write_ranges_chunked_with_conn(conn, &chunked_ranges)
             .await?;
 
-        if preserve_times {
-            conn.execute(
-                "UPDATE fs_inode SET size = ?, data_inline = NULL, storage_kind = ? WHERE ino = ?",
-                (new_size as i64, STORAGE_CHUNKED, self.ino),
-            )
-            .await?;
-        } else {
-            let (now_secs, now_nsec) = current_timestamp()?;
-            conn.execute(
-                "UPDATE fs_inode SET size = ?, data_inline = NULL, storage_kind = ?, mtime = ?, ctime = ?, mtime_nsec = ?, ctime_nsec = ? WHERE ino = ?",
-                (
-                    new_size as i64,
-                    STORAGE_CHUNKED,
-                    now_secs,
-                    now_secs,
-                    now_nsec,
-                    now_nsec,
-                    self.ino,
-                ),
-            )
-            .await?;
-        }
+        let mut sets = vec!["size = ?", "data_inline = NULL", "storage_kind = ?"];
+        let mut values: Vec<Value> = vec![
+            Value::Integer(new_size as i64),
+            Value::Integer(STORAGE_CHUNKED),
+        ];
+        let (time_sets, time_values) = write_commit_time_sets(preserve_times, explicit_times)?;
+        sets.extend(time_sets);
+        values.extend(time_values);
+        values.push(Value::Integer(self.ino));
+        let sql = format!("UPDATE fs_inode SET {} WHERE ino = ?", sets.join(", "));
+        conn.execute(&sql, values).await?;
 
         Ok(())
     }
@@ -3711,7 +3740,7 @@ impl AgentFS {
                 overlay_reads: self.overlay_reads,
             };
             let ranges = [WriteRangeRef { offset, data }];
-            file.pwrite_ranges_inode_with_conn(&conn, &ranges, false)
+            file.pwrite_ranges_inode_with_conn(&conn, &ranges, false, None)
                 .await?;
 
             Ok((ino, created))

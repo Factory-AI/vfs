@@ -835,6 +835,20 @@ impl Filesystem for AgentFSFuse {
             || atime.is_some()
             || mtime.is_some();
 
+        // Preserve FUSE request order, not SDK enqueue order: a data write
+        // buffered in OpenFile::pending arrived BEFORE this SETATTR, so it
+        // must reach the batcher first. Otherwise its later enqueue (on
+        // FLUSH/RELEASE) resets `times_explicit` and clears the stashed
+        // mtime/ctime that writeback SETATTR just recorded, the group commit
+        // re-stamps the times, and git's stat cache no longer matches the
+        // filesystem (measured as a ~4,700-file re-read storm in checkout).
+        if mutated {
+            if let Err(e) = self.flush_pending_inode(ino) {
+                reply.error(error_to_errno(&e));
+                return;
+            }
+        }
+
         // Handle chmod
         if let Some(new_mode) = mode {
             let fs = self.fs.clone();
@@ -865,11 +879,6 @@ impl Filesystem for AgentFSFuse {
 
         // Handle truncate
         if let Some(new_size) = size {
-            if let Err(e) = self.flush_pending_inode(ino) {
-                reply.error(error_to_errno(&e));
-                return;
-            }
-
             let result = if let Some(fh) = fh {
                 // Use file handle if available (ftruncate).
                 let file = {
@@ -885,11 +894,6 @@ impl Filesystem for AgentFSFuse {
                 self.runtime
                     .block_on(async move { file.truncate(new_size).await })
             } else {
-                if let Err(e) = self.flush_pending_inode(ino) {
-                    reply.error(error_to_errno(&e));
-                    return;
-                }
-
                 // Open file and truncate via file handle
                 let fs = self.fs.clone();
                 self.runtime.block_on(async move {
