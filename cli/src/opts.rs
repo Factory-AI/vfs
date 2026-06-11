@@ -242,6 +242,38 @@ pub enum Command {
         #[arg(long, env = "AGENTFS_CIPHER")]
         cipher: Option<String>,
     },
+    /// Clone a git repository into an AgentFS database (fast bulk ingest).
+    ///
+    /// Runs `git clone --no-checkout` through a temporary mount (pack files
+    /// are large sequential writes), then materializes the worktree by
+    /// bulk-importing blobs straight into the database in large transactions
+    /// and fabricating a matching git index, skipping the per-file FUSE
+    /// round trips of a regular checkout. The resulting repository lives
+    /// entirely inside the database; nothing is written to the host
+    /// filesystem. Submodules and smudge/clean filters are not supported.
+    #[cfg(unix)]
+    Clone {
+        /// Agent ID or database path (created if it does not exist)
+        #[arg(value_name = "ID_OR_PATH")]
+        id_or_path: String,
+
+        /// Git repository to clone (URL or local path)
+        #[arg(value_name = "SOURCE")]
+        source: String,
+
+        /// Directory name for the repository inside the filesystem
+        /// (default: derived from the source)
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
+
+        /// Backend to use for mounting (default: fuse on Linux, nfs on macOS)
+        #[arg(long, default_value_t = MountBackend::default())]
+        backend: MountBackend,
+
+        /// Verify `git status` is clean through the mount before finishing
+        #[arg(long)]
+        verify: bool,
+    },
     /// Mount an agent filesystem using FUSE (or list mounts if no args)
     Mount {
         /// Agent ID or database path (if omitted, lists current mounts)

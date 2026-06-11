@@ -174,6 +174,22 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        #[cfg(unix)]
+        Command::Clone {
+            id_or_path,
+            source,
+            name,
+            backend,
+            verify,
+        } => {
+            let rt = get_runtime();
+            if let Err(e) = rt.block_on(cmd::clone::handle_clone_command(
+                id_or_path, source, name, backend, verify,
+            )) {
+                eprintln!("Error: {e:?}");
+                std::process::exit(1);
+            }
+        }
         Command::Mount {
             id_or_path,
             mountpoint,

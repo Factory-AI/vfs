@@ -24,5 +24,9 @@ pub mod nfs;
 #[cfg(unix)]
 pub mod exec;
 
+// Clone command (Unix only)
+#[cfg(unix)]
+pub mod clone;
+
 pub use mount::{mount, MountArgs, MountBackend};
 pub use run::handle_run_command;
