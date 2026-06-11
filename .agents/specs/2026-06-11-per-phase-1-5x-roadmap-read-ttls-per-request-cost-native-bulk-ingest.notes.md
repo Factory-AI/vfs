@@ -6,6 +6,21 @@ User comment: none
 
 ---
 
+## 2026-06-11T12:30-07:00 — Read-path 12.7x root cause: FLUSH on read-only fds permanently revoked keep-cache
+**Type**: surprise
+**Context**: Counters on the read profile showed `base_fast_open_keep_cache=64` vs `base_fast_open_rejected=1216` with `base_fast_inode_invalidations=1280` — one invalidation per close. Stepping the state machine: every close(2) sends FLUSH; the handler called `invalidate_inode_cache_self` unconditionally, which feeds the drift guard's STICKY `dropped` set, so the first close of a file revoked `FOPEN_KEEP_CACHE` eligibility forever. Each re-open of an unchanged base file then re-read everything through FUSE. The kernel page cache was being destroyed by the very flag machinery built to preserve it.
+**Resolution**: FLUSH now invalidates only when it actually drained buffered writes (`drain.is_some()`); a no-write FLUSH is not a mutation (MutationAudit gets an explicit `discard_no_mutation`). Kill switch `AGENTFS_FUSE_FLUSH_INVAL=1`. After: 1,280/1,280 opens keep-cache, READs 1,280→64 (one cold read per file), stale rejections 0. 8/8 A/B pairs win, paired wall median 0.744.
+
+## 2026-06-11T12:35-07:00 — FOPEN_CACHE_DIR requires giving back the OPENDIR round trip
+**Type**: decision
+**Context**: readdirplus dominated handler time (482 calls × 30.6µs) because the kernel re-fetched directory contents on every scandir. Granting `FOPEN_CACHE_DIR|FOPEN_KEEP_CACHE` lets warm getdents hit the page cache, but the mount advertised `FUSE_NO_OPENDIR_SUPPORT`, so the kernel never sent OPENDIR and there was no reply to carry the flag.
+**Resolution**: `FUSE_NO_OPENDIR_SUPPORT` is now advertised only when dir caching is off (`AGENTFS_FUSE_CACHE_DIR=0`). Trade: one OPENDIR+RELEASEDIR round trip per opendir(3) (handler ~1.5µs) buys cached getdents for every warm re-listing — readdirplus 482→24 on the read profile, 2,858→1,425 on the git workload. Coherency: mount-local mutations notify the parent inode (kernel drops dir pages); cross-mount divergence is TTL-bounded like attrs.
+
+## 2026-06-11T12:40-07:00 — Read-path verdict: 4.0x, floor is the OPEN+FLUSH round-trip pair; next levers logged
+**Type**: deviation
+**Context**: Target was ≤1.5x. With READs and readdirplus mostly eliminated, each warm open/read/close cycle still pays two synchronous FUSE round trips (OPEN ~11µs handler + FLUSH ~1.6µs handler, ~60µs wall vs native ~14µs). FOPEN_NOFLUSH is ignored by the kernel under writeback cache (re-confirmed reasoning from the earlier spike), and connection-wide ENOSYS-on-FLUSH was evaluated and rejected for now: the per-fh write buffer tail would only land at async RELEASE, opening a stat-after-close staleness window.
+**Resolution**: 4.0x recorded honestly (3.2x better than the 12.7x start). Logged next levers, in order of expected value: (1) extend `keep_cache_for_read_open` beyond `Layer::Base` to upper/DB-backed files — requires relaxing the drift guard's sticky drop to fingerprint-based revalidation, since files created through the mount (git clone) currently lose eligibility permanently at first write; (2) FUSE passthrough for read fds (infrastructure counters already exist); (3) ENOSYS-on-FLUSH revisited only with a getattr-side pending-flush guarantee.
+
 ## 2026-06-11T10:25-07:00 — WS1 TTL hypothesis falsified by counters; warm-read target moves to WS2
 **Type**: surprise
 **Context**: The spec predicted raising entry/attr TTLs 1s→10s would fix the read-path warm steady-state (12.7x). Counter measurement shows request counts are IDENTICAL across TTL settings in the read benchmark (getattr 235, open 256, readdirplus 482, cold AND warm): the kernel already caches within iteration loops at 1s, and "warm" remounts, so every object pays exactly one round trip per mount regardless of TTL. Steady-state cost is ~1,229 requests x ~98us = per-request cost, not TTL expiry.
