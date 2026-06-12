@@ -240,7 +240,7 @@ impl agentfs_sdk::FileSystem for ReadWriteLaneFsAdapter {
         &self,
         ino: i64,
         flags: i32,
-    ) -> std::result::Result<bool, agentfs_sdk::error::Error> {
+    ) -> std::result::Result<Option<agentfs_sdk::Stats>, agentfs_sdk::error::Error> {
         match classify_open(flags) {
             FuseFsOperationClass::PureRead => {
                 let _lane = self.lock_read_fs().await;

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 // Re-export implementations
-pub use agentfs::{AgentFS, ImportEntry, ImportOptions, ImportedEntry};
+pub use agentfs::{keepcache_delta_enabled, AgentFS, ImportEntry, ImportOptions, ImportedEntry};
 #[cfg(target_os = "macos")]
 pub use hostfs_darwin::HostFS;
 #[cfg(target_os = "linux")]
@@ -271,14 +271,16 @@ pub trait FileSystem: Send + Sync {
     /// with the appropriate permissions.
     async fn open(&self, ino: i64, flags: i32) -> Result<BoxedFile>;
 
-    /// Return true when a FUSE adapter may keep the kernel page cache across
-    /// read-only opens for this inode.
+    /// Return the inode's stats when a FUSE adapter may keep the kernel page
+    /// cache across this read-only open, or None when the cache must drop.
     ///
-    /// Implementations must only return true for immutable read-only handles
-    /// whose cached data cannot become stale without a later invalidating
-    /// mutation. The default is conservative and disables `FOPEN_KEEP_CACHE`.
-    async fn keep_cache_for_read_open(&self, _ino: i64, _flags: i32) -> Result<bool> {
-        Ok(false)
+    /// Implementations must only return stats for read-only handles whose
+    /// cached data cannot become stale without a later invalidating mutation.
+    /// The returned stats are the ones consulted for the decision, letting
+    /// the caller fingerprint the grant without a second getattr. The default
+    /// is conservative and disables `FOPEN_KEEP_CACHE`.
+    async fn keep_cache_for_read_open(&self, _ino: i64, _flags: i32) -> Result<Option<Stats>> {
+        Ok(None)
     }
 
     /// Create a directory with the specified ownership.

@@ -2046,21 +2046,21 @@ impl FileSystem for OverlayFS {
         self.delta.utimens(delta_ino, atime, mtime).await
     }
 
-    async fn keep_cache_for_read_open(&self, ino: i64, flags: i32) -> Result<bool> {
+    async fn keep_cache_for_read_open(&self, ino: i64, flags: i32) -> Result<Option<Stats>> {
         if is_write_open(flags) {
-            return Ok(false);
+            return Ok(None);
         }
 
         let info = self.get_inode_info(ino).ok_or(FsError::NotFound)?;
         match info.layer {
             Layer::Base => {
                 if self.is_whiteout(&info.path) {
-                    return Ok(false);
+                    return Ok(None);
                 }
                 let Some(stats) = self.base.getattr(info.underlying_ino).await? else {
-                    return Ok(false);
+                    return Ok(None);
                 };
-                Ok(stats.is_file())
+                Ok(stats.is_file().then_some(stats))
             }
             // Delta (DB-backed) files inherit the AgentFS keep-cache policy:
             // the adapter fingerprint guard revalidates per open.
@@ -2622,16 +2622,23 @@ mod tests {
         let (overlay, _base_dir, _delta_dir) = create_test_overlay().await?;
 
         let stats = overlay.lookup(ROOT_INO, "base.txt").await?.unwrap();
+        let granted = overlay
+            .keep_cache_for_read_open(stats.ino, libc::O_RDONLY)
+            .await?;
         assert!(
-            overlay
-                .keep_cache_for_read_open(stats.ino, libc::O_RDONLY)
-                .await?,
+            granted.is_some(),
             "read-only base files are eligible for FOPEN_KEEP_CACHE"
         );
+        assert_eq!(
+            granted.map(|s| s.size),
+            Some(stats.size),
+            "keep-cache grant must carry the stats it was decided on"
+        );
         assert!(
-            !overlay
+            overlay
                 .keep_cache_for_read_open(stats.ino, libc::O_RDWR)
-                .await?,
+                .await?
+                .is_none(),
             "writable opens must not keep the base page cache"
         );
 
@@ -2640,7 +2647,8 @@ mod tests {
         assert!(
             overlay
                 .keep_cache_for_read_open(stats.ino, libc::O_RDONLY)
-                .await?,
+                .await?
+                .is_some(),
             "delta-backed files stay keep-cache eligible; staleness is the \
              adapter fingerprint guard's job"
         );

@@ -630,6 +630,10 @@ struct AgentFSFuse {
     /// `drain_on_release` is set: legacy commit-on-close needs the FLUSH.
     /// Set `AGENTFS_FUSE_NOFLUSH=0` to restore close-time FLUSH replies.
     noflush: bool,
+    /// Mirror of the SDK's `AGENTFS_KEEPCACHE_DELTA` gate: when off, the
+    /// adapter's cached-stats keep-cache fast path must defer to the SDK
+    /// (only the SDK knows whether an inode is base- or delta-backed).
+    keepcache_delta_enabled: bool,
     /// Number of open handles whose pending `WriteBuffer` is nonempty.
     /// Attr-bearing read paths that must observe buffered tails (lookup,
     /// readdirplus) check this before scanning `open_files`, keeping the hot
@@ -1587,19 +1591,46 @@ impl Filesystem for AgentFSFuse {
             && self.cache_config.keepcache_enabled
             && !self.has_pending_write_for_inode(ino);
 
-        // One runtime hop for the keep-cache probe, fingerprint getattr and
-        // the open itself: this handler runs ~1x per open(2) on the warm read
-        // path, so the extra block_on round trips were pure dispatch cost.
+        // Keep-cache fast path: the adapter attr cache already holds
+        // epoch-valid stats for almost every warm open (populated by the
+        // preceding lookup/readdirplus), and the SDK keep-cache verdict for a
+        // visible regular file reduces to `is_file()` when the delta
+        // keep-cache kill switch is off. Skipping the SDK probe here removes
+        // the dominant per-open cost on warm read paths (47.9us -> the open
+        // call alone). The fingerprint drift guard still revalidates the
+        // grant exactly as it does for SDK-derived stats.
+        let cached_fingerprint = if check_keep_cache && self.keepcache_delta_enabled {
+            let epoch = self.cache_epoch();
+            let stats = self.attr_cache.lock().get(&ino).cloned();
+            match stats {
+                Some(stats) if stats.is_file() => {
+                    let cache_reply = self.cache_reply_lock.try_lock();
+                    if cache_reply.is_some() && !self.cache_epoch_changed(epoch) {
+                        Some(KeepCacheFingerprint::from_stats(&stats))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        // One runtime hop for the keep-cache probe (when the fast path
+        // missed) and the open itself: this handler runs ~1x per open(2) on
+        // the warm read path, so extra block_on round trips and SDK queries
+        // were pure dispatch cost.
         let fs = self.fs.clone();
         let result = self.runtime.block_on(async move {
-            let fingerprint =
-                if check_keep_cache && fs.keep_cache_for_read_open(ino as i64, flags).await? {
-                    fs.getattr(ino as i64)
-                        .await?
-                        .map(|stats| KeepCacheFingerprint::from_stats(&stats))
-                } else {
-                    None
-                };
+            let fingerprint = match cached_fingerprint {
+                Some(fingerprint) => Some(fingerprint),
+                None if check_keep_cache => fs
+                    .keep_cache_for_read_open(ino as i64, flags)
+                    .await?
+                    .map(|stats| KeepCacheFingerprint::from_stats(&stats)),
+                None => None,
+            };
             let file = fs.open(ino as i64, flags).await?;
             Ok::<_, SdkError>((file, fingerprint))
         });
@@ -2577,6 +2608,7 @@ impl AgentFSFuse {
             drain_on_forget,
             flush_inval_always,
             noflush,
+            keepcache_delta_enabled: agentfs_sdk::filesystem::keepcache_delta_enabled(),
             pending_dirty_handles: AtomicUsize::new(0),
             cache_dir_enabled,
             _profile_report: Arc::new(agentfs_sdk::profiling::ProfileReportGuard::new(

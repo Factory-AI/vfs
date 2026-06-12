@@ -146,7 +146,10 @@ fn drain_on_setattr() -> bool {
 /// Whether DB-backed regular files may keep the kernel page cache across
 /// read-only opens (`FOPEN_KEEP_CACHE`). Default true; the FUSE adapter's
 /// fingerprint guard revalidates stats at each open.
-fn keepcache_delta_enabled() -> bool {
+/// Whether DB-backed (delta) files may grant `FOPEN_KEEP_CACHE` on read-only
+/// opens. Public so FUSE adapters can gate their own cached-stats fast path
+/// on the same kill switch (`AGENTFS_KEEPCACHE_DELTA=0`).
+pub fn keepcache_delta_enabled() -> bool {
     static KEEPCACHE_DELTA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *KEEPCACHE_DELTA.get_or_init(|| env_flag_default("AGENTFS_KEEPCACHE_DELTA", true))
 }
@@ -5056,17 +5059,17 @@ impl FileSystem for AgentFS {
     /// are caught exactly like external edits to host-backed base files.
     /// Kill switch: `AGENTFS_KEEPCACHE_DELTA=0` restores the old policy
     /// where only host-backed base-layer files were eligible.
-    async fn keep_cache_for_read_open(&self, ino: i64, flags: i32) -> Result<bool> {
+    async fn keep_cache_for_read_open(&self, ino: i64, flags: i32) -> Result<Option<Stats>> {
         if (flags & libc::O_ACCMODE) != libc::O_RDONLY || (flags & libc::O_TRUNC) != 0 {
-            return Ok(false);
+            return Ok(None);
         }
         if !keepcache_delta_enabled() {
-            return Ok(false);
+            return Ok(None);
         }
         let Some(stats) = FileSystem::getattr(self, ino).await? else {
-            return Ok(false);
+            return Ok(None);
         };
-        Ok(stats.is_file())
+        Ok(stats.is_file().then_some(stats))
     }
 
     async fn readlink(&self, ino: i64) -> Result<Option<String>> {
