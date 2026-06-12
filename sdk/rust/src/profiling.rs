@@ -68,6 +68,9 @@ pub struct ProfileSnapshot {
     pub fuse_flush_bytes: u64,
     pub fuse_noflush_enosys_replies: u64,
     pub fuse_pending_tail_drains: u64,
+    pub fuse_noopen_enosys_replies: u64,
+    pub fuse_ino_file_resolutions: u64,
+    pub fuse_ino_file_upgrades: u64,
     pub fuse_sync_inval_inode_ok: u64,
     pub fuse_sync_inval_inode_err: u64,
     pub fuse_sync_inval_entry_ok: u64,
@@ -216,6 +219,9 @@ pub struct ProfileCounters {
     fuse_flush_bytes: AtomicU64,
     fuse_noflush_enosys_replies: AtomicU64,
     fuse_pending_tail_drains: AtomicU64,
+    fuse_noopen_enosys_replies: AtomicU64,
+    fuse_ino_file_resolutions: AtomicU64,
+    fuse_ino_file_upgrades: AtomicU64,
     fuse_sync_inval_inode_ok: AtomicU64,
     fuse_sync_inval_inode_err: AtomicU64,
     fuse_sync_inval_entry_ok: AtomicU64,
@@ -325,6 +331,9 @@ impl ProfileCounters {
             fuse_flush_bytes: AtomicU64::new(0),
             fuse_noflush_enosys_replies: AtomicU64::new(0),
             fuse_pending_tail_drains: AtomicU64::new(0),
+            fuse_noopen_enosys_replies: AtomicU64::new(0),
+            fuse_ino_file_resolutions: AtomicU64::new(0),
+            fuse_ino_file_upgrades: AtomicU64::new(0),
             fuse_sync_inval_inode_ok: AtomicU64::new(0),
             fuse_sync_inval_inode_err: AtomicU64::new(0),
             fuse_sync_inval_entry_ok: AtomicU64::new(0),
@@ -619,6 +628,20 @@ impl ProfileCounters {
     fn add_fuse_pending_tail_drain(&self) {
         self.fuse_pending_tail_drains
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_fuse_noopen_enosys_reply(&self) {
+        self.fuse_noopen_enosys_replies
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_fuse_ino_file_resolution(&self) {
+        self.fuse_ino_file_resolutions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_fuse_ino_file_upgrade(&self) {
+        self.fuse_ino_file_upgrades.fetch_add(1, Ordering::Relaxed);
     }
 
     fn add_fuse_sync_inval_inode_ok(&self) {
@@ -933,6 +956,9 @@ impl ProfileCounters {
             fuse_flush_bytes: self.fuse_flush_bytes.load(Ordering::Relaxed),
             fuse_noflush_enosys_replies: self.fuse_noflush_enosys_replies.load(Ordering::Relaxed),
             fuse_pending_tail_drains: self.fuse_pending_tail_drains.load(Ordering::Relaxed),
+            fuse_noopen_enosys_replies: self.fuse_noopen_enosys_replies.load(Ordering::Relaxed),
+            fuse_ino_file_resolutions: self.fuse_ino_file_resolutions.load(Ordering::Relaxed),
+            fuse_ino_file_upgrades: self.fuse_ino_file_upgrades.load(Ordering::Relaxed),
             fuse_sync_inval_inode_ok: self.fuse_sync_inval_inode_ok.load(Ordering::Relaxed),
             fuse_sync_inval_inode_err: self.fuse_sync_inval_inode_err.load(Ordering::Relaxed),
             fuse_sync_inval_entry_ok: self.fuse_sync_inval_entry_ok.load(Ordering::Relaxed),
@@ -1327,6 +1353,24 @@ pub fn record_fuse_noflush_enosys_reply() {
 pub fn record_fuse_pending_tail_drain() {
     if is_enabled() {
         COUNTERS.add_fuse_pending_tail_drain();
+    }
+}
+
+pub fn record_fuse_noopen_enosys_reply() {
+    if is_enabled() {
+        COUNTERS.add_fuse_noopen_enosys_reply();
+    }
+}
+
+pub fn record_fuse_ino_file_resolution() {
+    if is_enabled() {
+        COUNTERS.add_fuse_ino_file_resolution();
+    }
+}
+
+pub fn record_fuse_ino_file_upgrade() {
+    if is_enabled() {
+        COUNTERS.add_fuse_ino_file_upgrade();
     }
 }
 

@@ -1,8 +1,8 @@
 use crate::fuser::{
     consts::{
         FOPEN_CACHE_DIR, FOPEN_KEEP_CACHE, FUSE_ASYNC_READ, FUSE_CACHE_SYMLINKS,
-        FUSE_DO_READDIRPLUS, FUSE_NO_OPENDIR_SUPPORT, FUSE_OVER_IO_URING, FUSE_PARALLEL_DIROPS,
-        FUSE_READDIRPLUS_AUTO, FUSE_WRITEBACK_CACHE,
+        FUSE_DO_READDIRPLUS, FUSE_NO_OPENDIR_SUPPORT, FUSE_NO_OPEN_SUPPORT, FUSE_OVER_IO_URING,
+        FUSE_PARALLEL_DIROPS, FUSE_READDIRPLUS_AUTO, FUSE_WRITEBACK_CACHE,
     },
     fuse_forget_one, FileAttr, FileType, Filesystem, KernelConfig, MountOption, ReplyAttr,
     ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen,
@@ -19,7 +19,7 @@ use std::{
     ffi::OsStr,
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -345,7 +345,7 @@ impl OpenFile {
     /// `runtime.block_on(...)`: doing so serializes every other FUSE handler
     /// behind one fh's SQLite commit and was the source of a 2x checkout
     /// regression observed in the first Tier Two benchmark pass.
-    fn take_pending(&mut self) -> Option<(BoxedFile, Vec<WriteRange>, u64, u64)> {
+    fn take_pending(&mut self) -> Option<PendingDrain> {
         if self.pending.is_empty() {
             return None;
         }
@@ -376,6 +376,46 @@ impl OpenFile {
     }
 }
 
+/// `(file, ranges, range_count, byte_count)` drained from a pending
+/// `WriteBuffer`; flushed out-of-lock via `flush_pending_batched_out_of_lock`.
+type PendingDrain = (BoxedFile, Vec<WriteRange>, u64, u64);
+
+/// Per-inode file state for the zero-message-open path. With the kernel's
+/// `no_open` latched (ENOSYS-OPEN), file ops arrive with `fh=0` and no
+/// per-handle state exists: all I/O for an inode shares one resolved
+/// `BoxedFile` and one coalescing write buffer. Entries live until FORGET
+/// drops the inode (or soft-cap eviction reclaims a clean entry).
+struct InoFile {
+    file: BoxedFile,
+    /// Pending writes buffered for coalescing, shared by every open(2) of
+    /// this inode. Cross-handle write ordering is inherent (one buffer).
+    pending: WriteBuffer,
+    /// False while the file was resolved for reads only. The first write op
+    /// re-resolves with `O_RDWR` (triggering overlay copy-up) and replaces
+    /// `file`, so post-copy-up reads go through the delta layer.
+    write_capable: bool,
+    /// Resolution stamp consulted by the soft-cap eviction scan.
+    last_used: u64,
+}
+
+impl InoFile {
+    /// See `OpenFile::take_pending` for the out-of-lock drain contract.
+    fn take_pending(&mut self) -> Option<PendingDrain> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let file = self.file.clone();
+        let ranges = self.pending.ranges_for_flush();
+        let range_count = ranges.len() as u64;
+        let byte_count = ranges
+            .iter()
+            .map(|range| range.data.len() as u64)
+            .sum::<u64>();
+        self.pending.clear();
+        Some((file, ranges, range_count, byte_count))
+    }
+}
+
 /// Flush a `(file, ranges, range_count, byte_count)` tuple produced by
 /// `OpenFile::take_pending()` via the SDK write batcher (so the coalesced
 /// ranges enter the cross-inode batched-commit path). Called by the FUSE
@@ -383,7 +423,7 @@ impl OpenFile {
 /// `open_files` parking_lot mutex.
 fn flush_pending_batched_out_of_lock(
     runtime: &Runtime,
-    drain: (BoxedFile, Vec<WriteRange>, u64, u64),
+    drain: PendingDrain,
 ) -> Result<(), SdkError> {
     let (file, ranges, range_count, byte_count) = drain;
     runtime.block_on(async move { file.pwrite_ranges_batched(ranges).await })?;
@@ -634,6 +674,25 @@ struct AgentFSFuse {
     /// adapter's cached-stats keep-cache fast path must defer to the SDK
     /// (only the SDK knows whether an inode is base- or delta-backed).
     keepcache_delta_enabled: bool,
+    /// ENOSYS-OPEN env gate (`AGENTFS_FUSE_NOOPEN`). The open handler only
+    /// replies ENOSYS once `noopen_active` is also latched, which requires
+    /// the kernel to have offered `FUSE_NO_OPEN_SUPPORT` in INIT.
+    noopen: bool,
+    /// Latched in `init()` when `noopen` is requested and the kernel
+    /// supports zero-message opens. Once the first OPEN gets ENOSYS the
+    /// kernel sets its connection-wide `no_open`: every open(2)/close(2)
+    /// completes with no FUSE request at all (the default fuse_file carries
+    /// `fh = 0` and `FOPEN_KEEP_CACHE`), and FUSE_RELEASE is skipped for
+    /// every file — including CREATE-opened ones, which is why CREATE also
+    /// stores its file per-inode and replies `fh = 0` in this mode.
+    noopen_active: AtomicBool,
+    /// Shared per-inode files for `fh = 0` traffic (see `InoFile`).
+    ino_files: Mutex<HashMap<u64, InoFile>>,
+    /// Soft cap on `ino_files`: clean entries are evicted (oldest first)
+    /// when the table would exceed it; dirty entries are never evicted.
+    ino_files_cap: usize,
+    /// Monotonic stamp source for `InoFile::last_used`.
+    ino_file_stamp: AtomicU64,
     /// Number of open handles whose pending `WriteBuffer` is nonempty.
     /// Attr-bearing read paths that must observe buffered tails (lookup,
     /// readdirplus) check this before scanning `open_files`, keeping the hot
@@ -686,6 +745,18 @@ impl Filesystem for AgentFSFuse {
             } else {
                 tracing::warn!(
                     "AGENTFS_FUSE_URING=1 but kernel/ring support missing; using legacy channel"
+                );
+            }
+        }
+        if self.noopen {
+            // The latch itself is ENOSYS-driven (first OPEN reply); the INIT
+            // capability only proves the kernel knows zero-message opens, so
+            // a pre-no_open kernel never sees the ENOSYS.
+            if config.add_capabilities(FUSE_NO_OPEN_SUPPORT).is_ok() {
+                self.noopen_active.store(true, Ordering::Release);
+            } else {
+                tracing::warn!(
+                    "AGENTFS_FUSE_NOOPEN=1 but kernel lacks FUSE_NO_OPEN_SUPPORT; opens stay per-handle"
                 );
             }
         }
@@ -1008,30 +1079,30 @@ impl Filesystem for AgentFSFuse {
             self.invalidate_inode_cache_self(req, ino);
         }
 
-        // Handle truncate
+        // Handle truncate. An fh-keyed handle is used when present
+        // (ftruncate via CREATE/OPEN handles); otherwise — including the
+        // `fh = 0` that zero-message opens echo — resolve the shared
+        // per-inode write file (triggering overlay copy-up as needed).
         if let Some(new_size) = size {
-            let result = if let Some(fh) = fh {
-                // Use file handle if available (ftruncate).
-                let file = {
-                    let open_files = self.open_files.lock();
-                    let Some(open_file) = open_files.get(&fh) else {
-                        reply.error(libc::EBADF);
+            let file = fh.and_then(|fh| {
+                self.open_files
+                    .lock()
+                    .get(&fh)
+                    .map(|open_file| open_file.file.clone())
+            });
+            let file = match file {
+                Some(file) => file,
+                None => match self.resolve_ino_file(ino, true) {
+                    Ok(file) => file,
+                    Err(e) => {
+                        reply.error(error_to_errno(&e));
                         return;
-                    };
-
-                    open_file.file.clone()
-                };
-
-                self.runtime
-                    .block_on(async move { file.truncate(new_size).await })
-            } else {
-                // Open file and truncate via file handle
-                let fs = self.fs.clone();
-                self.runtime.block_on(async move {
-                    let file = fs.open(ino as i64, libc::O_RDWR).await?;
-                    file.truncate(new_size).await
-                })
+                    }
+                },
             };
+            let result = self
+                .runtime
+                .block_on(async move { file.truncate(new_size).await });
 
             if let Err(e) = result {
                 reply.error(error_to_errno(&e));
@@ -1355,10 +1426,31 @@ impl Filesystem for AgentFSFuse {
                 self.invalidate_entry_cache_self(req, parent, name);
                 let attr = fillattr(&stats);
 
-                let fh = self.alloc_fh();
-                self.open_files
-                    .lock()
-                    .insert(fh, OpenFile::new(stats.ino as u64, file));
+                // Zero-message opens: the kernel skips FUSE_RELEASE for
+                // every file once `no_open` latches, so an fh-keyed entry
+                // would leak. Store the created file per-inode (where the
+                // fh = 0 writes will find it for free) and echo fh = 0.
+                let fh = if self.noopen_active.load(Ordering::Acquire) {
+                    let stamp = self.ino_file_stamp.fetch_add(1, Ordering::Relaxed);
+                    let mut ino_files = self.ino_files.lock();
+                    self.evict_ino_files_overflow(&mut ino_files);
+                    ino_files.insert(
+                        stats.ino as u64,
+                        InoFile {
+                            file,
+                            pending: WriteBuffer::default(),
+                            write_capable: true,
+                            last_used: stamp,
+                        },
+                    );
+                    0
+                } else {
+                    let fh = self.alloc_fh();
+                    self.open_files
+                        .lock()
+                        .insert(fh, OpenFile::new(stats.ino as u64, file));
+                    fh
+                };
 
                 audit.assert_invalidated("create");
                 let (entry_ttl, attr_ttl) = self.mutation_reply_ttls();
@@ -1583,6 +1675,21 @@ impl Filesystem for AgentFSFuse {
         agentfs_sdk::profiling::record_fuse_open();
         tracing::debug!("FUSE::open: ino={}, flags={}", ino, flags);
 
+        if self.noopen_active.load(Ordering::Acquire) {
+            // Latches the kernel's connection-wide `no_open`: this open(2)
+            // and every later one succeed with a default `fh = 0` +
+            // `FOPEN_KEEP_CACHE` fuse_file and zero FUSE requests; releases
+            // are skipped too. I/O reaches us as `fh = 0` and resolves
+            // through `ino_files`. Page-cache coherence rests on the same
+            // contract as the rest of the kernel cache: self-writes are
+            // writeback-coherent, truncates arrive as SETATTR (we never
+            // advertise FUSE_ATOMIC_O_TRUNC), and external divergence is
+            // bounded by the attr TTLs.
+            agentfs_sdk::profiling::record_fuse_noopen_enosys_reply();
+            reply.error(libc::ENOSYS);
+            return;
+        }
+
         let write_open = fuse_write_open(flags);
         if write_open {
             self.drop_keepcache_eligibility(ino);
@@ -1709,11 +1816,18 @@ impl Filesystem for AgentFSFuse {
 
         let file = {
             let open_files = self.open_files.lock();
-            let Some(open_file) = open_files.get(&fh) else {
-                reply.error(libc::EBADF);
-                return;
-            };
-            open_file.file.clone()
+            open_files.get(&fh).map(|open_file| open_file.file.clone())
+        };
+        // `fh = 0` under zero-message opens: resolve the shared per-inode file.
+        let file = match file {
+            Some(file) => file,
+            None => match self.resolve_ino_file(ino, false) {
+                Ok(file) => file,
+                Err(e) => {
+                    reply.error(error_to_errno(&e));
+                    return;
+                }
+            },
         };
 
         if let Err(e) = self.flush_pending_inode(ino) {
@@ -1779,32 +1893,45 @@ impl Filesystem for AgentFSFuse {
             // or every other FUSE handler serializes behind this fh's SQLite
             // commit. An earlier draft of Axis A2 held the lock through the
             // flush and regressed checkout by 2x.
-            let drain = {
+            let fh_drain = {
                 let mut open_files = self.open_files.lock();
-                let Some(open_file) = open_files.get_mut(&fh) else {
-                    reply.error(libc::EBADF);
-                    return;
-                };
-                let was_empty = open_file.pending.is_empty();
-                match open_file.buffer_fuse_write(offset as u64, data) {
-                    Ok(true) => {
-                        let drain = open_file.take_pending();
-                        if !was_empty {
-                            self.pending_dirty_handles.fetch_sub(1, Ordering::Release);
+                match open_files.get_mut(&fh) {
+                    None => None,
+                    Some(open_file) => {
+                        let was_empty = open_file.pending.is_empty();
+                        match open_file.buffer_fuse_write(offset as u64, data) {
+                            Ok(true) => {
+                                let drain = open_file.take_pending();
+                                if !was_empty {
+                                    self.pending_dirty_handles.fetch_sub(1, Ordering::Release);
+                                }
+                                Some(drain)
+                            }
+                            Ok(false) => {
+                                if was_empty && !open_file.pending.is_empty() {
+                                    self.pending_dirty_handles.fetch_add(1, Ordering::Release);
+                                }
+                                Some(None)
+                            }
+                            Err(errno) => {
+                                reply.error(errno);
+                                return;
+                            }
                         }
-                        drain
                     }
-                    Ok(false) => {
-                        if was_empty && !open_file.pending.is_empty() {
-                            self.pending_dirty_handles.fetch_add(1, Ordering::Release);
-                        }
-                        None
-                    }
+                }
+            };
+            // `fh = 0` under zero-message opens: coalesce into the shared
+            // per-inode buffer (write resolution triggers copy-up).
+            let drain = match fh_drain {
+                Some(drain) => drain,
+                None => match self.buffer_ino_write(ino, offset as u64, data) {
+                    Ok(drain) => drain,
                     Err(errno) => {
                         reply.error(errno);
                         return;
                     }
-                }
+                },
             };
             match drain {
                 Some(drain) => flush_pending_batched_out_of_lock(&self.runtime, drain),
@@ -1817,11 +1944,17 @@ impl Filesystem for AgentFSFuse {
             // of writeback).
             let file = {
                 let open_files = self.open_files.lock();
-                let Some(open_file) = open_files.get(&fh) else {
-                    reply.error(libc::EBADF);
-                    return;
-                };
-                open_file.file.clone()
+                open_files.get(&fh).map(|open_file| open_file.file.clone())
+            };
+            let file = match file {
+                Some(file) => file,
+                None => match self.resolve_ino_file(ino, true) {
+                    Ok(file) => file,
+                    Err(e) => {
+                        reply.error(error_to_errno(&e));
+                        return;
+                    }
+                },
             };
             let data = data.to_vec();
             self.runtime.block_on(async move {
@@ -1854,18 +1987,33 @@ impl Filesystem for AgentFSFuse {
         // and serialised reads behind a much larger commit. Keep the
         // restoration of synchronous drain on flush/release; FUSE
         // close-time latency is bounded.
-        let (drain, file) = {
+        let fh_state = {
             let mut open_files = self.open_files.lock();
-            let Some(open_file) = open_files.get_mut(&fh) else {
-                reply.error(libc::EBADF);
-                return;
-            };
-            let drain = open_file.take_pending();
-            if drain.is_some() {
-                self.pending_dirty_handles.fetch_sub(1, Ordering::Release);
-            }
-            (drain, open_file.file.clone())
+            open_files.get_mut(&fh).map(|open_file| {
+                let drain = open_file.take_pending();
+                if drain.is_some() {
+                    self.pending_dirty_handles.fetch_sub(1, Ordering::Release);
+                }
+                (drain, Some(open_file.file.clone()))
+            })
         };
+        // `fh = 0` under zero-message opens (including the very first FLUSH
+        // that races the ENOSYS-OPEN latch): drain the shared per-inode
+        // buffer instead. drain_on_release never applies here (it forces
+        // both noflush and noopen off).
+        let (drain, file) = fh_state.unwrap_or_else(|| {
+            let mut ino_files = self.ino_files.lock();
+            match ino_files.get_mut(&ino) {
+                Some(entry) => {
+                    let drain = entry.take_pending();
+                    if drain.is_some() {
+                        self.pending_dirty_handles.fetch_sub(1, Ordering::Release);
+                    }
+                    (drain, Some(entry.file.clone()))
+                }
+                None => (None, None),
+            }
+        });
         let drain_on_release = self.drain_on_release;
         let had_pending_writes = drain.is_some();
         let result = (|| -> Result<(), SdkError> {
@@ -1877,8 +2025,10 @@ impl Filesystem for AgentFSFuse {
                 flush_pending_batched_out_of_lock(&self.runtime, drain)?;
             }
             if drain_on_release {
-                self.runtime
-                    .block_on(async move { file.drain_writes().await })?;
+                if let Some(file) = file {
+                    self.runtime
+                        .block_on(async move { file.drain_writes().await })?;
+                }
             }
             Ok(())
         })();
@@ -1925,11 +2075,17 @@ impl Filesystem for AgentFSFuse {
         tracing::debug!("FUSE::fsync: fh={}", fh);
         let file = {
             let open_files = self.open_files.lock();
-            let Some(open_file) = open_files.get(&fh) else {
-                reply.error(libc::EBADF);
-                return;
-            };
-            open_file.file.clone()
+            open_files.get(&fh).map(|open_file| open_file.file.clone())
+        };
+        let file = match file {
+            Some(file) => file,
+            None => match self.resolve_ino_file(ino, false) {
+                Ok(file) => file,
+                Err(e) => {
+                    reply.error(error_to_errno(&e));
+                    return;
+                }
+            },
         };
 
         if let Err(e) = self.flush_pending_inode(ino) {
@@ -2046,6 +2202,7 @@ impl Filesystem for AgentFSFuse {
     /// that were cached for the inode, preventing file descriptor exhaustion.
     fn forget(&self, _req: &Request, ino: u64, nlookup: u64) {
         tracing::debug!("FUSE::forget: ino={}, nlookup={}", ino, nlookup);
+        self.drop_ino_file(ino);
         let fs = self.fs.clone();
         // Default: do NOT commit pending batched writes here. The kernel
         // FORGETs every freshly-written file shortly after our post-write
@@ -2073,6 +2230,9 @@ impl Filesystem for AgentFSFuse {
     /// This is an optimization over calling forget() individually for each inode.
     fn batch_forget(&self, _req: &Request, nodes: &[fuse_forget_one]) {
         tracing::debug!("FUSE::batch_forget: {} nodes", nodes.len());
+        for node in nodes {
+            self.drop_ino_file(node.nodeid);
+        }
         let fs = self.fs.clone();
         let nodes_vec: Vec<(i64, u64)> =
             nodes.iter().map(|n| (n.nodeid as i64, n.nlookup)).collect();
@@ -2113,9 +2273,15 @@ impl AgentFSFuse {
         // reads from the in-memory overlay (peek_pending merge), so a
         // synchronous SQLite commit on every read is wasted work. Durability
         // remains via fsync/destroy/timer.
-        self.flush_open_file_pending_inode_except(ino, 0)
+        self.flush_open_file_pending_inode_except(ino, 0)?;
+        self.flush_ino_file_pending(ino)
     }
 
+    /// Write-path pre-drain: moves OTHER handles' buffers for `ino` into the
+    /// batcher before this write buffers, preserving FUSE request order
+    /// across fh-keyed handles. Deliberately skips the shared per-inode
+    /// buffer — under zero-message opens that buffer IS this write's
+    /// destination, and ordering within one buffer is inherent.
     fn flush_pending_inode_except(&self, ino: u64, except_fh: u64) -> Result<(), SdkError> {
         self.flush_open_file_pending_inode_except(ino, except_fh)
     }
@@ -2154,7 +2320,7 @@ impl AgentFSFuse {
 
     fn flush_all_pending(&self) -> Result<(), SdkError> {
         // Same lock-release pattern as `flush_open_file_pending_inode_except`.
-        let drains = {
+        let mut drains = {
             let mut open_files = self.open_files.lock();
             let mut drains = Vec::new();
             for open_file in open_files.values_mut() {
@@ -2168,6 +2334,20 @@ impl AgentFSFuse {
             }
             drains
         };
+        {
+            let mut ino_files = self.ino_files.lock();
+            let start = drains.len();
+            for entry in ino_files.values_mut() {
+                if let Some(drain) = entry.take_pending() {
+                    drains.push(drain);
+                }
+            }
+            let drained = drains.len() - start;
+            if drained > 0 {
+                self.pending_dirty_handles
+                    .fetch_sub(drained, Ordering::Release);
+            }
+        }
         for drain in drains {
             flush_pending_batched_out_of_lock(&self.runtime, drain)?;
         }
@@ -2207,6 +2387,162 @@ impl AgentFSFuse {
             .lock()
             .values()
             .any(|open_file| open_file.ino == ino && !open_file.pending.is_empty())
+            || self
+                .ino_files
+                .lock()
+                .get(&ino)
+                .is_some_and(|entry| !entry.pending.is_empty())
+    }
+
+    /// Get-or-create the shared per-inode file for `fh = 0` traffic. A
+    /// `write` resolution of a read-resolved inode re-opens with `O_RDWR`
+    /// (triggering overlay copy-up) and replaces the entry's file, so later
+    /// reads go through the delta layer instead of a stale base handle.
+    /// Never holds the `ino_files` lock across `block_on` (same contract as
+    /// `open_files`).
+    fn resolve_ino_file(&self, ino: u64, write: bool) -> Result<BoxedFile, SdkError> {
+        let stamp = self.ino_file_stamp.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut ino_files = self.ino_files.lock();
+            if let Some(entry) = ino_files.get_mut(&ino) {
+                if !write || entry.write_capable {
+                    entry.last_used = stamp;
+                    return Ok(entry.file.clone());
+                }
+            }
+        }
+        let flags = if write { libc::O_RDWR } else { libc::O_RDONLY };
+        let fs = self.fs.clone();
+        let file = self
+            .runtime
+            .block_on(async move { fs.open(ino as i64, flags).await })?;
+        agentfs_sdk::profiling::record_fuse_ino_file_resolution();
+        let mut ino_files = self.ino_files.lock();
+        match ino_files.get_mut(&ino) {
+            Some(entry) if write && !entry.write_capable => {
+                entry.file = file.clone();
+                entry.write_capable = true;
+                entry.last_used = stamp;
+                agentfs_sdk::profiling::record_fuse_ino_file_upgrade();
+                Ok(file)
+            }
+            Some(entry) => {
+                // Raced another resolver; keep the winner's file.
+                entry.last_used = stamp;
+                Ok(entry.file.clone())
+            }
+            None => {
+                self.evict_ino_files_overflow(&mut ino_files);
+                ino_files.insert(
+                    ino,
+                    InoFile {
+                        file: file.clone(),
+                        pending: WriteBuffer::default(),
+                        write_capable: write,
+                        last_used: stamp,
+                    },
+                );
+                Ok(file)
+            }
+        }
+    }
+
+    /// Soft-cap safety valve: when the table would exceed `ino_files_cap`,
+    /// evict the oldest clean entries. Dirty entries are never evicted —
+    /// their buffered tails drain via the guards, FORGET, or destroy.
+    fn evict_ino_files_overflow(&self, ino_files: &mut HashMap<u64, InoFile>) {
+        if ino_files.len() < self.ino_files_cap {
+            return;
+        }
+        let mut clean: Vec<(u64, u64)> = ino_files
+            .iter()
+            .filter(|(_, entry)| entry.pending.is_empty())
+            .map(|(&ino, entry)| (entry.last_used, ino))
+            .collect();
+        clean.sort_unstable();
+        let excess = ino_files.len() + 1 - self.ino_files_cap;
+        for &(_, ino) in clean.iter().take(excess) {
+            ino_files.remove(&ino);
+        }
+    }
+
+    /// Coalesce a `fh = 0` write into the shared per-inode buffer, resolving
+    /// the write-capable file first. Returns a drain tuple when the buffer
+    /// crossed the flush threshold. Loops on the narrow race where a clean
+    /// entry is evicted between resolution and re-locking.
+    fn buffer_ino_write(
+        &self,
+        ino: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<Option<PendingDrain>, i32> {
+        loop {
+            self.resolve_ino_file(ino, true)
+                .map_err(|e| error_to_errno(&e))?;
+            let mut ino_files = self.ino_files.lock();
+            let Some(entry) = ino_files.get_mut(&ino) else {
+                continue;
+            };
+            if !entry.write_capable {
+                continue;
+            }
+            let was_empty = entry.pending.is_empty();
+            entry.pending.write(offset, data)?;
+            if entry.pending.bytes >= FUSE_COALESCE_FLUSH_BYTES {
+                let drain = entry.take_pending();
+                if !was_empty {
+                    self.pending_dirty_handles.fetch_sub(1, Ordering::Release);
+                }
+                return Ok(drain);
+            }
+            if was_empty && !entry.pending.is_empty() {
+                self.pending_dirty_handles.fetch_add(1, Ordering::Release);
+            }
+            return Ok(None);
+        }
+    }
+
+    /// FORGET is the lifecycle end of a per-inode file: the kernel
+    /// guarantees no further ops for `ino` without a fresh LOOKUP, so the
+    /// entry is dropped after moving any buffered tail into the batcher.
+    fn drop_ino_file(&self, ino: u64) {
+        let drain = {
+            let mut ino_files = self.ino_files.lock();
+            let Some(mut entry) = ino_files.remove(&ino) else {
+                return;
+            };
+            let drain = entry.take_pending();
+            if drain.is_some() {
+                self.pending_dirty_handles.fetch_sub(1, Ordering::Release);
+            }
+            drain
+        };
+        if let Some(drain) = drain {
+            if let Err(error) = flush_pending_batched_out_of_lock(&self.runtime, drain) {
+                tracing::warn!("FUSE::forget failed to flush pending writes for {ino}: {error}");
+            }
+        }
+    }
+
+    /// Drain the per-inode pending buffer for `ino` into the SDK batcher.
+    fn flush_ino_file_pending(&self, ino: u64) -> Result<(), SdkError> {
+        let drain = {
+            let mut ino_files = self.ino_files.lock();
+            match ino_files.get_mut(&ino) {
+                Some(entry) => {
+                    let drain = entry.take_pending();
+                    if drain.is_some() {
+                        self.pending_dirty_handles.fetch_sub(1, Ordering::Release);
+                    }
+                    drain
+                }
+                None => None,
+            }
+        };
+        match drain {
+            Some(drain) => flush_pending_batched_out_of_lock(&self.runtime, drain),
+            None => Ok(()),
+        }
     }
 
     /// Drains buffered write tails for `ino` before an attr-bearing reply
@@ -2582,6 +2918,17 @@ impl AgentFSFuse {
                 "AGENTFS_FUSE_NOFLUSH disabled: AGENTFS_DRAIN_ON_RELEASE needs the close-time FLUSH"
             );
         }
+        let noopen = env_flag_default("AGENTFS_FUSE_NOOPEN", false) && !drain_on_release;
+        if noopen != env_flag_default("AGENTFS_FUSE_NOOPEN", false) {
+            tracing::warn!(
+                "AGENTFS_FUSE_NOOPEN disabled: AGENTFS_DRAIN_ON_RELEASE needs per-handle releases"
+            );
+        }
+        let ino_files_cap = std::env::var("AGENTFS_FUSE_INO_FILES_CAP")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|cap| *cap >= 16)
+            .unwrap_or(65_536);
         let cache_config = FuseKernelCacheConfig::from_env();
         cache_config.record_profile();
         let cache_dir_enabled =
@@ -2609,6 +2956,11 @@ impl AgentFSFuse {
             flush_inval_always,
             noflush,
             keepcache_delta_enabled: agentfs_sdk::filesystem::keepcache_delta_enabled(),
+            noopen,
+            noopen_active: AtomicBool::new(false),
+            ino_files: Mutex::new(HashMap::new()),
+            ino_files_cap,
+            ino_file_stamp: AtomicU64::new(0),
             pending_dirty_handles: AtomicUsize::new(0),
             cache_dir_enabled,
             _profile_report: Arc::new(agentfs_sdk::profiling::ProfileReportGuard::new(
