@@ -674,9 +674,10 @@ struct AgentFSFuse {
     /// adapter's cached-stats keep-cache fast path must defer to the SDK
     /// (only the SDK knows whether an inode is base- or delta-backed).
     keepcache_delta_enabled: bool,
-    /// ENOSYS-OPEN env gate (`AGENTFS_FUSE_NOOPEN`). The open handler only
-    /// replies ENOSYS once `noopen_active` is also latched, which requires
-    /// the kernel to have offered `FUSE_NO_OPEN_SUPPORT` in INIT.
+    /// ENOSYS-OPEN, default on; set `AGENTFS_FUSE_NOOPEN=0` to restore
+    /// per-handle opens. The open handler only replies ENOSYS once
+    /// `noopen_active` is also latched, which requires the kernel to have
+    /// offered `FUSE_NO_OPEN_SUPPORT` in INIT.
     noopen: bool,
     /// Latched in `init()` when `noopen` is requested and the kernel
     /// supports zero-message opens. Once the first OPEN gets ENOSYS the
@@ -2918,8 +2919,8 @@ impl AgentFSFuse {
                 "AGENTFS_FUSE_NOFLUSH disabled: AGENTFS_DRAIN_ON_RELEASE needs the close-time FLUSH"
             );
         }
-        let noopen = env_flag_default("AGENTFS_FUSE_NOOPEN", false) && !drain_on_release;
-        if noopen != env_flag_default("AGENTFS_FUSE_NOOPEN", false) {
+        let noopen = env_flag_default("AGENTFS_FUSE_NOOPEN", true) && !drain_on_release;
+        if noopen != env_flag_default("AGENTFS_FUSE_NOOPEN", true) {
             tracing::warn!(
                 "AGENTFS_FUSE_NOOPEN disabled: AGENTFS_DRAIN_ON_RELEASE needs per-handle releases"
             );
