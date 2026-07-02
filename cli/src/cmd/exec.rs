@@ -7,7 +7,6 @@
 use agentfs_sdk::{AgentFSOptions, EncryptionConfig, FileSystem, HostFS, OverlayFS};
 use anyhow::{Context, Result};
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::Arc;
 use turso::value::Value;
 
@@ -90,31 +89,90 @@ pub async fn handle_exec_command(
         gid: None,
         allow_other: false,
         allow_root: false,
+        // Not auto_unmount: the vendored fuser forces allow_other with it,
+        // which requires user_allow_other in /etc/fuse.conf and widens access.
         auto_unmount: false,
         lazy_unmount: true,
         timeout: std::time::Duration::from_secs(10),
     };
 
     // Mount the filesystem
-    let _mount_handle = mount_fs(fs, mount_opts).await?;
+    let mount_handle = mount_fs(fs, mount_opts).await?;
 
-    // Run the command with the mountpoint as working directory
-    let status = Command::new(&command)
-        .args(&args)
-        .current_dir(&mountpoint)
-        .status()
-        .with_context(|| format!("Failed to execute: {}", command.display()))?;
+    let outcome = supervise_child(&command, &args, &mountpoint).await;
 
-    // Drop the mount handle to unmount
-    drop(_mount_handle);
-
-    // Clean up the temporary directory
+    // Unmount and remove the mountpoint even when the workload was
+    // interrupted, so no dead mount table entry or temp directory survives.
+    drop(mount_handle);
     let _ = std::fs::remove_dir_all(&mountpoint);
 
-    // Exit with the command's exit code
-    if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
+    match outcome? {
+        ChildOutcome::Exited(status) => {
+            if !status.success() {
+                std::process::exit(status.code().unwrap_or(1));
+            }
+            Ok(())
+        }
+        ChildOutcome::Interrupted(signo) => std::process::exit(128 + signo),
     }
+}
 
-    Ok(())
+enum ChildOutcome {
+    Exited(std::process::ExitStatus),
+    Interrupted(i32),
+}
+
+/// Run the workload while listening for termination signals.
+///
+/// The default signal disposition would kill this process without running
+/// `MountHandle`'s unmount, leaving a dead mount table entry and the child
+/// orphaned but alive inside it. PR_SET_PDEATHSIG additionally guarantees the
+/// child cannot outlive us even under SIGKILL, which no userspace handler can
+/// intercept.
+async fn supervise_child(
+    command: &std::path::Path,
+    args: &[String],
+    mountpoint: &std::path::Path,
+) -> Result<ChildOutcome> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut cmd = tokio::process::Command::new(command);
+    cmd.args(args).current_dir(mountpoint);
+    #[cfg(target_os = "linux")]
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // The parent may have died between fork and prctl.
+            if libc::getppid() == 1 {
+                libc::raise(libc::SIGKILL);
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("Failed to execute: {}", command.display()))?;
+
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sighup = signal(SignalKind::hangup())?;
+    let signo = tokio::select! {
+        status = child.wait() => return Ok(ChildOutcome::Exited(status?)),
+        _ = sigterm.recv() => libc::SIGTERM,
+        _ = sigint.recv() => libc::SIGINT,
+        _ = sighup.recv() => libc::SIGHUP,
+    };
+
+    if let Some(pid) = child.id() {
+        unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+    }
+    if tokio::time::timeout(std::time::Duration::from_secs(5), child.wait())
+        .await
+        .is_err()
+    {
+        let _ = child.kill().await;
+    }
+    Ok(ChildOutcome::Interrupted(signo))
 }

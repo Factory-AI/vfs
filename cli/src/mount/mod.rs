@@ -196,6 +196,25 @@ pub async fn mount_fs(
     }
 }
 
+/// Resolve when SIGTERM, SIGINT, or SIGHUP is delivered.
+///
+/// Mount-owning commands must tear down through this rather than the default
+/// signal disposition: dying without unmounting leaves a dead mount table
+/// entry (ENOTCONN for every later visitor) and skips `MountHandle`'s Drop.
+#[cfg(unix)]
+pub async fn shutdown_signal() -> std::io::Result<()> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = signal(SignalKind::terminate())?;
+    let mut int = signal(SignalKind::interrupt())?;
+    let mut hup = signal(SignalKind::hangup())?;
+    tokio::select! {
+        _ = term.recv() => (),
+        _ = int.recv() => (),
+        _ = hup.recv() => (),
+    }
+    Ok(())
+}
+
 /// Wait for a path to become a mountpoint.
 pub fn wait_for_mount(path: &Path, timeout: Duration) -> bool {
     let start = std::time::Instant::now();
