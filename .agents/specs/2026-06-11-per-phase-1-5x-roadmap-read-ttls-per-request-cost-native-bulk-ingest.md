@@ -2,18 +2,20 @@
 
 **Invariants (non-negotiable, apply to every workstream):** (1) whole state lives in the single session DB file; (2) no writes to the user's filesystem except that DB file. Reads of the user's FS are allowed.
 
-## Scoreboard (current @ 121fdd4 → target)
+## Scoreboard (current @ WS9 ENOSYS-OPEN default-on, 2026-07-02 idle-host A/B; kernel 7.1 shifted native baselines so per-phase ratios are not comparable to the 06-11 column — same-day off/on deltas are the signal)
 
-| Phase | Now (2026-06-11, WS5 keep-cache-delta) | Target | Lever |
+| Phase | WS9 delta (noopen off → on, same day) | Target | Lever |
 |---|---|---|---|
-| clone | **2.34x** via `agentfs clone` (WS3; was 8.41x via plain FUSE, FUSE path ~8.3x) | **≤1.5x**; residual = pack+import double write | WS3 done |
-| checkout | **0.91x** ✓ | hold ≤1.5x | — |
-| status | **0.71x** ✓ (was 2.41x) | ≤1.5x **MET** | WS4+WS5 |
-| read_search | **2.25x** (was 3.39x) | ≤1.5x; open-RT-bound (one open/flush pair per file) | WS5 partial |
-| diff | **≤1x** ✓ (24.7ms absolute, was 2.79x) | ≤1.5x **MET** | WS4+WS5 |
-| edit | 13.3x (8.8ms) | ≤3ms absolute; ratio noise at this scale, recorded honestly | — |
-| fsck | **1.16x** ✓ | hold ≤1.5x | — |
-| read-path warm steady | **3.35x** (12.7x → 4.0x WS4 → 3.35x WS5) | ≤1.5x missed; floor = OPEN+FLUSH sync round trips per open/close cycle | candidates: FUSE-over-io_uring, ENOSYS-FLUSH w/ getattr guard |
+| clone | neutral (SQLite-bound; `agentfs clone` 2.34x stands) | ≤1.5x; residual = pack+import double write | WS3 done |
+| checkout | **−22..−34%** | hold | WS9 |
+| status | **−20..−47%** | ≤1.5x | WS9 |
+| read_search | **−56..−83%** (11.3x → 1.80x @n=4; 8.6x → 3.14x @n=8, host drift; native denominator 4-5ms) | ≤1.5x not strictly met on this host | WS9 partial |
+| diff | **−57..−62%** | ≤1.5x | WS9 |
+| edit | neutral (+3% @n=8; the n=4 +74% was noise) | ≤3ms absolute | — |
+| fsck | **−18..−34%** | hold | WS9 |
+| read-path warm steady | micro open/read/close **47.3 → 21.2µs/cycle** (paired 0.469); full read-path benchmark neutral (normalized 2.54x → 2.25x) | ≤1.5x | WS9 + uring compound pending |
+
+WS9 verdict (2026-07-02): promoted **default-on** (`AGENTFS_FUSE_NOOPEN=0` kill switch) — uniform improvement, no phase regression, all gates green; the strict read_search ≤1.5x bar was unmeasurable-to-missed on this host (see WS9 notes). Deviation from the written GO bar flagged to the user.
 
 First commit: write this scoreboard + plan to `.agents/specs/2026-06-11-per-phase-1.5x-roadmap.md` and update it after each workstream's verdict.
 
