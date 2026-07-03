@@ -21,8 +21,9 @@
 //! reply synchronously, so each ring's submission queue is effectively
 //! single-threaded (guarded by a mutex that is never contended in practice).
 //!
-//! Opt-in via `AGENTFS_FUSE_URING=1`; depth per queue via
-//! `AGENTFS_FUSE_URING_DEPTH` (default 4).
+//! Default on when the kernel side is available (root sysctl
+//! `fuse.enable_uring=1`); kill switch `AGENTFS_FUSE_URING=0`; depth per
+//! queue via `AGENTFS_FUSE_URING_DEPTH` (default 4).
 
 #![cfg(target_os = "linux")]
 
@@ -134,10 +135,16 @@ const PAYLOAD_BUF_SIZE: usize = (URING_MAX_WRITE as usize) + 4096;
 
 // ─── configuration ──────────────────────────────────────────────────────────
 
+/// Default on: codex A/B showed the transport equal-or-better on every
+/// phase (total 3.37x -> 2.92x). Safe unconditionally because INIT only
+/// advertises FUSE_OVER_IO_URING after a ring-setup probe succeeds, which
+/// requires the root sysctl `fuse.enable_uring=1`; everything else falls
+/// back to the legacy /dev/fuse channel. `AGENTFS_FUSE_URING=0` is the
+/// kill switch.
 pub(crate) fn uring_enabled() -> bool {
-    matches!(
+    !matches!(
         std::env::var("AGENTFS_FUSE_URING").as_deref(),
-        Ok("1") | Ok("true") | Ok("on")
+        Ok("0") | Ok("false") | Ok("off")
     )
 }
 

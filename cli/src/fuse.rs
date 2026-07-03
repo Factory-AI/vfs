@@ -730,23 +730,23 @@ impl Filesystem for AgentFSFuse {
             capabilities |= FUSE_NO_OPENDIR_SUPPORT;
         }
         let _ = config.add_capabilities(capabilities);
-        // Opt-in fuse-over-io_uring (AGENTFS_FUSE_URING=1): only advertise
-        // when the kernel offered it and ring setup works, since the kernel
-        // stalls requests after INIT until the ring queues register. The
-        // max_write clamp keeps per-entry ring payload buffers at 1 MiB
-        // (the kernel caps single WRITEs at max_pages = 256 pages anyway,
-        // so >1 MiB writes never materialize on Linux).
+        // FUSE-over-io_uring, default on (kill switch AGENTFS_FUSE_URING=0):
+        // only advertised when the kernel offered it and ring setup works,
+        // since the kernel stalls requests after INIT until the ring queues
+        // register; without the root sysctl fuse.enable_uring=1 the probe
+        // fails and the legacy /dev/fuse channel is used. The max_write
+        // clamp keeps per-entry ring payload buffers at 1 MiB (the kernel
+        // caps single WRITEs at max_pages = 256 pages anyway, so >1 MiB
+        // writes never materialize on Linux).
         if crate::fuser::uring::uring_enabled() {
             if crate::fuser::uring::probe_ring_setup()
                 && config.add_capabilities(FUSE_OVER_IO_URING).is_ok()
             {
                 let _ = config.set_max_write(crate::fuser::uring::URING_MAX_WRITE);
                 let _ = config.set_max_readahead(crate::fuser::uring::URING_MAX_WRITE);
-                tracing::info!("advertising FUSE_OVER_IO_URING (AGENTFS_FUSE_URING=1)");
+                tracing::info!("advertising FUSE_OVER_IO_URING");
             } else {
-                tracing::warn!(
-                    "AGENTFS_FUSE_URING=1 but kernel/ring support missing; using legacy channel"
-                );
+                tracing::debug!("fuse-over-io_uring unavailable; using legacy channel");
             }
         }
         if self.noopen {
