@@ -23,6 +23,11 @@ from typing import Any, Optional
 OUTPUT_TAIL_CHARS = 20000
 HASH_BLOCK_BYTES = 1024 * 1024
 
+# The workload every scoreboard number and perf target is defined against:
+# a local openai/codex checkout. Kept as the no-flag default so ad-hoc runs
+# cannot silently measure the synthetic fixture instead.
+CANONICAL_FIXTURE = Path(__file__).resolve().parents[2] / ".agents" / "benchmarks" / "fixtures" / "codex"
+
 
 GIT_WORKLOAD = r'''
 import argparse
@@ -376,11 +381,17 @@ Environment:
         "--remote",
         help="optional remote URL used to prepare the bare mirror (networked, not used by default)",
     )
+    source_group.add_argument(
+        "--synthetic",
+        action="store_true",
+        help="use the tiny generated fixture instead of the canonical codex checkout "
+        "(numbers from it are NOT comparable to the scoreboard)",
+    )
     parser.add_argument("--fixture-files", type=positive_int, default=96)
     parser.add_argument("--fixture-dirs", type=positive_int, default=8)
     parser.add_argument("--fixture-file-size-bytes", type=positive_int, default=1024)
     parser.add_argument("--read-files", type=positive_int, default=64)
-    parser.add_argument("--read-bytes", type=positive_int, default=2048)
+    parser.add_argument("--read-bytes", type=positive_int, default=4096)
     parser.add_argument("--edit-files", type=positive_int, default=8)
     parser.add_argument("--search-token", default="AGENTFS_TOKEN")
     parser.add_argument(
@@ -774,7 +785,29 @@ def prepare_bare_mirror(args: argparse.Namespace, temp_root: Path) -> tuple[Path
         require_git_ok(clone, "git clone --mirror source")
         kind = "source"
         source_path = str(source)
+    elif not args.synthetic and CANONICAL_FIXTURE.is_dir():
+        # The scoreboard and every perf target are defined against the codex
+        # checkout. Bare invocations silently measuring the 96x1KB synthetic
+        # fixture produced incomparable ratios more than once, so the
+        # canonical fixture is the default; --synthetic is the explicit
+        # opt-out.
+        print(
+            f"note: no --source given; defaulting to the canonical fixture {CANONICAL_FIXTURE}",
+            file=sys.stderr,
+        )
+        clone = run_git(
+            ["clone", "--mirror", str(CANONICAL_FIXTURE), str(mirror)], prepared, timeout=args.timeout
+        )
+        require_git_ok(clone, "git clone --mirror canonical fixture")
+        kind = "canonical-fixture"
+        source_path = str(CANONICAL_FIXTURE)
     else:
+        if not args.synthetic:
+            print(
+                "warning: canonical fixture missing; falling back to the generated synthetic "
+                "fixture — numbers are NOT comparable to the scoreboard",
+                file=sys.stderr,
+            )
         generated = prepared / "generated-source"
         create_generated_repo(generated, args.fixture_files, args.fixture_dirs, args.fixture_file_size_bytes)
         clone = run_git(["clone", "--mirror", str(generated), str(mirror)], prepared, timeout=args.timeout)
