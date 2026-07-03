@@ -224,19 +224,6 @@ fn print_welcome_banner(session: &RunSession, encrypted: bool) {
     eprintln!();
 }
 
-/// Print the welcome banner showing sandbox configuration (Linux).
-#[cfg(target_os = "linux")]
-fn print_welcome_banner(session: &RunSession, encrypted: bool) {
-    eprintln!("Welcome to AgentFS!");
-    eprintln!();
-    eprintln!("  {} (copy-on-write)", session.cwd.display());
-    eprintln!("  ⚠️  Everything else is WRITABLE.");
-    if encrypted {
-        eprintln!("🔐 Delta layer is encrypted.");
-    }
-    eprintln!();
-}
-
 /// Configuration for a sandbox run session.
 struct RunSession {
     /// Directory containing session artifacts.
@@ -378,35 +365,6 @@ fn mount_nfs(port: u32, mountpoint: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Mount the NFS filesystem (Linux version).
-#[cfg(target_os = "linux")]
-fn mount_nfs(port: u32, mountpoint: &Path) -> Result<()> {
-    let output = Command::new("mount")
-        .args([
-            "-t",
-            "nfs",
-            "-o",
-            &format!(
-                "vers=3,tcp,port={},mountport={},nolock,soft,timeo=100,retrans=5",
-                port, port
-            ),
-            "127.0.0.1:/",
-            mountpoint.to_str().unwrap(),
-        ])
-        .output()
-        .context("Failed to execute mount. Make sure nfs-common is installed.")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(
-            "Failed to mount NFS: {}. Make sure nfs-common is installed (apt-get install nfs-common).",
-            stderr.trim()
-        );
-    }
-
-    Ok(())
-}
-
 /// Run a command with the working directory set to the mounted filesystem (macOS).
 ///
 /// On macOS, the command is wrapped with sandbox-exec using a Sandbox profile
@@ -423,7 +381,6 @@ fn command_in_mount(
     let config = SandboxConfig {
         mountpoint: session.mountpoint.clone(),
         allow_paths: session.allow_paths.clone(),
-        allow_read_paths: Vec::new(),
         allow_network: true,
         session_id: session.session_id.clone(),
     };
@@ -440,28 +397,6 @@ fn command_in_mount(
         .env("AGENTFS_SANDBOX", "macos-sandbox")
         // Bash prompt - show full path since we're not changing HOME
         .env("PS1", "🤖 \\w\\$ ")
-        // Zsh: use custom ZDOTDIR to override prompt
-        .env("ZDOTDIR", session.run_dir.join("zsh"));
-
-    cmd
-}
-
-/// Run a command with the working directory set to the mounted filesystem (Linux).
-///
-/// On Linux, the command runs without additional sandboxing (NFS provides
-/// copy-on-write for the working directory).
-#[cfg(target_os = "linux")]
-fn command_in_mount(
-    session: &RunSession,
-    command: PathBuf,
-    args: Vec<String>,
-) -> tokio::process::Command {
-    let mut cmd = tokio::process::Command::new(&command);
-    cmd.args(&args)
-        .current_dir(&session.mountpoint)
-        .env("AGENTFS", "1")
-        // Bash prompt
-        .env("PS1", "🤖 \\u@\\h:\\w\\$ ")
         // Zsh: use custom ZDOTDIR to override prompt
         .env("ZDOTDIR", session.run_dir.join("zsh"));
 
@@ -499,31 +434,6 @@ fn unmount(mountpoint: &Path) -> Result<()> {
         if !output2.status.success() {
             anyhow::bail!(
                 "Failed to unmount: {}. You may need to manually unmount with: umount -f {}",
-                stderr.trim(),
-                mountpoint.display()
-            );
-        }
-    }
-
-    Ok(())
-}
-
-/// Unmount the NFS filesystem (Linux version).
-#[cfg(target_os = "linux")]
-fn unmount(mountpoint: &Path) -> Result<()> {
-    let output = Command::new("umount")
-        .arg(mountpoint)
-        .output()
-        .context("Failed to execute umount")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // Try lazy unmount
-        let output2 = Command::new("umount").arg("-l").arg(mountpoint).output()?;
-
-        if !output2.status.success() {
-            anyhow::bail!(
-                "Failed to unmount: {}. You may need to manually unmount with: umount -l {}",
                 stderr.trim(),
                 mountpoint.display()
             );

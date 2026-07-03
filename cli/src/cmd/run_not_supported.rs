@@ -6,7 +6,7 @@ use agentfs_sdk::PartialOriginPolicy;
 use anyhow::{bail, Result};
 use std::path::PathBuf;
 
-/// Run the command in a Windows sandbox.
+/// Report that the run command is unavailable on this platform.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     _allow: Vec<PathBuf>,

@@ -14,11 +14,9 @@
 //!     session_id: "abc123".to_string(),
 //! };
 //! let profile = generate_sandbox_profile(&config);
-//! let wrapped = wrap_command_with_sandbox(&config, "zsh", &[]);
 //! ```
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 
 /// Configuration for the Sandbox sandbox.
 #[derive(Debug, Clone)]
@@ -28,9 +26,6 @@ pub struct SandboxConfig {
 
     /// Additional paths to allow read/write access.
     pub allow_paths: Vec<PathBuf>,
-
-    /// Additional paths to allow read-only access.
-    pub allow_read_paths: Vec<PathBuf>,
 
     /// Whether to allow network access.
     pub allow_network: bool,
@@ -44,7 +39,6 @@ impl Default for SandboxConfig {
         Self {
             mountpoint: PathBuf::new(),
             allow_paths: Vec::new(),
-            allow_read_paths: Vec::new(),
             allow_network: false,
             session_id: String::new(),
         }
@@ -170,72 +164,6 @@ pub fn generate_sandbox_profile(config: &SandboxConfig) -> String {
     profile.join("\n")
 }
 
-/// Wrap a command with sandbox-exec.
-///
-/// Returns a Command configured to run the given program inside the sandbox.
-pub fn wrap_command_with_sandbox(
-    config: &SandboxConfig,
-    program: &Path,
-    args: &[String],
-) -> Command {
-    let profile = generate_sandbox_profile(config);
-
-    let mut cmd = Command::new("sandbox-exec");
-    cmd.arg("-p").arg(&profile);
-    cmd.arg(program);
-    cmd.args(args);
-    cmd.current_dir(&config.mountpoint);
-
-    // Set environment variables
-    cmd.env("AGENTFS", "1");
-    cmd.env("AGENTFS_SANDBOX", "macos-sandbox");
-
-    cmd
-}
-
-/// Generate a minimal Sandbox profile for testing.
-///
-/// This profile is more permissive and useful for debugging sandbox issues.
-pub fn generate_permissive_profile(config: &SandboxConfig) -> String {
-    let mut profile = Vec::new();
-    let log_tag = format!("agentfs-{}", config.session_id);
-
-    profile.push("(version 1)".to_string());
-
-    // Log denials but don't block most things
-    profile.push(format!("(deny default (with message \"{}\")))", log_tag));
-
-    // Allow almost everything for debugging
-    profile.push("(allow process*)".to_string());
-    profile.push("(allow file-read*)".to_string());
-    profile.push("(allow mach*)".to_string());
-    profile.push("(allow sysctl*)".to_string());
-    profile.push("(allow signal)".to_string());
-    profile.push("(allow ipc*)".to_string());
-    profile.push("(allow pseudo-tty)".to_string());
-    profile.push("(allow system*)".to_string());
-
-    // Only restrict writes to outside mountpoint
-    let mountpoint_str = config.mountpoint.to_string_lossy();
-    profile.push(format!(
-        r#"(allow file-write* (subpath "{}"))"#,
-        mountpoint_str
-    ));
-    profile.push(r#"(allow file-write* (subpath "/private/tmp"))"#.to_string());
-    profile.push(r#"(allow file-write* (subpath "/tmp"))"#.to_string());
-    profile.push(r#"(allow file-write* (subpath "/private/var/folders"))"#.to_string());
-
-    // Network
-    if config.allow_network {
-        profile.push("(allow network*)".to_string());
-    } else {
-        profile.push("(allow network* (remote ip \"localhost:*\"))".to_string());
-        profile.push("(allow network* (local ip \"localhost:*\"))".to_string());
-    }
-
-    profile.join("\n")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,7 +173,6 @@ mod tests {
         let config = SandboxConfig {
             mountpoint: PathBuf::from("/Users/test/.agentfs/run/abc/mnt"),
             allow_paths: vec![],
-            allow_read_paths: vec![],
             allow_network: false,
             session_id: "test123".to_string(),
         };
@@ -275,13 +202,11 @@ mod tests {
         let config = SandboxConfig {
             mountpoint: PathBuf::from("/mnt"),
             allow_paths: vec![PathBuf::from("/custom/writable")],
-            allow_read_paths: vec![PathBuf::from("/custom/readonly")],
             ..Default::default()
         };
 
         let profile = generate_sandbox_profile(&config);
         // Writable paths should be included
         assert!(profile.contains("/custom/writable"));
-        // Note: allow_read_paths is not used since we allow all reads by default
     }
 }
