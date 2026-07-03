@@ -39,7 +39,7 @@ until re-verified against codex.
 | diff | 0.45x (80ms) | **0.05x** ✓ (18ms) | 0.04x ✓ | ≤1.5x **MET** |
 | edit | 7ms abs | **6ms abs** | 8ms | ≤3ms absolute miss |
 | fsck | 0.98x | **0.83x** ✓ | 0.88x ✓ | hold **MET** |
-| read-path warm (protocol) | 2.26x | 2.38x (paired 0.984, neutral) | 2.14x (paired 0.972) | ≤1.5x miss |
+| read-path warm (protocol) | 2.26x | 2.38x (paired 0.984, neutral) | 2.14x (paired 0.972) | ≤1.5x miss — floor: kernel close-time STATX_BLOCKS inval under writeback cache forces 1 GETATTR RT per stat-after-close (see WS9 notes 07-03); userspace-unfixable, upstream patch is the path |
 | TOTAL workload | 4.08x | **3.37x** | 2.92x (stdev 0.12) | — |
 
 **WS9 verdict (final, 2026-07-03)**: GO bar (read_search ≤1.5x AND no phase
