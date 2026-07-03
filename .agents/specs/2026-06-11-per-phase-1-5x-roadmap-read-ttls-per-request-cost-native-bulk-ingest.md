@@ -2,20 +2,50 @@
 
 **Invariants (non-negotiable, apply to every workstream):** (1) whole state lives in the single session DB file; (2) no writes to the user's filesystem except that DB file. Reads of the user's FS are allowed.
 
-## Scoreboard (current @ WS9 ENOSYS-OPEN default-on, 2026-07-02 idle-host A/B; kernel 7.1 shifted native baselines so per-phase ratios are not comparable to the 06-11 column — same-day off/on deltas are the signal)
+## Canonical measurement contract (do not lose this across compactions)
 
-| Phase | WS9 delta (noopen off → on, same day) | Target | Lever |
+Every scoreboard number and per-phase target is defined against:
+
+```
+scripts/validation/git-workload-benchmark.py \
+  --source .agents/benchmarks/fixtures/codex \
+  --read-files 64 --read-bytes 4096 --edit-files 8
+```
+
+(now the no-flag default: the harness falls back to the codex fixture and
+prints a note; `--synthetic` is the explicit opt-out) plus
+`read-path-benchmark.py --modes warm --repeated-read-iterations 32
+--repeated-read-files 32` for read-path warm steady state.
+
+**2026-07-03 CORRECTION**: the 2026-07-02 WS9 git-workload A/B and the
+uring compound git-workload numbers were accidentally measured against the
+synthetic 96x1KB fixture (bare multi-wrapper invocation after a compaction
+lost the `--source` args) and are NOT scoreboard-comparable. The "kernel 7.1
+shifted native baselines" explanation recorded that day was wrong — the
+workload was different. The micro base-read numbers (200-iter protocol,
+47.3 → 21.2µs/cycle, +uring 19.3µs) match the historical protocol and stand.
+Codex re-runs of the WS9 off/on A/B, uring compound, and read-path protocol
+are pending an idle host; the noopen default-on promotion is provisional
+until re-verified against codex.
+
+## Scoreboard (last valid codex measurements @ WS5-era + WS3; WS9 codex re-run pending)
+
+| Phase | Codex (2026-06-11, pre-WS9) | Target | Lever |
 |---|---|---|---|
-| clone | neutral (SQLite-bound; `agentfs clone` 2.34x stands) | ≤1.5x; residual = pack+import double write | WS3 done |
-| checkout | **−22..−34%** | hold | WS9 |
-| status | **−20..−47%** | ≤1.5x | WS9 |
-| read_search | **−56..−83%** (11.3x → 1.80x @n=4; 8.6x → 3.14x @n=8, host drift; native denominator 4-5ms) | ≤1.5x not strictly met on this host | WS9 partial |
-| diff | **−57..−62%** | ≤1.5x | WS9 |
-| edit | neutral (+3% @n=8; the n=4 +74% was noise) | ≤3ms absolute | — |
-| fsck | **−18..−34%** | hold | WS9 |
-| read-path warm steady | micro open/read/close **47.3 → 21.2µs/cycle** (paired 0.469); full read-path benchmark neutral (normalized 2.54x → 2.25x) | ≤1.5x | WS9 + uring compound pending |
+| clone | **2.34x** via `agentfs clone` (plain FUSE ~8.3x) | ≤1.5x; residual = pack+import double write | WS3 done |
+| checkout | **0.91x** ✓ | hold ≤1.5x | — |
+| status | **0.71x** ✓ | ≤1.5x **MET** | WS4+WS5 |
+| read_search | **2.25x** | ≤1.5x | WS9 re-measure pending |
+| diff | **≤1x** ✓ | ≤1.5x **MET** | WS4+WS5 |
+| edit | 13.3x (8.8ms abs) | ≤3ms absolute | — |
+| fsck | **1.16x** ✓ | hold ≤1.5x | — |
+| read-path warm steady | **3.35x** (WS5); micro cycle since improved 47.3 → 21.2µs by WS9 | ≤1.5x | WS9 re-measure pending |
 
-WS9 verdict (2026-07-02): promoted **default-on** (`AGENTFS_FUSE_NOOPEN=0` kill switch) — uniform improvement, no phase regression, all gates green; the strict read_search ≤1.5x bar was unmeasurable-to-missed on this host (see WS9 notes). Deviation from the written GO bar flagged to the user.
+WS9 verdict (2026-07-02, provisional): promoted **default-on**
+(`AGENTFS_FUSE_NOOPEN=0` kill switch) — correctness gates all green and the
+protocol-valid micro shows −55% per open/read/close cycle; the git-workload
+deltas that day were synthetic-fixture-only and must be re-established on
+codex before the verdict is final.
 
 First commit: write this scoreboard + plan to `.agents/specs/2026-06-11-per-phase-1.5x-roadmap.md` and update it after each workstream's verdict.
 
