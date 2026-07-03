@@ -252,45 +252,22 @@ impl Request {
             && parsed.uid() != 0)
             || (shared.allowed == SessionACL::Owner && parsed.uid() != shared.session_owner)
         {
-            #[cfg(feature = "abi-7-21")]
-            {
-                match op {
-                    // Only allow operations that the kernel may issue without a uid set
-                    ll::Operation::Init(_)
-                    | ll::Operation::Destroy(_)
-                    | ll::Operation::Read(_)
-                    | ll::Operation::ReadDir(_)
-                    | ll::Operation::ReadDirPlus(_)
-                    | ll::Operation::BatchForget(_)
-                    | ll::Operation::Forget(_)
-                    | ll::Operation::Write(_)
-                    | ll::Operation::FSync(_)
-                    | ll::Operation::FSyncDir(_)
-                    | ll::Operation::Release(_)
-                    | ll::Operation::ReleaseDir(_) => {}
-                    _ => {
-                        return Err(Errno::EACCES);
-                    }
-                }
-            }
-            #[cfg(not(feature = "abi-7-21"))]
-            {
-                match op {
-                    // Only allow operations that the kernel may issue without a uid set
-                    ll::Operation::Init(_)
-                    | ll::Operation::Destroy(_)
-                    | ll::Operation::Read(_)
-                    | ll::Operation::ReadDir(_)
-                    | ll::Operation::BatchForget(_)
-                    | ll::Operation::Forget(_)
-                    | ll::Operation::Write(_)
-                    | ll::Operation::FSync(_)
-                    | ll::Operation::FSyncDir(_)
-                    | ll::Operation::Release(_)
-                    | ll::Operation::ReleaseDir(_) => {}
-                    _ => {
-                        return Err(Errno::EACCES);
-                    }
+            match op {
+                // Only allow operations that the kernel may issue without a uid set
+                ll::Operation::Init(_)
+                | ll::Operation::Destroy(_)
+                | ll::Operation::Read(_)
+                | ll::Operation::ReadDir(_)
+                | ll::Operation::ReadDirPlus(_)
+                | ll::Operation::BatchForget(_)
+                | ll::Operation::Forget(_)
+                | ll::Operation::Write(_)
+                | ll::Operation::FSync(_)
+                | ll::Operation::FSyncDir(_)
+                | ll::Operation::Release(_)
+                | ll::Operation::ReleaseDir(_) => {}
+                _ => {
+                    return Err(Errno::EACCES);
                 }
             }
         }
@@ -688,7 +665,6 @@ impl Request {
             ll::Operation::BatchForget(x) => {
                 shared.filesystem.batch_forget(self, x.nodes()); // no reply
             }
-            #[cfg(feature = "abi-7-19")]
             ll::Operation::FAllocate(x) => {
                 shared.filesystem.fallocate(
                     self,
@@ -700,7 +676,6 @@ impl Request {
                     self.reply(),
                 );
             }
-            #[cfg(feature = "abi-7-21")]
             ll::Operation::ReadDirPlus(x) => {
                 shared.filesystem.readdirplus(
                     self,
@@ -714,7 +689,6 @@ impl Request {
                     ),
                 );
             }
-            #[cfg(feature = "abi-7-23")]
             ll::Operation::Rename2(x) => {
                 shared.filesystem.rename(
                     self,
@@ -726,7 +700,6 @@ impl Request {
                     self.reply(),
                 );
             }
-            #[cfg(feature = "abi-7-24")]
             ll::Operation::Lseek(x) => {
                 shared.filesystem.lseek(
                     self,
@@ -737,7 +710,6 @@ impl Request {
                     self.reply(),
                 );
             }
-            #[cfg(feature = "abi-7-28")]
             ll::Operation::CopyFileRange(x) => {
                 let (i, o) = (x.src(), x.dest());
                 shared.filesystem.copy_file_range(

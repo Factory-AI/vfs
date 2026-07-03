@@ -155,17 +155,11 @@ impl<'a> Response<'a> {
     }
 
     // TODO: Could flags be more strongly typed?
-    pub(crate) fn new_open(fh: FileHandle, flags: u32, backing_id: u32) -> Self {
-        #[cfg(not(feature = "abi-7-40"))]
-        let _ = backing_id;
-
+    pub(crate) fn new_open(fh: FileHandle, flags: u32) -> Self {
         let r = abi::fuse_open_out {
             fh: fh.into(),
             open_flags: flags,
-            #[cfg(not(feature = "abi-7-40"))]
             padding: 0,
-            #[cfg(feature = "abi-7-40")]
-            backing_id,
         };
         Self::from_struct(&r)
     }
@@ -231,11 +225,7 @@ impl<'a> Response<'a> {
         generation: Generation,
         fh: FileHandle,
         flags: u32,
-        backing_id: u32,
     ) -> Self {
-        #[cfg(not(feature = "abi-7-40"))]
-        let _ = backing_id;
-
         let r = abi::fuse_create_out(
             abi::fuse_entry_out {
                 nodeid: attr.attr.ino,
@@ -249,10 +239,7 @@ impl<'a> Response<'a> {
             abi::fuse_open_out {
                 fh: fh.into(),
                 open_flags: flags,
-                #[cfg(not(feature = "abi-7-40"))]
                 padding: 0,
-                #[cfg(feature = "abi-7-40")]
-                backing_id,
             },
         );
         Self::from_struct(&r)
@@ -733,7 +720,7 @@ mod test {
             0x00, 0x00, 0x22, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x33, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00,
         ];
-        let r = Response::new_open(FileHandle(0x1122), 0x33, 0);
+        let r = Response::new_open(FileHandle(0x1122), 0x33);
         assert_eq!(
             r.with_iovec(RequestId(0xdeadbeef), ioslice_to_vec),
             expected
@@ -837,7 +824,6 @@ mod test {
             Generation(0xaa),
             FileHandle(0xbb),
             0xcc,
-            0,
         );
         assert_eq!(
             r.with_iovec(RequestId(0xdeadbeef), ioslice_to_vec),

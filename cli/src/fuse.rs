@@ -3208,26 +3208,6 @@ fn configure_writeback_cache(config: &mut KernelConfig, enabled: bool) {
 fn configure_readdirplus(config: &mut KernelConfig, mode: ReaddirPlusMode) {
     agentfs_sdk::profiling::set_fuse_readdirplus_mode(mode.profile_value());
 
-    // FUSE_READDIRPLUS opcode 44 is decoded by the vendored fuser dispatcher
-    // only when the `abi-7-21` feature is enabled. If we advertised the
-    // capability without that feature, the kernel would send opcode 44 and the
-    // dispatcher would return ENOSYS, breaking readdir on the mount. Gating the
-    // capability negotiation here turns the mismatch into a compile-time
-    // expectation rather than a runtime kernel error.
-    #[cfg(not(feature = "abi-7-21"))]
-    {
-        if !matches!(mode, ReaddirPlusMode::Off) {
-            tracing::warn!(
-                ?mode,
-                "AGENTFS_FUSE_READDIRPLUS requested but cli compiled without abi-7-21 feature; \
-                 capability not advertised (kernel would send opcodes the dispatcher cannot decode)"
-            );
-        }
-        let _ = config;
-        return;
-    }
-
-    #[cfg(feature = "abi-7-21")]
     match mode {
         ReaddirPlusMode::Off => {}
         ReaddirPlusMode::Auto => {

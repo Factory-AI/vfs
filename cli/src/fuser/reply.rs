@@ -283,33 +283,9 @@ impl Reply for ReplyOpen {
 
 impl ReplyOpen {
     /// Reply to a request with the given open result
-    /// # Panics
-    /// When attempting to use kernel passthrough. Use `opened_passthrough()` instead.
     pub fn opened(self, fh: u64, flags: u32) {
-        #[cfg(feature = "abi-7-40")]
-        assert_eq!(flags & FOPEN_PASSTHROUGH, 0);
         self.reply
-            .send_ll(&ll::Response::new_open(ll::FileHandle(fh), flags, 0));
-    }
-
-    /// Registers a fd for passthrough, returning a `BackingId`.  Once you have the backing ID,
-    /// you can pass it as the 3rd parameter of `OpenReply::opened_passthrough()`.  This is done in
-    /// two separate steps because it may make sense to reuse backing IDs (to avoid having to
-    /// repeatedly reopen the underlying file or potentially keep thousands of fds open).
-    #[cfg(feature = "abi-7-40")]
-    pub fn open_backing(&self, fd: impl std::os::fd::AsFd) -> std::io::Result<BackingId> {
-        self.reply.sender.as_ref().unwrap().open_backing(fd.as_fd())
-    }
-
-    /// Reply to a request with an opened backing id.  Call `ReplyOpen::open_backing()` to get one of
-    /// these.
-    #[cfg(feature = "abi-7-40")]
-    pub fn opened_passthrough(self, fh: u64, flags: u32, backing_id: &BackingId) {
-        self.reply.send_ll(&ll::Response::new_open(
-            ll::FileHandle(fh),
-            flags | FOPEN_PASSTHROUGH,
-            backing_id.backing_id,
-        ));
+            .send_ll(&ll::Response::new_open(ll::FileHandle(fh), flags));
     }
 
     /// Reply to a request with the given error code
@@ -423,8 +399,6 @@ impl ReplyCreate {
         fh: u64,
         flags: u32,
     ) {
-        #[cfg(feature = "abi-7-40")]
-        assert_eq!(flags & FOPEN_PASSTHROUGH, 0);
         self.reply.send_ll(&ll::Response::new_create(
             attr_ttl,
             entry_ttl,
@@ -432,7 +406,6 @@ impl ReplyCreate {
             ll::Generation(generation),
             ll::FileHandle(fh),
             flags,
-            0,
         ));
     }
 
@@ -781,11 +754,6 @@ mod test {
             }
             assert_eq!(self.expected, v);
             Ok(())
-        }
-
-        #[cfg(feature = "abi-7-40")]
-        fn open_backing(&self, _fd: BorrowedFd<'_>) -> std::io::Result<BackingId> {
-            unreachable!()
         }
     }
 
@@ -1147,11 +1115,6 @@ mod test {
         fn send(&self, _: &[IoSlice<'_>]) -> std::io::Result<()> {
             self.send(()).unwrap();
             Ok(())
-        }
-
-        #[cfg(feature = "abi-7-40")]
-        fn open_backing(&self, _fd: BorrowedFd<'_>) -> std::io::Result<BackingId> {
-            unreachable!()
         }
     }
 

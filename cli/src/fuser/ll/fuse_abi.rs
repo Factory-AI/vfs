@@ -26,46 +26,6 @@ use std::convert::TryFrom;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 pub const FUSE_KERNEL_VERSION: u32 = 7;
-
-#[cfg(not(feature = "abi-7-19"))]
-pub const FUSE_KERNEL_MINOR_VERSION: u32 = 18;
-#[cfg(all(feature = "abi-7-19", not(feature = "abi-7-20")))]
-pub const FUSE_KERNEL_MINOR_VERSION: u32 = 19;
-#[cfg(all(feature = "abi-7-20", not(feature = "abi-7-21")))]
-pub const FUSE_KERNEL_MINOR_VERSION: u32 = 20;
-#[cfg(all(feature = "abi-7-21", not(feature = "abi-7-22")))]
-pub const FUSE_KERNEL_MINOR_VERSION: u32 = 21;
-#[cfg(all(feature = "abi-7-22", not(feature = "abi-7-23")))]
-pub const FUSE_KERNEL_MINOR_VERSION: u32 = 22;
-#[cfg(all(feature = "abi-7-23", not(feature = "abi-7-24")))]
-pub const FUSE_KERNEL_MINOR_VERSION: u32 = 23;
-#[cfg(all(feature = "abi-7-24", not(feature = "abi-7-25")))]
-pub const FUSE_KERNEL_MINOR_VERSION: u32 = 24;
-#[cfg(all(feature = "abi-7-25", not(feature = "abi-7-26")))]
-pub const FUSE_KERNEL_MINOR_VERSION: u32 = 25;
-#[cfg(all(feature = "abi-7-26", not(feature = "abi-7-27")))]
-pub const FUSE_KERNEL_MINOR_VERSION: u32 = 26;
-#[cfg(all(feature = "abi-7-27", not(feature = "abi-7-28")))]
-pub const FUSE_KERNEL_MINOR_VERSION: u32 = 27;
-#[cfg(all(feature = "abi-7-28", not(feature = "abi-7-29")))]
-pub const FUSE_KERNEL_MINOR_VERSION: u32 = 28;
-#[cfg(all(feature = "abi-7-29", not(feature = "abi-7-30")))]
-pub const FUSE_KERNEL_MINOR_VERSION: u32 = 29;
-#[cfg(all(feature = "abi-7-30", not(feature = "abi-7-31")))]
-pub const FUSE_KERNEL_MINOR_VERSION: u32 = 30;
-#[cfg(all(feature = "abi-7-31", not(feature = "abi-7-36")))]
-pub const FUSE_KERNEL_MINOR_VERSION: u32 = 31;
-#[cfg(all(
-    feature = "abi-7-36",
-    not(feature = "abi-7-40"),
-    not(feature = "abi-7-41")
-))]
-pub const FUSE_KERNEL_MINOR_VERSION: u32 = 36;
-#[cfg(all(feature = "abi-7-40", not(feature = "abi-7-41")))]
-pub const FUSE_KERNEL_MINOR_VERSION: u32 = 40;
-#[cfg(all(feature = "abi-7-41", not(feature = "abi-7-42")))]
-pub const FUSE_KERNEL_MINOR_VERSION: u32 = 41;
-#[cfg(feature = "abi-7-42")]
 pub const FUSE_KERNEL_MINOR_VERSION: u32 = 42;
 
 pub const FUSE_ROOT_ID: u64 = 1;
@@ -140,7 +100,6 @@ pub mod consts {
     pub const FATTR_ATIME_NOW: u32 = 1 << 7;
     pub const FATTR_MTIME_NOW: u32 = 1 << 8;
     pub const FATTR_LOCKOWNER: u32 = 1 << 9;
-    #[cfg(feature = "abi-7-23")]
     pub const FATTR_CTIME: u32 = 1 << 10;
 
     #[cfg(target_os = "macos")]
@@ -187,7 +146,6 @@ pub mod consts {
     pub const FUSE_EXPLICIT_INVAL_DATA: u64 = 1 << 25; // only invalidate cached pages on explicit request
     pub const FUSE_INIT_EXT: u64 = 1 << 30; // extended fuse_init_in request
     pub const FUSE_INIT_RESERVED: u64 = 1 << 31; // reserved, do not use
-    #[cfg(feature = "abi-7-42")]
     pub const FUSE_OVER_IO_URING: u64 = 1 << 41; // client supports fuse-over-io-uring
 
     // CUSE init request/reply flags
@@ -206,7 +164,6 @@ pub mod consts {
     // Write flags
     pub const FUSE_WRITE_CACHE: u32 = 1 << 0; // delayed write from page cache, file handle is guessed
     pub const FUSE_WRITE_LOCKOWNER: u32 = 1 << 1; // lock_owner field is valid
-    #[cfg(feature = "abi-7-31")]
     pub const FUSE_WRITE_KILL_PRIV: u32 = 1 << 2; // kill suid and sgid bits
 
     // Read flags
@@ -218,7 +175,6 @@ pub mod consts {
     pub const FUSE_IOCTL_RETRY: u32 = 1 << 2; // retry with new iovecs
     pub const FUSE_IOCTL_32BIT: u32 = 1 << 3; // 32bit ioctl
     pub const FUSE_IOCTL_DIR: u32 = 1 << 4; // is a directory
-    #[cfg(feature = "abi-7-30")]
     pub const FUSE_IOCTL_COMPAT_X32: u32 = 1 << 5; // x32 compat ioctl on 64bit machine (64bit time_t)
     pub const FUSE_IOCTL_MAX_IOV: u32 = 256; // maximum of in_iovecs + out_iovecs
 
@@ -280,15 +236,10 @@ pub enum fuse_opcode {
     FUSE_POLL = 40,
     FUSE_NOTIFY_REPLY = 41,
     FUSE_BATCH_FORGET = 42,
-    #[cfg(feature = "abi-7-19")]
     FUSE_FALLOCATE = 43,
-    #[cfg(feature = "abi-7-21")]
     FUSE_READDIRPLUS = 44,
-    #[cfg(feature = "abi-7-23")]
     FUSE_RENAME2 = 45,
-    #[cfg(feature = "abi-7-24")]
     FUSE_LSEEK = 46,
-    #[cfg(feature = "abi-7-28")]
     FUSE_COPY_FILE_RANGE = 47,
 
     #[cfg(target_os = "macos")]
@@ -346,15 +297,10 @@ impl TryFrom<u32> for fuse_opcode {
             40 => Ok(fuse_opcode::FUSE_POLL),
             41 => Ok(fuse_opcode::FUSE_NOTIFY_REPLY),
             42 => Ok(fuse_opcode::FUSE_BATCH_FORGET),
-            #[cfg(feature = "abi-7-19")]
             43 => Ok(fuse_opcode::FUSE_FALLOCATE),
-            #[cfg(feature = "abi-7-21")]
             44 => Ok(fuse_opcode::FUSE_READDIRPLUS),
-            #[cfg(feature = "abi-7-23")]
             45 => Ok(fuse_opcode::FUSE_RENAME2),
-            #[cfg(feature = "abi-7-24")]
             46 => Ok(fuse_opcode::FUSE_LSEEK),
-            #[cfg(feature = "abi-7-28")]
             47 => Ok(fuse_opcode::FUSE_COPY_FILE_RANGE),
 
             #[cfg(target_os = "macos")]
@@ -526,17 +472,11 @@ pub struct fuse_setattr_in {
     // NOTE: this field is defined as u64 in fuse_kernel.h in libfuse. However, it is treated as signed
     // to match stat.st_mtime
     pub mtime: i64,
-    #[cfg(not(feature = "abi-7-23"))]
-    pub unused2: u64,
-    #[cfg(feature = "abi-7-23")]
     // NOTE: this field is defined as u64 in fuse_kernel.h in libfuse. However, it is treated as signed
     // to match stat.st_ctime
     pub ctime: i64,
     pub atimensec: u32,
     pub mtimensec: u32,
-    #[cfg(not(feature = "abi-7-23"))]
-    pub unused3: u32,
-    #[cfg(feature = "abi-7-23")]
     pub ctimensec: u32,
     pub mode: u32,
     pub unused4: u32,
@@ -598,10 +538,7 @@ pub struct fuse_create_out(pub fuse_entry_out, pub fuse_open_out);
 pub struct fuse_open_out {
     pub fh: u64,
     pub open_flags: u32,
-    #[cfg(not(feature = "abi-7-40"))]
     pub padding: u32,
-    #[cfg(feature = "abi-7-40")]
-    pub backing_id: u32,
 }
 
 #[repr(C)]
@@ -740,9 +677,7 @@ pub struct fuse_init_in {
     pub minor: u32,
     pub max_readahead: u32,
     pub flags: u32,
-    #[cfg(feature = "abi-7-36")]
     pub flags2: u32,
-    #[cfg(feature = "abi-7-36")]
     pub unused: [u32; 11],
 }
 
@@ -756,24 +691,11 @@ pub struct fuse_init_out {
     pub max_background: u16,
     pub congestion_threshold: u16,
     pub max_write: u32,
-    #[cfg(feature = "abi-7-23")]
     pub time_gran: u32,
-    #[cfg(all(feature = "abi-7-23", not(feature = "abi-7-28")))]
-    pub reserved: [u32; 9],
-    #[cfg(feature = "abi-7-28")]
     pub max_pages: u16,
-    #[cfg(feature = "abi-7-28")]
     pub unused2: u16,
-    #[cfg(all(feature = "abi-7-28", not(feature = "abi-7-36")))]
-    pub reserved: [u32; 8],
-    #[cfg(feature = "abi-7-36")]
     pub flags2: u32,
-    #[cfg(all(feature = "abi-7-36", not(feature = "abi-7-40")))]
     pub reserved: [u32; 7],
-    #[cfg(feature = "abi-7-40")]
-    pub max_stack_depth: u32,
-    #[cfg(feature = "abi-7-40")]
-    pub reserved: [u32; 6],
 }
 
 #[repr(C)]
@@ -852,9 +774,6 @@ pub struct fuse_poll_in {
     pub fh: u64,
     pub kh: u64,
     pub flags: u32,
-    #[cfg(not(feature = "abi-7-21"))]
-    pub padding: u32,
-    #[cfg(feature = "abi-7-21")]
     pub events: u32,
 }
 
@@ -871,7 +790,6 @@ pub struct fuse_notify_poll_wakeup_out {
     pub kh: u64,
 }
 
-#[cfg(feature = "abi-7-19")]
 #[repr(C)]
 #[derive(Debug, FromBytes, KnownLayout, Immutable)]
 pub struct fuse_fallocate_in {
@@ -1014,18 +932,13 @@ pub struct fuse_copy_file_range_in {
 // (in_out + op_in + ring_ent_in_out) lives in a page-aligned per-entry buffer
 // the kernel reads requests into / we write replies into; the variable payload
 // lives in a separate per-entry buffer. See cli/src/fuser/uring.rs.
-#[cfg(feature = "abi-7-42")]
 pub const FUSE_URING_IN_OUT_HEADER_SZ: usize = 128;
-#[cfg(feature = "abi-7-42")]
 pub const FUSE_URING_OP_IN_OUT_SZ: usize = 128;
 
 // Subcommands carried in the SQE cmd_op field.
-#[cfg(feature = "abi-7-42")]
 pub const FUSE_IO_URING_CMD_REGISTER: u32 = 1;
-#[cfg(feature = "abi-7-42")]
 pub const FUSE_IO_URING_CMD_COMMIT_AND_FETCH: u32 = 2;
 
-#[cfg(feature = "abi-7-42")]
 #[repr(C)]
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
 pub struct fuse_uring_ent_in_out {
@@ -1038,7 +951,6 @@ pub struct fuse_uring_ent_in_out {
     pub reserved: u64,
 }
 
-#[cfg(feature = "abi-7-42")]
 #[repr(C)]
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
 pub struct fuse_uring_req_header {
@@ -1050,7 +962,6 @@ pub struct fuse_uring_req_header {
 }
 
 /// In the 80B command area of the SQE.
-#[cfg(feature = "abi-7-42")]
 #[repr(C)]
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
 pub struct fuse_uring_cmd_req {

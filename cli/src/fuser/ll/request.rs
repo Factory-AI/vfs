@@ -396,13 +396,10 @@ mod op {
             }
         }
         pub fn ctime(&self) -> Option<SystemTime> {
-            #[cfg(feature = "abi-7-23")]
             match self.arg.valid & FATTR_CTIME {
                 0 => None,
                 _ => Some(system_time_from_time(self.arg.ctime, self.arg.ctimensec)),
             }
-            #[cfg(not(feature = "abi-7-23"))]
-            None
         }
         /// The value set by the [`Open`] method. See [`FileHandle`].
         ///
@@ -945,7 +942,6 @@ mod op {
     impl_request!(Init<'a>);
     impl<'a> Init<'a> {
         pub fn capabilities(&self) -> u64 {
-            #[cfg(feature = "abi-7-36")]
             if self.arg.flags & (FUSE_INIT_EXT as u32) != 0 {
                 return u64::from(self.arg.flags) | (u64::from(self.arg.flags2) << 32);
             }
@@ -965,31 +961,15 @@ mod op {
                 major: FUSE_KERNEL_VERSION,
                 minor: FUSE_KERNEL_MINOR_VERSION,
                 max_readahead: config.max_readahead,
-                #[cfg(not(feature = "abi-7-36"))]
-                flags: flags as u32,
-                #[cfg(feature = "abi-7-36")]
                 flags: (flags | FUSE_INIT_EXT) as u32,
                 max_background: config.max_background,
                 congestion_threshold: config.congestion_threshold(),
                 max_write: config.max_write,
-                #[cfg(feature = "abi-7-23")]
                 time_gran: config.time_gran.as_nanos() as u32,
-                #[cfg(all(feature = "abi-7-23", not(feature = "abi-7-28")))]
-                reserved: [0; 9],
-                #[cfg(feature = "abi-7-28")]
                 max_pages: config.max_pages(),
-                #[cfg(feature = "abi-7-28")]
                 unused2: 0,
-                #[cfg(all(feature = "abi-7-28", not(feature = "abi-7-36")))]
-                reserved: [0; 8],
-                #[cfg(feature = "abi-7-36")]
                 flags2: (flags >> 32) as u32,
-                #[cfg(all(feature = "abi-7-36", not(feature = "abi-7-40")))]
                 reserved: [0; 7],
-                #[cfg(feature = "abi-7-40")]
-                max_stack_depth: config.max_stack_depth,
-                #[cfg(feature = "abi-7-40")]
-                reserved: [0; 6],
             };
             Response::new_data(init.as_bytes())
         }
@@ -1331,10 +1311,7 @@ mod op {
 
         /// The requested poll events
         pub fn events(&self) -> u32 {
-            #[cfg(feature = "abi-7-21")]
-            return self.arg.events;
-            #[cfg(not(feature = "abi-7-21"))]
-            return 0;
+            self.arg.events
         }
 
         /// The poll request's flags
@@ -1371,15 +1348,12 @@ mod op {
     /// Preallocate or deallocate space to a file
     ///
     /// Implementations should return EINVAL if offset or length are < 0
-    #[cfg(feature = "abi-7-19")]
     #[derive(Debug)]
     pub struct FAllocate<'a> {
         header: &'a fuse_in_header,
         arg: &'a fuse_fallocate_in,
     }
-    #[cfg(feature = "abi-7-19")]
     impl_request!(FAllocate<'a>);
-    #[cfg(feature = "abi-7-19")]
     impl FAllocate<'_> {
         /// The value set by the [`Open`] method. See [`FileHandle`].
         pub fn file_handle(&self) -> FileHandle {
@@ -1400,15 +1374,12 @@ mod op {
     /// Read directory.
     ///
     /// TODO: Document when this is called rather than `ReadDir`
-    #[cfg(feature = "abi-7-21")]
     #[derive(Debug)]
     pub struct ReadDirPlus<'a> {
         header: &'a fuse_in_header,
         arg: &'a fuse_read_in,
     }
-    #[cfg(feature = "abi-7-21")]
     impl_request!(ReadDirPlus<'a>);
-    #[cfg(feature = "abi-7-21")]
     impl ReadDirPlus<'_> {
         /// The value set by the [`Open`] method. See [`FileHandle`].
         pub fn file_handle(&self) -> FileHandle {
@@ -1425,7 +1396,6 @@ mod op {
     /// Rename a file.
     ///
     /// TODO: Document the differences to [`Rename`] and [`Exchange`]
-    #[cfg(feature = "abi-7-23")]
     #[derive(Debug)]
     pub struct Rename2<'a> {
         header: &'a fuse_in_header,
@@ -1434,9 +1404,7 @@ mod op {
         newname: &'a Path,
         old_parent: INodeNo,
     }
-    #[cfg(feature = "abi-7-23")]
     impl_request!(Rename2<'a>);
-    #[cfg(feature = "abi-7-23")]
     impl<'a> Rename2<'a> {
         pub fn from(&self) -> FilenameInDir<'a> {
             FilenameInDir::<'a> {
@@ -1464,15 +1432,12 @@ mod op {
     /// Reposition read/write file offset
     ///
     /// TODO: Document when you need to implement this.  Read and Write provide the offset anyway.
-    #[cfg(feature = "abi-7-24")]
     #[derive(Debug)]
     pub struct Lseek<'a> {
         header: &'a fuse_in_header,
         arg: &'a fuse_lseek_in,
     }
-    #[cfg(feature = "abi-7-24")]
     impl_request!(Lseek<'a>);
-    #[cfg(feature = "abi-7-24")]
     impl Lseek<'_> {
         /// The value set by the [`Open`] method. See [`FileHandle`].
         pub fn file_handle(&self) -> FileHandle {
@@ -1488,7 +1453,6 @@ mod op {
     }
 
     /// Copy the specified range from the source inode to the destination inode
-    #[cfg(feature = "abi-7-28")]
     #[derive(Debug, Clone, Copy)]
     pub struct CopyFileRangeFile {
         pub inode: INodeNo,
@@ -1496,15 +1460,12 @@ mod op {
         pub file_handle: FileHandle,
         pub offset: i64,
     }
-    #[cfg(feature = "abi-7-28")]
     #[derive(Debug)]
     pub struct CopyFileRange<'a> {
         header: &'a fuse_in_header,
         arg: &'a fuse_copy_file_range_in,
     }
-    #[cfg(feature = "abi-7-28")]
     impl_request!(CopyFileRange<'a>);
-    #[cfg(feature = "abi-7-28")]
     impl CopyFileRange<'_> {
         /// File and offset to copy data from
         pub fn src(&self) -> CopyFileRangeFile {
@@ -1787,17 +1748,14 @@ mod op {
                     nodes: data.fetch_slice(arg.count as usize)?,
                 })
             }
-            #[cfg(feature = "abi-7-19")]
             fuse_opcode::FUSE_FALLOCATE => Operation::FAllocate(FAllocate {
                 header,
                 arg: data.fetch()?,
             }),
-            #[cfg(feature = "abi-7-21")]
             fuse_opcode::FUSE_READDIRPLUS => Operation::ReadDirPlus(ReadDirPlus {
                 header,
                 arg: data.fetch()?,
             }),
-            #[cfg(feature = "abi-7-23")]
             fuse_opcode::FUSE_RENAME2 => Operation::Rename2(Rename2 {
                 header,
                 arg: data.fetch()?,
@@ -1805,12 +1763,10 @@ mod op {
                 newname: data.fetch_str()?.as_ref(),
                 old_parent: INodeNo(header.nodeid),
             }),
-            #[cfg(feature = "abi-7-24")]
             fuse_opcode::FUSE_LSEEK => Operation::Lseek(Lseek {
                 header,
                 arg: data.fetch()?,
             }),
-            #[cfg(feature = "abi-7-28")]
             fuse_opcode::FUSE_COPY_FILE_RANGE => Operation::CopyFileRange(CopyFileRange {
                 header,
                 arg: data.fetch()?,
@@ -1888,15 +1844,10 @@ pub enum Operation<'a> {
     #[allow(dead_code)]
     NotifyReply(NotifyReply<'a>),
     BatchForget(BatchForget<'a>),
-    #[cfg(feature = "abi-7-19")]
     FAllocate(FAllocate<'a>),
-    #[cfg(feature = "abi-7-21")]
     ReadDirPlus(ReadDirPlus<'a>),
-    #[cfg(feature = "abi-7-23")]
     Rename2(Rename2<'a>),
-    #[cfg(feature = "abi-7-24")]
     Lseek(Lseek<'a>),
-    #[cfg(feature = "abi-7-28")]
     CopyFileRange(CopyFileRange<'a>),
 
     #[cfg(target_os = "macos")]
@@ -2056,9 +2007,7 @@ impl fmt::Display for Operation<'_> {
             Operation::Poll(x) => write!(f, "POLL fh {:?}", x.file_handle()),
             Operation::NotifyReply(_) => write!(f, "NOTIFYREPLY"),
             Operation::BatchForget(x) => write!(f, "BATCHFORGET nodes {:?}", x.nodes()),
-            #[cfg(feature = "abi-7-19")]
             Operation::FAllocate(_) => write!(f, "FALLOCATE"),
-            #[cfg(feature = "abi-7-21")]
             Operation::ReadDirPlus(x) => write!(
                 f,
                 "READDIRPLUS fh {:?}, offset {}, size {}",
@@ -2066,9 +2015,7 @@ impl fmt::Display for Operation<'_> {
                 x.offset(),
                 x.size()
             ),
-            #[cfg(feature = "abi-7-23")]
             Operation::Rename2(x) => write!(f, "RENAME2 from {:?}, to {:?}", x.from(), x.to()),
-            #[cfg(feature = "abi-7-24")]
             Operation::Lseek(x) => write!(
                 f,
                 "LSEEK fh {:?}, offset {}, whence {}",
@@ -2076,7 +2023,6 @@ impl fmt::Display for Operation<'_> {
                 x.offset(),
                 x.whence()
             ),
-            #[cfg(feature = "abi-7-28")]
             Operation::CopyFileRange(x) => write!(
                 f,
                 "COPY_FILE_RANGE src {:?}, dest {:?}, len {}",
@@ -2168,31 +2114,7 @@ mod tests {
     use super::*;
     use std::ffi::OsStr;
 
-    #[cfg(all(target_endian = "big", not(feature = "abi-7-36")))]
-    const INIT_REQUEST: AlignedData<[u8; 56]> = AlignedData([
-        // decimal 56 == hex 0x38
-        0x00, 0x00, 0x00, 0x38, 0x00, 0x00, 0x00, 0x1a, // len, opcode
-        0xde, 0xad, 0xbe, 0xef, 0xba, 0xad, 0xd0, 0x0d, // unique
-        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, // nodeid
-        0xc0, 0x01, 0xd0, 0x0d, 0xc0, 0x01, 0xca, 0xfe, // uid, gid
-        0xc0, 0xde, 0xba, 0x5e, 0x00, 0x00, 0x00, 0x00, // pid, padding
-        0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x08, // major, minor
-        0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, // max_readahead, flags
-    ]);
-
-    #[cfg(all(target_endian = "little", not(feature = "abi-7-36")))]
-    const INIT_REQUEST: AlignedData<[u8; 56]> = AlignedData([
-        // decimal 56 == hex 0x38
-        0x38, 0x00, 0x00, 0x00, 0x1a, 0x00, 0x00, 0x00, // len, opcode
-        0x0d, 0xf0, 0xad, 0xba, 0xef, 0xbe, 0xad, 0xde, // unique
-        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // nodeid
-        0x0d, 0xd0, 0x01, 0xc0, 0xfe, 0xca, 0x01, 0xc0, // uid, gid
-        0x5e, 0xba, 0xde, 0xc0, 0x00, 0x00, 0x00, 0x00, // pid, padding
-        0x07, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, // major, minor
-        0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // max_readahead, flags
-    ]);
-
-    #[cfg(all(target_endian = "big", feature = "abi-7-36"))]
+    #[cfg(target_endian = "big")]
     const INIT_REQUEST: AlignedData<[u8; 104]> = AlignedData([
         // decimal 104 == hex 0x68
         0x00, 0x00, 0x00, 0x68, 0x00, 0x00, 0x00, 0x1a, // len, opcode
@@ -2209,7 +2131,7 @@ mod tests {
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     ]);
 
-    #[cfg(all(target_endian = "little", feature = "abi-7-36"))]
+    #[cfg(target_endian = "little")]
     const INIT_REQUEST: AlignedData<[u8; 104]> = AlignedData([
         // decimal 104 == hex 0x68
         0x68, 0x00, 0x00, 0x00, 0x1a, 0x00, 0x00, 0x00, // len, opcode
@@ -2260,9 +2182,6 @@ mod tests {
     #[test]
     fn short_read() {
         match AnyRequest::try_from(&INIT_REQUEST[..48]) {
-            #[cfg(not(feature = "abi-7-36"))]
-            Err(RequestError::ShortRead(48, 56)) => (),
-            #[cfg(feature = "abi-7-36")]
             Err(RequestError::ShortRead(48, 104)) => (),
             _ => panic!("Unexpected request parsing result"),
         }
@@ -2271,9 +2190,6 @@ mod tests {
     #[test]
     fn init() {
         let req = AnyRequest::try_from(&INIT_REQUEST[..]).unwrap();
-        #[cfg(not(feature = "abi-7-36"))]
-        assert_eq!(req.header.len, 56);
-        #[cfg(feature = "abi-7-36")]
         assert_eq!(req.header.len, 104);
         assert_eq!(req.header.opcode, 26);
         assert_eq!(req.unique(), RequestId(0xdead_beef_baad_f00d));
