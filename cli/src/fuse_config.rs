@@ -148,13 +148,9 @@ pub struct FuseKernelCacheConfig {
 
 impl FuseKernelCacheConfig {
     pub(crate) fn record_profile(&self) {
-        agentfs_sdk::profiling::set_fuse_ttl_ms(
-            self.entry_ttl_ms,
-            self.attr_ttl_ms,
-            self.neg_ttl_ms,
-        );
-        agentfs_sdk::profiling::set_fuse_keepcache_enabled(self.keepcache_enabled);
-        agentfs_sdk::profiling::set_fuse_readdirplus_mode(self.readdirplus_mode.profile_value());
+        crate::profiling::set_fuse_ttl_ms(self.entry_ttl_ms, self.attr_ttl_ms, self.neg_ttl_ms);
+        crate::profiling::set_fuse_keepcache_enabled(self.keepcache_enabled);
+        crate::profiling::set_fuse_readdirplus_mode(self.readdirplus_mode.profile_value());
     }
 }
 

@@ -253,17 +253,19 @@ async fn run_init_cmd(
 
     drop(mount_handle);
 
-    agentfs_sdk::profiling::report_summary("init_command_parent");
-
     let _ = std::fs::remove_dir_all(&mountpoint);
 
     match outcome? {
         ChildOutcome::Exited(status) => {
             if !status.success() {
+                crate::profiling::emit_cli_report();
                 std::process::exit(status.code().unwrap_or(1));
             }
         }
-        ChildOutcome::Interrupted(signo) => std::process::exit(128 + signo),
+        ChildOutcome::Interrupted(signo) => {
+            crate::profiling::emit_cli_report();
+            std::process::exit(128 + signo);
+        }
     }
 
     Ok(())

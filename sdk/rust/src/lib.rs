@@ -5,6 +5,21 @@ pub mod filesystem;
 pub mod kvstore;
 pub mod profiling;
 pub mod schema;
+pub mod telemetry {
+    //! Compatibility façade for the M3 telemetry registry while the SDK crate
+    //! still uses the pre-M5 `profiling` module path internally.
+    pub use crate::profiling::*;
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn sdk_only_usage_does_not_emit_report() {
+            crate::profiling::record_connection_create();
+            let snapshot = crate::profiling::snapshot();
+            assert!(snapshot.counter("connection_create") >= 1);
+        }
+    }
+}
 pub mod toolcalls;
 
 use error::{Error, Result};

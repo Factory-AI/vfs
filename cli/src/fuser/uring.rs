@@ -855,7 +855,7 @@ fn handle_request<FS: Filesystem>(
         (buf, commit_id, unique)
     };
 
-    agentfs_sdk::profiling::record_fuse_uring_request();
+    crate::profiling::record_fuse_uring_request();
 
     let sender = ChannelSender::Uring(UringSender {
         queue: queue.clone(),
@@ -868,7 +868,7 @@ fn handle_request<FS: Filesystem>(
             // Mirror the legacy worker pool's concurrency accounting so the
             // serialization gates observe uring-side parallelism too.
             let concurrent = active_dispatches.fetch_add(1, Ordering::AcqRel) + 1;
-            agentfs_sdk::profiling::record_fuse_dispatch_concurrency(concurrent);
+            crate::profiling::record_fuse_dispatch_concurrency(concurrent);
             request.dispatch(shared);
             active_dispatches.fetch_sub(1, Ordering::AcqRel);
             // Every op the kernel routes through uring expects a reply

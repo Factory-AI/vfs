@@ -244,7 +244,7 @@ impl OpenFile {
         };
 
         runtime.block_on(async move { file.pwrite_ranges(ranges).await })?;
-        agentfs_sdk::profiling::record_fuse_flush(range_count, byte_count);
+        crate::profiling::record_fuse_flush(range_count, byte_count);
         Ok(())
     }
 }
@@ -300,7 +300,7 @@ fn flush_pending_batched_out_of_lock(
 ) -> Result<(), SdkError> {
     let (file, ranges, range_count, byte_count) = drain;
     runtime.block_on(async move { file.pwrite_ranges_batched(ranges).await })?;
-    agentfs_sdk::profiling::record_fuse_flush(range_count, byte_count);
+    crate::profiling::record_fuse_flush(range_count, byte_count);
     Ok(())
 }
 
@@ -574,8 +574,6 @@ struct AgentFSFuse {
     /// readdirplus) check this before scanning `open_files`, keeping the hot
     /// no-writes-in-flight case at a single atomic load.
     pending_dirty_handles: AtomicUsize,
-    /// Emits a profiling summary when the FUSE session object is dropped.
-    _profile_report: Arc<agentfs_sdk::profiling::ProfileReportGuard>,
     /// Whether FUSE writeback mode is enabled for this mount.
     writeback_enabled: bool,
 }
@@ -659,7 +657,7 @@ impl Filesystem for AgentFSFuse {
     ///
     /// Resolves `name` under the directory identified by `parent` inode.
     fn lookup(&self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        agentfs_sdk::profiling::record_fuse_lookup();
+        crate::profiling::record_fuse_lookup();
         tracing::debug!("FUSE::lookup: parent={}, name={:?}", parent, name);
 
         let Some(name_str) = name.to_str() else {
@@ -681,7 +679,7 @@ impl Filesystem for AgentFSFuse {
                 .is_ok();
             let cache_reply = self.cache_reply_lock.try_lock();
             if retained && cache_reply.is_some() && !self.cache_epoch_changed(cache_epoch) {
-                agentfs_sdk::profiling::record_fuse_adapter_entry_hit();
+                crate::profiling::record_fuse_adapter_entry_hit();
                 let attr = fillattr(&stats);
                 reply.entry_with_ttls(
                     &self.cache_config.entry_ttl,
@@ -707,17 +705,17 @@ impl Filesystem for AgentFSFuse {
         {
             let cache_reply = self.cache_reply_lock.try_lock();
             if cache_reply.is_some() && !self.cache_epoch_changed(cache_epoch) {
-                agentfs_sdk::profiling::record_negative_cache_hit();
-                agentfs_sdk::profiling::record_fuse_adapter_negative_hit();
+                crate::profiling::record_negative_cache_hit();
+                crate::profiling::record_fuse_adapter_negative_hit();
                 self.reply_negative_entry(reply);
                 return;
             }
         }
-        agentfs_sdk::profiling::record_negative_cache_miss();
-        agentfs_sdk::profiling::record_fuse_adapter_negative_miss();
+        crate::profiling::record_negative_cache_miss();
+        crate::profiling::record_fuse_adapter_negative_miss();
         // Neither the positive entry cache nor the negative cache satisfied this
         // lookup; the request falls through to the backend.
-        agentfs_sdk::profiling::record_fuse_adapter_entry_miss();
+        crate::profiling::record_fuse_adapter_entry_miss();
 
         let mut stable = false;
         let mut stable_epoch = 0;
@@ -798,7 +796,7 @@ impl Filesystem for AgentFSFuse {
     /// Returns metadata (size, permissions, timestamps, etc.) for the file or
     /// directory identified by `ino`. Root inode (1) is handled specially.
     fn getattr(&self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-        agentfs_sdk::profiling::record_fuse_getattr();
+        crate::profiling::record_fuse_getattr();
         tracing::debug!("FUSE::getattr: ino={}", ino);
 
         if let Err(e) = self.flush_pending_inode(ino) {
@@ -810,12 +808,12 @@ impl Filesystem for AgentFSFuse {
         if let Some(stats) = self.attr_cache.lock().get(&ino).cloned() {
             let cache_reply = self.cache_reply_lock.try_lock();
             if cache_reply.is_some() && !self.cache_epoch_changed(cache_epoch) {
-                agentfs_sdk::profiling::record_fuse_adapter_attr_hit();
+                crate::profiling::record_fuse_adapter_attr_hit();
                 reply.attr(&self.cache_config.attr_ttl, &fillattr(&stats));
                 return;
             }
         }
-        agentfs_sdk::profiling::record_fuse_adapter_attr_miss();
+        crate::profiling::record_fuse_adapter_attr_miss();
 
         let mut stable = false;
         let mut stable_epoch = 0;
@@ -1045,7 +1043,7 @@ impl Filesystem for AgentFSFuse {
     /// Uses readdir_plus to fetch entries with stats in a single query,
     /// avoiding N+1 database queries.
     fn readdir(&self, _req: &Request, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
-        agentfs_sdk::profiling::record_fuse_readdir();
+        crate::profiling::record_fuse_readdir();
         tracing::debug!("FUSE::readdir: ino={}, offset={}", ino, offset);
 
         let all_entries = match self.cached_readdir_entries(ino) {
@@ -1077,7 +1075,7 @@ impl Filesystem for AgentFSFuse {
         offset: i64,
         mut reply: ReplyDirectoryPlus,
     ) {
-        agentfs_sdk::profiling::record_fuse_readdir_plus();
+        crate::profiling::record_fuse_readdir_plus();
         tracing::debug!("FUSE::readdirplus: ino={}, offset={}", ino, offset);
 
         let (all_entries, stable, stable_epoch) = match self.cached_readdir_entries(ino) {
@@ -1544,7 +1542,7 @@ impl Filesystem for AgentFSFuse {
     ///
     /// Allocates a file handle and opens the file in the filesystem layer.
     fn open(&self, req: &Request, ino: u64, flags: i32, reply: ReplyOpen) {
-        agentfs_sdk::profiling::record_fuse_open();
+        crate::profiling::record_fuse_open();
         tracing::debug!("FUSE::open: ino={}, flags={}", ino, flags);
 
         if self.noopen_active.load(Ordering::Acquire) {
@@ -1557,7 +1555,7 @@ impl Filesystem for AgentFSFuse {
             // writeback-coherent, truncates arrive as SETATTR (we never
             // advertise FUSE_ATOMIC_O_TRUNC), and external divergence is
             // bounded by the attr TTLs.
-            agentfs_sdk::profiling::record_fuse_noopen_enosys_reply();
+            crate::profiling::record_fuse_noopen_enosys_reply();
             reply.error(libc::ENOSYS);
             return;
         }
@@ -1623,7 +1621,7 @@ impl Filesystem for AgentFSFuse {
                         if self.keepcache_allows(ino, fingerprint) {
                             true
                         } else {
-                            agentfs_sdk::profiling::record_base_fast_stale_rejection();
+                            crate::profiling::record_base_fast_stale_rejection();
                             false
                         }
                     })
@@ -1635,10 +1633,10 @@ impl Filesystem for AgentFSFuse {
                         ino,
                         keep_cache_fingerprint.expect("checked before enabling keep-cache"),
                     );
-                    agentfs_sdk::profiling::record_base_fast_open_eligible();
-                    agentfs_sdk::profiling::record_base_fast_open_keep_cache();
+                    crate::profiling::record_base_fast_open_eligible();
+                    crate::profiling::record_base_fast_open_keep_cache();
                 } else {
-                    agentfs_sdk::profiling::record_base_fast_open_rejected();
+                    crate::profiling::record_base_fast_open_rejected();
                 }
                 if write_open {
                     self.invalidate_inode_cache_self(req, ino);
@@ -1679,7 +1677,7 @@ impl Filesystem for AgentFSFuse {
         _lock: Option<u64>,
         reply: ReplyData,
     ) {
-        agentfs_sdk::profiling::record_fuse_read();
+        crate::profiling::record_fuse_read();
         tracing::debug!("FUSE::read: fh={}, offset={}, size={}", fh, offset, size);
         if offset < 0 {
             reply.error(libc::EINVAL);
@@ -1744,7 +1742,7 @@ impl Filesystem for AgentFSFuse {
         }
 
         let data_len = data.len();
-        agentfs_sdk::profiling::record_fuse_write(data_len as u64);
+        crate::profiling::record_fuse_write(data_len as u64);
         if let Err(e) = self.flush_pending_inode_except(ino, fh) {
             reply.error(error_to_errno(&e));
             return;
@@ -1929,7 +1927,7 @@ impl Filesystem for AgentFSFuse {
                     // or the pending-tail guards on attr-bearing paths. On
                     // drain errors the real errno is replied instead, which
                     // leaves FLUSH enabled and close() still reporting them.
-                    agentfs_sdk::profiling::record_fuse_noflush_enosys_reply();
+                    crate::profiling::record_fuse_noflush_enosys_reply();
                     reply.error(libc::ENOSYS);
                 } else {
                     reply.ok();
@@ -1986,7 +1984,7 @@ impl Filesystem for AgentFSFuse {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        agentfs_sdk::profiling::record_fuse_release();
+        crate::profiling::record_fuse_release();
         tracing::debug!("FUSE::release: fh={}", fh);
         // Deferred-drain default: move this handle's buffered writes into the
         // SDK batcher overlay, but do NOT force a SQLite commit on close. The
@@ -2288,14 +2286,14 @@ impl AgentFSFuse {
         let file = self
             .runtime
             .block_on(async move { fs.open(ino as i64, flags).await })?;
-        agentfs_sdk::profiling::record_fuse_ino_file_resolution();
+        crate::profiling::record_fuse_ino_file_resolution();
         let mut ino_files = self.ino_files.lock();
         match ino_files.get_mut(&ino) {
             Some(entry) if write && !entry.write_capable => {
                 entry.file = file.clone();
                 entry.write_capable = true;
                 entry.last_used = stamp;
-                agentfs_sdk::profiling::record_fuse_ino_file_upgrade();
+                crate::profiling::record_fuse_ino_file_upgrade();
                 Ok(file)
             }
             Some(entry) => {
@@ -2430,7 +2428,7 @@ impl AgentFSFuse {
             return Ok(false);
         }
         self.flush_pending_inode(ino)?;
-        agentfs_sdk::profiling::record_fuse_pending_tail_drain();
+        crate::profiling::record_fuse_pending_tail_drain();
         Ok(true)
     }
 
@@ -2446,7 +2444,7 @@ impl AgentFSFuse {
 
     fn drop_keepcache_eligibility(&self, ino: u64) {
         if self.keepcache_drift_guard.lock().drop_eligibility(ino) {
-            agentfs_sdk::profiling::record_fuse_keepcache_eligibility_drop();
+            crate::profiling::record_fuse_keepcache_eligibility_drop();
         }
     }
 
@@ -2471,7 +2469,7 @@ impl AgentFSFuse {
         self.drop_keepcache_eligibility(ino);
         self.invalidate_cached_inode(ino);
         self.notify_inval_inode(req, ino, 0, i64::MAX);
-        agentfs_sdk::profiling::record_base_fast_inode_invalidation();
+        crate::profiling::record_base_fast_inode_invalidation();
         record_mutation_invalidation();
     }
 
@@ -2501,7 +2499,7 @@ impl AgentFSFuse {
         self.bump_cache_epoch();
         self.drop_keepcache_eligibility(ino);
         self.invalidate_cached_inode(ino);
-        agentfs_sdk::profiling::record_base_fast_inode_invalidation();
+        crate::profiling::record_base_fast_inode_invalidation();
         record_mutation_invalidation();
     }
 
@@ -2538,7 +2536,7 @@ impl AgentFSFuse {
     }
 
     fn notify_inval_inode(&self, req: &Request, ino: u64, offset: i64, len: i64) {
-        agentfs_sdk::profiling::record_fuse_adapter_inval_inode_notification();
+        crate::profiling::record_fuse_adapter_inval_inode_notification();
         if !self.sync_inval {
             req.deferred_notifier().inval_inode(ino, offset, len);
             return;
@@ -2546,10 +2544,10 @@ impl AgentFSFuse {
 
         let start = Instant::now();
         let result = req.notifier().inval_inode(ino, offset, len);
-        agentfs_sdk::profiling::record_fuse_sync_inval_latency(start.elapsed());
+        crate::profiling::record_fuse_sync_inval_latency(start.elapsed());
 
         match result {
-            Ok(()) => agentfs_sdk::profiling::record_fuse_sync_inval_inode_ok(),
+            Ok(()) => crate::profiling::record_fuse_sync_inval_inode_ok(),
             Err(e) => {
                 tracing::warn!(
                     "synchronous FUSE inval_inode failed ino={}, offset={}, len={}: {}",
@@ -2558,13 +2556,13 @@ impl AgentFSFuse {
                     len,
                     e
                 );
-                agentfs_sdk::profiling::record_fuse_sync_inval_inode_err();
+                crate::profiling::record_fuse_sync_inval_inode_err();
             }
         }
     }
 
     fn notify_inval_entry(&self, req: &Request, parent: u64, name: &OsStr) {
-        agentfs_sdk::profiling::record_fuse_adapter_inval_entry_notification();
+        crate::profiling::record_fuse_adapter_inval_entry_notification();
         if !self.sync_inval {
             req.deferred_notifier().inval_entry(parent, name);
             return;
@@ -2572,10 +2570,10 @@ impl AgentFSFuse {
 
         let start = Instant::now();
         let result = req.notifier().inval_entry(parent, name);
-        agentfs_sdk::profiling::record_fuse_sync_inval_latency(start.elapsed());
+        crate::profiling::record_fuse_sync_inval_latency(start.elapsed());
 
         match result {
-            Ok(()) => agentfs_sdk::profiling::record_fuse_sync_inval_entry_ok(),
+            Ok(()) => crate::profiling::record_fuse_sync_inval_entry_ok(),
             Err(e) => {
                 tracing::warn!(
                     "synchronous FUSE inval_entry failed parent={}, name={:?}: {}",
@@ -2583,7 +2581,7 @@ impl AgentFSFuse {
                     name,
                     e
                 );
-                agentfs_sdk::profiling::record_fuse_sync_inval_entry_err();
+                crate::profiling::record_fuse_sync_inval_entry_err();
             }
         }
     }
@@ -2602,7 +2600,7 @@ impl AgentFSFuse {
         let key = (parent, name.to_string());
         self.entry_cache.lock().remove(&key);
         if self.negative_entry_cache.lock().remove(&key).is_some() {
-            agentfs_sdk::profiling::record_negative_cache_invalidation();
+            crate::profiling::record_negative_cache_invalidation();
         }
     }
 
@@ -2728,7 +2726,7 @@ impl AgentFSFuse {
             } else {
                 for tail_ino in affected {
                     self.flush_pending_inode(tail_ino)?;
-                    agentfs_sdk::profiling::record_fuse_pending_tail_drain();
+                    crate::profiling::record_fuse_pending_tail_drain();
                 }
                 let fs = self.fs.clone();
                 match self
@@ -2815,9 +2813,6 @@ impl AgentFSFuse {
             ino_file_stamp: AtomicU64::new(0),
             pending_dirty_handles: AtomicUsize::new(0),
             cache_dir_enabled,
-            _profile_report: Arc::new(agentfs_sdk::profiling::ProfileReportGuard::new(
-                "fuse_session",
-            )),
             writeback_enabled,
         }
     }
@@ -2841,46 +2836,46 @@ fn fuse_write_open(flags: i32) -> bool {
 
 fn configure_writeback_cache(config: &mut KernelConfig, enabled: bool) {
     if !enabled {
-        agentfs_sdk::profiling::set_fuse_writeback_cache_enabled(false);
+        crate::profiling::set_fuse_writeback_cache_enabled(false);
         return;
     }
 
     match config.add_capabilities(FUSE_WRITEBACK_CACHE) {
-        Ok(()) => agentfs_sdk::profiling::set_fuse_writeback_cache_enabled(true),
+        Ok(()) => crate::profiling::set_fuse_writeback_cache_enabled(true),
         Err(_) => {
             tracing::warn!("Kernel does not support FUSE_WRITEBACK_CACHE; leaving it disabled");
-            agentfs_sdk::profiling::set_fuse_writeback_cache_enabled(false);
+            crate::profiling::set_fuse_writeback_cache_enabled(false);
         }
     }
 }
 
 fn configure_readdirplus(config: &mut KernelConfig, mode: ReaddirPlusMode) {
-    agentfs_sdk::profiling::set_fuse_readdirplus_mode(mode.profile_value());
+    crate::profiling::set_fuse_readdirplus_mode(mode.profile_value());
 
     match mode {
         ReaddirPlusMode::Off => {}
         ReaddirPlusMode::Auto => {
-            agentfs_sdk::profiling::record_fuse_readdirplus_auto_requested();
+            crate::profiling::record_fuse_readdirplus_auto_requested();
             match config.add_capabilities(FUSE_DO_READDIRPLUS) {
-                Ok(()) => agentfs_sdk::profiling::record_fuse_readdirplus_do_enabled(),
+                Ok(()) => crate::profiling::record_fuse_readdirplus_do_enabled(),
                 Err(_) => {
                     tracing::warn!("Kernel does not support FUSE_DO_READDIRPLUS");
-                    agentfs_sdk::profiling::record_fuse_readdirplus_unsupported();
+                    crate::profiling::record_fuse_readdirplus_unsupported();
                 }
             }
             match config.add_capabilities(FUSE_READDIRPLUS_AUTO) {
-                Ok(()) => agentfs_sdk::profiling::record_fuse_readdirplus_auto_enabled(),
+                Ok(()) => crate::profiling::record_fuse_readdirplus_auto_enabled(),
                 Err(_) => {
                     tracing::warn!("Kernel does not support FUSE_READDIRPLUS_AUTO");
-                    agentfs_sdk::profiling::record_fuse_readdirplus_unsupported();
+                    crate::profiling::record_fuse_readdirplus_unsupported();
                 }
             }
         }
         ReaddirPlusMode::Always => {
-            agentfs_sdk::profiling::record_fuse_readdirplus_do_requested();
+            crate::profiling::record_fuse_readdirplus_do_requested();
             match config.add_capabilities(FUSE_DO_READDIRPLUS) {
-                Ok(()) => agentfs_sdk::profiling::record_fuse_readdirplus_do_enabled(),
-                Err(_) => agentfs_sdk::profiling::record_fuse_readdirplus_unsupported(),
+                Ok(()) => crate::profiling::record_fuse_readdirplus_do_enabled(),
+                Err(_) => crate::profiling::record_fuse_readdirplus_unsupported(),
             }
         }
     }

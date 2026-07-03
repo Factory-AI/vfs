@@ -114,10 +114,14 @@ pub async fn handle_exec_command(
     match outcome? {
         ChildOutcome::Exited(status) => {
             if !status.success() {
+                crate::profiling::emit_cli_report();
                 std::process::exit(status.code().unwrap_or(1));
             }
             Ok(())
         }
-        ChildOutcome::Interrupted(signo) => std::process::exit(128 + signo),
+        ChildOutcome::Interrupted(signo) => {
+            crate::profiling::emit_cli_report();
+            std::process::exit(128 + signo);
+        }
     }
 }

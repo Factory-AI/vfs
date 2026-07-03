@@ -4,10 +4,7 @@
 //! connections with a maximum limit. When the pool is exhausted, callers block
 //! until a connection becomes available or timeout occurs.
 
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{sync::Arc, time::Duration};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use turso::{Connection, Database};
 
@@ -163,21 +160,17 @@ impl ConnectionPool {
     /// available within the timeout period.
     pub async fn get_connection(&self) -> Result<PooledConnection> {
         // Try to acquire a permit with timeout
-        let wait_started = if crate::profiling::is_enabled() {
-            Some(Instant::now())
-        } else {
-            None
+        let permit = {
+            let _wait_timer =
+                crate::profiling::timer(&crate::profiling::CORE_COUNTERS.connection_wait);
+            tokio::time::timeout(
+                self.inner.timeout,
+                Arc::clone(&self.inner.semaphore).acquire_owned(),
+            )
+            .await
+            .map_err(|_| Error::ConnectionPoolTimeout)?
+            .map_err(|_| Error::Internal("semaphore closed".to_string()))?
         };
-        let permit = tokio::time::timeout(
-            self.inner.timeout,
-            Arc::clone(&self.inner.semaphore).acquire_owned(),
-        )
-        .await
-        .map_err(|_| Error::ConnectionPoolTimeout)?
-        .map_err(|_| Error::Internal("semaphore closed".to_string()))?;
-        if let Some(wait_started) = wait_started {
-            crate::profiling::record_connection_wait(wait_started.elapsed());
-        }
 
         // We have a permit - try to get an existing connection or create new one
         let conn = {

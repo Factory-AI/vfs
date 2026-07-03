@@ -163,7 +163,7 @@ fn dispatch_request<FS: Filesystem>(
     request: Request,
 ) {
     let concurrent = active_dispatches.fetch_add(1, Ordering::AcqRel) + 1;
-    agentfs_sdk::profiling::record_fuse_dispatch_concurrency(concurrent);
+    crate::profiling::record_fuse_dispatch_concurrency(concurrent);
     let _guard = ActiveDispatchGuard { active_dispatches };
     request.dispatch(shared);
 }
@@ -173,8 +173,8 @@ fn dispatch_queued_request<FS: Filesystem>(
     active_dispatches: &AtomicU64,
     queued: QueuedRequest,
 ) {
-    agentfs_sdk::profiling::record_fuse_dispatch_parallel_task();
-    agentfs_sdk::profiling::record_fuse_dispatch_wait(queued.enqueued_at.elapsed());
+    crate::profiling::record_fuse_dispatch_parallel_task();
+    crate::profiling::record_fuse_dispatch_wait(queued.enqueued_at.elapsed());
     dispatch_request(shared, active_dispatches, queued.request);
 }
 
@@ -301,7 +301,7 @@ impl<FS: Filesystem> Session<FS> {
         let result = match self.dispatch_mode {
             DispatchMode::Serial => {
                 tracing::info!("resolved FUSE dispatch mode: serial");
-                agentfs_sdk::profiling::set_fuse_workers_configured(0);
+                crate::profiling::set_fuse_workers_configured(0);
                 self.run_serial(deferred.clone())
             }
             DispatchMode::Parallel {
@@ -313,7 +313,7 @@ impl<FS: Filesystem> Session<FS> {
                     queue_capacity,
                     "resolved FUSE dispatch mode: parallel"
                 );
-                agentfs_sdk::profiling::set_fuse_workers_configured(workers as u64);
+                crate::profiling::set_fuse_workers_configured(workers as u64);
                 self.run_parallel(deferred.clone(), workers, queue_capacity)
             }
         };
@@ -390,11 +390,11 @@ impl<FS: Filesystem> Session<FS> {
                 let lane_depth = lane_depths[lane].fetch_add(1, Ordering::AcqRel) + 1;
                 match lane_senders[lane].try_send(queued) {
                     Ok(()) => {
-                        agentfs_sdk::profiling::record_fuse_worker_queue_depth(depth);
+                        crate::profiling::record_fuse_worker_queue_depth(depth);
                         Ok(())
                     }
                     Err(mpsc::TrySendError::Full(queued)) => {
-                        agentfs_sdk::profiling::record_fuse_dispatch_inline_fallback();
+                        crate::profiling::record_fuse_dispatch_inline_fallback();
                         lane_senders[lane].send(queued).map_err(|_| {
                             queue_depth.fetch_sub(1, Ordering::AcqRel);
                             lane_depths[lane].fetch_sub(1, Ordering::AcqRel);
@@ -403,15 +403,15 @@ impl<FS: Filesystem> Session<FS> {
                                 "FUSE dispatch worker queue disconnected",
                             )
                         })?;
-                        agentfs_sdk::profiling::record_fuse_worker_queue_depth(depth);
-                        agentfs_sdk::profiling::record_fuse_worker_queue_depth(lane_depth);
+                        crate::profiling::record_fuse_worker_queue_depth(depth);
+                        crate::profiling::record_fuse_worker_queue_depth(lane_depth);
                         Ok(())
                     }
                     Err(mpsc::TrySendError::Disconnected(queued)) => {
                         queue_depth.fetch_sub(1, Ordering::AcqRel);
                         lane_depths[lane].fetch_sub(1, Ordering::AcqRel);
                         drop(queued);
-                        agentfs_sdk::profiling::record_fuse_dispatch_inline_fallback();
+                        crate::profiling::record_fuse_dispatch_inline_fallback();
                         Err(io::Error::new(
                             io::ErrorKind::BrokenPipe,
                             "FUSE dispatch worker queue disconnected",

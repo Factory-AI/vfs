@@ -7,7 +7,6 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
-use std::time::Instant;
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use super::{wait_for_mount, MountBackend, MountHandle, MountHandleInner, MountOpts};
@@ -112,14 +111,12 @@ impl ReadWriteLaneFsAdapter {
     }
 
     async fn enter_read_lane(&self) -> ReadLaneGuard<'_> {
-        let started = agentfs_sdk::profiling::is_enabled().then(Instant::now);
+        let _wait_timer =
+            crate::profiling::timer(&crate::profiling::FUSE_COUNTERS.fuse_read_lane_wait);
         let guard = self.lanes.read().await;
-        if let Some(started) = started {
-            agentfs_sdk::profiling::record_fuse_read_lane_wait(started.elapsed());
-        }
 
         let active_reads = self.active_reads.fetch_add(1, Ordering::Relaxed) + 1;
-        agentfs_sdk::profiling::record_fuse_read_lane_concurrency(active_reads);
+        crate::profiling::record_fuse_read_lane_concurrency(active_reads);
 
         ReadLaneGuard {
             active_reads: &self.active_reads,
@@ -128,11 +125,9 @@ impl ReadWriteLaneFsAdapter {
     }
 
     async fn enter_write_lane(&self) -> RwLockWriteGuard<'_, ()> {
-        let started = agentfs_sdk::profiling::is_enabled().then(Instant::now);
+        let _wait_timer =
+            crate::profiling::timer(&crate::profiling::FUSE_COUNTERS.fuse_write_lane_wait);
         let guard = self.lanes.write().await;
-        if let Some(started) = started {
-            agentfs_sdk::profiling::record_fuse_write_lane_wait(started.elapsed());
-        }
         guard
     }
 

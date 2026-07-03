@@ -52,16 +52,10 @@ pub(crate) fn file_backed_connection_pool_options() -> ConnectionPoolOptions {
 }
 
 async fn checkpoint_wal(conn: &Connection) -> Result<()> {
-    let started = if crate::profiling::is_enabled() {
-        Some(Instant::now())
-    } else {
-        None
-    };
+    let _checkpoint_timer =
+        crate::profiling::timer(&crate::profiling::CORE_COUNTERS.wal_checkpoint);
     let mut rows = conn.query(WAL_CHECKPOINT_SQL, ()).await?;
     while rows.next().await?.is_some() {}
-    if let Some(started) = started {
-        crate::profiling::record_wal_checkpoint(started.elapsed());
-    }
     Ok(())
 }
 
@@ -1394,8 +1388,6 @@ pub struct AgentFS {
     /// Live open-handle registry for deferred orphan reaping (see
     /// [`OpenInodes`]).
     open_inodes: Arc<OpenInodes>,
-    /// Emits a profiling summary when the final filesystem clone is dropped.
-    _profile_report: Arc<crate::profiling::ProfileReportGuard>,
 }
 
 /// Tracks inodes with live `AgentFSFile` handles so unlink and
@@ -2573,7 +2565,6 @@ impl AgentFS {
             overlay_reads,
             core_config,
             open_inodes: Arc::new(OpenInodes::default()),
-            _profile_report: Arc::new(crate::profiling::ProfileReportGuard::new("agentfs")),
         };
         Ok(fs)
     }
@@ -8196,8 +8187,8 @@ mod tests {
             .await?;
 
         let pre = crate::profiling::snapshot();
-        let pre_enq = pre.agentfs_batcher_enqueues;
-        let pre_explicit = pre.agentfs_batcher_drains_explicit;
+        let pre_enq = pre.counter("agentfs_batcher_enqueues");
+        let pre_explicit = pre.counter("agentfs_batcher_drains_explicit");
 
         // 200 write-then-read cycles, no intervening fsync. Tier 3 would
         // drain Explicit on every read; Tier 4 must not.
@@ -8207,8 +8198,8 @@ mod tests {
         }
 
         let post = crate::profiling::snapshot();
-        let enq = post.agentfs_batcher_enqueues - pre_enq;
-        let explicit = post.agentfs_batcher_drains_explicit - pre_explicit;
+        let enq = post.counter("agentfs_batcher_enqueues") - pre_enq;
+        let explicit = post.counter("agentfs_batcher_drains_explicit") - pre_explicit;
         assert!(enq >= 200, "expected ≥200 enqueues, got {enq}");
         let ratio = explicit as f64 / enq.max(1) as f64;
         assert!(

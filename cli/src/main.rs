@@ -56,6 +56,7 @@ fn main() {
     reset_sigpipe();
 
     CompleteEnv::with_factory(Args::command).complete();
+    let _profile_report = agentfs::profiling::install_cli_sink();
     let args = Args::parse();
 
     match args.command {

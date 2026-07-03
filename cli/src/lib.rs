@@ -2,6 +2,7 @@ pub mod cmd;
 pub mod config;
 pub mod knobs;
 pub mod opts;
+pub mod profiling;
 pub mod sandbox;
 
 #[cfg(target_os = "linux")]

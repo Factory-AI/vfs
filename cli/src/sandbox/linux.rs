@@ -124,7 +124,7 @@ extern "C" fn request_profile_checkpoint(_sig: libc::c_int) {
 fn drain_profile_checkpoints() {
     let pending = PROFILE_CHECKPOINT_PENDING.swap(0, Ordering::SeqCst);
     for _ in 0..pending {
-        agentfs_sdk::profiling::report_checkpoint();
+        crate::profiling::report_checkpoint();
     }
 }
 
@@ -447,7 +447,7 @@ fn run_in_existing_session(
         // Clean up proc file
         crate::cmd::ps::remove_proc_file(session_id);
 
-        agentfs_sdk::profiling::report_summary("run_parent");
+        crate::profiling::emit_cli_report();
 
         std::process::exit(exit_code);
     }
@@ -987,7 +987,7 @@ fn run_parent(
     eprintln!("To see what changed:");
     eprintln!("  agentfs diff {}", session_id);
 
-    agentfs_sdk::profiling::report_summary("run_parent");
+    crate::profiling::emit_cli_report();
 
     std::process::exit(exit_code);
 }

@@ -24,9 +24,9 @@ use super::Filesystem;
 use super::{ll, KernelConfig};
 
 /// Classify a parsed request into a per-op latency slot (see
-/// `agentfs_sdk::profiling::FuseOpSlot`).
-fn fuse_op_slot(op: &ll::Operation<'_>) -> agentfs_sdk::profiling::FuseOpSlot {
-    use agentfs_sdk::profiling::FuseOpSlot as Slot;
+/// `crate::profiling::FuseOpSlot`).
+fn fuse_op_slot(op: &ll::Operation<'_>) -> crate::profiling::FuseOpSlot {
+    use crate::profiling::FuseOpSlot as Slot;
     match op {
         ll::Operation::Lookup(_) => Slot::Lookup,
         ll::Operation::GetAttr(_) => Slot::GetAttr,
@@ -209,23 +209,15 @@ impl Request {
         let parsed = self.request();
         debug!("{}", parsed);
         let unique = parsed.unique();
-        let started = std::time::Instant::now();
         let op_slot = parsed.operation().ok().map(|op| fuse_op_slot(&op));
+        let _op_timer = op_slot.map(crate::profiling::fuse_op_timer);
 
         let res = match self.dispatch_req(shared, &parsed) {
             Ok(Some(resp)) => resp,
-            Ok(None) => {
-                if let Some(slot) = op_slot {
-                    agentfs_sdk::profiling::record_fuse_op(slot, started.elapsed());
-                }
-                return;
-            }
+            Ok(None) => return,
             Err(errno) => parsed.reply_err(errno),
         }
         .with_iovec(unique, |iov| self.ch.send(iov));
-        if let Some(slot) = op_slot {
-            agentfs_sdk::profiling::record_fuse_op(slot, started.elapsed());
-        }
 
         if let Err(err) = res {
             warn!("Request {unique:?}: Failed to send reply: {err}");

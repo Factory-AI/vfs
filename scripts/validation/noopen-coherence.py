@@ -199,7 +199,7 @@ def parse_workload_json(stdout: str) -> Optional[dict[str, Any]]:
 
 def parse_fuse_counters(output: str) -> Optional[dict[str, Any]]:
     for line in reversed(output.splitlines()):
-        if '"agentfs_profile_summary"' not in line or '"fuse_session"' not in line:
+        if '"agentfs_profile_summary"' not in line:
             continue
         start = line.find("{")
         if start < 0:
@@ -209,7 +209,7 @@ def parse_fuse_counters(output: str) -> Optional[dict[str, Any]]:
         except json.JSONDecodeError:
             continue
         counters = value.get("counters")
-        if isinstance(counters, dict):
+        if isinstance(counters, dict) and any(key.startswith("fuse_") for key in counters):
             return counters
     return None
 
