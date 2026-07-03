@@ -4,11 +4,14 @@
 //! A regular `git clone` through the mount pays ~9-11 FUSE round trips plus
 //! two SQLite transactions per worktree file. This command instead runs
 //! `git clone --no-checkout` through a temporary mount (pack files are a few
-//! large sequential writes), reads the worktree content out of the object
-//! database with `git ls-tree` + `git cat-file --batch`, bulk-imports it via
-//! `AgentFS::import_entries` (large multi-inode transactions), and fabricates
-//! a git index whose cached stat data matches exactly what the filesystem
-//! serves — so `git status` is clean without re-reading any content.
+//! large sequential writes), then streams the worktree content out of the
+//! object database: a producer thread parses `git ls-tree` + `git cat-file
+//! --batch` output while an [`agentfs_sdk::ImportSession`] consumer bulk
+//! imports each chunk (large multi-inode transactions), so blob decoding
+//! overlaps SQLite writes instead of buffering every blob in memory first.
+//! Finally it fabricates a git index whose cached stat data matches exactly
+//! what the filesystem serves — so `git status` is clean without re-reading
+//! any content.
 //!
 //! Invariants: all state lands in the single database file; nothing is
 //! written to the host filesystem. Limitations (v1): submodules are
@@ -136,35 +139,56 @@ async fn clone_into_mount(
 
     let rows = ls_tree(&repo_dir)?;
     stage("ls-tree");
-    let blobs = cat_file_batch(&repo_dir, &rows)?;
-    stage("cat-file-batch");
 
     let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
     let timestamp = (dur.as_secs() as i64, dur.subsec_nanos() as i64);
     let uid = unsafe { libc::geteuid() };
     let gid = unsafe { libc::getegid() };
 
-    let entries = build_import_entries(&rows, &blobs)?;
-    let bytes: u64 = entries.iter().map(|e| e.data.len() as u64).sum();
-
     use std::os::unix::fs::MetadataExt;
     let repo_meta = std::fs::metadata(&repo_dir).context("failed to stat repository root")?;
     let dest_parent = repo_meta.ino() as i64;
     let dev = repo_meta.dev();
 
-    let imported = agent
-        .import_entries(
+    let mut session = agent
+        .begin_import(
             dest_parent,
-            &entries,
-            &ImportOptions {
+            ImportOptions {
                 uid,
                 gid,
                 timestamp,
             },
         )
         .await
-        .context("bulk import failed")?;
-    stage("import-entries");
+        .context("failed to begin bulk import")?;
+
+    // All directories go in one up-front chunk so streamed file chunks may
+    // arrive in any order relative to each other.
+    session
+        .import_chunk(&dir_entries(&rows)?)
+        .await
+        .context("bulk import failed (directories)")?;
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<ImportEntry>>(4);
+    let producer = spawn_blob_producer(repo_dir.clone(), &rows, tx)?;
+
+    let mut import_err: Option<anyhow::Error> = None;
+    while let Some(chunk) = rx.recv().await {
+        if let Err(error) = session.import_chunk(&chunk).await {
+            import_err = Some(anyhow::Error::from(error));
+            break;
+        }
+    }
+    drop(rx); // unblocks the producer if the import bailed early
+    let produced = producer
+        .join()
+        .map_err(|_| anyhow::anyhow!("blob producer thread panicked"))?;
+    if let Some(error) = import_err {
+        return Err(error.context("bulk import failed"));
+    }
+    let bytes = produced?;
+    let imported = session.finish();
+    stage("stream-import");
 
     let index = build_index_v2(&rows, &imported, timestamp, uid, gid, dev)?;
     std::fs::write(repo_dir.join(".git").join("index"), index)
@@ -268,28 +292,69 @@ fn ls_tree(repo: &Path) -> Result<Vec<TreeRow>> {
     Ok(rows)
 }
 
-/// Fetch every unique blob via one `git cat-file --batch` process. A writer
-/// thread feeds requests so neither side blocks on a full pipe.
-fn cat_file_batch(repo: &Path, rows: &[TreeRow]) -> Result<HashMap<String, Vec<u8>>> {
-    let unique: Vec<String> = {
-        let mut seen = HashSet::new();
-        rows.iter()
-            .filter(|row| seen.insert(row.sha.as_str()))
-            .map(|row| row.sha.clone())
-            .collect()
-    };
+/// Synthesize one import entry per parent directory, first-seen order.
+/// `ls-tree -r` emits paths in index order, so parents always precede
+/// children. Also validates every row's tree entry mode so the streaming
+/// pipeline never starts for an unsupported repository.
+fn dir_entries(rows: &[TreeRow]) -> Result<Vec<ImportEntry>> {
+    let mut entries = Vec::new();
+    let mut known_dirs: HashSet<&str> = HashSet::new();
+
+    for row in rows {
+        match row.mode {
+            MODE_FILE | MODE_EXEC | MODE_SYMLINK => {}
+            // Tolerate historical non-canonical modes git itself normalizes.
+            other => bail!("unsupported tree entry mode {other:o} for {}", row.path),
+        }
+        let mut offset = 0;
+        while let Some(pos) = row.path[offset..].find('/') {
+            let dir = &row.path[..offset + pos];
+            if known_dirs.insert(dir) {
+                entries.push(ImportEntry {
+                    path: dir.to_string(),
+                    mode: S_IFDIR | 0o755,
+                    data: Vec::new(),
+                });
+            }
+            offset += pos + 1;
+        }
+    }
+    Ok(entries)
+}
+
+/// Producer half of the streaming import: fetch every unique blob via one
+/// `git cat-file --batch` process (a writer thread feeds requests so neither
+/// side blocks on a full pipe), fan each blob out to the tree rows that
+/// reference it, and send bounded chunks of import entries down `tx` as they
+/// accumulate. Returns the total content bytes emitted.
+fn spawn_blob_producer(
+    repo: std::path::PathBuf,
+    rows: &[TreeRow],
+    tx: tokio::sync::mpsc::Sender<Vec<ImportEntry>>,
+) -> Result<std::thread::JoinHandle<Result<u64>>> {
+    // sha -> (path, mode) fanout, plus unique shas in first-seen order.
+    let mut unique: Vec<String> = Vec::new();
+    let mut fanout: HashMap<String, Vec<(String, u32)>> = HashMap::new();
+    for row in rows {
+        let refs = fanout.entry(row.sha.clone()).or_insert_with(|| {
+            unique.push(row.sha.clone());
+            Vec::new()
+        });
+        refs.push((row.path.clone(), row.mode));
+    }
 
     let mut child = Command::new("git")
         .arg("-C")
-        .arg(repo)
+        .arg(&repo)
         .args(["cat-file", "--batch"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .context("failed to spawn git cat-file --batch")?;
-
     let mut stdin = child.stdin.take().context("missing cat-file stdin")?;
+    let stdout = child.stdout.take().context("missing cat-file stdout")?;
+
     let requests = unique.clone();
     let writer = std::thread::spawn(move || -> std::io::Result<()> {
         for sha in &requests {
@@ -299,15 +364,49 @@ fn cat_file_batch(repo: &Path, rows: &[TreeRow]) -> Result<HashMap<String, Vec<u
         Ok(())
     });
 
-    let mut blobs = HashMap::with_capacity(unique.len());
-    let mut stdout = BufReader::new(child.stdout.take().context("missing cat-file stdout")?);
-    for sha in &unique {
+    let handle = std::thread::spawn(move || -> Result<u64> {
+        let streamed = stream_blobs(&unique, &mut fanout, stdout, &tx);
+        if streamed.is_err() {
+            // Consumer went away or the stream broke; don't leave a git
+            // process wedged on a dead pipe.
+            let _ = child.kill();
+        }
+        let writer_result = writer
+            .join()
+            .map_err(|_| anyhow::anyhow!("cat-file writer thread panicked"));
+        let status = child.wait()?;
+        let bytes = streamed?;
+        writer_result??;
+        if !status.success() {
+            bail!("git cat-file --batch failed with {status}");
+        }
+        Ok(bytes)
+    });
+    Ok(handle)
+}
+
+/// Parse `cat-file --batch` output blob by blob, emitting bounded chunks.
+fn stream_blobs(
+    unique: &[String],
+    fanout: &mut HashMap<String, Vec<(String, u32)>>,
+    stdout: std::process::ChildStdout,
+    tx: &tokio::sync::mpsc::Sender<Vec<ImportEntry>>,
+) -> Result<u64> {
+    const CHUNK_BYTES: usize = 4 * 1024 * 1024;
+    const CHUNK_ENTRIES: usize = 512;
+
+    let mut stdout = BufReader::new(stdout);
+    let mut chunk: Vec<ImportEntry> = Vec::new();
+    let mut chunk_bytes = 0usize;
+    let mut total_bytes = 0u64;
+
+    for sha in unique {
         let mut header = String::new();
         stdout.read_line(&mut header)?;
         let mut fields = header.trim_end().split(' ');
         let echoed = fields.next().unwrap_or_default();
         let kind = fields.next().unwrap_or_default();
-        if kind == "missing" || echoed != sha {
+        if kind == "missing" || echoed != sha.as_str() {
             bail!("git cat-file returned unexpected header for {sha}: {header}");
         }
         let size: usize = fields
@@ -319,59 +418,32 @@ fn cat_file_batch(repo: &Path, rows: &[TreeRow]) -> Result<HashMap<String, Vec<u
         stdout.read_exact(&mut data)?;
         let mut newline = [0u8; 1];
         stdout.read_exact(&mut newline)?;
-        blobs.insert(sha.clone(), data);
-    }
 
-    writer
-        .join()
-        .map_err(|_| anyhow::anyhow!("cat-file writer thread panicked"))??;
-    let status = child.wait()?;
-    if !status.success() {
-        bail!("git cat-file --batch failed with {status}");
-    }
-    Ok(blobs)
-}
-
-/// Expand tree rows into import entries, synthesizing each parent directory
-/// the first time it is seen. `ls-tree -r` emits paths in index order, so
-/// parents always precede children.
-fn build_import_entries(
-    rows: &[TreeRow],
-    blobs: &HashMap<String, Vec<u8>>,
-) -> Result<Vec<ImportEntry>> {
-    let mut entries = Vec::with_capacity(rows.len());
-    let mut known_dirs: HashSet<String> = HashSet::new();
-
-    for row in rows {
-        let mut offset = 0;
-        while let Some(pos) = row.path[offset..].find('/') {
-            let dir = &row.path[..offset + pos];
-            if known_dirs.insert(dir.to_string()) {
-                entries.push(ImportEntry {
-                    path: dir.to_string(),
-                    mode: S_IFDIR | 0o755,
-                    data: Vec::new(),
-                });
+        let refs = fanout
+            .remove(sha.as_str())
+            .with_context(|| format!("no tree rows reference blob {sha}"))?;
+        let last = refs.len() - 1;
+        for (index, (path, mode)) in refs.into_iter().enumerate() {
+            let data = if index == last {
+                std::mem::take(&mut data)
+            } else {
+                data.clone()
+            };
+            total_bytes += data.len() as u64;
+            chunk_bytes += data.len();
+            chunk.push(ImportEntry { path, mode, data });
+            if chunk_bytes >= CHUNK_BYTES || chunk.len() >= CHUNK_ENTRIES {
+                tx.blocking_send(std::mem::take(&mut chunk))
+                    .map_err(|_| anyhow::anyhow!("import consumer stopped"))?;
+                chunk_bytes = 0;
             }
-            offset += pos + 1;
         }
-
-        let data = blobs
-            .get(&row.sha)
-            .with_context(|| format!("missing blob {} for {}", row.sha, row.path))?
-            .clone();
-        let mode = match row.mode {
-            MODE_FILE | MODE_EXEC | MODE_SYMLINK => row.mode,
-            // Tolerate historical non-canonical modes git itself normalizes.
-            other => bail!("unsupported tree entry mode {other:o} for {}", row.path),
-        };
-        entries.push(ImportEntry {
-            path: row.path.clone(),
-            mode,
-            data,
-        });
     }
-    Ok(entries)
+    if !chunk.is_empty() {
+        tx.blocking_send(chunk)
+            .map_err(|_| anyhow::anyhow!("import consumer stopped"))?;
+    }
+    Ok(total_bytes)
 }
 
 /// Serialize a git index (version 2) whose cached stat data matches exactly

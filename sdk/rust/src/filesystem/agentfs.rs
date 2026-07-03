@@ -1505,6 +1505,47 @@ pub struct ImportOptions {
     pub timestamp: (i64, i64),
 }
 
+/// A streaming bulk import started by [`AgentFS::begin_import`]. Holds one
+/// pooled connection plus the directory-path -> ino map across
+/// [`ImportSession::import_chunk`] calls, so a producer can feed entries as
+/// they become available (e.g. as `git cat-file --batch` emits blobs)
+/// instead of buffering the whole tree in memory. The ordering contract
+/// matches [`AgentFS::import_entries`]: every parent directory must appear
+/// in some chunk before (or in the same chunk as) its children.
+pub struct ImportSession {
+    fs: AgentFS,
+    conn: crate::connection_pool::PooledConnection,
+    dest_parent: i64,
+    opts: ImportOptions,
+    dir_inos: HashMap<String, i64>,
+    results: Vec<ImportedEntry>,
+}
+
+impl ImportSession {
+    /// Import one batch of entries. Parent directories imported by earlier
+    /// chunks (or earlier in this chunk) resolve normally; a parent that has
+    /// never been imported yields `FsError::NotFound`.
+    pub async fn import_chunk(&mut self, entries: &[ImportEntry]) -> Result<()> {
+        self.fs
+            .import_chunk_with_conn(
+                &self.conn,
+                self.dest_parent,
+                &self.opts,
+                &mut self.dir_inos,
+                &mut self.results,
+                entries,
+            )
+            .await
+    }
+
+    /// Finish the import and return one [`ImportedEntry`] per imported node,
+    /// in the order the entries were fed.
+    pub fn finish(self) -> Vec<ImportedEntry> {
+        self.fs.invalidate_attr(self.dest_parent);
+        self.results
+    }
+}
+
 /// A filesystem backed by SQLite
 #[derive(Clone)]
 pub struct AgentFS {
@@ -3532,11 +3573,46 @@ impl AgentFS {
         entries: &[ImportEntry],
         opts: &ImportOptions,
     ) -> Result<Vec<ImportedEntry>> {
+        let mut session = self.begin_import(dest_parent, opts.clone()).await?;
+        session.import_chunk(entries).await?;
+        Ok(session.finish())
+    }
+
+    /// Begin a streaming bulk import under `dest_parent`; see
+    /// [`ImportSession`]. [`AgentFS::import_entries`] is the buffered
+    /// one-shot form.
+    pub async fn begin_import(
+        &self,
+        dest_parent: i64,
+        opts: ImportOptions,
+    ) -> Result<ImportSession> {
+        Ok(ImportSession {
+            fs: self.clone(),
+            conn: self.pool.get_connection().await?,
+            dest_parent,
+            opts,
+            dir_inos: HashMap::new(),
+            results: Vec::new(),
+        })
+    }
+
+    /// One chunk of a streaming import. `conn`, `dir_inos`, and `results`
+    /// persist across calls so later chunks may reference directories
+    /// imported by earlier ones; each call still splits its entries into
+    /// bounded transactions.
+    async fn import_chunk_with_conn(
+        &self,
+        conn: &crate::connection_pool::PooledConnection,
+        dest_parent: i64,
+        opts: &ImportOptions,
+        dir_inos: &mut HashMap<String, i64>,
+        results: &mut Vec<ImportedEntry>,
+        entries: &[ImportEntry],
+    ) -> Result<()> {
         let max_inodes = env_usize(WRITE_BATCHER_TXN_INODES_ENV, 1024).max(1);
         let max_bytes = env_usize(WRITE_BATCHER_TXN_BYTES_ENV, 32 * 1024 * 1024).max(1);
         let (ts_secs, ts_nsec) = opts.timestamp;
 
-        let conn = self.pool.get_connection().await?;
         let mut inode_stmt = conn
             .prepare_cached(
                 "INSERT INTO fs_inode (mode, nlink, uid, gid, size, atime, mtime, ctime, atime_nsec, mtime_nsec, ctime_nsec, data_inline, storage_kind)
@@ -3558,8 +3634,7 @@ impl AgentFS {
             )
             .await?;
 
-        let mut dir_inos: HashMap<String, i64> = HashMap::new();
-        let mut results: Vec<ImportedEntry> = Vec::with_capacity(entries.len());
+        results.reserve(entries.len());
 
         let mut idx = 0usize;
         while idx < entries.len() {
@@ -3723,8 +3798,7 @@ impl AgentFS {
             idx = batch_end;
         }
 
-        self.invalidate_attr(dest_parent);
-        Ok(results)
+        Ok(())
     }
 
     /// Create a directory
@@ -9229,18 +9303,18 @@ mod tests {
             .create_file("/escape.bin", DEFAULT_FILE_MODE, 0, 0)
             .await?;
 
-        let pre = crate::profiling::snapshot();
-        let pre_enq = pre.agentfs_batcher_enqueues;
-
         file.pwrite(0, b"hello world").await?;
+        // Per-inode check rather than the global enqueue counter: parallel
+        // tests share the profiling globals, so counter deltas race.
+        let escape_ino = fs.resolve_path("/escape.bin").await?.unwrap();
+        if let Some(batcher) = &fs.write_batcher {
+            assert!(
+                !batcher.has_pending(escape_ino),
+                "with overlay_reads=false, pwrite must not enqueue"
+            );
+        }
         let got = file.pread(0, 11).await?;
         assert_eq!(&got, b"hello world");
-
-        let post = crate::profiling::snapshot();
-        assert_eq!(
-            post.agentfs_batcher_enqueues, pre_enq,
-            "with overlay_reads=false, pwrite must not enqueue"
-        );
 
         // And the file is durably in SQLite without an explicit fsync —
         // the Tier 3 contract.

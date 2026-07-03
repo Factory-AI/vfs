@@ -11,7 +11,9 @@ use std::sync::Arc;
 use thiserror::Error;
 
 // Re-export implementations
-pub use agentfs::{keepcache_delta_enabled, AgentFS, ImportEntry, ImportOptions, ImportedEntry};
+pub use agentfs::{
+    keepcache_delta_enabled, AgentFS, ImportEntry, ImportOptions, ImportSession, ImportedEntry,
+};
 #[cfg(target_os = "macos")]
 pub use hostfs_darwin::HostFS;
 #[cfg(target_os = "linux")]

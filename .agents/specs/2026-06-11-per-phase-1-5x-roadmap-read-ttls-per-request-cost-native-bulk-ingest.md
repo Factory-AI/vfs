@@ -32,7 +32,7 @@ until re-verified against codex.
 
 | Phase | noopen off | Default (WS9) | +uring (opt-in) | Target |
 |---|---|---|---|---|
-| clone (plain FUSE) | 9.63x (3.63s) | 9.48x (3.25s) | 8.81x (3.14s) | ≤1.5x miss; `agentfs clone` 2.58x (07-03 remeasure); floor = whole-state double write (pack+worktree 2x43MB into SQLite); pipelining reaches ~2.0x, not 1.5x |
+| clone (plain FUSE) | 9.63x (3.63s) | 9.48x (3.25s) | 8.81x (3.14s) | ≤1.5x miss; `agentfs clone` 2.22x (07-03, streamed ImportSession pipeline: cat-file hidden under import); floor = whole-state double write (pack+worktree 2x43MB into SQLite); 1.5x unreachable in userspace |
 | checkout | 0.49x | **0.42x** ✓ | 0.42x ✓ | hold |
 | status | 1.10x | **0.93x** ✓ | 0.60x ✓ | ≤1.5x **MET** |
 | read_search | 1.87x | **1.41x** ✓ (p25 1.24, p75 1.63) | 1.37x ✓ | ≤1.5x **MET** |
