@@ -76,9 +76,13 @@ validate_positive_integer PANIC_CENSUS_CYCLES "$CYCLES"
 validate_positive_integer PANIC_CENSUS_TEARDOWN_TIMEOUT "$TEARDOWN_TIMEOUT"
 
 if [ -z "$AGENTFS_BIN" ]; then
-    cargo build --quiet --manifest-path "$CARGO_MANIFEST" >/dev/null 2>&1 ||
+    cargo +nightly build --quiet --manifest-path "$CARGO_MANIFEST" >/dev/null 2>&1 ||
         fail "failed to build agentfs CLI"
-    AGENTFS_BIN="$CLI_DIR/target/debug/agentfs"
+    TARGET_DIR="$(
+        cargo +nightly metadata --format-version 1 --no-deps --manifest-path "$CARGO_MANIFEST" |
+            python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])'
+    )" || fail "failed to resolve cargo target directory"
+    AGENTFS_BIN="$TARGET_DIR/debug/agentfs"
 fi
 
 if [ ! -x "$AGENTFS_BIN" ]; then

@@ -35,12 +35,18 @@ const STORAGE_INLINE: i64 = 1;
 const DENTRY_CACHE_MAX_SIZE: usize = 10000;
 const NEGATIVE_DENTRY_CACHE_MAX_SIZE: usize = 10000;
 const FILE_BACKED_MAX_CONNECTIONS: usize = 8;
+const TEMP_STORE_MEMORY_SQL: &str = "PRAGMA temp_store = MEMORY";
 const BUSY_TIMEOUT_SQL: &str = "PRAGMA busy_timeout = 5000";
 const WAL_MODE_SQL: &str = "PRAGMA journal_mode = WAL";
 const BASELINE_SYNCHRONOUS_SQL: &str = "PRAGMA synchronous = NORMAL";
 const DURABLE_SYNCHRONOUS_SQL: &str = "PRAGMA synchronous = FULL";
 const WAL_CHECKPOINT_SQL: &str = "PRAGMA wal_checkpoint(TRUNCATE)";
-const FILE_BACKED_SETUP_SQL: &[&str] = &[BUSY_TIMEOUT_SQL, WAL_MODE_SQL, BASELINE_SYNCHRONOUS_SQL];
+const FILE_BACKED_SETUP_SQL: &[&str] = &[
+    TEMP_STORE_MEMORY_SQL,
+    BUSY_TIMEOUT_SQL,
+    WAL_MODE_SQL,
+    BASELINE_SYNCHRONOUS_SQL,
+];
 const ATTR_CACHE_MAX_SIZE: usize = 10000;
 const WRITE_BATCHER_ENABLE_ENV: &str = "AGENTFS_FUSE_WRITEBACK";
 const WRITE_BATCHER_MS_ENV: &str = "AGENTFS_BATCH_MS";
@@ -7951,6 +7957,7 @@ mod tests {
                 TURSO_OBSERVED_SYNCHRONOUS_NORMAL
             );
             assert_eq!(read_pragma_i64(conn, "PRAGMA busy_timeout").await, 5000);
+            assert_eq!(read_pragma_i64(conn, "PRAGMA temp_store").await, 2);
             assert_eq!(
                 read_pragma_text(conn, "PRAGMA journal_mode")
                     .await
@@ -7967,7 +7974,8 @@ mod tests {
         let options = file_backed_connection_pool_options();
 
         assert_eq!(options.max_connections, FILE_BACKED_MAX_CONNECTIONS);
-        assert_eq!(options.setup_sql[0], BUSY_TIMEOUT_SQL);
+        assert_eq!(options.setup_sql[0], TEMP_STORE_MEMORY_SQL);
+        assert!(options.setup_sql.iter().any(|sql| sql == BUSY_TIMEOUT_SQL));
         assert!(options.setup_sql.iter().any(|sql| sql == WAL_MODE_SQL));
         assert!(options
             .setup_sql
