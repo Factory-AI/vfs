@@ -5,11 +5,7 @@
 //! interface is versioned and capabilities are exchanged during the initialization (mounting)
 //! of a filesystem.
 //!
-//! OSXFUSE (macOS): <https://github.com/osxfuse/fuse/blob/master/include/fuse_kernel.h>
-//! - supports ABI 7.8 in OSXFUSE 2.x
-//! - supports ABI 7.19 since OSXFUSE 3.0.0
-//!
-//! libfuse (Linux/BSD): <https://github.com/libfuse/libfuse/blob/master/include/fuse_kernel.h>
+//! libfuse (Linux): <https://github.com/libfuse/libfuse/blob/master/include/fuse_kernel.h>
 //! - supports ABI 7.8 since FUSE 2.6.0
 //! - supports ABI 7.12 since FUSE 2.8.0
 //! - supports ABI 7.18 since FUSE 2.9.0
@@ -45,20 +41,14 @@ pub struct fuse_attr {
     // NOTE: this field is defined as u64 in fuse_kernel.h in libfuse. However, it is treated as signed
     // to match stat.st_ctime
     pub ctime: i64,
-    #[cfg(target_os = "macos")]
-    pub crtime: u64,
     pub atimensec: u32,
     pub mtimensec: u32,
     pub ctimensec: u32,
-    #[cfg(target_os = "macos")]
-    pub crtimensec: u32,
     pub mode: u32,
     pub nlink: u32,
     pub uid: u32,
     pub gid: u32,
     pub rdev: u32,
-    #[cfg(target_os = "macos")]
-    pub flags: u32, // see chflags(2)
     pub blksize: u32,
     pub padding: u32,
 }
@@ -102,15 +92,6 @@ pub mod consts {
     pub const FATTR_LOCKOWNER: u32 = 1 << 9;
     pub const FATTR_CTIME: u32 = 1 << 10;
 
-    #[cfg(target_os = "macos")]
-    pub const FATTR_CRTIME: u32 = 1 << 28;
-    #[cfg(target_os = "macos")]
-    pub const FATTR_CHGTIME: u32 = 1 << 29;
-    #[cfg(target_os = "macos")]
-    pub const FATTR_BKUPTIME: u32 = 1 << 30;
-    #[cfg(target_os = "macos")]
-    pub const FATTR_FLAGS: u32 = 1 << 31;
-
     // Flags returned by the open request
     pub const FOPEN_DIRECT_IO: u32 = 1 << 0; // bypass page cache for this open file
     pub const FOPEN_KEEP_CACHE: u32 = 1 << 1; // don't invalidate the data cache on open
@@ -128,7 +109,7 @@ pub mod consts {
     pub const FUSE_SPLICE_WRITE: u64 = 1 << 7; // kernel supports splice write on the device
     pub const FUSE_SPLICE_MOVE: u64 = 1 << 8; // kernel supports splice move on the device
     pub const FUSE_SPLICE_READ: u64 = 1 << 9; // kernel supports splice read on the device
-    pub const FUSE_FLOCK_LOCKS: u64 = 1 << 10; // remote locking for BSD style file locks
+    pub const FUSE_FLOCK_LOCKS: u64 = 1 << 10; // remote locking for flock-style file locks
     pub const FUSE_HAS_IOCTL_DIR: u64 = 1 << 11; // kernel supports ioctl on directories
     pub const FUSE_AUTO_INVAL_DATA: u64 = 1 << 12; // automatically invalidate cached pages
     pub const FUSE_DO_READDIRPLUS: u64 = 1 << 13; // do READDIRPLUS (READDIR+LOOKUP in one)
@@ -234,22 +215,12 @@ pub enum fuse_opcode {
     FUSE_DESTROY = 38,
     FUSE_IOCTL = 39,
     FUSE_POLL = 40,
-    FUSE_NOTIFY_REPLY = 41,
     FUSE_BATCH_FORGET = 42,
     FUSE_FALLOCATE = 43,
     FUSE_READDIRPLUS = 44,
     FUSE_RENAME2 = 45,
     FUSE_LSEEK = 46,
     FUSE_COPY_FILE_RANGE = 47,
-
-    #[cfg(target_os = "macos")]
-    FUSE_SETVOLNAME = 61,
-    #[cfg(target_os = "macos")]
-    FUSE_GETXTIMES = 62,
-    #[cfg(target_os = "macos")]
-    FUSE_EXCHANGE = 63,
-
-    CUSE_INIT = 4096,
 }
 
 impl TryFrom<u32> for fuse_opcode {
@@ -295,23 +266,12 @@ impl TryFrom<u32> for fuse_opcode {
             38 => Ok(fuse_opcode::FUSE_DESTROY),
             39 => Ok(fuse_opcode::FUSE_IOCTL),
             40 => Ok(fuse_opcode::FUSE_POLL),
-            41 => Ok(fuse_opcode::FUSE_NOTIFY_REPLY),
             42 => Ok(fuse_opcode::FUSE_BATCH_FORGET),
             43 => Ok(fuse_opcode::FUSE_FALLOCATE),
             44 => Ok(fuse_opcode::FUSE_READDIRPLUS),
             45 => Ok(fuse_opcode::FUSE_RENAME2),
             46 => Ok(fuse_opcode::FUSE_LSEEK),
             47 => Ok(fuse_opcode::FUSE_COPY_FILE_RANGE),
-
-            #[cfg(target_os = "macos")]
-            61 => Ok(fuse_opcode::FUSE_SETVOLNAME),
-            #[cfg(target_os = "macos")]
-            62 => Ok(fuse_opcode::FUSE_GETXTIMES),
-            #[cfg(target_os = "macos")]
-            63 => Ok(fuse_opcode::FUSE_EXCHANGE),
-
-            4096 => Ok(fuse_opcode::CUSE_INIT),
-
             _ => Err(InvalidOpcodeError),
         }
     }
@@ -399,16 +359,6 @@ pub struct fuse_attr_out {
     pub attr: fuse_attr,
 }
 
-#[cfg(target_os = "macos")]
-#[repr(C)]
-#[derive(Debug, IntoBytes, KnownLayout, Immutable)]
-pub struct fuse_getxtimes_out {
-    pub bkuptime: u64,
-    pub crtime: u64,
-    pub bkuptimensec: u32,
-    pub crtimensec: u32,
-}
-
 #[repr(C)]
 #[derive(Debug, FromBytes, KnownLayout, Immutable)]
 pub struct fuse_mknod_in {
@@ -429,10 +379,6 @@ pub struct fuse_mkdir_in {
 #[derive(Debug, FromBytes, KnownLayout, Immutable)]
 pub struct fuse_rename_in {
     pub newdir: u64,
-    #[cfg(feature = "macfuse-4-compat")]
-    pub flags: u32,
-    #[cfg(feature = "macfuse-4-compat")]
-    pub padding: u32,
 }
 
 #[repr(C)]
@@ -441,15 +387,6 @@ pub struct fuse_rename2_in {
     pub newdir: u64,
     pub flags: u32,
     pub padding: u32,
-}
-
-#[cfg(target_os = "macos")]
-#[repr(C)]
-#[derive(Debug, FromBytes, KnownLayout, Immutable)]
-pub struct fuse_exchange_in {
-    pub olddir: u64,
-    pub newdir: u64,
-    pub options: u64,
 }
 
 #[repr(C)]
@@ -483,20 +420,6 @@ pub struct fuse_setattr_in {
     pub uid: u32,
     pub gid: u32,
     pub unused5: u32,
-    #[cfg(target_os = "macos")]
-    pub bkuptime: u64,
-    #[cfg(target_os = "macos")]
-    pub chgtime: u64,
-    #[cfg(target_os = "macos")]
-    pub crtime: u64,
-    #[cfg(target_os = "macos")]
-    pub bkuptimensec: u32,
-    #[cfg(target_os = "macos")]
-    pub chgtimensec: u32,
-    #[cfg(target_os = "macos")]
-    pub crtimensec: u32,
-    #[cfg(target_os = "macos")]
-    pub flags: u32, // see chflags(2)
 }
 
 impl fuse_setattr_in {
@@ -621,10 +544,6 @@ pub struct fuse_setxattr_in {
     // NOTE: this field is defined as u32 in fuse_kernel.h in libfuse. However, it is then cast
     // to an i32 when invoking the filesystem's setxattr method
     pub flags: i32,
-    #[cfg(target_os = "macos")]
-    pub position: u32,
-    #[cfg(target_os = "macos")]
-    pub padding: u32,
 }
 
 #[repr(C)]
@@ -632,10 +551,6 @@ pub struct fuse_setxattr_in {
 pub struct fuse_getxattr_in {
     pub size: u32,
     pub padding: u32,
-    #[cfg(target_os = "macos")]
-    pub position: u32,
-    #[cfg(target_os = "macos")]
-    pub padding2: u32,
 }
 
 #[repr(C)]
@@ -700,29 +615,6 @@ pub struct fuse_init_out {
 
 #[repr(C)]
 #[derive(Debug, FromBytes, KnownLayout, Immutable)]
-pub struct cuse_init_in {
-    pub major: u32,
-    pub minor: u32,
-    pub unused: u32,
-    pub flags: u32,
-}
-
-#[repr(C)]
-#[derive(Debug, KnownLayout, Immutable)]
-pub struct cuse_init_out {
-    pub major: u32,
-    pub minor: u32,
-    pub unused: u32,
-    pub flags: u32,
-    pub max_read: u32,
-    pub max_write: u32,
-    pub dev_major: u32, // chardev major
-    pub dev_minor: u32, // chardev minor
-    pub spare: [u32; 10],
-}
-
-#[repr(C)]
-#[derive(Debug, FromBytes, KnownLayout, Immutable)]
 pub struct fuse_interrupt_in {
     pub unique: u64,
 }
@@ -753,13 +645,6 @@ pub struct fuse_ioctl_in {
 }
 
 #[repr(C)]
-#[derive(Debug, KnownLayout, Immutable)]
-pub struct fuse_ioctl_iovec {
-    pub base: u64,
-    pub len: u64,
-}
-
-#[repr(C)]
 #[derive(Debug, IntoBytes, KnownLayout, Immutable)]
 pub struct fuse_ioctl_out {
     pub result: i32,
@@ -782,12 +667,6 @@ pub struct fuse_poll_in {
 pub struct fuse_poll_out {
     pub revents: u32,
     pub padding: u32,
-}
-
-#[repr(C)]
-#[derive(Debug, IntoBytes, KnownLayout, Immutable)]
-pub struct fuse_notify_poll_wakeup_out {
-    pub kh: u64,
 }
 
 #[repr(C)]
@@ -859,46 +738,6 @@ pub struct fuse_notify_inval_entry_out {
 }
 
 #[repr(C)]
-#[derive(Debug, IntoBytes, KnownLayout, Immutable)]
-pub struct fuse_notify_delete_out {
-    pub parent: u64,
-    pub child: u64,
-    pub namelen: u32,
-    pub padding: u32,
-}
-
-#[repr(C)]
-#[derive(Debug, IntoBytes, KnownLayout, Immutable)]
-pub struct fuse_notify_store_out {
-    pub nodeid: u64,
-    pub offset: u64,
-    pub size: u32,
-    pub padding: u32,
-}
-
-#[repr(C)]
-#[derive(Debug, KnownLayout, Immutable)]
-pub struct fuse_notify_retrieve_out {
-    pub notify_unique: u64,
-    pub nodeid: u64,
-    pub offset: u64,
-    pub size: u32,
-    pub padding: u32,
-}
-
-#[repr(C)]
-#[derive(Debug, FromBytes, KnownLayout, Immutable)]
-pub struct fuse_notify_retrieve_in {
-    // matches the size of fuse_write_in
-    pub dummy1: u64,
-    pub offset: u64,
-    pub size: u32,
-    pub dummy2: u32,
-    pub dummy3: u64,
-    pub dummy4: u64,
-}
-
-#[repr(C)]
 #[derive(Debug, FromBytes, KnownLayout, Immutable)]
 pub struct fuse_lseek_in {
     pub fh: u64,
@@ -926,49 +765,4 @@ pub struct fuse_copy_file_range_in {
     pub off_out: i64,
     pub len: u64,
     pub flags: u64,
-}
-
-// FUSE-over-io-uring (ABI 7.42). Mirrors the uapi in <linux/fuse.h>. The header
-// (in_out + op_in + ring_ent_in_out) lives in a page-aligned per-entry buffer
-// the kernel reads requests into / we write replies into; the variable payload
-// lives in a separate per-entry buffer. See cli/src/fuser/uring.rs.
-pub const FUSE_URING_IN_OUT_HEADER_SZ: usize = 128;
-pub const FUSE_URING_OP_IN_OUT_SZ: usize = 128;
-
-// Subcommands carried in the SQE cmd_op field.
-pub const FUSE_IO_URING_CMD_REGISTER: u32 = 1;
-pub const FUSE_IO_URING_CMD_COMMIT_AND_FETCH: u32 = 2;
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
-pub struct fuse_uring_ent_in_out {
-    pub flags: u64,
-    /// commit ID to be used in a reply to a ring request
-    pub commit_id: u64,
-    /// size of user payload buffer
-    pub payload_sz: u32,
-    pub padding: u32,
-    pub reserved: u64,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
-pub struct fuse_uring_req_header {
-    /// struct fuse_in_header / struct fuse_out_header
-    pub in_out: [u8; FUSE_URING_IN_OUT_HEADER_SZ],
-    /// per-opcode header
-    pub op_in: [u8; FUSE_URING_OP_IN_OUT_SZ],
-    pub ring_ent_in_out: fuse_uring_ent_in_out,
-}
-
-/// In the 80B command area of the SQE.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
-pub struct fuse_uring_cmd_req {
-    pub flags: u64,
-    /// entry identifier for commits
-    pub commit_id: u64,
-    /// queue the command is for (queue index)
-    pub qid: u16,
-    pub padding: [u8; 6],
 }

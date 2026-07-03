@@ -54,7 +54,6 @@ const IORING_SETUP_SQE128: u32 = 1 << 10;
 const IORING_FEAT_SINGLE_MMAP: u32 = 1 << 0;
 
 const IORING_OFF_SQ_RING: i64 = 0;
-const IORING_OFF_CQ_RING: i64 = 0x800_0000;
 const IORING_OFF_SQES: i64 = 0x1000_0000;
 
 const IORING_ENTER_GETEVENTS: u32 = 1;
@@ -111,12 +110,11 @@ struct IoUringParams {
 const FUSE_IO_URING_CMD_REGISTER: u32 = 1;
 const FUSE_IO_URING_CMD_COMMIT_AND_FETCH: u32 = 2;
 
-/// `fuse_uring_req_header` layout: 128B in_out (fuse_in/out_header), 128B
-/// op_in (first request argument), 32B `fuse_uring_ent_in_out`.
+/// Header layout: 128B in_out (fuse_in/out_header), 128B op_in
+/// (first request argument), 32B ring-entry metadata.
 const HDR_IN_OUT_OFFSET: usize = 0;
 const HDR_OP_IN_OFFSET: usize = 128;
 const HDR_ENT_OFFSET: usize = 256;
-const HDR_STRUCT_SIZE: usize = 288;
 /// The kernel copies the first request argument into the 128-byte op_in area
 /// without bounds-checking against it (names up to 255 bytes overflow into
 /// and past `ent_in_out`). Oversize the header buffer so the overflow stays
@@ -216,7 +214,6 @@ struct RawRing {
     sq_ring_size: usize,
     sqes_ptr: *mut u8,
     sqes_size: usize,
-    sq_khead: *const AtomicU32,
     sq_ktail: *const AtomicU32,
     sq_mask: u32,
     sq_array: *mut u32,
@@ -268,7 +265,6 @@ impl RawRing {
 
         let at = |off: u32| unsafe { sq_ring_ptr.add(off as usize) };
         let ring = RawRing {
-            sq_khead: at(params.sq_off.head).cast::<AtomicU32>(),
             sq_ktail: at(params.sq_off.tail).cast::<AtomicU32>(),
             sq_mask: unsafe { *at(params.sq_off.ring_mask).cast::<u32>() },
             sq_array: at(params.sq_off.array).cast::<u32>(),
@@ -376,7 +372,7 @@ fn enter(ring_fd: RawFd, to_submit: u32, min_complete: u32) -> io::Result<()> {
     }
 }
 
-/// Build the 128-byte uring_cmd SQE carrying `struct fuse_uring_cmd_req`.
+/// Build the 128-byte uring_cmd SQE carrying the FUSE uring command request.
 fn build_cmd_sqe(
     dev_fd: RawFd,
     cmd_op: u32,
@@ -393,7 +389,7 @@ fn build_cmd_sqe(
     sqe[16..24].copy_from_slice(&addr.to_le_bytes());
     sqe[24..28].copy_from_slice(&len.to_le_bytes());
     sqe[32..40].copy_from_slice(&user_data.to_le_bytes());
-    // struct fuse_uring_cmd_req in the 80-byte SQE128 command area.
+    // FUSE uring command request in the 80-byte SQE128 command area.
     sqe[48..56].copy_from_slice(&0u64.to_le_bytes()); // flags
     sqe[56..64].copy_from_slice(&commit_id.to_le_bytes());
     sqe[64..66].copy_from_slice(&qid.to_le_bytes());

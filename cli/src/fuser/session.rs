@@ -11,28 +11,27 @@ use nix::unistd::geteuid;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     Arc, Mutex,
 };
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::Instant;
 
 use std::sync::mpsc;
 
 use super::deferred_notify::{DeferredNotifier, NotifyOp};
 use super::ll::fuse_abi as abi;
-use super::request::{AlignedRequestBuf, Request, ScheduleClass, ScheduleKey};
+use super::notify::Notifier;
+use super::request::{AlignedRequestBuf, Request, ScheduleClass};
 use super::Filesystem;
 use super::MountOption;
 use super::{channel::Channel, mnt::Mount};
-use super::{channel::ChannelSender, notify::Notifier};
 
 /// The max size of write requests from the kernel. The absolute minimum is 4k,
-/// FUSE recommends at least 128k, max 16M. The FUSE default is 16M on macOS
-/// and 128k on other systems.
+/// FUSE recommends at least 128k, max 16M. Linux defaults to 128k.
 pub const MAX_WRITE_SIZE: usize = 16 * 1024 * 1024;
 
 /// Size of the buffer for reading a request from the kernel. Since the kernel may send
@@ -405,22 +404,6 @@ impl<FS: Filesystem> Session<FS> {
         })
     }
 
-    /// Wrap an existing /dev/fuse file descriptor. This doesn't mount the
-    /// filesystem anywhere; that must be done separately.
-    pub fn from_fd(filesystem: FS, fd: OwnedFd, acl: SessionACL) -> Self {
-        let ch = Channel::new(Arc::new(fd.into()));
-        let (notify_tx, notify_rx) = mpsc::channel();
-        Session {
-            shared: Arc::new(SessionShared::new(filesystem, acl, geteuid().as_raw())),
-            ch,
-            mount: Arc::new(Mutex::new(None)),
-            notify_tx: Some(notify_tx),
-            notify_rx: Some(notify_rx),
-            #[cfg(target_os = "linux")]
-            uring_control: super::uring::UringQueueControl::new(),
-        }
-    }
-
     /// Run the session loop that receives kernel requests and dispatches them to method
     /// calls into the filesystem. This read-dispatch-loop is non-concurrent to prevent
     /// having multiple buffers (which take up much memory), but the filesystem methods
@@ -637,11 +620,6 @@ impl<FS: Filesystem> Session<FS> {
         Ok(())
     }
 
-    /// Unmount the filesystem
-    pub fn unmount(&mut self) {
-        drop(std::mem::take(&mut *self.mount.lock().unwrap()));
-    }
-
     /// Returns a thread-safe object that can be used to unmount the Filesystem
     pub fn unmount_callable(&mut self) -> SessionUnmounter {
         SessionUnmounter {
@@ -708,13 +686,6 @@ fn aligned_sub_buf(buf: &mut [u8], alignment: usize) -> &mut [u8] {
     }
 }
 
-impl<FS: 'static + Filesystem + Send> Session<FS> {
-    /// Run the session loop in a background thread
-    pub fn spawn(self) -> io::Result<BackgroundSession> {
-        BackgroundSession::new(self)
-    }
-}
-
 impl<FS: Filesystem> Drop for Session<FS> {
     fn drop(&mut self) {
         if !self.shared.is_destroyed() {
@@ -725,77 +696,5 @@ impl<FS: Filesystem> Drop for Session<FS> {
         if let Some((mountpoint, _mount)) = std::mem::take(&mut *self.mount.lock().unwrap()) {
             debug!("unmounting session at {}", mountpoint.display());
         }
-    }
-}
-
-/// The background session data structure
-#[derive(Debug)]
-pub struct BackgroundSession {
-    /// Thread guard of the background session
-    pub guard: JoinHandle<io::Result<()>>,
-    /// Object for creating Notifiers for client use
-    sender: ChannelSender,
-    /// Ensures the filesystem is unmounted when the session ends
-    _mount: Option<Mount>,
-    /// Device fd used to abort the FUSE connection during cooperative teardown.
-    #[cfg(target_os = "linux")]
-    device: Arc<std::fs::File>,
-    /// Shutdown/join control for optional FUSE-over-io_uring queue threads.
-    #[cfg(target_os = "linux")]
-    uring_control: Arc<super::uring::UringQueueControl>,
-}
-
-impl BackgroundSession {
-    /// Create a new background session for the given session by running its
-    /// session loop in a background thread. If the returned handle is dropped,
-    /// the filesystem is unmounted and the given session ends.
-    pub fn new<FS: Filesystem + Send + 'static>(se: Session<FS>) -> io::Result<BackgroundSession> {
-        let sender = se.ch.sender();
-        #[cfg(target_os = "linux")]
-        let device = se.ch.device();
-        // Take the fuse_session, so that we can unmount it
-        let mount = std::mem::take(&mut *se.mount.lock().unwrap()).map(|(_, mount)| mount);
-        #[cfg(target_os = "linux")]
-        let uring_control = se.uring_control.clone();
-        let guard = thread::spawn(move || {
-            let mut se = se;
-            se.run()
-        });
-        Ok(BackgroundSession {
-            guard,
-            sender,
-            _mount: mount,
-            #[cfg(target_os = "linux")]
-            device,
-            #[cfg(target_os = "linux")]
-            uring_control,
-        })
-    }
-    /// Unmount the filesystem and join the background thread.
-    /// # Panics
-    /// Panics if the background thread can't be recovered (e.g., because it panicked).
-    pub fn join(self) {
-        let Self {
-            guard,
-            sender: _,
-            _mount,
-            #[cfg(target_os = "linux")]
-            device,
-            #[cfg(target_os = "linux")]
-            uring_control,
-        } = self;
-        #[cfg(target_os = "linux")]
-        uring_control.shutdown_and_join();
-        #[cfg(target_os = "linux")]
-        if let Err(err) = abort_fuse_connection(&device) {
-            debug!("failed to abort FUSE connection during background join: {err}");
-        }
-        drop(_mount);
-        guard.join().unwrap().unwrap();
-    }
-
-    /// Returns an object that can be used to send notifications to the kernel
-    pub fn notifier(&self) -> Notifier {
-        Notifier::new(self.sender.clone())
     }
 }

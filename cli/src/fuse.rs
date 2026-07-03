@@ -1016,10 +1016,6 @@ impl Filesystem for AgentFSFuse {
         mtime: Option<crate::fuser::TimeOrNow>,
         _ctime: Option<SystemTime>,
         fh: Option<u64>,
-        _crtime: Option<SystemTime>,
-        _chgtime: Option<SystemTime>,
-        _bkuptime: Option<SystemTime>,
-        _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
         tracing::debug!(

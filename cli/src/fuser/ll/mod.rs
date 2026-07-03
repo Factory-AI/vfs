@@ -215,18 +215,9 @@ impl Errno {
     pub const ENOTSUP: Errno = errno!(libc::ENOTSUP);
 
     /// No data available
-    #[cfg(target_os = "linux")]
     pub const ENODATA: Errno = errno!(libc::ENODATA);
     #[doc = no_xattr_doc!()]
-    #[cfg(target_os = "linux")]
     pub const NO_XATTR: Errno = Self::ENODATA;
-
-    /// Attribute not found
-    #[cfg(not(target_os = "linux"))]
-    pub const ENOATTR: Errno = errno!(libc::ENOATTR);
-    #[doc = no_xattr_doc!()]
-    #[cfg(not(target_os = "linux"))]
-    pub const NO_XATTR: Errno = Self::ENOATTR;
 
     pub fn from_i32(err: i32) -> Errno {
         err.try_into().ok().map_or(Errno::EIO, Errno)

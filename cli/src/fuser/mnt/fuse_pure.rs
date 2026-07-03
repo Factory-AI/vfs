@@ -12,19 +12,10 @@ use libc::c_int;
 use log::{debug, error};
 use std::ffi::{CStr, CString, OsStr};
 use std::fs::File;
-#[cfg(any(
-    target_os = "linux",
-    target_os = "macos",
-    target_os = "freebsd",
-    target_os = "dragonfly",
-    target_os = "openbsd",
-    target_os = "netbsd",
-))]
 use std::fs::OpenOptions;
 use std::io;
 use std::io::{Error, ErrorKind, Read};
 use std::os::unix::ffi::OsStrExt;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::net::UnixStream;
@@ -36,19 +27,6 @@ use std::{mem, ptr};
 const FUSERMOUNT_BIN: &str = "fusermount";
 const FUSERMOUNT3_BIN: &str = "fusermount3";
 const FUSERMOUNT_COMM_ENV: &str = "_FUSE_COMMFD";
-const MOUNT_FUSEFS_BIN: &str = "mount_fusefs";
-
-#[cfg_attr(target_os = "freebsd", allow(dead_code))]
-#[cfg(target_os = "freebsd")]
-const BSD_MNT_NODEV: libc::c_int = 0x0000_0010;
-#[cfg_attr(target_os = "freebsd", allow(dead_code))]
-#[cfg(any(
-    target_os = "dragonfly",
-    target_os = "macos",
-    target_os = "netbsd",
-    target_os = "openbsd",
-))]
-const BSD_MNT_NODEV: libc::c_int = libc::MNT_NODEV;
 
 #[derive(Debug)]
 pub struct Mount {
@@ -107,23 +85,12 @@ fn fuse_mount_pure(
         return fuse_mount_fusermount(mountpoint, options);
     }
 
-    // The direct mount path is currently implemented only for Linux and macOS.
-    // Other supported Unix targets (such as the BSDs) rely on the setuid
-    // mount helper, which mirrors libfuse's approach.
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        return fuse_mount_fusermount(mountpoint, options);
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
-        let res = fuse_mount_sys(mountpoint, options)?;
-        match res {
-            Some(file) => Ok((file, None)),
-            _ => {
-                // Retry
-                fuse_mount_fusermount(mountpoint, options)
-            }
+    let res = fuse_mount_sys(mountpoint, options)?;
+    match res {
+        Some(file) => Ok((file, None)),
+        _ => {
+            // Retry
+            fuse_mount_fusermount(mountpoint, options)
         }
     }
 }
@@ -136,14 +103,6 @@ fn fuse_unmount_pure(mountpoint: &CStr) {
             return;
         }
     }
-    #[cfg(target_os = "macos")]
-    unsafe {
-        let result = libc::unmount(mountpoint.as_ptr(), libc::MNT_FORCE);
-        if result == 0 {
-            return;
-        }
-    }
-
     let mut builder = Command::new(detect_fusermount_bin());
     builder.stdout(Stdio::piped()).stderr(Stdio::piped());
     builder
@@ -163,10 +122,8 @@ fn detect_fusermount_bin() -> String {
     for name in [
         FUSERMOUNT3_BIN.to_string(),
         FUSERMOUNT_BIN.to_string(),
-        MOUNT_FUSEFS_BIN.to_string(),
         format!("/sbin/{FUSERMOUNT3_BIN}"),
         format!("/sbin/{FUSERMOUNT_BIN}"),
-        format!("/sbin/{MOUNT_FUSEFS_BIN}"),
         format!("/bin/{FUSERMOUNT3_BIN}"),
         format!("/bin/{FUSERMOUNT_BIN}"),
     ]
@@ -212,25 +169,6 @@ fn receive_fusermount_message(socket: &UnixStream) -> Result<File, Error> {
         message.msg_controllen = cmsg_buffer.len() as u32;
         message.msg_flags = 0;
     }
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "freebsd",
-        target_os = "dragonfly",
-        target_os = "openbsd",
-        target_os = "netbsd"
-    ))]
-    {
-        message = libc::msghdr {
-            msg_name: ptr::null_mut(),
-            msg_namelen: 0,
-            msg_iov: &mut io_vec,
-            msg_iovlen: 1,
-            msg_control: (&mut cmsg_buffer).as_mut_ptr() as *mut libc::c_void,
-            msg_controllen: cmsg_buffer.len() as u32,
-            msg_flags: 0,
-        };
-    }
-
     let mut result;
     loop {
         unsafe {
@@ -278,10 +216,6 @@ fn fuse_mount_fusermount(
     options: &[MountOption],
 ) -> Result<(File, Option<UnixStream>), Error> {
     let fusermount_bin = detect_fusermount_bin();
-
-    if fusermount_bin.ends_with(MOUNT_FUSEFS_BIN) {
-        return fuse_mount_mount_fusefs(&fusermount_bin, mountpoint, options);
-    }
 
     let (child_socket, receive_socket) = UnixStream::pair()?;
 
@@ -362,60 +296,7 @@ fn fuse_mount_fusermount(
     Ok((file, receive_socket))
 }
 
-// TODO: This method was written by Codex, and seems to work, but it would be good to audit it more thoroughly.
-fn fuse_mount_mount_fusefs(
-    fusermount_bin: &str,
-    mountpoint: &OsStr,
-    options: &[MountOption],
-) -> Result<(File, Option<UnixStream>), Error> {
-    let fuse_device = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/fuse")?;
-
-    // Ensure the file descriptor is preserved across the helper exec.
-    let current_flags = unsafe { libc::fcntl(fuse_device.as_raw_fd(), libc::F_GETFD) };
-    if current_flags == -1 {
-        return Err(io::Error::last_os_error());
-    }
-
-    if current_flags & libc::FD_CLOEXEC != 0 {
-        let cleared = current_flags & !libc::FD_CLOEXEC;
-        let ret = unsafe { libc::fcntl(fuse_device.as_raw_fd(), libc::F_SETFD, cleared) };
-        if ret == -1 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-
-    let mut builder = Command::new(fusermount_bin);
-    builder.stdout(Stdio::piped()).stderr(Stdio::piped());
-    if !options.is_empty() {
-        builder.arg("-o");
-        let options_strs: Vec<String> = options.iter().map(option_to_string).collect();
-        builder.arg(options_strs.join(","));
-    }
-
-    builder
-        .arg(fuse_device.as_raw_fd().to_string())
-        .arg(mountpoint);
-
-    let output = builder.output()?;
-    if !output.status.success() {
-        return Err(io::Error::new(
-            ErrorKind::Other,
-            String::from_utf8_lossy(&output.stderr).to_string(),
-        ));
-    }
-
-    unsafe {
-        libc::fcntl(fuse_device.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
-    }
-
-    Ok((fuse_device, None))
-}
-
 // If returned option is none. Then fusermount binary should be tried
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn fuse_mount_sys(mountpoint: &OsStr, options: &[MountOption]) -> Result<Option<File>, Error> {
     let fuse_device_name = "/dev/fuse";
 
@@ -460,43 +341,13 @@ fn fuse_mount_sys(mountpoint: &OsStr, options: &[MountOption]) -> Result<Option<
     }
 
     let mut flags = 0;
-    if !options.contains(&MountOption::Dev) {
-        // Default to nodev
-        #[cfg(target_os = "linux")]
-        {
-            flags |= libc::MS_NODEV;
-        }
-        #[cfg(target_os = "macos")]
-        {
-            flags |= libc::MNT_NODEV;
-        }
-    }
-    if !options.contains(&MountOption::Suid) {
-        // Default to nosuid
-        #[cfg(target_os = "linux")]
-        {
-            flags |= libc::MS_NOSUID;
-        }
-        #[cfg(target_os = "macos")]
-        {
-            flags |= libc::MNT_NOSUID;
-        }
-    }
-    for flag in options
-        .iter()
-        .filter(|x| option_group(x) == MountOptionGroup::KernelFlag)
-    {
-        flags |= option_to_flag(flag);
-    }
+    // Preserve the Linux direct-mount defaults from the former generic option set.
+    flags |= libc::MS_NODEV;
+    flags |= libc::MS_NOSUID;
 
-    // Default name is "/dev/fuse", then use the subtype, and lastly prefer the name
+    // Default name is "/dev/fuse"; AgentFS supplies a typed FSName when it wants a
+    // different source label.
     let mut source = fuse_device_name;
-    if let Some(MountOption::Subtype(subtype)) = options
-        .iter()
-        .find(|x| matches!(**x, MountOption::Subtype(_)))
-    {
-        source = subtype;
-    }
     if let Some(MountOption::FSName(name)) = options
         .iter()
         .find(|x| matches!(**x, MountOption::FSName(_)))
@@ -508,28 +359,15 @@ fn fuse_mount_sys(mountpoint: &OsStr, options: &[MountOption]) -> Result<Option<
     let c_mountpoint = CString::new(mountpoint.as_bytes()).unwrap();
 
     let result = unsafe {
-        #[cfg(target_os = "linux")]
-        {
-            let c_options = CString::new(mount_options.clone()).unwrap();
-            let c_type = CString::new("fuse").unwrap();
-            libc::mount(
-                c_source.as_ptr(),
-                c_mountpoint.as_ptr(),
-                c_type.as_ptr(),
-                flags,
-                c_options.as_ptr() as *const libc::c_void,
-            )
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let mut c_options = CString::new(mount_options.clone()).unwrap();
-            libc::mount(
-                c_source.as_ptr(),
-                c_mountpoint.as_ptr(),
-                flags,
-                c_options.as_ptr() as *mut libc::c_void,
-            )
-        }
+        let c_options = CString::new(mount_options.clone()).unwrap();
+        let c_type = CString::new("fuse").unwrap();
+        libc::mount(
+            c_source.as_ptr(),
+            c_mountpoint.as_ptr(),
+            c_type.as_ptr(),
+            flags,
+            c_options.as_ptr() as *const libc::c_void,
+        )
     };
     if result == -1 {
         let err = Error::last_os_error();
@@ -548,115 +386,18 @@ fn fuse_mount_sys(mountpoint: &OsStr, options: &[MountOption]) -> Result<Option<
     Ok(Some(file))
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-#[allow(dead_code)]
-fn fuse_mount_sys(_mountpoint: &OsStr, _options: &[MountOption]) -> Result<Option<File>, Error> {
-    Ok(None)
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(PartialEq)]
 pub enum MountOptionGroup {
     KernelOption,
-    KernelFlag,
     Fusermount,
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn option_group(option: &MountOption) -> MountOptionGroup {
     match option {
         MountOption::FSName(_) => MountOptionGroup::Fusermount,
-        MountOption::Subtype(_) => MountOptionGroup::Fusermount,
-        MountOption::CUSTOM(_) => MountOptionGroup::KernelOption,
         MountOption::AutoUnmount => MountOptionGroup::Fusermount,
         MountOption::AllowOther => MountOptionGroup::KernelOption,
-        MountOption::Dev => MountOptionGroup::KernelFlag,
-        MountOption::NoDev => MountOptionGroup::KernelFlag,
-        MountOption::Suid => MountOptionGroup::KernelFlag,
-        MountOption::NoSuid => MountOptionGroup::KernelFlag,
-        MountOption::RO => MountOptionGroup::KernelFlag,
-        MountOption::RW => MountOptionGroup::KernelFlag,
-        MountOption::Exec => MountOptionGroup::KernelFlag,
-        MountOption::NoExec => MountOptionGroup::KernelFlag,
-        MountOption::Atime => MountOptionGroup::KernelFlag,
-        MountOption::NoAtime => MountOptionGroup::KernelFlag,
-        MountOption::DirSync => MountOptionGroup::KernelFlag,
-        MountOption::Sync => MountOptionGroup::KernelFlag,
-        MountOption::Async => MountOptionGroup::KernelFlag,
         MountOption::AllowRoot => MountOptionGroup::KernelOption,
         MountOption::DefaultPermissions => MountOptionGroup::KernelOption,
-    }
-}
-
-#[cfg(target_os = "linux")]
-pub fn option_to_flag(option: &MountOption) -> libc::c_ulong {
-    match option {
-        MountOption::Dev => 0, // There is no option for dev. It's the absence of NoDev
-        MountOption::NoDev => libc::MS_NODEV,
-        MountOption::Suid => 0,
-        MountOption::NoSuid => libc::MS_NOSUID,
-        MountOption::RW => 0,
-        MountOption::RO => libc::MS_RDONLY,
-        MountOption::Exec => 0,
-        MountOption::NoExec => libc::MS_NOEXEC,
-        MountOption::Atime => 0,
-        MountOption::NoAtime => libc::MS_NOATIME,
-        MountOption::Async => 0,
-        MountOption::Sync => libc::MS_SYNCHRONOUS,
-        MountOption::DirSync => libc::MS_DIRSYNC,
-        _ => unreachable!(),
-    }
-}
-
-#[cfg(target_os = "macos")]
-pub fn option_to_flag(option: &MountOption) -> libc::c_int {
-    match option {
-        MountOption::Dev => 0, // There is no option for dev. It's the absence of NoDev
-        MountOption::NoDev => BSD_MNT_NODEV,
-        MountOption::Suid => 0,
-        MountOption::NoSuid => libc::MNT_NOSUID,
-        MountOption::RW => 0,
-        MountOption::RO => libc::MNT_RDONLY,
-        MountOption::Exec => 0,
-        MountOption::NoExec => libc::MNT_NOEXEC,
-        MountOption::Atime => 0,
-        MountOption::NoAtime => libc::MNT_NOATIME,
-        MountOption::Async => 0,
-        MountOption::Sync => libc::MNT_SYNCHRONOUS,
-        _ => unreachable!(),
-    }
-}
-
-#[cfg_attr(
-    any(
-        target_os = "freebsd",
-        target_os = "dragonfly",
-        target_os = "openbsd",
-        target_os = "netbsd"
-    ),
-    allow(dead_code)
-)]
-#[cfg(any(
-    target_os = "freebsd",
-    target_os = "dragonfly",
-    target_os = "openbsd",
-    target_os = "netbsd"
-))]
-pub fn option_to_flag(option: &MountOption) -> libc::c_int {
-    match option {
-        MountOption::Dev => 0,
-        MountOption::NoDev => BSD_MNT_NODEV,
-        MountOption::Suid => 0,
-        MountOption::NoSuid => libc::MNT_NOSUID,
-        MountOption::RW => 0,
-        MountOption::RO => libc::MNT_RDONLY,
-        MountOption::Exec => 0,
-        MountOption::NoExec => libc::MNT_NOEXEC,
-        MountOption::Atime => 0,
-        MountOption::NoAtime => libc::MNT_NOATIME,
-        MountOption::Async => 0,
-        MountOption::Sync => libc::MNT_SYNCHRONOUS,
-        MountOption::DirSync => libc::MNT_SYNCHRONOUS,
-        _ => unreachable!(),
     }
 }

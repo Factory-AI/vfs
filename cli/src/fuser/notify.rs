@@ -1,7 +1,5 @@
+use std::ffi::OsStr;
 use std::io;
-
-#[allow(unused)]
-use std::{convert::TryInto, ffi::OsStr};
 
 use super::{
     channel::ChannelSender,
@@ -13,42 +11,6 @@ use super::{
     reply::ReplySender,
 };
 
-/// A handle to a pending `poll()` request. Can be saved and used to notify the
-/// kernel when a poll is ready.
-#[derive(Clone)]
-pub struct PollHandle {
-    handle: u64,
-    notifier: Notifier,
-}
-
-impl PollHandle {
-    pub(crate) fn new(cs: ChannelSender, kh: u64) -> Self {
-        Self {
-            handle: kh,
-            notifier: Notifier::new(cs),
-        }
-    }
-
-    /// Notify the kernel that the associated file handle is ready to be polled.
-    /// # Errors
-    /// Returns an error if the kernel rejects the notification.
-    pub fn notify(self) -> io::Result<()> {
-        self.notifier.poll(self.handle)
-    }
-}
-
-impl From<PollHandle> for u64 {
-    fn from(value: PollHandle) -> Self {
-        value.handle
-    }
-}
-
-impl std::fmt::Debug for PollHandle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("PollHandle").field(&self.handle).finish()
-    }
-}
-
 /// A handle by which the application can send notifications to the server
 #[derive(Debug, Clone)]
 pub struct Notifier(ChannelSender);
@@ -56,14 +18,6 @@ pub struct Notifier(ChannelSender);
 impl Notifier {
     pub(crate) fn new(cs: ChannelSender) -> Self {
         Self(cs)
-    }
-
-    /// Notify poll clients of I/O readiness
-    /// # Errors
-    /// Returns an error if the kernel rejects the notification.
-    pub fn poll(&self, kh: u64) -> io::Result<()> {
-        let notif = Notification::new_poll(kh);
-        self.send(notify_code::FUSE_POLL, &notif)
     }
 
     /// Invalidate the kernel cache for a given directory entry
@@ -84,28 +38,6 @@ impl Notifier {
         self.send_inval(notify_code::FUSE_NOTIFY_INVAL_INODE, &notif)
     }
 
-    /// Update the kernel's cached copy of a given inode's data
-    /// # Errors
-    /// Returns an error if the notification data is too large.
-    /// Returns an error if the kernel rejects the notification.
-    pub fn store(&self, ino: u64, offset: u64, data: &[u8]) -> io::Result<()> {
-        let notif = Notification::new_store(ino, offset, data).map_err(Self::too_big_err)?;
-        // Not strictly an invalidate, but the inode we're operating
-        // on may have been evicted anyway, so treat is as such
-        self.send_inval(notify_code::FUSE_NOTIFY_STORE, &notif)
-    }
-
-    /// Invalidate the kernel cache for a given directory entry and inform
-    /// inotify watchers of a file deletion.
-    /// # Errors
-    /// Returns an error if the notification data is too large.
-    /// Returns an error if the kernel rejects the notification.
-    pub fn delete(&self, parent: u64, child: u64, name: &OsStr) -> io::Result<()> {
-        let notif = Notification::new_delete(parent, child, name).map_err(Self::too_big_err)?;
-        self.send_inval(notify_code::FUSE_NOTIFY_DELETE, &notif)
-    }
-
-    #[allow(unused)]
     fn send_inval(&self, code: notify_code, notification: &Notification<'_>) -> io::Result<()> {
         match self.send(code, notification) {
             // ENOENT is harmless for an invalidation (the

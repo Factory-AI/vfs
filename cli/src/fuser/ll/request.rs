@@ -268,10 +268,8 @@ mod op {
         abi::consts::*, abi::*, FileHandle, INodeNo, Lock, LockOwner, Operation, RequestId,
     };
     use std::{
-        convert::TryInto,
         ffi::OsStr,
         fmt::Display,
-        num::NonZeroU32,
         path::Path,
         time::{Duration, SystemTime},
     };
@@ -411,54 +409,6 @@ mod op {
                 _ => Some(FileHandle(self.arg.fh)),
             }
         }
-        pub fn crtime(&self) -> Option<SystemTime> {
-            #[cfg(target_os = "macos")]
-            match self.arg.valid & FATTR_CRTIME {
-                0 => None,
-                // During certain operation, macOS use some helper that send request to the mountpoint with `crtime` set to 0xffffffff83da4f80.
-                // That value correspond to `-2_082_844_800u64` which is the difference between the date 1904-01-01 and 1970-01-01 because macOS epoch start at 1904 and not 1970.
-                // https://github.com/macfuse/macfuse/issues/1042
-                _ if self.arg.crtime == 0xffffffff83da4f80 => None,
-                _ => Some(
-                    SystemTime::UNIX_EPOCH + Duration::new(self.arg.crtime, self.arg.crtimensec),
-                ),
-            }
-            #[cfg(not(target_os = "macos"))]
-            None
-        }
-        pub fn chgtime(&self) -> Option<SystemTime> {
-            #[cfg(target_os = "macos")]
-            match self.arg.valid & FATTR_CHGTIME {
-                0 => None,
-                _ => Some(
-                    SystemTime::UNIX_EPOCH + Duration::new(self.arg.chgtime, self.arg.chgtimensec),
-                ),
-            }
-            #[cfg(not(target_os = "macos"))]
-            None
-        }
-        pub fn bkuptime(&self) -> Option<SystemTime> {
-            #[cfg(target_os = "macos")]
-            match self.arg.valid & FATTR_BKUPTIME {
-                0 => None,
-                _ => Some(
-                    SystemTime::UNIX_EPOCH
-                        + Duration::new(self.arg.bkuptime, self.arg.bkuptimensec),
-                ),
-            }
-            #[cfg(not(target_os = "macos"))]
-            None
-        }
-        pub fn flags(&self) -> Option<u32> {
-            #[cfg(target_os = "macos")]
-            match self.arg.valid & FATTR_FLAGS {
-                0 => None,
-                _ => Some(self.arg.flags),
-            }
-            #[cfg(not(target_os = "macos"))]
-            None
-        }
-
         // TODO: Why does *set*attr want to have an attr response?
     }
     impl Display for SetAttr<'_> {
@@ -466,8 +416,7 @@ mod op {
             write!(
                 f,
                 "SETATTR mode: {:?}, uid: {:?}, gid: {:?}, size: {:?}, atime: {:?}, \
-                mtime: {:?}, ctime: {:?}, file_handle: {:?}, crtime: {:?}, chgtime: {:?}, \
-                bkuptime: {:?}, flags: {:?}",
+                mtime: {:?}, ctime: {:?}, file_handle: {:?}",
                 self.mode(),
                 self.uid(),
                 self.gid(),
@@ -475,21 +424,10 @@ mod op {
                 self.atime(),
                 self.mtime(),
                 self.ctime(),
-                self.file_handle(),
-                self.crtime(),
-                self.chgtime(),
-                self.bkuptime(),
-                self.flags()
+                self.file_handle()
             )
         }
     }
-
-    /// Read symbolic link.
-    #[derive(Debug)]
-    pub struct ReadLink<'a> {
-        header: &'a fuse_in_header,
-    }
-    impl_request!(ReadLink<'_>);
 
     /// Create a symbolic link.
     #[derive(Debug)]
@@ -730,13 +668,6 @@ mod op {
         }
     }
 
-    /// Get file system statistics.
-    #[derive(Debug)]
-    pub struct StatFs<'a> {
-        header: &'a fuse_in_header,
-    }
-    impl_request!(StatFs<'_>);
-
     /// Release an open file.
     ///
     /// Release is called when there are no more references to an open file: all file
@@ -810,12 +741,7 @@ mod op {
         pub fn flags(&self) -> i32 {
             self.arg.flags
         }
-        /// This will always be 0 except on `MacOS`.  It's recommended that
-        /// implementations return EINVAL if this is not 0.
         pub fn position(&self) -> u32 {
-            #[cfg(target_os = "macos")]
-            return self.arg.position;
-            #[cfg(not(target_os = "macos"))]
             0
         }
     }
@@ -832,40 +758,12 @@ mod op {
     }
     impl_request!(GetXAttr<'a>);
 
-    /// Type for [`GetXAttrSizeEnum::GetSize`].
-    ///
-    /// Represents a request from the user to get the size of the data stored in the `XAttr`.
-    #[derive(Debug)]
-    pub struct GetXAttrSize();
-
-    #[derive(Debug)]
-    /// Return type for [`GetXAttr::size`].
-    pub enum GetXAttrSizeEnum {
-        /// User is requesting the size of the data stored in the `XAttr`
-        GetSize(GetXAttrSize),
-        /// User is requesting the data stored in the `XAttr`.  If the data will fit
-        /// in this number of bytes it should be returned, otherwise return [`Err(Errno::ERANGE)`].
-        #[allow(dead_code)]
-        Size(NonZeroU32),
-    }
     impl<'a> GetXAttr<'a> {
         /// Name of the `XAttr`
         pub fn name(&self) -> &'a OsStr {
             self.name
         }
-        /// See [`GetXAttrSizeEnum`].
-        ///
-        /// You only need to check this value as an optimisation where there's a
-        /// cost difference between checking the size of the data stored in an `XAttr`
-        /// and actually providing the data.  Otherwise just call [`reply()`] with the
-        /// data and it will do the right thing.
-        pub fn size(&self) -> GetXAttrSizeEnum {
-            let s: Result<NonZeroU32, _> = self.arg.size.try_into();
-            match s {
-                Ok(s) => GetXAttrSizeEnum::Size(s),
-                Err(_) => GetXAttrSizeEnum::GetSize(GetXAttrSize()),
-            }
-        }
+
         /// The size of the buffer the user has allocated to store the `XAttr` value.
         pub(crate) fn size_u32(&self) -> u32 {
             self.arg.size
@@ -1320,15 +1218,6 @@ mod op {
         }
     }
 
-    /// `NotifyReply`.  TODO: currently unsupported by fuser
-    #[derive(Debug)]
-    pub struct NotifyReply<'a> {
-        header: &'a fuse_in_header,
-        #[allow(unused)]
-        arg: &'a [u8],
-    }
-    impl_request!(NotifyReply<'a>);
-
     /// `BatchForget`: TODO: merge with Forget
     #[derive(Debug)]
     pub struct BatchForget<'a> {
@@ -1395,7 +1284,7 @@ mod op {
 
     /// Rename a file.
     ///
-    /// TODO: Document the differences to [`Rename`] and [`Exchange`]
+    /// TODO: Document the differences to [`Rename`]
     #[derive(Debug)]
     pub struct Rename2<'a> {
         header: &'a fuse_in_header,
@@ -1493,71 +1382,6 @@ mod op {
         }
     }
 
-    /// `MacOS` only: Rename the volume. Set `fuse_init_out.flags` during init to
-    /// `FUSE_VOL_RENAME` to enable
-    #[cfg(target_os = "macos")]
-    #[derive(Debug)]
-    pub struct SetVolName<'a> {
-        header: &'a fuse_in_header,
-        name: &'a OsStr,
-    }
-    #[cfg(target_os = "macos")]
-    impl_request!(SetVolName<'a>);
-    #[cfg(target_os = "macos")]
-    impl<'a> SetVolName<'a> {
-        pub fn name(&self) -> &'a OsStr {
-            self.name
-        }
-    }
-
-    /// `MacOS` only: Query extended times (`bkuptime` and `crtime`). Set `fuse_init_out.flags`
-    /// during init to `FUSE_XTIMES` to enable
-    #[cfg(target_os = "macos")]
-    #[derive(Debug)]
-    pub struct GetXTimes<'a> {
-        header: &'a fuse_in_header,
-    }
-    #[cfg(target_os = "macos")]
-    impl_request!(GetXTimes<'a>);
-    // API TODO: Consider `rename2(RENAME_EXCHANGE)`
-    /// `MacOS` only (undocumented)
-    #[cfg(target_os = "macos")]
-    #[derive(Debug)]
-    pub struct Exchange<'a> {
-        header: &'a fuse_in_header,
-        arg: &'a fuse_exchange_in,
-        oldname: &'a Path,
-        newname: &'a Path,
-    }
-    #[cfg(target_os = "macos")]
-    impl_request!(Exchange<'a>);
-    #[cfg(target_os = "macos")]
-    impl<'a> Exchange<'a> {
-        pub fn from(&self) -> FilenameInDir<'a> {
-            FilenameInDir::<'a> {
-                dir: INodeNo(self.arg.olddir),
-                name: self.oldname,
-            }
-        }
-        pub fn to(&self) -> FilenameInDir<'a> {
-            FilenameInDir::<'a> {
-                dir: INodeNo(self.arg.newdir),
-                name: self.newname,
-            }
-        }
-        pub fn options(&self) -> u64 {
-            self.arg.options
-        }
-    }
-    /// TODO: Document
-    #[derive(Debug)]
-    pub struct CuseInit<'a> {
-        header: &'a fuse_in_header,
-        #[allow(unused)]
-        arg: &'a fuse_init_in,
-    }
-    impl_request!(CuseInit<'a>);
-
     fn system_time_from_time(secs: i64, nsecs: u32) -> SystemTime {
         if secs >= 0 {
             SystemTime::UNIX_EPOCH + Duration::new(secs as u64, nsecs)
@@ -1589,7 +1413,7 @@ mod op {
                 header,
                 arg: data.fetch()?,
             }),
-            fuse_opcode::FUSE_READLINK => Operation::ReadLink(ReadLink { header }),
+            fuse_opcode::FUSE_READLINK => Operation::ReadLink,
             fuse_opcode::FUSE_SYMLINK => Operation::SymLink(SymLink {
                 header,
                 link_name: data.fetch_str()?.as_ref(),
@@ -1641,7 +1465,7 @@ mod op {
                 assert!(out.data().len() == out.arg.size as usize);
                 out
             }),
-            fuse_opcode::FUSE_STATFS => Operation::StatFs(StatFs { header }),
+            fuse_opcode::FUSE_STATFS => Operation::StatFs,
             fuse_opcode::FUSE_RELEASE => Operation::Release(Release {
                 header,
                 arg: data.fetch()?,
@@ -1736,10 +1560,6 @@ mod op {
                 header,
                 arg: data.fetch()?,
             }),
-            fuse_opcode::FUSE_NOTIFY_REPLY => Operation::NotifyReply(NotifyReply {
-                header,
-                arg: data.fetch_all(),
-            }),
             fuse_opcode::FUSE_BATCH_FORGET => {
                 let arg = data.fetch()?;
                 Operation::BatchForget(BatchForget {
@@ -1771,26 +1591,6 @@ mod op {
                 header,
                 arg: data.fetch()?,
             }),
-
-            #[cfg(target_os = "macos")]
-            fuse_opcode::FUSE_SETVOLNAME => Operation::SetVolName(SetVolName {
-                header,
-                name: data.fetch_str()?,
-            }),
-            #[cfg(target_os = "macos")]
-            fuse_opcode::FUSE_GETXTIMES => Operation::GetXTimes(GetXTimes { header }),
-            #[cfg(target_os = "macos")]
-            fuse_opcode::FUSE_EXCHANGE => Operation::Exchange(Exchange {
-                header,
-                arg: data.fetch()?,
-                oldname: data.fetch_str()?.as_ref(),
-                newname: data.fetch_str()?.as_ref(),
-            }),
-
-            fuse_opcode::CUSE_INIT => Operation::CuseInit(CuseInit {
-                header,
-                arg: data.fetch()?,
-            }),
         })
     }
 }
@@ -1805,8 +1605,7 @@ pub enum Operation<'a> {
     Forget(Forget<'a>),
     GetAttr(GetAttr<'a>),
     SetAttr(SetAttr<'a>),
-    #[allow(dead_code)]
-    ReadLink(ReadLink<'a>),
+    ReadLink,
     SymLink(SymLink<'a>),
     MkNod(MkNod<'a>),
     MkDir(MkDir<'a>),
@@ -1817,8 +1616,7 @@ pub enum Operation<'a> {
     Open(Open<'a>),
     Read(Read<'a>),
     Write(Write<'a>),
-    #[allow(dead_code)]
-    StatFs(StatFs<'a>),
+    StatFs,
     Release(Release<'a>),
     FSync(FSync<'a>),
     SetXAttr(SetXAttr<'a>),
@@ -1841,24 +1639,12 @@ pub enum Operation<'a> {
     Destroy(Destroy<'a>),
     IoCtl(IoCtl<'a>),
     Poll(Poll<'a>),
-    #[allow(dead_code)]
-    NotifyReply(NotifyReply<'a>),
     BatchForget(BatchForget<'a>),
     FAllocate(FAllocate<'a>),
     ReadDirPlus(ReadDirPlus<'a>),
     Rename2(Rename2<'a>),
     Lseek(Lseek<'a>),
     CopyFileRange(CopyFileRange<'a>),
-
-    #[cfg(target_os = "macos")]
-    SetVolName(SetVolName<'a>),
-    #[cfg(target_os = "macos")]
-    GetXTimes(GetXTimes<'a>),
-    #[cfg(target_os = "macos")]
-    Exchange(Exchange<'a>),
-
-    #[allow(dead_code)]
-    CuseInit(CuseInit<'a>),
 }
 
 impl fmt::Display for Operation<'_> {
@@ -1868,7 +1654,7 @@ impl fmt::Display for Operation<'_> {
             Operation::Forget(x) => write!(f, "FORGET nlookup {}", x.nlookup()),
             Operation::GetAttr(_) => write!(f, "GETATTR"),
             Operation::SetAttr(x) => x.fmt(f),
-            Operation::ReadLink(_) => write!(f, "READLINK"),
+            Operation::ReadLink => write!(f, "READLINK"),
             Operation::SymLink(x) => {
                 write!(
                     f,
@@ -1905,7 +1691,7 @@ impl fmt::Display for Operation<'_> {
                 x.data().len(),
                 x.write_flags()
             ),
-            Operation::StatFs(_) => write!(f, "STATFS"),
+            Operation::StatFs => write!(f, "STATFS"),
             Operation::Release(x) => write!(
                 f,
                 "RELEASE fh {:?}, flags {:#x}, flush {}, lock owner {:?}",
@@ -1928,7 +1714,7 @@ impl fmt::Display for Operation<'_> {
                 x.flags()
             ),
             Operation::GetXAttr(x) => {
-                write!(f, "GETXATTR name {:?}, size {:?}", x.name(), x.size())
+                write!(f, "GETXATTR name {:?}, size {:?}", x.name(), x.size_u32())
             }
             Operation::ListXAttr(x) => write!(f, "LISTXATTR size {}", x.size()),
             Operation::RemoveXAttr(x) => write!(f, "REMOVEXATTR name {:?}", x.name()),
@@ -2005,7 +1791,6 @@ impl fmt::Display for Operation<'_> {
                 x.flags()
             ),
             Operation::Poll(x) => write!(f, "POLL fh {:?}", x.file_handle()),
-            Operation::NotifyReply(_) => write!(f, "NOTIFYREPLY"),
             Operation::BatchForget(x) => write!(f, "BATCHFORGET nodes {:?}", x.nodes()),
             Operation::FAllocate(_) => write!(f, "FALLOCATE"),
             Operation::ReadDirPlus(x) => write!(
@@ -2030,21 +1815,6 @@ impl fmt::Display for Operation<'_> {
                 x.dest(),
                 x.len()
             ),
-
-            #[cfg(target_os = "macos")]
-            Operation::SetVolName(x) => write!(f, "SETVOLNAME name {:?}", x.name()),
-            #[cfg(target_os = "macos")]
-            Operation::GetXTimes(_) => write!(f, "GETXTIMES"),
-            #[cfg(target_os = "macos")]
-            Operation::Exchange(x) => write!(
-                f,
-                "EXCHANGE from {:?}, to {:?}, options {:#x}",
-                x.from(),
-                x.to(),
-                x.options()
-            ),
-
-            Operation::CuseInit(_) => write!(f, "CUSE_INIT"),
         }
     }
 }

@@ -21,7 +21,6 @@ use super::reply::ReplyDirectoryPlus;
 use super::reply::{Reply, ReplyDirectory, ReplySender};
 use super::session::{SessionACL, SessionShared};
 use super::Filesystem;
-use super::PollHandle;
 use super::{ll, KernelConfig};
 
 /// Classify a parsed request into a per-op latency slot (see
@@ -123,9 +122,6 @@ pub struct Request {
 
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub(crate) enum ScheduleKey {
-    FileHandle(u64),
-    Inode(u64),
-    Parent(u64),
     Pid(u64),
 }
 
@@ -175,11 +171,7 @@ impl Request {
             ll::Operation::Init(_)
             | ll::Operation::Destroy(_)
             | ll::Operation::BatchForget(_)
-            | ll::Operation::Interrupt(_)
-            | ll::Operation::NotifyReply(_)
-            | ll::Operation::CuseInit(_) => ScheduleClass::GlobalWrite,
-            #[cfg(target_os = "macos")]
-            ll::Operation::SetVolName(_) => ScheduleClass::GlobalWrite,
+            | ll::Operation::Interrupt(_) => ScheduleClass::GlobalWrite,
             _ => ScheduleClass::Keyed(pid_key),
         }
     }
@@ -359,14 +351,10 @@ impl Request {
                     x.mtime(),
                     x.ctime(),
                     x.file_handle().map(std::convert::Into::into),
-                    x.crtime(),
-                    x.chgtime(),
-                    x.bkuptime(),
-                    x.flags(),
                     self.reply(),
                 );
             }
-            ll::Operation::ReadLink(_) => {
+            ll::Operation::ReadLink => {
                 shared
                     .filesystem
                     .readlink(self, parsed.nodeid().into(), self.reply());
@@ -528,7 +516,7 @@ impl Request {
                     self.reply(),
                 );
             }
-            ll::Operation::StatFs(_) => {
+            ll::Operation::StatFs => {
                 shared
                     .filesystem
                     .statfs(self, parsed.nodeid().into(), self.reply());
@@ -646,21 +634,15 @@ impl Request {
                 );
             }
             ll::Operation::Poll(x) => {
-                let ph = PollHandle::new(self.ch.for_notify(), x.kernel_handle());
-
                 shared.filesystem.poll(
                     self,
                     parsed.nodeid().into(),
                     x.file_handle().into(),
-                    ph,
+                    x.kernel_handle(),
                     x.events(),
                     x.flags(),
                     self.reply(),
                 );
-            }
-            ll::Operation::NotifyReply(_) => {
-                // TODO: handle FUSE_NOTIFY_REPLY
-                return Err(Errno::ENOSYS);
             }
             ll::Operation::BatchForget(x) => {
                 shared.filesystem.batch_forget(self, x.nodes()); // no reply
@@ -724,33 +706,6 @@ impl Request {
                     x.flags().try_into().unwrap(),
                     self.reply(),
                 );
-            }
-            #[cfg(target_os = "macos")]
-            ll::Operation::SetVolName(x) => {
-                shared.filesystem.setvolname(self, x.name(), self.reply());
-            }
-            #[cfg(target_os = "macos")]
-            ll::Operation::GetXTimes(x) => {
-                shared
-                    .filesystem
-                    .getxtimes(self, x.nodeid().into(), self.reply());
-            }
-            #[cfg(target_os = "macos")]
-            ll::Operation::Exchange(x) => {
-                shared.filesystem.exchange(
-                    self,
-                    x.from().dir.into(),
-                    x.from().name.as_ref(),
-                    x.to().dir.into(),
-                    x.to().name.as_ref(),
-                    x.options(),
-                    self.reply(),
-                );
-            }
-
-            ll::Operation::CuseInit(_) => {
-                // TODO: handle CUSE_INIT
-                return Err(Errno::ENOSYS);
             }
         }
         Ok(None)

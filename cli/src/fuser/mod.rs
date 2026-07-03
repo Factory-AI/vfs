@@ -7,20 +7,15 @@
 #![allow(
     missing_docs,
     missing_debug_implementations,
-    dead_code,
-    unused_imports,
-    unexpected_cfgs,
     clippy::manual_is_multiple_of,
     clippy::io_other_error
 )]
 
 use libc::{c_int, ENOSYS, EPERM};
 use log::debug;
-use mnt::mount_options::parse_options_from_args;
 use std::cmp::min;
 use std::ffi::OsStr;
 use std::io;
-use std::io::ErrorKind;
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -29,7 +24,7 @@ pub use ll::fuse_abi::fuse_forget_one;
 pub use ll::fuse_abi::FUSE_ROOT_ID;
 pub use ll::TimeOrNow;
 pub use mnt::mount_options::MountOption;
-pub use notify::{Notifier, PollHandle};
+pub use notify::Notifier;
 pub use reply::ReplyPoll;
 pub use reply::ReplyXattr;
 pub use reply::{Reply, ReplyAttr, ReplyData, ReplyEmpty, ReplyEntry, ReplyOpen};
@@ -38,28 +33,20 @@ pub use reply::{
     ReplyStatfs, ReplyWrite,
 };
 pub use request::Request;
-pub use session::{BackgroundSession, Session, SessionACL, SessionUnmounter};
+pub use session::{Session, SessionACL, SessionUnmounter};
 
 use ll::fuse_abi::consts::*;
 use mnt::mount_options::check_option_conflicts;
 use session::MAX_WRITE_SIZE;
 
 mod channel;
-#[allow(
-    dead_code,
-    unused_imports,
-    unexpected_cfgs,
-    clippy::manual_is_multiple_of
-)]
 pub(crate) mod deferred_notify;
 mod ll;
 #[allow(clippy::io_other_error)]
 mod mnt;
 #[allow(clippy::io_other_error)]
 mod notify;
-#[allow(unexpected_cfgs)]
 mod reply;
-#[allow(unused_imports, unexpected_cfgs)]
 mod request;
 mod session;
 #[cfg(target_os = "linux")]
@@ -106,7 +93,7 @@ pub struct FileAttr {
     pub mtime: SystemTime,
     /// Time of last change
     pub ctime: SystemTime,
-    /// Time of creation (macOS only, but kept for API compatibility)
+    /// Time of creation retained for compatibility with the higher-level attribute type
     pub crtime: SystemTime,
     /// Kind of file (directory, file, pipe, etc)
     pub kind: FileType,
@@ -122,7 +109,7 @@ pub struct FileAttr {
     pub rdev: u32,
     /// Block size
     pub blksize: u32,
-    /// Flags (macOS only, but kept for API compatibility)
+    /// Platform attribute flags retained for compatibility with the higher-level attribute type
     pub flags: u32,
 }
 
@@ -151,29 +138,6 @@ impl KernelConfig {
             max_write: MAX_WRITE_SIZE as u32,
             time_gran: std::time::Duration::new(0, 1),
         }
-    }
-
-    /// Set the timestamp granularity
-    pub fn set_time_granularity(
-        &mut self,
-        value: std::time::Duration,
-    ) -> Result<std::time::Duration, std::time::Duration> {
-        if value.as_nanos() == 0 {
-            return Err(std::time::Duration::new(0, 1));
-        }
-        if value.as_secs() > 1 || (value.as_secs() == 1 && value.subsec_nanos() > 0) {
-            return Err(std::time::Duration::new(1, 0));
-        }
-        let mut power_of_10 = 1;
-        while power_of_10 < value.as_nanos() {
-            if value.as_nanos() < power_of_10 * 10 {
-                return Err(std::time::Duration::new(0, power_of_10 as u32));
-            }
-            power_of_10 *= 10;
-        }
-        let previous = self.time_gran;
-        self.time_gran = value;
-        Ok(previous)
     }
 
     /// Set the maximum write size for a single request
@@ -211,26 +175,6 @@ impl KernelConfig {
         Ok(())
     }
 
-    /// Set the maximum number of pending background requests
-    pub fn set_max_background(&mut self, value: u16) -> Result<u16, u16> {
-        if value == 0 {
-            return Err(1);
-        }
-        let previous = self.max_background;
-        self.max_background = value;
-        Ok(previous)
-    }
-
-    /// Set the congestion threshold
-    pub fn set_congestion_threshold(&mut self, value: u16) -> Result<u16, u16> {
-        if value == 0 {
-            return Err(1);
-        }
-        let previous = self.congestion_threshold();
-        self.congestion_threshold = Some(value);
-        Ok(previous)
-    }
-
     pub(crate) fn congestion_threshold(&self) -> u16 {
         match self.congestion_threshold {
             None => (u32::from(self.max_background) * 3 / 4) as u16,
@@ -241,26 +185,6 @@ impl KernelConfig {
     pub(crate) fn max_pages(&self) -> u16 {
         ((std::cmp::max(self.max_write, self.max_readahead) - 1) / page_size::get() as u32) as u16
             + 1
-    }
-
-    pub(crate) fn requested(&self) -> u64 {
-        self.requested
-    }
-
-    pub(crate) fn max_readahead(&self) -> u32 {
-        self.max_readahead
-    }
-
-    pub(crate) fn max_background(&self) -> u16 {
-        self.max_background
-    }
-
-    pub(crate) fn max_write(&self) -> u32 {
-        self.max_write
-    }
-
-    pub(crate) fn time_gran(&self) -> std::time::Duration {
-        self.time_gran
     }
 }
 
@@ -316,15 +240,11 @@ pub trait Filesystem: Send + Sync + 'static {
         _mtime: Option<TimeOrNow>,
         _ctime: Option<SystemTime>,
         fh: Option<u64>,
-        _crtime: Option<SystemTime>,
-        _chgtime: Option<SystemTime>,
-        _bkuptime: Option<SystemTime>,
-        flags: Option<u32>,
         reply: ReplyAttr,
     ) {
         debug!(
             "[Not Implemented] setattr(ino: {ino:#x?}, mode: {mode:?}, uid: {uid:?}, \
-            gid: {gid:?}, size: {size:?}, fh: {fh:?}, flags: {flags:?})"
+            gid: {gid:?}, size: {size:?}, fh: {fh:?})"
         );
         reply.error(ENOSYS);
     }
@@ -667,14 +587,14 @@ pub trait Filesystem: Send + Sync + 'static {
         _req: &Request,
         ino: u64,
         fh: u64,
-        ph: PollHandle,
+        kernel_handle: u64,
         events: u32,
         flags: u32,
         reply: ReplyPoll,
     ) {
         debug!(
             "[Not Implemented] poll(ino: {ino:#x?}, fh: {fh}, \
-            ph: {ph:?}, events: {events}, flags: {flags})"
+            kernel_handle: {kernel_handle:?}, events: {events}, flags: {flags})"
         );
         reply.error(ENOSYS);
     }
@@ -739,18 +659,6 @@ pub trait Filesystem: Send + Sync + 'static {
 
 /// Mount the given filesystem to the given mountpoint. This function will
 /// not return until the filesystem is unmounted.
-#[deprecated(note = "use mount2() instead")]
-pub fn mount<FS: Filesystem, P: AsRef<Path>>(
-    filesystem: FS,
-    mountpoint: P,
-    options: &[&OsStr],
-) -> io::Result<()> {
-    let options = parse_options_from_args(options)?;
-    mount2(filesystem, mountpoint, options.as_ref())
-}
-
-/// Mount the given filesystem to the given mountpoint. This function will
-/// not return until the filesystem is unmounted.
 pub fn mount2<FS: Filesystem, P: AsRef<Path>>(
     filesystem: FS,
     mountpoint: P,
@@ -758,34 +666,4 @@ pub fn mount2<FS: Filesystem, P: AsRef<Path>>(
 ) -> io::Result<()> {
     check_option_conflicts(options)?;
     Session::new(filesystem, mountpoint.as_ref(), options).and_then(|mut se| se.run())
-}
-
-/// Mount the given filesystem to the given mountpoint. This function spawns
-/// a background thread to handle filesystem operations while being mounted
-/// and therefore returns immediately.
-#[deprecated(note = "use spawn_mount2() instead")]
-pub fn spawn_mount<'a, FS: Filesystem + 'static + 'a, P: AsRef<Path>>(
-    filesystem: FS,
-    mountpoint: P,
-    options: &[&OsStr],
-) -> io::Result<BackgroundSession> {
-    let options: Option<Vec<_>> = options
-        .iter()
-        .map(|x| Some(MountOption::from_str(x.to_str()?)))
-        .collect();
-    let options = options.ok_or(ErrorKind::InvalidData)?;
-    Session::new(filesystem, mountpoint.as_ref(), options.as_ref())
-        .and_then(session::Session::spawn)
-}
-
-/// Mount the given filesystem to the given mountpoint. This function spawns
-/// a background thread to handle filesystem operations while being mounted
-/// and therefore returns immediately.
-pub fn spawn_mount2<'a, FS: Filesystem + 'static + 'a, P: AsRef<Path>>(
-    filesystem: FS,
-    mountpoint: P,
-    options: &[MountOption],
-) -> io::Result<BackgroundSession> {
-    check_option_conflicts(options)?;
-    Session::new(filesystem, mountpoint.as_ref(), options).and_then(session::Session::spawn)
 }
