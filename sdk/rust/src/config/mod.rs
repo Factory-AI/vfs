@@ -20,6 +20,19 @@ mod tests {
 
     #[test]
     fn runtime_env_bool_grammar_is_shared() {
+        let covered_runtime_bool_knobs = [
+            "AGENTFS_FUSE_WRITEBACK",
+            "AGENTFS_FUSE_NOOPEN",
+            "AGENTFS_FUSE_NOFLUSH",
+            "AGENTFS_FUSE_URING",
+            "AGENTFS_PROFILE",
+            "AGENTFS_DRAIN_ON_SETATTR",
+        ];
+        eprintln!(
+            "covered runtime bool knobs: {}",
+            covered_runtime_bool_knobs.join(", ")
+        );
+
         for value in ["1", "true", "TRUE", "True", "yes", "YES", "on", "ON"] {
             assert_eq!(
                 EnvReader::parse_bool(value),

@@ -663,7 +663,15 @@ pub fn mount2<FS: Filesystem, P: AsRef<Path>>(
     filesystem: FS,
     mountpoint: P,
     options: &[MountOption],
+    config: crate::fuse_config::FuseConfig,
 ) -> io::Result<()> {
     check_option_conflicts(options)?;
-    Session::new(filesystem, mountpoint.as_ref(), options).and_then(|mut se| se.run())
+    Session::new(
+        filesystem,
+        mountpoint.as_ref(),
+        options,
+        config.dispatch_mode,
+        config.uring,
+    )
+    .and_then(|mut se| se.run())
 }

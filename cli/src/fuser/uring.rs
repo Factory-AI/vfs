@@ -21,9 +21,8 @@
 //! reply synchronously, so each ring's submission queue is effectively
 //! single-threaded (guarded by a mutex that is never contended in practice).
 //!
-//! Default on when the kernel side is available (root sysctl
-//! `fuse.enable_uring=1`); kill switch `AGENTFS_FUSE_URING=0`; depth per
-//! queue via `AGENTFS_FUSE_URING_DEPTH` (default 4).
+//! Runtime enable/depth/spin settings are parsed by `crate::fuse_config` and
+//! passed into the session. This transport reads no environment variables.
 
 #![cfg(target_os = "linux")]
 
@@ -36,6 +35,8 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use log::{debug, error, warn};
+
+use crate::fuse_config::UringConfig;
 
 use super::channel::ChannelSender;
 use super::deferred_notify::DeferredNotifier;
@@ -133,40 +134,6 @@ const MAX_OP_IN_SIZE: usize = 128;
 /// size is exactly max(8K, 1M, 1M). Allocate with one page of slack.
 pub(crate) const URING_MAX_WRITE: u32 = 1 << 20;
 const PAYLOAD_BUF_SIZE: usize = (URING_MAX_WRITE as usize) + 4096;
-
-// ─── configuration ──────────────────────────────────────────────────────────
-
-/// Default on: codex A/B showed the transport equal-or-better on every
-/// phase (total 3.37x -> 2.92x). Safe unconditionally because INIT only
-/// advertises FUSE_OVER_IO_URING after a ring-setup probe succeeds, which
-/// requires the root sysctl `fuse.enable_uring=1`; everything else falls
-/// back to the legacy /dev/fuse channel. `AGENTFS_FUSE_URING=0` is the
-/// kill switch.
-pub(crate) fn uring_enabled() -> bool {
-    !matches!(
-        std::env::var("AGENTFS_FUSE_URING").as_deref(),
-        Ok("0") | Ok("false") | Ok("off")
-    )
-}
-
-fn uring_queue_depth() -> usize {
-    std::env::var("AGENTFS_FUSE_URING_DEPTH")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|d| (1..=64).contains(d))
-        .unwrap_or(4)
-}
-
-/// Busy-poll the completion queue for this long before blocking in
-/// io_uring_enter, trading idle CPU for wakeup latency on request bursts.
-/// Default 0 (no spin).
-fn uring_spin_us() -> u64 {
-    std::env::var("AGENTFS_FUSE_URING_SPIN_US")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|us| *us <= 1000)
-        .unwrap_or(0)
-}
 
 /// One queue per possible CPU: the kernel sizes its queue array with
 /// `num_possible_cpus()` and routes requests by `task_cpu(current)`.
@@ -529,6 +496,13 @@ fn classify_cqe_user_data(user_data: u64, depth: usize) -> CqeUserData {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct QueueThreadConfig {
+    qid: u16,
+    depth: usize,
+    spin: Duration,
+}
+
 /// Per-request reply target: commits the reply into the ring entry's buffers
 /// and queues a COMMIT_AND_FETCH SQE. Replies happen inline on the queue
 /// thread (handlers are synchronous), so the submission mutex is uncontended;
@@ -613,8 +587,10 @@ pub(crate) fn start_uring_queues<FS: Filesystem + Send + Sync + 'static>(
     deferred: Arc<DeferredNotifier>,
     device: Arc<File>,
     control: Arc<UringQueueControl>,
+    config: UringConfig,
 ) {
-    let depth = uring_queue_depth();
+    let depth = config.depth;
+    let spin = Duration::from_micros(config.spin_us);
     let nr_queues = possible_cpus();
     let active_dispatches = Arc::new(AtomicU64::new(0));
     let starter_control = control.clone();
@@ -646,9 +622,13 @@ pub(crate) fn start_uring_queues<FS: Filesystem + Send + Sync + 'static>(
             match std::thread::Builder::new()
                 .name(format!("agentfs-fuse-uring-{qid}"))
                 .spawn(move || {
-                    queue_thread(
-                        qid as u16,
+                    let queue_config = QueueThreadConfig {
+                        qid: qid as u16,
                         depth,
+                        spin,
+                    };
+                    queue_thread(
+                        queue_config,
                         shared,
                         deferred,
                         device,
@@ -674,14 +654,16 @@ pub(crate) fn start_uring_queues<FS: Filesystem + Send + Sync + 'static>(
 }
 
 fn queue_thread<FS: Filesystem>(
-    qid: u16,
-    depth: usize,
+    config: QueueThreadConfig,
     shared: Arc<SessionShared<FS>>,
     deferred: Arc<DeferredNotifier>,
     device: Arc<File>,
     active_dispatches: Arc<AtomicU64>,
     control: Arc<UringQueueControl>,
 ) {
+    let qid = config.qid;
+    let depth = config.depth;
+    let spin = config.spin;
     let ring = match RawRing::new((depth + 1) as u32) {
         Ok(ring) => ring,
         Err(e) => {
@@ -742,8 +724,6 @@ fn queue_thread<FS: Filesystem>(
     let mut dead = 0usize;
     let mut register_retries = 0u32;
     let ring_fd = queue.ring.lock().unwrap().fd.as_raw_fd();
-    let spin = Duration::from_micros(uring_spin_us());
-
     loop {
         if control.is_shutdown() {
             debug!("fuse-uring: queue {qid} shutting down");

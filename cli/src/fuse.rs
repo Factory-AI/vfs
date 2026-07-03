@@ -1,3 +1,4 @@
+use crate::fuse_config::{FuseConfig, FuseKernelCacheConfig, ReaddirPlusMode, UringConfig};
 use crate::fuser::{
     consts::{
         FOPEN_CACHE_DIR, FOPEN_KEEP_CACHE, FUSE_ASYNC_READ, FUSE_CACHE_SYMLINKS,
@@ -70,126 +71,6 @@ fn maximize_fd_limit() {
             "Failed to get fd limit: {}",
             std::io::Error::last_os_error()
         );
-    }
-}
-
-/// Default kernel TTLs for positive dentries and attributes. 10s lets a whole
-/// git-style workload (clone ≈3s + status/diff/fsck) reuse the dentries and
-/// attrs established by mutation replies instead of re-LOOKUP/GETATTR storms
-/// (warm steady-state reads measured 12.7x native at the old 1s default).
-/// Within one mount the kernel is coherent for its own operations regardless
-/// of TTL; the TTL only bounds staleness ACROSS concurrent mounts of the same
-/// session DB (`agentfs run --session` from another terminal), which now see
-/// attribute/namespace changes within 10s. Override with
-/// `AGENTFS_FUSE_ENTRY_TTL_MS` / `AGENTFS_FUSE_ATTR_TTL_MS`.
-const DEFAULT_FUSE_POSITIVE_TTL_MS: u64 = 10_000;
-/// Default kernel TTL for negative dentries. Kept at 1s: a file created by a
-/// second mount stays invisible to this mount for the negative TTL, and
-/// lookup-miss caching is the most surprising staleness to debug. Override
-/// with `AGENTFS_FUSE_NEG_TTL_MS`.
-const DEFAULT_FUSE_NEG_TTL_MS: u64 = 1000;
-const READDIRPLUS_MODE_OFF: u64 = 0;
-const READDIRPLUS_MODE_AUTO: u64 = 1;
-const READDIRPLUS_MODE_ALWAYS: u64 = 2;
-
-/// FUSE kernel cache policy derived once per mount from environment knobs.
-#[derive(Debug, Clone)]
-struct FuseKernelCacheConfig {
-    entry_ttl: Duration,
-    attr_ttl: Duration,
-    neg_ttl: Duration,
-    entry_ttl_ms: u64,
-    attr_ttl_ms: u64,
-    neg_ttl_ms: u64,
-    writeback_cache_enabled: bool,
-    keepcache_enabled: bool,
-    readdirplus_mode: ReaddirPlusMode,
-}
-
-impl FuseKernelCacheConfig {
-    fn from_env() -> Self {
-        let entry_ttl_ms =
-            env_duration_ms("AGENTFS_FUSE_ENTRY_TTL_MS", DEFAULT_FUSE_POSITIVE_TTL_MS);
-        let attr_ttl_ms = env_duration_ms("AGENTFS_FUSE_ATTR_TTL_MS", DEFAULT_FUSE_POSITIVE_TTL_MS);
-        let neg_ttl_ms = env_duration_ms("AGENTFS_FUSE_NEG_TTL_MS", DEFAULT_FUSE_NEG_TTL_MS);
-
-        // Kernel cache safety requires non-serial workers: we need a worker thread
-        // distinct from the session loop to send FUSE_NOTIFY_INVAL_* without
-        // blocking the request reader. Serial mode keeps reply+notify on the same
-        // thread which deadlocks per cli/src/fuser/deferred_notify.rs.
-        //
-        // Whether AGENTFS_FUSE_SYNC_INVAL is on does NOT affect safety here:
-        // - On (sync): worker writev's notify directly. Risk: kernel may block
-        //   the worker's writev waiting for an inline FUSE_FORGET that the
-        //   session thread cannot deliver if its lane queue is full. This
-        //   reproduces under git clone on Linux 6+ kernels.
-        // - Off (deferred, the default): notify is enqueued to the dedicated
-        //   notify thread that owns its own writev fd. The notify thread is
-        //   never blocked by the dispatch path, so the kernel-side FORGET
-        //   round-trip drains independently. Cache coherency is bounded by
-        //   the few-microsecond latency between mutation reply and notify
-        //   delivery, which is well within the entry/attr TTL window.
-        //
-        // So: safe_kernel_cache only requires non-serial workers, and the
-        // sync_invalidation env var is treated as an unsafe opt-in.
-        let workers_not_serial = fuse_workers_not_serial_from_env();
-        let safe_kernel_cache = workers_not_serial;
-        let (entry_ttl_ms, attr_ttl_ms, neg_ttl_ms) = if safe_kernel_cache {
-            (entry_ttl_ms, attr_ttl_ms, neg_ttl_ms)
-        } else {
-            if entry_ttl_ms != 0 || attr_ttl_ms != 0 || neg_ttl_ms != 0 {
-                tracing::warn!(
-                    "Refusing nonzero FUSE TTLs: kernel entry/attr/negative TTLs require non-serial AGENTFS_FUSE_WORKERS"
-                );
-            }
-            (0, 0, 0)
-        };
-
-        let writeback_requested = env_flag_default("AGENTFS_FUSE_WRITEBACK", true);
-        let writeback_cache_enabled = writeback_requested && safe_kernel_cache;
-        if writeback_requested && !writeback_cache_enabled {
-            tracing::warn!(
-                "Refusing FUSE writeback cache: AGENTFS_FUSE_WRITEBACK requires non-serial AGENTFS_FUSE_WORKERS"
-            );
-        }
-
-        let keepcache_requested = env_flag_default("AGENTFS_FUSE_KEEPCACHE", true);
-        let keepcache_enabled = keepcache_requested && safe_kernel_cache;
-        if keepcache_requested && !keepcache_enabled {
-            tracing::warn!(
-                "Refusing FOPEN_KEEP_CACHE: AGENTFS_FUSE_KEEPCACHE requires non-serial AGENTFS_FUSE_WORKERS"
-            );
-        }
-        let readdirplus_mode = if safe_kernel_cache {
-            readdirplus_mode_from_env()
-        } else {
-            tracing::warn!(
-                "Refusing FUSE readdirplus: readdirplus requires non-serial AGENTFS_FUSE_WORKERS"
-            );
-            ReaddirPlusMode::Off
-        };
-
-        Self {
-            entry_ttl: Duration::from_millis(entry_ttl_ms),
-            attr_ttl: Duration::from_millis(attr_ttl_ms),
-            neg_ttl: Duration::from_millis(neg_ttl_ms),
-            entry_ttl_ms,
-            attr_ttl_ms,
-            neg_ttl_ms,
-            writeback_cache_enabled,
-            keepcache_enabled,
-            readdirplus_mode,
-        }
-    }
-
-    fn record_profile(&self) {
-        agentfs_sdk::profiling::set_fuse_ttl_ms(
-            self.entry_ttl_ms,
-            self.attr_ttl_ms,
-            self.neg_ttl_ms,
-        );
-        agentfs_sdk::profiling::set_fuse_keepcache_enabled(self.keepcache_enabled);
-        agentfs_sdk::profiling::set_fuse_readdirplus_mode(self.readdirplus_mode.profile_value());
     }
 }
 
@@ -267,14 +148,6 @@ impl KeepCacheDriftGuard {
             had_fingerprint
         }
     }
-}
-
-/// Kernel readdirplus policy.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum ReaddirPlusMode {
-    Off,
-    Auto,
-    Always,
 }
 
 /// Options for mounting an agent filesystem via FUSE.
@@ -601,6 +474,8 @@ struct AgentFSFuse {
     runtime: Runtime,
     /// Env-backed kernel cache safety configuration for this mount.
     cache_config: FuseKernelCacheConfig,
+    /// Env-backed FUSE-over-io_uring settings for this mount.
+    uring: UringConfig,
     /// Maps file handle -> open file state
     open_files: Arc<Mutex<HashMap<u64, OpenFile>>>,
     /// Caches fully materialized directory entries across FUSE readdir offset calls.
@@ -738,7 +613,7 @@ impl Filesystem for AgentFSFuse {
         // clamp keeps per-entry ring payload buffers at 1 MiB (the kernel
         // caps single WRITEs at max_pages = 256 pages anyway, so >1 MiB
         // writes never materialize on Linux).
-        if crate::fuser::uring::uring_enabled() {
+        if self.uring.enabled {
             if crate::fuser::uring::probe_ring_setup()
                 && config.add_capabilities(FUSE_OVER_IO_URING).is_ok()
             {
@@ -2903,61 +2778,40 @@ impl AgentFSFuse {
     ///
     /// The provided Tokio runtime is used to execute async FileSystem operations
     /// from within synchronous FUSE callbacks via `block_on`.
-    fn new(fs: Arc<dyn FileSystem>, runtime: Runtime) -> Self {
+    fn new(fs: Arc<dyn FileSystem>, runtime: Runtime, config: FuseConfig) -> Self {
         let keepcache_delta_enabled = fs.delta_keep_cache_fast_path();
-        let sync_inval = fuse_sync_inval_enabled_from_env();
-        let self_inval = env_flag_default("AGENTFS_FUSE_SELF_INVAL", false);
-        let drain_on_release = fuse_drain_on_release_from_env();
-        let drain_on_forget = fuse_drain_on_forget_from_env();
-        let flush_inval_always = env_flag_default("AGENTFS_FUSE_FLUSH_INVAL", false);
-        let noflush = env_flag_default("AGENTFS_FUSE_NOFLUSH", true) && !drain_on_release;
-        if noflush != env_flag_default("AGENTFS_FUSE_NOFLUSH", true) {
-            tracing::warn!(
-                "AGENTFS_FUSE_NOFLUSH disabled: AGENTFS_DRAIN_ON_RELEASE needs the close-time FLUSH"
-            );
-        }
-        let noopen = env_flag_default("AGENTFS_FUSE_NOOPEN", true) && !drain_on_release;
-        if noopen != env_flag_default("AGENTFS_FUSE_NOOPEN", true) {
-            tracing::warn!(
-                "AGENTFS_FUSE_NOOPEN disabled: AGENTFS_DRAIN_ON_RELEASE needs per-handle releases"
-            );
-        }
-        let ino_files_cap = std::env::var("AGENTFS_FUSE_INO_FILES_CAP")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|cap| *cap >= 16)
-            .unwrap_or(65_536);
-        let cache_config = FuseKernelCacheConfig::from_env();
+        let cache_config = config.kernel_cache();
         cache_config.record_profile();
-        let cache_dir_enabled =
-            env_flag_default("AGENTFS_FUSE_CACHE_DIR", true) && cache_config.keepcache_enabled;
+        let cache_dir_enabled = config.cache_dir_enabled();
         let writeback_enabled = cache_config.writeback_cache_enabled;
+        let uring = config.uring;
         Self {
             fs,
             runtime,
             cache_config,
+            uring,
             open_files: Arc::new(Mutex::new(HashMap::new())),
             dir_entries_cache: Arc::new(Mutex::new(HashMap::new())),
             attr_cache: Arc::new(Mutex::new(HashMap::new())),
             entry_cache: Arc::new(Mutex::new(HashMap::new())),
             negative_entry_cache: Arc::new(Mutex::new(HashMap::new())),
             keepcache_drift_guard: Arc::new(Mutex::new(KeepCacheDriftGuard::new(
-                env_flag_default("AGENTFS_FUSE_STICKY_KEEPCACHE_DROP", false),
+                config.keepcache_sticky_drop,
             ))),
             cache_reply_lock: Arc::new(Mutex::new(())),
             cache_epoch: AtomicU64::new(0),
             next_fh: AtomicU64::new(1),
-            sync_inval,
-            self_inval,
-            drain_on_release,
-            drain_on_forget,
-            flush_inval_always,
-            noflush,
+            sync_inval: config.sync_inval,
+            self_inval: config.self_inval,
+            drain_on_release: config.drain_on_release,
+            drain_on_forget: config.drain_on_forget,
+            flush_inval_always: config.flush_inval_always,
+            noflush: config.noflush,
             keepcache_delta_enabled,
-            noopen,
+            noopen: config.noopen,
             noopen_active: AtomicBool::new(false),
             ino_files: Mutex::new(HashMap::new()),
-            ino_files_cap,
+            ino_files_cap: config.ino_files_cap,
             ino_file_stamp: AtomicU64::new(0),
             pending_dirty_handles: AtomicUsize::new(0),
             cache_dir_enabled,
@@ -2983,208 +2837,6 @@ fn readdir_start(offset: i64) -> usize {
 
 fn fuse_write_open(flags: i32) -> bool {
     (flags & libc::O_ACCMODE) != libc::O_RDONLY || (flags & libc::O_TRUNC) != 0
-}
-
-fn env_bool(value: &str) -> Option<bool> {
-    match value.trim() {
-        "1" => Some(true),
-        "0" => Some(false),
-        value
-            if value.eq_ignore_ascii_case("true")
-                || value.eq_ignore_ascii_case("yes")
-                || value.eq_ignore_ascii_case("on") =>
-        {
-            Some(true)
-        }
-        value
-            if value.eq_ignore_ascii_case("false")
-                || value.eq_ignore_ascii_case("no")
-                || value.eq_ignore_ascii_case("off") =>
-        {
-            Some(false)
-        }
-        _ => None,
-    }
-}
-
-fn env_duration_ms(name: &str, default: u64) -> u64 {
-    match std::env::var(name) {
-        Ok(value) => match value.parse::<u64>() {
-            Ok(ms) => ms,
-            Err(_) => {
-                tracing::warn!(
-                    "Ignoring invalid {}={} for FUSE TTL; using {}ms",
-                    name,
-                    value,
-                    default
-                );
-                default
-            }
-        },
-        Err(_) => default,
-    }
-}
-
-fn env_flag_default(name: &str, default: bool) -> bool {
-    match std::env::var(name) {
-        Ok(value) => env_bool(&value).unwrap_or_else(|| {
-            tracing::warn!(
-                "Ignoring invalid {}={} for FUSE kernel cache flag; using default {}",
-                name,
-                value,
-                default
-            );
-            default
-        }),
-        Err(_) => default,
-    }
-}
-
-fn fuse_workers_serial_from_env() -> bool {
-    std::env::var("AGENTFS_FUSE_WORKERS")
-        .map(|value| {
-            let value = value.trim();
-            value.eq_ignore_ascii_case("serial") || value == "0"
-        })
-        // Default (unset): parallel dispatch so kernel cache invariants hold.
-        // Pair with the matching default in cli/src/fuser/session.rs::FuseDispatchMode::from_env.
-        .unwrap_or(false)
-}
-
-fn fuse_workers_not_serial_from_env() -> bool {
-    !fuse_workers_serial_from_env()
-}
-
-/// Whether flush/release should force a synchronous SDK drain (SQLite commit).
-///
-/// Default false: the Tier-4 overlay serves reads from pending writes, so a
-/// commit on every close is unnecessary and serialises the clone critical path.
-/// Durability is preserved by fsync, the batcher timer/bytes/global triggers,
-/// and finalize-on-unmount. `AGENTFS_DRAIN_ON_RELEASE=1` restores the legacy
-/// commit-on-close behaviour (a kill switch for the deferral).
-fn fuse_drain_on_release_from_env() -> bool {
-    match std::env::var("AGENTFS_DRAIN_ON_RELEASE") {
-        Ok(value) => match env_bool(&value) {
-            Some(enabled) => enabled,
-            None => {
-                tracing::warn!(
-                    "Ignoring invalid AGENTFS_DRAIN_ON_RELEASE={:?}; expected 0/1/true/false",
-                    value
-                );
-                false
-            }
-        },
-        Err(_) => false,
-    }
-}
-
-/// Whether FUSE forget/batch_forget should force a synchronous SDK drain
-/// (SQLite commit) for the forgotten inode.
-///
-/// Default false: a kernel FORGET only drops the kernel's reference to the
-/// inode — the SDK's pending batched writes stay readable through the Tier-4
-/// overlay and are committed by the batcher timer/bytes triggers, fsync, or
-/// finalize-on-unmount. Draining here used to issue one serial SQLite commit
-/// per written file during git-clone-style workloads (the kernel FORGETs each
-/// file shortly after our post-write entry invalidation), which sat on the
-/// clone critical path. `AGENTFS_DRAIN_ON_FORGET=1` restores the legacy
-/// commit-on-forget behaviour (a kill switch for the deferral).
-fn fuse_drain_on_forget_from_env() -> bool {
-    match std::env::var("AGENTFS_DRAIN_ON_FORGET") {
-        Ok(value) => match env_bool(&value) {
-            Some(enabled) => enabled,
-            None => {
-                tracing::warn!(
-                    "Ignoring invalid AGENTFS_DRAIN_ON_FORGET={:?}; expected 0/1/true/false",
-                    value
-                );
-                false
-            }
-        },
-        Err(_) => false,
-    }
-}
-
-fn fuse_sync_inval_enabled_from_env() -> bool {
-    let workers_serial = fuse_workers_serial_from_env();
-    let sync_requested = match std::env::var("AGENTFS_FUSE_SYNC_INVAL") {
-        Ok(value) => match env_bool(&value) {
-            Some(enabled) => enabled,
-            None => {
-                tracing::warn!(
-                    "Ignoring invalid AGENTFS_FUSE_SYNC_INVAL={:?}; expected 0/1/true/false",
-                    value
-                );
-                // Fall back to deferred invalidation (the safe default).
-                false
-            }
-        },
-        // Default (unset): use deferred invalidation. Synchronous writev of
-        // FUSE_NOTIFY_INVAL_* from a request handler can deadlock with the
-        // kernel: the notify triggers d_invalidate -> iput -> FUSE_FORGET, and
-        // the kernel may block the writev call until that FORGET is delivered.
-        // In parallel mode this surfaces under git workloads (clone, checkout)
-        // when the session thread is blocked on a full worker queue and cannot
-        // read the pending FORGET. The DeferredNotifier thread is the only
-        // path that's safe in both serial and parallel modes, so it is the
-        // default. Users who explicitly opt into AGENTFS_FUSE_SYNC_INVAL=1
-        // accept the deadlock risk in exchange for tighter cache coherency.
-        Err(_) => false,
-    };
-
-    if workers_serial && sync_requested {
-        tracing::info!(
-            "AGENTFS_FUSE_SYNC_INVAL requested with AGENTFS_FUSE_WORKERS=serial; using deferred invalidation to avoid notify/reply deadlock"
-        );
-        false
-    } else {
-        sync_requested
-    }
-}
-
-fn readdirplus_mode_from_env() -> ReaddirPlusMode {
-    match std::env::var("AGENTFS_FUSE_READDIRPLUS") {
-        Ok(value)
-            if value.eq_ignore_ascii_case("off")
-                || value.eq_ignore_ascii_case("false")
-                || value.eq_ignore_ascii_case("no")
-                || value == "0" =>
-        {
-            ReaddirPlusMode::Off
-        }
-        Ok(value) if value.eq_ignore_ascii_case("auto") => ReaddirPlusMode::Auto,
-        Ok(value)
-            if value.eq_ignore_ascii_case("always")
-                || value.eq_ignore_ascii_case("on")
-                || value.eq_ignore_ascii_case("true")
-                || value.eq_ignore_ascii_case("yes")
-                || value == "1" =>
-        {
-            ReaddirPlusMode::Always
-        }
-        Ok(value) => {
-            tracing::warn!(
-                "Ignoring invalid AGENTFS_FUSE_READDIRPLUS={}; disabling readdirplus",
-                value
-            );
-            ReaddirPlusMode::Off
-        }
-        // Default ON: profiling shows `always` strictly reduces metadata
-        // round-trips (diff -34%, status -6.6%, checkout getattr -10.5%) with no
-        // regressions and identical invalidation safety. `auto`/`off` remain
-        // available as explicit rollbacks.
-        Err(_) => ReaddirPlusMode::Always,
-    }
-}
-
-impl ReaddirPlusMode {
-    fn profile_value(self) -> u64 {
-        match self {
-            ReaddirPlusMode::Off => READDIRPLUS_MODE_OFF,
-            ReaddirPlusMode::Auto => READDIRPLUS_MODE_AUTO,
-            ReaddirPlusMode::Always => READDIRPLUS_MODE_ALWAYS,
-        }
-    }
 }
 
 fn configure_writeback_cache(config: &mut KernelConfig, enabled: bool) {
@@ -3378,7 +3030,10 @@ pub fn spawn_mount(
     // when passthrough filesystems cache O_PATH file descriptors
     maximize_fd_limit();
 
-    let fs = AgentFSFuse::new(fs, runtime);
+    let fuse_config = FuseConfig::from_env();
+    let dispatch_mode = fuse_config.dispatch_mode;
+    let uring_config = fuse_config.uring;
+    let fs = AgentFSFuse::new(fs, runtime, fuse_config);
 
     let mut mount_opts = vec![
         MountOption::FSName(opts.fsname),
@@ -3406,7 +3061,13 @@ pub fn spawn_mount(
         mount_opts.push(MountOption::AllowRoot);
     }
 
-    let mut session = crate::fuser::Session::new(fs, &opts.mountpoint, &mount_opts)?;
+    let mut session = crate::fuser::Session::new(
+        fs,
+        &opts.mountpoint,
+        &mount_opts,
+        dispatch_mode,
+        uring_config,
+    )?;
     let unmounter = session.unmount_callable();
     let thread = std::thread::spawn(move || session.run().map_err(anyhow::Error::from));
 
@@ -3497,34 +3158,6 @@ mod tests {
         assert_eq!(readdir_start(-1), 0);
         assert_eq!(readdir_start(0), 0);
         assert_eq!(readdir_start(2), 2);
-    }
-
-    #[test]
-    fn readdirplus_mode_defaults_to_always_with_rollbacks() {
-        use super::{readdirplus_mode_from_env, ReaddirPlusMode};
-
-        let key = "AGENTFS_FUSE_READDIRPLUS";
-        let saved = std::env::var(key).ok();
-
-        std::env::remove_var(key);
-        assert_eq!(readdirplus_mode_from_env(), ReaddirPlusMode::Always);
-
-        std::env::set_var(key, "auto");
-        assert_eq!(readdirplus_mode_from_env(), ReaddirPlusMode::Auto);
-
-        std::env::set_var(key, "off");
-        assert_eq!(readdirplus_mode_from_env(), ReaddirPlusMode::Off);
-
-        std::env::set_var(key, "always");
-        assert_eq!(readdirplus_mode_from_env(), ReaddirPlusMode::Always);
-
-        std::env::set_var(key, "garbage");
-        assert_eq!(readdirplus_mode_from_env(), ReaddirPlusMode::Off);
-
-        match saved {
-            Some(value) => std::env::set_var(key, value),
-            None => std::env::remove_var(key),
-        }
     }
 
     #[test]

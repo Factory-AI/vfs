@@ -20,6 +20,8 @@ use std::sync::{
 use std::thread;
 use std::time::Instant;
 
+use crate::fuse_config::{DispatchMode, UringConfig, FUSE_REQUEST_BUFFER_SIZE};
+
 use std::sync::mpsc;
 
 use super::deferred_notify::{DeferredNotifier, NotifyOp};
@@ -36,7 +38,7 @@ pub const MAX_WRITE_SIZE: usize = 16 * 1024 * 1024;
 
 /// Size of the buffer for reading a request from the kernel. Since the kernel may send
 /// up to `MAX_WRITE_SIZE` bytes in a write request, we use that value plus some extra space.
-const BUFFER_SIZE: usize = MAX_WRITE_SIZE + 4096;
+const BUFFER_SIZE: usize = FUSE_REQUEST_BUFFER_SIZE;
 
 #[derive(Default, Debug, Eq, PartialEq)]
 /// How requests should be filtered based on the calling UID.
@@ -63,6 +65,11 @@ pub struct Session<FS: Filesystem> {
     notify_tx: Option<mpsc::Sender<NotifyOp>>,
     /// Receiver half — moved to the notify thread in run()
     notify_rx: Option<mpsc::Receiver<NotifyOp>>,
+    /// Request dispatch mode parsed by the FUSE adapter config.
+    dispatch_mode: DispatchMode,
+    /// FUSE-over-io_uring settings parsed by the FUSE adapter config.
+    #[cfg(target_os = "linux")]
+    uring_config: UringConfig,
     /// Shutdown/join control for optional FUSE-over-io_uring queue threads.
     #[cfg(target_os = "linux")]
     uring_control: Arc<super::uring::UringQueueControl>,
@@ -120,169 +127,6 @@ impl<FS: Filesystem> SessionShared<FS> {
     pub(crate) fn is_destroyed(&self) -> bool {
         self.destroyed.load(Ordering::Acquire)
     }
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum FuseDispatchMode {
-    Serial,
-    Parallel {
-        workers: usize,
-        queue_capacity: usize,
-    },
-}
-
-impl FuseDispatchMode {
-    fn from_env() -> Self {
-        // Tier Three Axis F: lift the default CPU/memory share from 25% to 50%.
-        // The previous 25% default chose 3 workers on a 14-core box and
-        // saturated under git-clone fork/fsync storms (`fuse_dispatch_wait_nanos`
-        // hit ~570 ms on the canonical mixed workload). 50% gives 7 workers on
-        // the same machine and trims dispatch wait roughly proportionally with
-        // no observed downside on Phase 8 stress gates.
-        const DEFAULT_AUTO_PERCENT: u8 = 50;
-        let workers = match std::env::var("AGENTFS_FUSE_WORKERS") {
-            Ok(value) if value.eq_ignore_ascii_case("serial") => return Self::Serial,
-            Ok(value) if value.eq_ignore_ascii_case("auto") => workers_from_resource_percent(
-                env_percent("AGENTFS_FUSE_CPU_PERCENT", DEFAULT_AUTO_PERCENT),
-                env_percent("AGENTFS_FUSE_MEMORY_PERCENT", DEFAULT_AUTO_PERCENT),
-            ),
-            Ok(value) => parse_workers(&value).unwrap_or_else(|| {
-                tracing::warn!(
-                    value,
-                    "invalid AGENTFS_FUSE_WORKERS; using serial FUSE dispatch"
-                );
-                0
-            }),
-            // Default (unset): resolve as if AGENTFS_FUSE_WORKERS=auto so the
-            // kernel-cache fast path is on by default. Pair this with the
-            // matching default flip in cli/src/fuse.rs::fuse_workers_serial_from_env.
-            Err(_) => workers_from_resource_percent(
-                env_percent("AGENTFS_FUSE_CPU_PERCENT", DEFAULT_AUTO_PERCENT),
-                env_percent("AGENTFS_FUSE_MEMORY_PERCENT", DEFAULT_AUTO_PERCENT),
-            ),
-        };
-        if workers == 0 {
-            return Self::Serial;
-        }
-        let default_queue_capacity = default_queue_capacity(workers);
-        let queue_capacity = match std::env::var("AGENTFS_FUSE_QUEUE") {
-            Ok(value) => parse_queue_capacity(&value, workers).unwrap_or_else(|| {
-                tracing::warn!(
-                    value,
-                    default_queue_capacity,
-                    "invalid AGENTFS_FUSE_QUEUE; using default queue capacity"
-                );
-                default_queue_capacity
-            }),
-            Err(_) => default_queue_capacity,
-        };
-
-        Self::Parallel {
-            workers,
-            queue_capacity,
-        }
-    }
-}
-
-fn parse_workers(value: &str) -> Option<usize> {
-    let value = value.trim();
-    if let Some(percent) = parse_percent_suffix(value) {
-        return Some(workers_from_resource_percent(
-            percent,
-            env_percent("AGENTFS_FUSE_MEMORY_PERCENT", percent),
-        ));
-    }
-    value.parse::<usize>().ok().filter(|workers| *workers > 0)
-}
-
-fn parse_queue_capacity(value: &str, workers: usize) -> Option<usize> {
-    let value = value.trim();
-    if let Some(percent) = parse_percent_suffix(value) {
-        return Some(queue_capacity_for_memory_percent(workers, percent));
-    }
-    value.parse::<usize>().ok().filter(|queue| *queue > 0)
-}
-
-fn parse_percent_suffix(value: &str) -> Option<u8> {
-    let percent = value.strip_suffix('%')?.trim().parse::<u8>().ok()?;
-    (1..=100).contains(&percent).then_some(percent)
-}
-
-fn env_percent(name: &str, default: u8) -> u8 {
-    match std::env::var(name) {
-        Ok(value) => parse_percent_suffix(&format!("{}%", value.trim()))
-            .or_else(|| {
-                value
-                    .trim()
-                    .parse::<u8>()
-                    .ok()
-                    .filter(|v| (1..=100).contains(v))
-            })
-            .unwrap_or_else(|| {
-                tracing::warn!(
-                    name,
-                    value,
-                    default,
-                    "invalid percent environment variable; using default"
-                );
-                default
-            }),
-        Err(_) => default,
-    }
-}
-
-fn workers_from_resource_percent(cpu_percent: u8, memory_percent: u8) -> usize {
-    let cpu_workers = thread::available_parallelism()
-        .map(|parallelism| percent_of_count(parallelism.get(), cpu_percent))
-        .unwrap_or(1);
-    let memory_workers = available_memory_bytes()
-        .map(|bytes| {
-            let budget = percent_of_bytes(bytes, memory_percent);
-            (budget / BUFFER_SIZE as u64).max(1) as usize
-        })
-        .unwrap_or(cpu_workers);
-    cpu_workers.min(memory_workers).max(1)
-}
-
-fn default_queue_capacity(workers: usize) -> usize {
-    let memory_percent = env_percent("AGENTFS_FUSE_QUEUE_MEMORY_PERCENT", 25);
-    workers
-        .saturating_mul(4)
-        .max(1)
-        .min(queue_capacity_for_memory_percent(workers, memory_percent))
-}
-
-fn queue_capacity_for_memory_percent(workers: usize, percent: u8) -> usize {
-    let Some(bytes) = available_memory_bytes() else {
-        return workers.saturating_mul(4).max(1);
-    };
-    let budget = percent_of_bytes(bytes, percent);
-    let worker_bytes = workers.saturating_mul(BUFFER_SIZE) as u64;
-    let queue_budget = budget.saturating_sub(worker_bytes);
-    (queue_budget / BUFFER_SIZE as u64).max(1) as usize
-}
-
-fn percent_of_count(count: usize, percent: u8) -> usize {
-    ((count as u64 * percent as u64) / 100).max(1) as usize
-}
-
-fn percent_of_bytes(bytes: u64, percent: u8) -> u64 {
-    bytes.saturating_mul(percent as u64) / 100
-}
-
-fn available_memory_bytes() -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-        for line in meminfo.lines() {
-            let Some(rest) = line.strip_prefix("MemAvailable:") else {
-                continue;
-            };
-            let kib = rest.split_whitespace().next()?.parse::<u64>().ok()?;
-            return kib.checked_mul(1024);
-        }
-    }
-    None
 }
 
 #[derive(Debug)]
@@ -362,6 +206,8 @@ impl<FS: Filesystem> Session<FS> {
         filesystem: FS,
         mountpoint: P,
         options: &[MountOption],
+        dispatch_mode: DispatchMode,
+        uring_config: UringConfig,
     ) -> io::Result<Session<FS>> {
         let mountpoint = mountpoint.as_ref();
         debug!("Mounting {}", mountpoint.display());
@@ -399,6 +245,9 @@ impl<FS: Filesystem> Session<FS> {
             mount: Arc::new(Mutex::new(Some((mountpoint.to_owned(), mount)))),
             notify_tx: Some(notify_tx),
             notify_rx: Some(notify_rx),
+            dispatch_mode,
+            #[cfg(target_os = "linux")]
+            uring_config,
             #[cfg(target_os = "linux")]
             uring_control: super::uring::UringQueueControl::new(),
         })
@@ -439,23 +288,23 @@ impl<FS: Filesystem> Session<FS> {
         // regular requests; this legacy loop keeps running for INIT, FORGET,
         // INTERRUPT and as fallback when the kernel rejects ring setup.
         #[cfg(target_os = "linux")]
-        if super::uring::uring_enabled() {
+        if self.uring_config.enabled {
             super::uring::start_uring_queues(
                 self.shared.clone(),
                 deferred.clone(),
                 self.ch.device(),
                 self.uring_control.clone(),
+                self.uring_config,
             );
         }
 
-        let dispatch_mode = FuseDispatchMode::from_env();
-        let result = match dispatch_mode {
-            FuseDispatchMode::Serial => {
+        let result = match self.dispatch_mode {
+            DispatchMode::Serial => {
                 tracing::info!("resolved FUSE dispatch mode: serial");
                 agentfs_sdk::profiling::set_fuse_workers_configured(0);
                 self.run_serial(deferred.clone())
             }
-            FuseDispatchMode::Parallel {
+            DispatchMode::Parallel {
                 workers,
                 queue_capacity,
             } => {
