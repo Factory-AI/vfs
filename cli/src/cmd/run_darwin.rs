@@ -16,6 +16,7 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 use crate::nfs::AgentNFS;
 use crate::nfsserve::tcp::NFSTcp;
@@ -108,11 +109,10 @@ pub async fn run(
         .context("Failed to bind NFS server")?;
 
     // Spawn the NFS server task
-    let server_handle = tokio::spawn(async move {
-        if let Err(e) = listener.handle_forever().await {
-            eprintln!("NFS server error: {}", e);
-        }
-    });
+    let shutdown = CancellationToken::new();
+    let server_shutdown = shutdown.clone();
+    let server_handle =
+        tokio::spawn(async move { listener.handle_until_cancelled(server_shutdown).await });
 
     // Give the server a moment to start
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -128,8 +128,11 @@ pub async fn run(
     // Unmount
     unmount(&session.mountpoint)?;
 
-    // Abort the server task (vendored nfsserve doesn't support graceful shutdown)
-    server_handle.abort();
+    shutdown.cancel();
+    server_handle
+        .await
+        .context("NFS server task failed to join")?
+        .context("NFS server shutdown failed")?;
 
     // Clean up mountpoint directory (but keep the delta database)
     if let Err(e) = std::fs::remove_dir(&session.mountpoint) {

@@ -99,7 +99,7 @@ pub(crate) enum MountHandleInner {
     },
     Nfs {
         shutdown: CancellationToken,
-        _server_handle: tokio::task::JoinHandle<()>,
+        server_handle: Option<tokio::task::JoinHandle<()>>,
     },
 }
 
@@ -157,7 +157,10 @@ impl Drop for MountHandle {
                     );
                 }
             }
-            MountHandleInner::Nfs { shutdown, .. } => {
+            MountHandleInner::Nfs {
+                shutdown,
+                server_handle,
+            } => {
                 // Signal the NFS server to shut down
                 shutdown.cancel();
 
@@ -168,6 +171,20 @@ impl Drop for MountHandle {
                         self.mountpoint.display(),
                         e
                     );
+                }
+
+                if let Some(handle) = server_handle.take() {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    while !handle.is_finished() && std::time::Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    if !handle.is_finished() {
+                        eprintln!(
+                            "Warning: NFS server did not stop gracefully for {} within 5s; aborting task",
+                            self.mountpoint.display()
+                        );
+                        handle.abort();
+                    }
                 }
             }
         }

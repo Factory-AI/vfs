@@ -3014,6 +3014,7 @@ mod tests {
     use crate::nfsserve::vfs::NFSFileSystem;
     use agentfs_sdk::{AgentFS as AgentSdk, AgentFSOptions, FileSystem};
     use std::io::Cursor;
+    use std::path::Path;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -3024,6 +3025,23 @@ mod tests {
         let agent = AgentSdk::open(AgentFSOptions::ephemeral())
             .await
             .expect("open ephemeral AgentFS");
+        test_context_from_agent(agent).await
+    }
+
+    async fn test_context_with_db_path(
+        db_path: &Path,
+    ) -> (RPCContext, agentfs_sdk::filesystem::AgentFS) {
+        let agent = AgentSdk::open(AgentFSOptions::with_path(
+            db_path.to_str().expect("test DB path is UTF-8"),
+        ))
+        .await
+        .expect("open file-backed AgentFS");
+        test_context_from_agent(agent).await
+    }
+
+    async fn test_context_from_agent(
+        agent: AgentSdk,
+    ) -> (RPCContext, agentfs_sdk::filesystem::AgentFS) {
         agent
             .fs
             .chmod(1, 0o777)
@@ -3048,6 +3066,14 @@ mod tests {
             transaction_tracker: Arc::new(TransactionTracker::new(Duration::from_secs(60))),
         };
         (context, fs)
+    }
+
+    fn force_long_write_batcher_window() {
+        std::env::set_var("AGENTFS_FUSE_WRITEBACK", "1");
+        std::env::set_var("AGENTFS_OVERLAY_READS", "1");
+        std::env::set_var("AGENTFS_BATCH_MS", "60000");
+        std::env::set_var("AGENTFS_BATCH_BYTES", "1048576");
+        std::env::set_var("AGENTFS_BATCH_GLOBAL_BYTES", "10485760");
     }
 
     fn parse_rpc_success(cursor: &mut Cursor<Vec<u8>>) {
@@ -3162,6 +3188,31 @@ mod tests {
         parse_nfs_status(&mut cursor)
     }
 
+    async fn write_file_sync_result(
+        context: &RPCContext,
+        file: nfs::nfs_fh3,
+        data: &[u8],
+    ) -> (nfs::nfsstat3, Option<WRITE3resok>) {
+        let mut input = Cursor::new(serialize_write_args(file, data));
+        let mut output = Vec::new();
+        nfsproc3_write(2, &mut input, &mut output, context)
+            .await
+            .expect("WRITE handler");
+
+        let mut cursor = Cursor::new(output);
+        parse_rpc_success(&mut cursor);
+        let status = parse_nfs_status(&mut cursor);
+        if matches!(status, nfs::nfsstat3::NFS3_OK) {
+            let mut resok = WRITE3resok::default();
+            resok
+                .deserialize(&mut cursor)
+                .expect("deserialize WRITE3resok");
+            (status, Some(resok))
+        } else {
+            (status, None)
+        }
+    }
+
     async fn setattr_size_status(
         context: &RPCContext,
         file: nfs::nfs_fh3,
@@ -3205,6 +3256,44 @@ mod tests {
             .await
             .expect("open file");
         file.pread(0, len).await.expect("read file")
+    }
+
+    #[tokio::test]
+    async fn file_sync_write_reply_survives_abort_before_batch_timer() {
+        force_long_write_batcher_window();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("nfs-file-sync.db");
+        let (context, fs) = test_context_with_db_path(&db_path).await;
+        let created_fh = create_readonly_file(&context).await;
+        let payload = b"FILE_SYNC bytes must survive immediate abort";
+
+        let (status, resok) = write_file_sync_result(&context, created_fh, payload).await;
+
+        assert!(matches!(status, nfs::nfsstat3::NFS3_OK));
+        let resok = resok.expect("WRITE should return success payload");
+        assert!(matches!(resok.committed, stable_how::FILE_SYNC));
+        println!(
+            "FILE_SYNC WRITE replied NFS3_OK count={} committed={:?}; aborting server before batch timer",
+            resok.count, resok.committed
+        );
+
+        drop(context);
+        drop(fs);
+
+        let reopened = AgentSdk::open(AgentFSOptions::with_path(
+            db_path.to_str().expect("test DB path is UTF-8"),
+        ))
+        .await
+        .expect("reopen AgentFS after simulated server abort");
+        let persisted = read_file(&reopened.fs, "loose-object", payload.len() as u64).await;
+        println!(
+            "reopened DB persisted {} bytes after FILE_SYNC abort",
+            persisted.len()
+        );
+        assert_eq!(
+            persisted, payload,
+            "NFS FILE_SYNC reply must not be sent before bytes are durable"
+        );
     }
 
     #[tokio::test]

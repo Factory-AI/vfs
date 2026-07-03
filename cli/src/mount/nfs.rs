@@ -91,11 +91,10 @@ pub(super) async fn mount_nfs(
         .await
         .context("Failed to bind NFS server")?;
 
-    // CancellationToken is kept for API compatibility, but the vendored nfsserve
-    // doesn't support graceful shutdown. The task will be aborted on drop.
     let shutdown = CancellationToken::new();
+    let server_shutdown = shutdown.clone();
     let server_handle = tokio::spawn(async move {
-        if let Err(e) = listener.handle_forever().await {
+        if let Err(e) = listener.handle_until_cancelled(server_shutdown).await {
             eprintln!("NFS server error: {}", e);
         }
     });
@@ -110,7 +109,7 @@ pub(super) async fn mount_nfs(
         lazy_unmount: opts.lazy_unmount,
         inner: MountHandleInner::Nfs {
             shutdown,
-            _server_handle: server_handle,
+            server_handle: Some(server_handle),
         },
     })
 }

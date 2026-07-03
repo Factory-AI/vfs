@@ -372,12 +372,13 @@ impl NFSFileSystem for AgentNFS {
             .await
             .map_err(error_to_nfsstat)?;
         file.pwrite(offset, data).await.map_err(error_to_nfsstat)?;
+        // NFS WRITE replies are emitted as FILE_SYNC by the protocol handler.
+        // Drain and checkpoint the SDK write batcher before returning so the
+        // acknowledged bytes are durable even if the server is aborted
+        // immediately after the reply.
+        file.fsync().await.map_err(error_to_nfsstat)?;
 
-        let stats = fs
-            .getattr(id_to_fs_ino(id))
-            .await
-            .map_err(error_to_nfsstat)?
-            .ok_or(nfsstat3::NFS3ERR_NOENT)?;
+        let stats = file.fstat().await.map_err(error_to_nfsstat)?;
 
         Ok(self.stats_to_fattr(&stats))
     }
@@ -669,6 +670,10 @@ impl NFSFileSystem for AgentNFS {
             .ok_or(nfsstat3::NFS3ERR_NOENT)?;
 
         Ok(target.into_bytes().into())
+    }
+
+    async fn finalize(&self) -> anyhow::Result<()> {
+        self.fs.finalize().await.map_err(anyhow::Error::from)
     }
 }
 

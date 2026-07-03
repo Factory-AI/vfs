@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::signal;
+use tokio_util::sync::CancellationToken;
 
 use crate::cmd::init::open_agentfs;
 use crate::nfs::AgentNFS;
@@ -72,11 +73,10 @@ pub async fn handle_nfs_command(id_or_path: String, bind: String, port: u32) -> 
 
     // Spawn the NFS server task
     use crate::nfsserve::tcp::NFSTcp;
-    let server_handle = tokio::spawn(async move {
-        if let Err(e) = listener.handle_forever().await {
-            eprintln!("NFS server error: {}", e);
-        }
-    });
+    let shutdown = CancellationToken::new();
+    let server_shutdown = shutdown.clone();
+    let server_handle =
+        tokio::spawn(async move { listener.handle_until_cancelled(server_shutdown).await });
 
     // Wait for Ctrl+C
     signal::ctrl_c()
@@ -86,8 +86,11 @@ pub async fn handle_nfs_command(id_or_path: String, bind: String, port: u32) -> 
     eprintln!();
     eprintln!("Shutting down...");
 
-    // Abort the server task (no graceful shutdown support)
-    server_handle.abort();
+    shutdown.cancel();
+    server_handle
+        .await
+        .context("NFS server task failed to join")?
+        .context("NFS server shutdown failed")?;
 
     Ok(())
 }

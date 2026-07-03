@@ -274,6 +274,12 @@ pub trait NFSFileSystem: Sync {
         Ok(res)
     }
 
+    /// Finalize a clean server shutdown after the accept loop has stopped and
+    /// all connection tasks have exited.
+    async fn finalize(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Converts the fileid to an opaque NFS file handle. Optional.
     fn id_to_fh(&self, id: fileid3) -> nfs_fh3 {
         let gennum = get_generation_number();
