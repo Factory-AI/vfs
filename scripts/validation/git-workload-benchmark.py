@@ -1126,7 +1126,9 @@ def main(argv: list[str]) -> int:
     if args.keep_temp:
         temp_root = Path(tempfile.mkdtemp(prefix="agentfs-git-workload-"))
     else:
-        temp_manager = tempfile.TemporaryDirectory(prefix="agentfs-git-workload-")
+        temp_manager = tempfile.TemporaryDirectory(
+            prefix="agentfs-git-workload-", ignore_cleanup_errors=True
+        )
         temp_root = Path(temp_manager.name)
 
     exit_code = 0
@@ -1351,15 +1353,18 @@ def main(argv: list[str]) -> int:
             "kept_temp": bool(args.keep_temp),
         }
 
-    payload = json.dumps(result, indent=args.json_indent, sort_keys=True) + "\n"
-    if args.output:
-        Path(args.output).expanduser().write_text(payload, encoding="utf-8")
-        print(f"Wrote Git workload benchmark JSON to {args.output}", file=sys.stderr)
-    else:
-        sys.stdout.write(payload)
-
-    if temp_manager is not None:
-        temp_manager.cleanup()
+    try:
+        payload = json.dumps(result, indent=args.json_indent, sort_keys=True) + "\n"
+        if args.output:
+            Path(args.output).expanduser().write_text(payload, encoding="utf-8")
+            print(f"Wrote Git workload benchmark JSON to {args.output}", file=sys.stderr)
+        else:
+            sys.stdout.write(payload)
+    finally:
+        # Not the context-manager protocol, but cleanup must survive output
+        # errors too; retried husks previously accumulated in /tmp.
+        if temp_manager is not None:
+            temp_manager.cleanup()
 
     return exit_code
 
