@@ -1637,6 +1637,16 @@ mod tests {
     use agentfs_sdk::{AgentFS, AgentFSOptions};
     use serde_json::Value as JsonValue;
 
+    async fn write_agent_file(agent: &AgentFS, path: &str, data: &[u8]) {
+        let (_, file) = agent
+            .fs
+            .create_file(path, (S_IFREG | 0o644) as u32, 0, 0)
+            .await
+            .unwrap();
+        file.pwrite(0, data).await.unwrap();
+        agent.fs.drain_all().await.unwrap();
+    }
+
     #[tokio::test]
     async fn integrity_succeeds_for_valid_database() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -1645,7 +1655,7 @@ mod tests {
             let agent = AgentFS::open(AgentFSOptions::with_path(db_path.to_string_lossy()))
                 .await
                 .unwrap();
-            agent.fs.pwrite("/hello.txt", 0, b"hello").await.unwrap();
+            write_agent_file(&agent, "/hello.txt", b"hello").await;
         }
 
         let mut stdout = Vec::new();
@@ -1671,7 +1681,7 @@ mod tests {
             let agent = AgentFS::open(AgentFSOptions::with_path(db_path.to_string_lossy()))
                 .await
                 .unwrap();
-            agent.fs.pwrite("/bad.txt", 0, b"bad").await.unwrap();
+            write_agent_file(&agent, "/bad.txt", b"bad").await;
             let conn = agent.get_connection().await.unwrap();
             let mut rows = conn
                 .query(
@@ -1760,8 +1770,8 @@ mod tests {
             let agent = AgentFS::open(AgentFSOptions::with_path(source.to_string_lossy()))
                 .await
                 .unwrap();
-            agent.fs.pwrite("/small.txt", 0, b"small").await.unwrap();
-            agent.fs.pwrite("/large.bin", 0, &large).await.unwrap();
+            write_agent_file(&agent, "/small.txt", b"small").await;
+            write_agent_file(&agent, "/large.bin", &large).await;
         }
 
         let mut stdout = Vec::new();
@@ -1806,7 +1816,7 @@ mod tests {
             )
             .await
             .unwrap();
-            agent.fs.pwrite("/secret.txt", 0, b"secret").await.unwrap();
+            write_agent_file(&agent, "/secret.txt", b"secret").await;
         }
 
         let encryption = (key.to_string(), cipher.to_string());

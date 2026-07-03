@@ -134,7 +134,7 @@ async fn concurrent_sdk_operations_preserve_database_integrity() -> Result<()> {
         handle.await.expect("worker task panicked")?;
     }
 
-    agent.fs.fsync("/").await?;
+    agent.fs.fsync().await?;
     assert_integrity_check_ok(&agent).await?;
     assert_final_state(&agent).await?;
 

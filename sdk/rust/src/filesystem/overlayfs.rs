@@ -1516,7 +1516,7 @@ impl File for OverlayPartialFile {
     }
 
     async fn fsync(&self) -> Result<()> {
-        self.delta.fsync("/").await
+        self.delta.fsync().await
     }
 
     async fn fstat(&self) -> Result<Stats> {

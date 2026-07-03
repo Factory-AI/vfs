@@ -1,5 +1,7 @@
+use agentfs_sdk::filesystem::FileSystem;
 use agentfs_sdk::{AgentFS, AgentFSOptions, Stats};
 
+const ROOT_INO: i64 = 1;
 const S_IFREG: u32 = 0o100000;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -779,14 +781,46 @@ impl McpServer {
     async fn handle_rename(&self, params: RenameParams) -> Result<String> {
         let from = normalize_path(&params.from)?;
         let to = normalize_path(&params.to)?;
+        let (from_parent, from_name) = self.parent_and_name(&from).await?;
+        let (to_parent, to_name) = self.parent_and_name(&to).await?;
 
-        self.agentfs
-            .fs
-            .rename(&from, &to)
-            .await
-            .context("Failed to rename")?;
+        FileSystem::rename(
+            &self.agentfs.fs,
+            from_parent,
+            &from_name,
+            to_parent,
+            &to_name,
+        )
+        .await
+        .context("Failed to rename")?;
 
         Ok(format!("Renamed {} to {}", from, to))
+    }
+
+    async fn parent_and_name(&self, path: &str) -> Result<(i64, String)> {
+        let path_obj = Path::new(path);
+        let name = path_obj
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow::anyhow!("Cannot operate on root path"))?
+            .to_string();
+        let parent_path = path_obj
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("/"))
+            .to_string_lossy()
+            .to_string();
+        let parent_ino = if parent_path == "/" {
+            ROOT_INO
+        } else {
+            self.agentfs
+                .fs
+                .stat(&parent_path)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Parent path not found: {}", parent_path))?
+                .ino
+        };
+        Ok((parent_ino, name))
     }
 
     /// Get file metadata

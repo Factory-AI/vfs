@@ -1,7 +1,10 @@
 use agentfs_sdk::error::Result;
+use agentfs_sdk::filesystem::{AgentFS as AgentFsCore, FileSystem, FsError};
 use agentfs_sdk::{AgentFS, AgentFSOptions, ToolCallStatus, DEFAULT_FILE_MODE};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+
+const ROOT_INO: i64 = 1;
 
 #[derive(Debug, Clone)]
 struct SnapshotCase {
@@ -44,7 +47,7 @@ async fn snapshot_restore_preserves_one_file_agent_state_after_checkpoint() -> R
     assert_generated_state(&agent, &cases, &tool_ids).await?;
     assert_integrity_check_ok(&agent).await?;
 
-    agent.fs.fsync("/").await?;
+    agent.fs.fsync().await?;
     assert_journal_mode_is_wal(&agent).await?;
     assert_wal_sidecar_checkpointed(&source_db);
 
@@ -91,7 +94,7 @@ async fn create_snapshot_case(
         .await?;
     crossing_file.pwrite(patch_offset as u64, &patch).await?;
 
-    agent.fs.link(&crossing_path, &hardlink_path).await?;
+    link_path(&agent.fs, &crossing_path, &hardlink_path).await?;
 
     let inline_data = patterned_bytes(512 + seed, 0x30 + seed as u8);
     let (_, inline_file) = agent
@@ -110,13 +113,17 @@ async fn create_snapshot_case(
 
     agent
         .fs
-        .symlink(
-            "nested/crossing.bin",
-            &symlink_path,
-            seed as u32,
-            seed as u32,
-        )
-        .await?;
+        .stat(&nested_dir)
+        .await?
+        .expect("nested dir should exist");
+    create_symlink_path(
+        &agent.fs,
+        "nested/crossing.bin",
+        &symlink_path,
+        seed as u32,
+        seed as u32,
+    )
+    .await?;
 
     agent
         .kv
@@ -238,7 +245,7 @@ async fn assert_generated_state(
         expected_sparse.extend_from_slice(&case.sparse_tail);
         assert_eq!(sparse_contents, expected_sparse);
 
-        let symlink_stats = agent.fs.lstat(&case.symlink_path).await?.unwrap();
+        let symlink_stats = lstat_path(&agent.fs, &case.symlink_path).await?.unwrap();
         assert!(symlink_stats.is_symlink());
         assert_eq!(
             agent.fs.readlink(&case.symlink_path).await?,
@@ -314,6 +321,73 @@ async fn assert_generated_state(
     Ok(())
 }
 
+async fn parent_and_name(fs: &AgentFsCore, path: &str) -> Result<(i64, String)> {
+    let normalized = normalize_test_path(path);
+    let components = normalized
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if components.is_empty() {
+        return Err(FsError::RootOperation.into());
+    }
+    let name = components.last().unwrap().to_string();
+    let parent_path = if components.len() == 1 {
+        "/".to_string()
+    } else {
+        format!("/{}", components[..components.len() - 1].join("/"))
+    };
+    let parent_ino = if parent_path == "/" {
+        ROOT_INO
+    } else {
+        fs.stat(&parent_path).await?.ok_or(FsError::NotFound)?.ino
+    };
+    Ok((parent_ino, name))
+}
+
+fn normalize_test_path(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    }
+}
+
+async fn link_path(fs: &AgentFsCore, oldpath: &str, newpath: &str) -> Result<()> {
+    let source = fs.stat(oldpath).await?.ok_or(FsError::NotFound)?;
+    let (newparent_ino, newname) = parent_and_name(fs, newpath).await?;
+    FileSystem::link(fs, source.ino, newparent_ino, &newname)
+        .await
+        .map(|_| ())
+}
+
+async fn create_symlink_path(
+    fs: &AgentFsCore,
+    target: &str,
+    linkpath: &str,
+    uid: u32,
+    gid: u32,
+) -> Result<()> {
+    let (parent_ino, name) = parent_and_name(fs, linkpath).await?;
+    FileSystem::symlink(fs, parent_ino, &name, target, uid, gid)
+        .await
+        .map(|_| ())
+}
+
+async fn lstat_path(
+    fs: &AgentFsCore,
+    path: &str,
+) -> Result<Option<agentfs_sdk::filesystem::Stats>> {
+    let normalized = normalize_test_path(path);
+    if normalized == "/" {
+        return FileSystem::getattr(fs, ROOT_INO).await;
+    }
+    let (parent_ino, name) = parent_and_name(fs, &normalized).await?;
+    FileSystem::lookup(fs, parent_ino, &name).await
+}
+
 async fn assert_integrity_check_ok(agent: &AgentFS) -> Result<()> {
     let conn = agent.get_connection().await?;
     let mut rows = conn.query("PRAGMA integrity_check", ()).await?;
@@ -338,6 +412,7 @@ async fn assert_inline_inode_has_no_chunks(
     ino: i64,
     expected: &[u8],
 ) -> Result<()> {
+    agent.fs.drain_all().await?;
     let conn = agent.get_connection().await?;
     let mut rows = conn
         .query(

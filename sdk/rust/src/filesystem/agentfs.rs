@@ -11,9 +11,11 @@ use tokio::sync::Mutex as AsyncMutex;
 use turso::transaction::{Transaction, TransactionBehavior};
 use turso::{Builder, Connection, Value};
 
+#[cfg(test)]
+use super::DEFAULT_FILE_MODE;
 use super::{
     BoxedFile, DirEntry, File, FileSystem, FilesystemStats, FsError, Stats, TimeChange, WriteRange,
-    DEFAULT_DIR_MODE, DEFAULT_FILE_MODE, MAX_NAME_LEN, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG,
+    DEFAULT_DIR_MODE, MAX_NAME_LEN, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG,
 };
 use crate::connection_pool::{ConnectionPool, ConnectionPoolOptions};
 use crate::schema::{self, AGENTFS_SCHEMA_VERSION};
@@ -3554,117 +3556,54 @@ impl AgentFS {
         Ok(Some(current_ino))
     }
 
-    /// Get file statistics without following symlinks
-    pub async fn lstat(&self, path: &str) -> Result<Option<Stats>> {
-        let conn = self.pool.get_connection().await?;
+    async fn resolve_parent_and_name(&self, path: &str) -> Result<(i64, String)> {
         let path = self.normalize_path(path);
-        let ino = match self.resolve_path_with_conn(&conn, &path).await? {
-            Some(ino) => ino,
-            None => return Ok(None),
+        let components = self.split_path(&path);
+        if components.is_empty() {
+            return Err(FsError::RootOperation.into());
+        }
+
+        let parent_path = match components.len() {
+            1 => "/".to_string(),
+            _ => format!("/{}", components[..components.len() - 1].join("/")),
         };
-
-        // Tier Four: don't drain while holding the conn (would deadlock on
-        // single-conn pools and starve under contention on larger pools).
-        // Read SQLite, then OR in pending writes' max-end.
-        let mut stats = self.getattr_with_conn(&conn, ino).await?;
-        self.merge_pending_view(ino, stats.as_mut());
-        Ok(stats)
+        let parent_ino = self
+            .resolve_path(&parent_path)
+            .await?
+            .ok_or(FsError::NotFound)?;
+        let name = components.last().cloned().ok_or(FsError::InvalidPath)?;
+        Ok((parent_ino, name))
     }
 
-    /// Get file statistics, following symlinks
+    /// Get file statistics, following symlinks.
     pub async fn stat(&self, path: &str) -> Result<Option<Stats>> {
-        let conn = self.pool.get_connection().await?;
         let path = self.normalize_path(path);
-
-        // Follow symlinks with a maximum depth to prevent infinite loops
         let mut current_path = path;
-        let max_symlink_depth = 40; // Standard limit for symlink following
-
-        for _ in 0..max_symlink_depth {
-            let ino = match self.resolve_path_with_conn(&conn, &current_path).await? {
+        for _ in 0..40 {
+            let ino = match self.resolve_path(&current_path).await? {
                 Some(ino) => ino,
                 None => return Ok(None),
             };
-            // Tier Four: see lstat — no drain while holding conn.
-            if let Some(mut stats) = self.getattr_with_conn(&conn, ino).await? {
-                // Check if this is a symlink
-                if (stats.mode & S_IFMT) == S_IFLNK {
-                    // Read the symlink target
-                    let target = self
-                        .readlink_with_conn(&conn, &current_path)
-                        .await?
-                        .ok_or(FsError::NotFound)?;
-
-                    // Resolve target path (handle both absolute and relative paths)
-                    current_path = if target.starts_with('/') {
-                        target
-                    } else {
-                        // Relative path - resolve relative to the symlink's directory
-                        let base_path = Path::new(&current_path);
-                        let parent = base_path.parent().unwrap_or(Path::new("/"));
-                        let joined = parent.join(&target);
-                        joined.to_string_lossy().into_owned()
-                    };
-                    current_path = self.normalize_path(&current_path);
-                    continue; // Follow the symlink
-                }
-
-                self.merge_pending_view(ino, Some(&mut stats));
-                return Ok(Some(stats));
-            } else {
+            let Some(stats) = FileSystem::getattr(self, ino).await? else {
                 return Ok(None);
-            }
-        }
-
-        // Too many symlinks
-        Err(FsError::SymlinkLoop.into())
-    }
-
-    /// Get file statistics, following symlinks (using provided connection)
-    async fn stat_with_conn(&self, conn: &Connection, path: &str) -> Result<Option<Stats>> {
-        let path = self.normalize_path(path);
-
-        // Follow symlinks with a maximum depth to prevent infinite loops
-        let mut current_path = path;
-        let max_symlink_depth = 40; // Standard limit for symlink following
-
-        for _ in 0..max_symlink_depth {
-            let ino = match self.resolve_path_with_conn(conn, &current_path).await? {
-                Some(ino) => ino,
-                None => return Ok(None),
             };
-
-            if let Some(stats) = self.getattr_with_conn(conn, ino).await? {
-                // Check if this is a symlink
-                if (stats.mode & S_IFMT) == S_IFLNK {
-                    // Read the symlink target
-                    let target = self
-                        .readlink_with_conn(conn, &current_path)
-                        .await?
-                        .ok_or(FsError::InvalidPath)?;
-
-                    // Resolve target path (handle both absolute and relative paths)
-                    current_path = if target.starts_with('/') {
-                        target
-                    } else {
-                        // Relative path - resolve relative to the symlink's directory
-                        let base_path = Path::new(&current_path);
-                        let parent = base_path.parent().unwrap_or(Path::new("/"));
-                        let joined = parent.join(&target);
-                        joined.to_string_lossy().into_owned()
-                    };
-                    current_path = self.normalize_path(&current_path);
-                    continue; // Follow the symlink
-                }
-
-                // Not a symlink, return the stats
+            if !stats.is_symlink() {
                 return Ok(Some(stats));
-            } else {
-                return Ok(None);
             }
+
+            let target = FileSystem::readlink(self, ino)
+                .await?
+                .ok_or(FsError::NotFound)?;
+            current_path = if target.starts_with('/') {
+                target
+            } else {
+                let base_path = Path::new(&current_path);
+                let parent = base_path.parent().unwrap_or(Path::new("/"));
+                parent.join(&target).to_string_lossy().into_owned()
+            };
+            current_path = self.normalize_path(&current_path);
         }
 
-        // Too many symlinks
         Err(FsError::SymlinkLoop.into())
     }
 
@@ -3918,165 +3857,8 @@ impl AgentFS {
 
     /// Create a directory
     pub async fn mkdir(&self, path: &str, uid: u32, gid: u32) -> Result<()> {
-        let conn = self.pool.get_connection().await?;
-        let path = self.normalize_path(path);
-        let components = self.split_path(&path);
-
-        if components.is_empty() {
-            return Err(FsError::RootOperation.into());
-        }
-
-        let parent_path = if components.len() == 1 {
-            "/".to_string()
-        } else {
-            format!("/{}", components[..components.len() - 1].join("/"))
-        };
-
-        let parent_ino = self
-            .resolve_path_with_conn(&conn, &parent_path)
-            .await?
-            .ok_or(FsError::NotFound)?;
-
-        let name = components.last().unwrap();
-
-        // Check if already exists (single query using parent_ino we already have)
-        if self.lookup_child(&conn, parent_ino, name).await?.is_some() {
-            return Err(FsError::AlreadyExists.into());
-        }
-
-        // Create inode with default directory mode (path-based API doesn't accept mode)
-        let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
-        let now_secs = dur.as_secs() as i64;
-        let now_nsec = dur.subsec_nanos() as i64;
-        let mut stmt = conn
-            .prepare_cached(
-                "INSERT INTO fs_inode (mode, uid, gid, size, atime, mtime, ctime, atime_nsec, mtime_nsec, ctime_nsec)
-                VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?) RETURNING ino",
-            )
-            .await?;
-        let row = stmt
-            .query_row((
-                DEFAULT_DIR_MODE as i64,
-                uid,
-                gid,
-                now_secs,
-                now_secs,
-                now_secs,
-                now_nsec,
-                now_nsec,
-                now_nsec,
-            ))
-            .await?;
-
-        let ino = row
-            .get_value(0)
-            .ok()
-            .and_then(|v| v.as_integer().copied())
-            .ok_or_else(|| Error::Internal("failed to get inode".to_string()))?;
-
-        // Create directory entry
-        let mut stmt = conn
-            .prepare_cached("INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, ?, ?)")
-            .await?;
-        stmt.execute((name.as_str(), parent_ino, ino)).await?;
-
-        // Set nlink to 2 for new directory (self "." + parent's dentry)
-        let mut stmt = conn
-            .prepare_cached("UPDATE fs_inode SET nlink = 2 WHERE ino = ?")
-            .await?;
-        stmt.execute((ino,)).await?;
-
-        // Increment parent nlink (new directory's ".." link) and update timestamps
-        let mut stmt = conn
-            .prepare_cached(
-                "UPDATE fs_inode SET nlink = nlink + 1, ctime = ?, mtime = ?, ctime_nsec = ?, mtime_nsec = ? WHERE ino = ?",
-            )
-            .await?;
-        stmt.execute((now_secs, now_secs, now_nsec, now_nsec, parent_ino))
-            .await?;
-
-        // Populate dentry cache
-        self.cache_dentry(parent_ino, name, ino);
-        self.invalidate_parent_attr(parent_ino);
-
-        Ok(())
-    }
-
-    /// Create a special file node (FIFO, device, socket, or regular file)
-    pub async fn mknod(&self, path: &str, mode: u32, rdev: u64, uid: u32, gid: u32) -> Result<()> {
-        let conn = self.pool.get_connection().await?;
-        let path = self.normalize_path(path);
-        let components = self.split_path(&path);
-
-        if components.is_empty() {
-            return Err(FsError::RootOperation.into());
-        }
-
-        let parent_path = if components.len() == 1 {
-            "/".to_string()
-        } else {
-            format!("/{}", components[..components.len() - 1].join("/"))
-        };
-
-        let parent_ino = self
-            .resolve_path_with_conn(&conn, &parent_path)
-            .await?
-            .ok_or(FsError::NotFound)?;
-
-        let name = components.last().unwrap();
-
-        // Check if already exists
-        if self.lookup_child(&conn, parent_ino, name).await?.is_some() {
-            return Err(FsError::AlreadyExists.into());
-        }
-
-        // Create inode with mode and rdev
-        let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
-        let now_secs = dur.as_secs() as i64;
-        let now_nsec = dur.subsec_nanos() as i64;
-        let mut stmt = conn
-            .prepare_cached(
-                "INSERT INTO fs_inode (mode, uid, gid, size, atime, mtime, ctime, rdev, atime_nsec, mtime_nsec, ctime_nsec)
-                VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?) RETURNING ino",
-            )
-            .await?;
-        let row = stmt
-            .query_row((
-                mode as i64,
-                uid,
-                gid,
-                now_secs,
-                now_secs,
-                now_secs,
-                rdev as i64,
-                now_nsec,
-                now_nsec,
-                now_nsec,
-            ))
-            .await?;
-
-        let ino = row
-            .get_value(0)
-            .ok()
-            .and_then(|v| v.as_integer().copied())
-            .ok_or_else(|| Error::Internal("failed to get inode".to_string()))?;
-
-        // Create directory entry
-        let mut stmt = conn
-            .prepare_cached("INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, ?, ?)")
-            .await?;
-        stmt.execute((name.as_str(), parent_ino, ino)).await?;
-
-        // Increment link count
-        let mut stmt = conn
-            .prepare_cached("UPDATE fs_inode SET nlink = nlink + 1 WHERE ino = ?")
-            .await?;
-        stmt.execute((ino,)).await?;
-
-        // Populate dentry cache
-        self.cache_dentry(parent_ino, name, ino);
-        self.invalidate_parent_attr(parent_ino);
-
+        let (parent_ino, name) = self.resolve_parent_and_name(path).await?;
+        FileSystem::mkdir(self, parent_ino, &name, DEFAULT_DIR_MODE, uid, gid).await?;
         Ok(())
     }
 
@@ -4092,324 +3874,19 @@ impl AgentFS {
         uid: u32,
         gid: u32,
     ) -> Result<(Stats, BoxedFile)> {
-        let conn = self.pool.get_connection().await?;
-        let path = self.normalize_path(path);
-        let components = self.split_path(&path);
-
-        if components.is_empty() {
-            return Err(FsError::RootOperation.into());
-        }
-
-        let parent_path = match components.len() {
-            1 => "/".to_string(),
-            _ => format!("/{}", components[..components.len() - 1].join("/")),
-        };
-
-        let parent_ino = self
-            .resolve_path_with_conn(&conn, &parent_path)
-            .await?
-            .ok_or(FsError::NotFound)?;
-
-        let name = components.last().unwrap();
-
-        if self.lookup_child(&conn, parent_ino, name).await?.is_some() {
-            return Err(FsError::AlreadyExists.into());
-        }
-
-        // Prepare statements before starting the transaction
-        let mut inode_stmt = conn
-            .prepare_cached(
-                "INSERT INTO fs_inode (mode, nlink, uid, gid, size, atime, mtime, ctime, atime_nsec, mtime_nsec, ctime_nsec, data_inline, storage_kind)
-                 VALUES (?, 1, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING ino",
-            )
-            .await?;
-        let mut dentry_stmt = conn
-            .prepare_cached("INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, ?, ?)")
-            .await?;
-
-        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
-
-        let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
-        let now_secs = dur.as_secs() as i64;
-        let now_nsec = dur.subsec_nanos() as i64;
-        let file_mode = S_IFREG | (mode & 0o7777);
-
-        let row = inode_stmt
-            .query_row((
-                file_mode as i64,
-                uid,
-                gid,
-                now_secs,
-                now_secs,
-                now_secs,
-                now_nsec,
-                now_nsec,
-                now_nsec,
-                Value::Blob(Vec::new()),
-                STORAGE_INLINE,
-            ))
-            .await?;
-
-        let ino = row
-            .get_value(0)
-            .ok()
-            .and_then(|v| v.as_integer().copied())
-            .ok_or_else(|| Error::Internal("failed to get inode".to_string()))?;
-
-        dentry_stmt
-            .execute((name.as_str(), parent_ino, ino))
-            .await?;
-
-        txn.commit().await?;
-
-        self.cache_dentry(parent_ino, name, ino);
-        self.invalidate_parent_attr(parent_ino);
-
-        let stats = Stats {
-            ino,
-            mode: file_mode,
-            nlink: 1,
-            uid,
-            gid,
-            size: 0,
-            atime: now_secs,
-            mtime: now_secs,
-            ctime: now_secs,
-            atime_nsec: now_nsec as u32,
-            mtime_nsec: now_nsec as u32,
-            ctime_nsec: now_nsec as u32,
-            rdev: 0,
-        };
-        self.cache_attr(stats.clone());
-
-        let file: BoxedFile = Arc::new(AgentFSFile {
-            pool: self.pool.clone(),
-            ino,
-            chunk_size: self.chunk_size,
-            inline_threshold: self.inline_threshold,
-            attr_cache: self.attr_cache.clone(),
-            write_batcher: self.write_batcher.clone(),
-            overlay_reads: self.overlay_reads,
-            _open_guard: Some(self.open_inodes.guard(ino)),
-        });
-
-        Ok((stats, file))
+        let (parent_ino, name) = self.resolve_parent_and_name(path).await?;
+        FileSystem::create_file(self, parent_ino, &name, mode, uid, gid).await
     }
 
     /// Read data from a file
     pub async fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>> {
-        let conn = self.pool.get_connection().await?;
-        let ino = match self.resolve_path_with_conn(&conn, path).await? {
-            Some(ino) => ino,
+        let stats = match self.stat(path).await? {
+            Some(stats) => stats,
             None => return Ok(None),
         };
-        drop(conn);
-        self.drain_inode_writes(ino).await?;
-        let conn = self.pool.get_connection().await?;
-
-        let file = AgentFSFile {
-            pool: self.pool.clone(),
-            ino,
-            chunk_size: self.chunk_size,
-            inline_threshold: self.inline_threshold,
-            attr_cache: self.attr_cache.clone(),
-            write_batcher: self.write_batcher.clone(),
-            overlay_reads: self.overlay_reads,
-            _open_guard: None,
-        };
-        Ok(Some(file.read_inode_with_conn(&conn, 0, u64::MAX).await?))
-    }
-
-    /// Reads from a file at a given offset.
-    ///
-    /// Similar to POSIX `pread`, this reads up to `size` bytes from the file
-    /// starting at `offset`, without modifying any file cursor.
-    ///
-    /// Returns `Ok(None)` if the file does not exist.
-    pub async fn pread(&self, path: &str, offset: u64, size: u64) -> Result<Option<Vec<u8>>> {
-        let conn = self.pool.get_connection().await?;
-        let ino = match self.resolve_path_with_conn(&conn, path).await? {
-            Some(ino) => ino,
-            None => return Ok(None),
-        };
-        drop(conn);
-        self.drain_inode_writes(ino).await?;
-        let conn = self.pool.get_connection().await?;
-
-        let file = AgentFSFile {
-            pool: self.pool.clone(),
-            ino,
-            chunk_size: self.chunk_size,
-            inline_threshold: self.inline_threshold,
-            attr_cache: self.attr_cache.clone(),
-            write_batcher: self.write_batcher.clone(),
-            overlay_reads: self.overlay_reads,
-            _open_guard: None,
-        };
-        Ok(Some(file.read_inode_with_conn(&conn, offset, size).await?))
-    }
-
-    /// Writes to a file at a given offset.
-    ///
-    /// Similar to POSIX `pwrite`, this writes `data` to the file starting at
-    /// `offset`, without modifying any file cursor.
-    ///
-    /// If the offset is beyond the current file size, the file is extended with zeros.
-    /// If the file does not exist, it will be created.
-    pub async fn pwrite(&self, path: &str, offset: u64, data: &[u8]) -> Result<()> {
-        let conn = self.pool.get_connection().await?;
-        let path = self.normalize_path(path);
-        let components = self.split_path(&path);
-
-        if components.is_empty() {
-            return Err(FsError::RootOperation.into());
-        }
-
-        let parent_path = if components.len() == 1 {
-            "/".to_string()
-        } else {
-            format!("/{}", components[..components.len() - 1].join("/"))
-        };
-
-        let parent_ino = self
-            .resolve_path_with_conn(&conn, &parent_path)
-            .await?
-            .ok_or(FsError::NotFound)?;
-
-        let name = components.last().unwrap();
-
-        let existing_ino = self.resolve_path_with_conn(&conn, &path).await?;
-        drop(conn);
-        if let Some(existing_ino) = existing_ino {
-            self.drain_inode_writes(existing_ino).await?;
-        }
-        let conn = self.pool.get_connection().await?;
-
-        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
-
-        let result: Result<(i64, bool)> = async {
-            // Get or create the inode
-            let (ino, created) = if let Some(ino) = self.resolve_path_with_conn(&conn, &path).await? {
-                (ino, false)
-            } else {
-                let (now_secs, now_nsec) = current_timestamp()?;
-                let mut stmt = conn
-                    .prepare_cached(
-                        "INSERT INTO fs_inode (mode, uid, gid, size, atime, mtime, ctime, nlink, atime_nsec, mtime_nsec, ctime_nsec, data_inline, storage_kind)
-                        VALUES (?, 0, 0, 0, ?, ?, ?, 1, ?, ?, ?, ?, ?) RETURNING ino",
-                    )
-                    .await?;
-                let row = stmt
-                    .query_row((
-                        DEFAULT_FILE_MODE as i64,
-                        now_secs,
-                        now_secs,
-                        now_secs,
-                        now_nsec,
-                        now_nsec,
-                        now_nsec,
-                        Value::Blob(Vec::new()),
-                        STORAGE_INLINE,
-                    ))
-                    .await?;
-
-                let ino = row
-                    .get_value(0)
-                    .ok()
-                    .and_then(|v| v.as_integer().copied())
-                    .ok_or_else(|| Error::Internal("failed to get inode".to_string()))?;
-
-                let mut stmt = conn
-                    .prepare_cached("INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, ?, ?)")
-                    .await?;
-                stmt.execute((name.as_str(), parent_ino, ino)).await?;
-                (ino, true)
-            };
-
-            if data.is_empty() {
-                let (now_secs, now_nsec) = current_timestamp()?;
-                conn.prepare_cached("UPDATE fs_inode SET mtime = ?, mtime_nsec = ? WHERE ino = ?")
-                    .await?
-                    .execute((now_secs, now_nsec, ino))
-                    .await?;
-                return Ok((ino, created));
-            }
-
-            let file = AgentFSFile {
-                pool: self.pool.clone(),
-                ino,
-                chunk_size: self.chunk_size,
-                inline_threshold: self.inline_threshold,
-                attr_cache: self.attr_cache.clone(),
-                write_batcher: self.write_batcher.clone(),
-                overlay_reads: self.overlay_reads,
-                _open_guard: None,
-            };
-            let ranges = [WriteRangeRef { offset, data }];
-            file.pwrite_ranges_inode_with_conn(&conn, &ranges, false, None)
-                .await?;
-
-            Ok((ino, created))
-        }
-        .await;
-
-        match result {
-            Ok((ino, created)) => {
-                txn.commit().await?;
-                self.invalidate_attr(ino);
-                if created {
-                    self.cache_dentry(parent_ino, name, ino);
-                    self.invalidate_parent_attr(parent_ino);
-                }
-                Ok(())
-            }
-            Err(e) => {
-                let _ = txn.rollback().await;
-                Err(e)
-            }
-        }
-    }
-
-    /// Truncate a file to a specific size.
-    ///
-    /// This operates directly on chunks without loading the entire file into memory:
-    /// - Shrinking: deletes chunks beyond new size, truncates the last chunk if needed
-    /// - Extending: pads with zeros up to the new size
-    pub async fn truncate(&self, path: &str, new_size: u64) -> Result<()> {
-        let conn = self.pool.get_connection().await?;
-        let path = self.normalize_path(path);
-        let ino = self
-            .resolve_path_with_conn(&conn, &path)
-            .await?
-            .ok_or(FsError::NotFound)?;
-        drop(conn);
-        self.drain_inode_writes(ino).await?;
-        let conn = self.pool.get_connection().await?;
-
-        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
-        let file = AgentFSFile {
-            pool: self.pool.clone(),
-            ino,
-            chunk_size: self.chunk_size,
-            inline_threshold: self.inline_threshold,
-            attr_cache: self.attr_cache.clone(),
-            write_batcher: self.write_batcher.clone(),
-            overlay_reads: self.overlay_reads,
-            _open_guard: None,
-        };
-        let result = file.truncate_inode_with_conn(&conn, new_size).await;
-
-        match result {
-            Ok(()) => {
-                txn.commit().await?;
-                self.invalidate_attr(ino);
-                Ok(())
-            }
-            Err(e) => {
-                let _ = txn.rollback().await;
-                Err(e)
-            }
-        }
+        let file = FileSystem::open(self, stats.ino, libc::O_RDONLY).await?;
+        let size = u64::try_from(stats.size).unwrap_or(0);
+        Ok(Some(file.pread(0, size).await?))
     }
 
     /// List directory contents
@@ -4441,282 +3918,6 @@ impl AgentFS {
         }
 
         Ok(Some(entries))
-    }
-
-    /// List directory contents with full statistics (optimized batch query)
-    ///
-    /// Returns entries with their stats in a single JOIN query, avoiding N+1 queries.
-    pub async fn readdir_plus(&self, ino: i64) -> Result<Option<Vec<DirEntry>>> {
-        let conn = self.pool.get_connection().await?;
-        let mut stmt = conn.prepare_cached("SELECT d.name, i.ino, i.mode, i.nlink, i.uid, i.gid, i.size, i.atime, i.mtime, i.ctime, i.rdev, i.atime_nsec, i.mtime_nsec, i.ctime_nsec
-            FROM fs_dentry d
-            JOIN fs_inode i ON d.ino = i.ino
-            WHERE d.parent_ino = ?
-            ORDER BY d.name"
-        ).await?;
-        // Single JOIN query to get all entry names and their stats (including link count)
-        let mut rows = stmt.query((ino,)).await?;
-
-        let mut entries = Vec::new();
-        while let Some(row) = rows.next().await? {
-            let name = row
-                .get_value(0)
-                .ok()
-                .and_then(|v| {
-                    if let Value::Text(s) = v {
-                        Some(s.clone())
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or_default();
-
-            if name.is_empty() {
-                continue;
-            }
-
-            let entry_ino = row
-                .get_value(1)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0);
-
-            let nlink = row
-                .get_value(3)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(1) as u32;
-
-            let stats = Stats {
-                ino: entry_ino,
-                mode: row
-                    .get_value(2)
-                    .ok()
-                    .and_then(|v| v.as_integer().copied())
-                    .unwrap_or(0) as u32,
-                nlink,
-                uid: row
-                    .get_value(4)
-                    .ok()
-                    .and_then(|v| v.as_integer().copied())
-                    .unwrap_or(0) as u32,
-                gid: row
-                    .get_value(5)
-                    .ok()
-                    .and_then(|v| v.as_integer().copied())
-                    .unwrap_or(0) as u32,
-                size: row
-                    .get_value(6)
-                    .ok()
-                    .and_then(|v| v.as_integer().copied())
-                    .unwrap_or(0),
-                atime: row
-                    .get_value(7)
-                    .ok()
-                    .and_then(|v| v.as_integer().copied())
-                    .unwrap_or(0),
-                mtime: row
-                    .get_value(8)
-                    .ok()
-                    .and_then(|v| v.as_integer().copied())
-                    .unwrap_or(0),
-                ctime: row
-                    .get_value(9)
-                    .ok()
-                    .and_then(|v| v.as_integer().copied())
-                    .unwrap_or(0),
-                atime_nsec: row
-                    .get_value(11)
-                    .ok()
-                    .and_then(|v| v.as_integer().copied())
-                    .unwrap_or(0) as u32,
-                mtime_nsec: row
-                    .get_value(12)
-                    .ok()
-                    .and_then(|v| v.as_integer().copied())
-                    .unwrap_or(0) as u32,
-                ctime_nsec: row
-                    .get_value(13)
-                    .ok()
-                    .and_then(|v| v.as_integer().copied())
-                    .unwrap_or(0) as u32,
-                rdev: row
-                    .get_value(10)
-                    .ok()
-                    .and_then(|v| v.as_integer().copied())
-                    .unwrap_or(0) as u64,
-            };
-
-            self.cache_attr(stats.clone());
-            entries.push(DirEntry { name, stats });
-        }
-
-        Ok(Some(entries))
-    }
-
-    /// Create a symbolic link with the specified ownership
-    pub async fn symlink(&self, target: &str, linkpath: &str, uid: u32, gid: u32) -> Result<()> {
-        let conn = self.pool.get_connection().await?;
-        let linkpath = self.normalize_path(linkpath);
-        let components = self.split_path(&linkpath);
-
-        if components.is_empty() {
-            return Err(FsError::RootOperation.into());
-        }
-
-        // Get parent directory
-        let parent_path = if components.len() == 1 {
-            "/".to_string()
-        } else {
-            format!("/{}", components[..components.len() - 1].join("/"))
-        };
-
-        let parent_ino = self
-            .resolve_path_with_conn(&conn, &parent_path)
-            .await?
-            .ok_or(FsError::NotFound)?;
-
-        let name = components.last().unwrap();
-
-        // Check if entry already exists (single query using parent_ino we already have)
-        if self.lookup_child(&conn, parent_ino, name).await?.is_some() {
-            return Err(FsError::AlreadyExists.into());
-        }
-
-        // Create inode for symlink
-        let dur = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-        let now_secs = dur.as_secs() as i64;
-        let now_nsec = dur.subsec_nanos() as i64;
-
-        let mode = S_IFLNK | 0o777; // Symlinks typically have 777 permissions
-        let size = target.len() as i64;
-
-        let mut stmt = conn
-            .prepare_cached(
-                "INSERT INTO fs_inode (mode, uid, gid, size, atime, mtime, ctime, atime_nsec, mtime_nsec, ctime_nsec)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING ino",
-            )
-            .await?;
-        let row = stmt
-            .query_row((
-                mode, uid, gid, size, now_secs, now_secs, now_secs, now_nsec, now_nsec, now_nsec,
-            ))
-            .await?;
-
-        // Get the newly created inode
-        let ino = row
-            .get_value(0)
-            .ok()
-            .and_then(|v| v.as_integer().copied())
-            .unwrap_or(0);
-
-        // Store symlink target
-        conn.execute(
-            "INSERT INTO fs_symlink (ino, target) VALUES (?, ?)",
-            (ino, target),
-        )
-        .await?;
-
-        // Create directory entry
-        conn.execute(
-            "INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, ?, ?)",
-            (name.as_str(), parent_ino, ino),
-        )
-        .await?;
-
-        // Increment link count
-        conn.execute(
-            "UPDATE fs_inode SET nlink = nlink + 1 WHERE ino = ?",
-            (ino,),
-        )
-        .await?;
-
-        // Populate dentry cache
-        self.cache_dentry(parent_ino, name, ino);
-        self.invalidate_parent_attr(parent_ino);
-
-        Ok(())
-    }
-
-    /// Create a hard link
-    ///
-    /// Creates a new directory entry `newpath` that refers to the same inode as `oldpath`.
-    /// Both paths will share the same file data and metadata (except for the name).
-    /// The link count (nlink) of the inode is incremented.
-    pub async fn link(&self, oldpath: &str, newpath: &str) -> Result<()> {
-        let conn = self.pool.get_connection().await?;
-        let oldpath = self.normalize_path(oldpath);
-        let newpath = self.normalize_path(newpath);
-        let components = self.split_path(&newpath);
-
-        if components.is_empty() {
-            return Err(FsError::RootOperation.into());
-        }
-
-        // Resolve old path to get its inode
-        let ino = self
-            .resolve_path_with_conn(&conn, &oldpath)
-            .await?
-            .ok_or(FsError::NotFound)?;
-
-        // Check if source is a directory (hard links to directories are not allowed)
-        let mut rows = conn
-            .query("SELECT mode FROM fs_inode WHERE ino = ?", (ino,))
-            .await?;
-
-        if let Some(row) = rows.next().await? {
-            let mode = row
-                .get_value(0)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0) as u32;
-
-            if (mode & S_IFMT) == super::S_IFDIR {
-                return Err(FsError::IsADirectory.into());
-            }
-        } else {
-            return Err(FsError::NotFound.into());
-        }
-
-        // Get parent directory of new path
-        let parent_path = if components.len() == 1 {
-            "/".to_string()
-        } else {
-            format!("/{}", components[..components.len() - 1].join("/"))
-        };
-
-        let parent_ino = self
-            .resolve_path_with_conn(&conn, &parent_path)
-            .await?
-            .ok_or(FsError::NotFound)?;
-
-        let name = components.last().unwrap();
-
-        // Check if new path already exists (single query using parent_ino we already have)
-        if self.lookup_child(&conn, parent_ino, name).await?.is_some() {
-            return Err(FsError::AlreadyExists.into());
-        }
-
-        // Create directory entry pointing to the same inode
-        conn.execute(
-            "INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, ?, ?)",
-            (name.as_str(), parent_ino, ino),
-        )
-        .await?;
-
-        // Increment link count
-        conn.execute(
-            "UPDATE fs_inode SET nlink = nlink + 1 WHERE ino = ?",
-            (ino,),
-        )
-        .await?;
-
-        // Populate dentry cache
-        self.cache_dentry(parent_ino, name, ino);
-        self.invalidate_parent_attr(parent_ino);
-        self.invalidate_attr(ino);
-
-        Ok(())
     }
 
     /// Read the target of a symbolic link
@@ -4776,390 +3977,14 @@ impl AgentFS {
 
     /// Remove a file or empty directory
     pub async fn remove(&self, path: &str) -> Result<()> {
-        let conn = self.pool.get_connection().await?;
-        let path = self.normalize_path(path);
-        let components = self.split_path(&path);
-
-        if components.is_empty() {
-            return Err(FsError::RootOperation.into());
-        }
-
-        let ino = self
-            .resolve_path_with_conn(&conn, &path)
+        let (parent_ino, name) = self.resolve_parent_and_name(path).await?;
+        let stats = FileSystem::lookup(self, parent_ino, &name)
             .await?
             .ok_or(FsError::NotFound)?;
-
-        if ino == ROOT_INO {
-            return Err(FsError::RootOperation.into());
-        }
-
-        // Get stats to check if it's a directory
-        let stats = self
-            .stat_with_conn(&conn, &path)
-            .await?
-            .ok_or(FsError::NotFound)?;
-
-        // Check if directory is empty
-        let mut stmt = conn
-            .prepare_cached("SELECT COUNT(*) FROM fs_dentry WHERE parent_ino = ?")
-            .await?;
-        let mut rows = stmt.query((ino,)).await?;
-
-        if let Some(row) = rows.next().await? {
-            let count = row
-                .get_value(0)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0);
-            if count > 0 {
-                return Err(FsError::NotEmpty.into());
-            }
-        }
-
-        // Get parent directory and name
-        let parent_path = if components.len() == 1 {
-            "/".to_string()
-        } else {
-            format!("/{}", components[..components.len() - 1].join("/"))
-        };
-
-        let parent_ino = self
-            .resolve_path_with_conn(&conn, &parent_path)
-            .await?
-            .ok_or(FsError::NotFound)?;
-
-        let name = components.last().unwrap();
-
-        // Delete the specific directory entry (not all entries pointing to this inode)
-        let mut stmt = conn
-            .prepare_cached("DELETE FROM fs_dentry WHERE parent_ino = ? AND name = ?")
-            .await?;
-        stmt.execute((parent_ino, name.as_str())).await?;
-
-        // Invalidate cache for this entry
-        self.invalidate_dentry(parent_ino, name);
-        self.invalidate_parent_attr(parent_ino);
-        self.invalidate_attr(ino);
-
-        // Decrement link count
-        let mut stmt = conn
-            .prepare_cached("UPDATE fs_inode SET nlink = nlink - 1 WHERE ino = ?")
-            .await?;
-        stmt.execute((ino,)).await?;
-
-        // If removing a directory, decrement parent nlink (removed dir's ".." link)
         if stats.is_directory() {
-            let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
-            let now_secs = dur.as_secs() as i64;
-            let now_nsec = dur.subsec_nanos() as i64;
-            let mut stmt = conn
-                .prepare_cached(
-                    "UPDATE fs_inode SET nlink = nlink - 1, ctime = ?, mtime = ?, ctime_nsec = ?, mtime_nsec = ? WHERE ino = ?",
-                )
-                .await?;
-            stmt.execute((now_secs, now_secs, now_nsec, now_nsec, parent_ino))
-                .await?;
-        }
-
-        // Check if this was the last link to the inode. POSIX: while open
-        // handles exist the nlink=0 rows stay alive (readable and writable);
-        // the last handle drop queues the orphan for process_deferred_reaps.
-        let link_count = self.get_link_count(&conn, ino).await?;
-        if link_count == 0 && !self.open_inodes.defer_reap_if_open(ino) {
-            // Tier Four: drop any pending batched writes — see the matching
-            // hook in the trait-method `unlink` and in `rename` overwrite.
-            if let Some(batcher) = &self.write_batcher {
-                batcher.discard_pending(ino);
-            }
-            // Manually handle cascading deletes since we don't use foreign keys
-            // Delete data blocks
-            let mut stmt = conn
-                .prepare_cached("DELETE FROM fs_data WHERE ino = ?")
-                .await?;
-            stmt.execute((ino,)).await?;
-
-            // Delete symlink if exists
-            let mut stmt = conn
-                .prepare_cached("DELETE FROM fs_symlink WHERE ino = ?")
-                .await?;
-            stmt.execute((ino,)).await?;
-
-            // Delete inode
-            let mut stmt = conn
-                .prepare_cached("DELETE FROM fs_inode WHERE ino = ?")
-                .await?;
-            stmt.execute((ino,)).await?;
-        }
-
-        self.invalidate_dentry(parent_ino, name);
-        self.invalidate_parent_attr(parent_ino);
-        self.invalidate_attr(ino);
-        self.cache_negative_dentry(parent_ino, name);
-        Ok(())
-    }
-
-    /// Change file ownership
-    ///
-    /// Changes the user and/or group ownership of a file.
-    /// Pass None for uid or gid to leave that value unchanged.
-    pub async fn chown(&self, ino: i64, uid: Option<u32>, gid: Option<u32>) -> Result<()> {
-        if uid.is_none() && gid.is_none() {
-            return Ok(());
-        }
-
-        let conn = self.pool.get_connection().await?;
-
-        // Build the update query dynamically based on which values are provided
-        let mut updates = Vec::new();
-        let mut values: Vec<Value> = Vec::new();
-
-        if let Some(uid) = uid {
-            updates.push("uid = ?");
-            values.push(Value::Integer(uid as i64));
-        }
-        if let Some(gid) = gid {
-            updates.push("gid = ?");
-            values.push(Value::Integer(gid as i64));
-        }
-
-        values.push(Value::Integer(ino));
-        let sql = format!("UPDATE fs_inode SET {} WHERE ino = ?", updates.join(", "));
-        conn.execute(&sql, values).await?;
-        self.invalidate_attr(ino);
-
-        Ok(())
-    }
-
-    /// Rename/move a file or directory.
-    ///
-    /// This operation is atomic - either all changes succeed or none do.
-    pub async fn rename(&self, from: &str, to: &str) -> Result<()> {
-        let conn = self.pool.get_connection().await?;
-        let from_path = self.normalize_path(from);
-        let to_path = self.normalize_path(to);
-
-        // Cannot rename root
-        if from_path == "/" {
-            return Err(FsError::RootOperation.into());
-        }
-
-        // Get source inode
-        let src_ino = self
-            .resolve_path_with_conn(&conn, &from_path)
-            .await?
-            .ok_or(FsError::NotFound)?;
-
-        // Get source stats to check if it's a directory
-        let src_stats = self
-            .stat_with_conn(&conn, &from_path)
-            .await?
-            .ok_or(FsError::NotFound)?;
-
-        // Prevent renaming a directory into its own subtree (would create a cycle)
-        if src_stats.is_directory() {
-            let from_prefix = format!("{}/", from_path);
-            if to_path.starts_with(&from_prefix) || to_path == from_path {
-                return Err(FsError::InvalidRename.into());
-            }
-        }
-
-        // Parse source path to get parent and name
-        let from_components = self.split_path(&from_path);
-        let src_name = from_components.last().ok_or(FsError::InvalidPath)?;
-        let src_parent_path = if from_components.len() == 1 {
-            "/".to_string()
+            FileSystem::rmdir(self, parent_ino, &name).await
         } else {
-            format!(
-                "/{}",
-                from_components[..from_components.len() - 1].join("/")
-            )
-        };
-        let src_parent_ino = self
-            .resolve_path_with_conn(&conn, &src_parent_path)
-            .await?
-            .ok_or(FsError::NotFound)?;
-
-        // Parse destination path to get parent and name
-        let to_components = self.split_path(&to_path);
-        if to_components.is_empty() {
-            return Err(FsError::RootOperation.into());
-        }
-        let dst_name = to_components.last().unwrap();
-        let dst_parent_path = if to_components.len() == 1 {
-            "/".to_string()
-        } else {
-            format!("/{}", to_components[..to_components.len() - 1].join("/"))
-        };
-        let dst_parent_ino = self
-            .resolve_path_with_conn(&conn, &dst_parent_path)
-            .await?
-            .ok_or(FsError::NotFound)?;
-
-        // Clone strings for use inside the transaction closure
-        let src_name = src_name.clone();
-        let dst_name = dst_name.clone();
-
-        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
-
-        let result: Result<Option<i64>> = async {
-            let mut replaced_dst_ino = None;
-            // Check if destination exists (inside transaction for atomicity)
-            if let Some(dst_ino) = self.resolve_path_with_conn(&conn, &to_path).await? {
-                replaced_dst_ino = Some(dst_ino);
-                let dst_stats = self.stat_with_conn(&conn, &to_path).await?.ok_or(FsError::NotFound)?;
-
-                // Can't replace directory with non-directory
-                if dst_stats.is_directory() && !src_stats.is_directory() {
-                    return Err(FsError::IsADirectory.into());
-                }
-
-                // Can't replace non-directory with directory
-                if !dst_stats.is_directory() && src_stats.is_directory() {
-                    return Err(FsError::NotADirectory.into());
-                }
-
-                // If destination is directory, it must be empty
-                if dst_stats.is_directory() {
-                    let mut stmt = conn
-                        .prepare_cached("SELECT COUNT(*) FROM fs_dentry WHERE parent_ino = ?")
-                        .await?;
-                    let mut rows = stmt.query((dst_ino,)).await?;
-
-                    if let Some(row) = rows.next().await? {
-                        let count = row
-                            .get_value(0)
-                            .ok()
-                            .and_then(|v| v.as_integer().copied())
-                            .unwrap_or(0);
-                        if count > 0 {
-                            return Err(FsError::NotEmpty.into());
-                        }
-                    }
-                }
-
-                // Remove destination entry
-                let mut stmt = conn
-                    .prepare_cached("DELETE FROM fs_dentry WHERE parent_ino = ? AND name = ?")
-                    .await?;
-                stmt.execute((dst_parent_ino, dst_name.as_str())).await?;
-
-                // Decrement link count
-                let mut stmt = conn
-                    .prepare_cached("UPDATE fs_inode SET nlink = nlink - 1 WHERE ino = ?")
-                    .await?;
-                stmt.execute((dst_ino,)).await?;
-
-                // Clean up destination inode if no more links (deferred while
-                // open handles exist — see OpenInodes)
-                let link_count = self.get_link_count(&conn, dst_ino).await?;
-                if link_count == 0 && !self.open_inodes.defer_reap_if_open(dst_ino) {
-                    // Tier Four: drop pending batched writes for the
-                    // soon-to-be-deleted inode. Without this, a later
-                    // drain (Explicit drains run drain_pending_batched
-                    // which touches every pending inode in one txn) tries
-                    // to write into a missing fs_inode row and fails the
-                    // whole batch with NotFound.
-                    if let Some(batcher) = &self.write_batcher {
-                        batcher.discard_pending(dst_ino);
-                    }
-                    let mut stmt = conn
-                        .prepare_cached("DELETE FROM fs_data WHERE ino = ?")
-                        .await?;
-                    stmt.execute((dst_ino,)).await?;
-                    let mut stmt = conn
-                        .prepare_cached("DELETE FROM fs_symlink WHERE ino = ?")
-                        .await?;
-                    stmt.execute((dst_ino,)).await?;
-                    let mut stmt = conn
-                        .prepare_cached("DELETE FROM fs_inode WHERE ino = ?")
-                        .await?;
-                    stmt.execute((dst_ino,)).await?;
-                }
-            }
-
-            // Update the dentry: change parent and/or name
-            let mut stmt = conn
-                .prepare_cached(
-                    "UPDATE fs_dentry SET parent_ino = ?, name = ? WHERE parent_ino = ? AND name = ?",
-                )
-                .await?;
-            stmt.execute((
-                dst_parent_ino,
-                dst_name.as_str(),
-                src_parent_ino,
-                src_name.as_str(),
-            ))
-            .await?;
-
-            // If renaming a directory across parents, adjust parent nlink counts
-            if src_stats.is_directory() && src_parent_ino != dst_parent_ino {
-                let mut stmt = conn
-                    .prepare_cached("UPDATE fs_inode SET nlink = nlink - 1 WHERE ino = ?")
-                    .await?;
-                stmt.execute((src_parent_ino,)).await?;
-
-                let mut stmt = conn
-                    .prepare_cached("UPDATE fs_inode SET nlink = nlink + 1 WHERE ino = ?")
-                    .await?;
-                stmt.execute((dst_parent_ino,)).await?;
-            }
-
-            // Update ctime of the inode
-            let dur = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default();
-            let now_secs = dur.as_secs() as i64;
-            let now_nsec = dur.subsec_nanos() as i64;
-
-            let mut stmt = conn
-                .prepare_cached("UPDATE fs_inode SET ctime = ?, ctime_nsec = ? WHERE ino = ?")
-                .await?;
-            stmt.execute((now_secs, now_nsec, src_ino)).await?;
-
-            // Update source parent directory timestamps
-            let mut stmt = conn
-                .prepare_cached("UPDATE fs_inode SET mtime = ?, ctime = ?, mtime_nsec = ?, ctime_nsec = ? WHERE ino = ?")
-                .await?;
-            stmt.execute((now_secs, now_secs, now_nsec, now_nsec, src_parent_ino)).await?;
-
-            // Update destination parent directory timestamps
-            if dst_parent_ino != src_parent_ino {
-                let mut stmt = conn
-                    .prepare_cached("UPDATE fs_inode SET mtime = ?, ctime = ?, mtime_nsec = ?, ctime_nsec = ? WHERE ino = ?")
-                    .await?;
-                stmt.execute((now_secs, now_secs, now_nsec, now_nsec, dst_parent_ino)).await?;
-            }
-
-            Ok(replaced_dst_ino)
-        }
-        .await;
-
-        match result {
-            Ok(replaced_dst_ino) => {
-                txn.commit().await?;
-
-                // Invalidate cache for source and destination
-                self.invalidate_dentry(src_parent_ino, &src_name);
-                self.invalidate_dentry(dst_parent_ino, &dst_name);
-                self.invalidate_attr(src_ino);
-                self.invalidate_parent_attr(src_parent_ino);
-                self.invalidate_parent_attr(dst_parent_ino);
-                if let Some(dst_ino) = replaced_dst_ino {
-                    self.invalidate_attr(dst_ino);
-                }
-
-                // Add exact post-rename namespace state to the caches.
-                if src_parent_ino != dst_parent_ino || src_name != dst_name {
-                    self.cache_negative_dentry(src_parent_ino, &src_name);
-                }
-                self.cache_dentry(dst_parent_ino, &dst_name, src_ino);
-
-                Ok(())
-            }
-            Err(e) => {
-                let _ = txn.rollback().await;
-                Err(e)
-            }
+            FileSystem::unlink(self, parent_ino, &name).await
         }
     }
 
@@ -5206,9 +4031,8 @@ impl AgentFS {
     /// a checkpoint, then restores NORMAL mode. This ensures durability while
     /// maintaining high performance for normal operations.
     ///
-    /// Note: The path parameter is ignored since all data is in a single database.
-    pub async fn fsync(&self, _path: &str) -> Result<()> {
-        self.drain_all().await?;
+    pub async fn fsync(&self) -> Result<()> {
+        FileSystem::drain_all(self).await?;
         let conn = self.pool.get_connection().await?;
         conn.prepare_cached(DURABLE_SYNCHRONOUS_SQL)
             .await?
@@ -6920,6 +5744,83 @@ mod tests {
         fs.negative_dentry_cache.contains(parent_ino, name)
     }
 
+    async fn parent_and_name_for_test(fs: &AgentFS, path: &str) -> Result<(i64, String)> {
+        let path = fs.normalize_path(path);
+        let components = fs.split_path(&path);
+        if components.is_empty() {
+            return Err(FsError::RootOperation.into());
+        }
+        let parent_path = if components.len() == 1 {
+            "/".to_string()
+        } else {
+            format!("/{}", components[..components.len() - 1].join("/"))
+        };
+        let parent_ino = fs
+            .resolve_path(&parent_path)
+            .await?
+            .ok_or(FsError::NotFound)?;
+        Ok((parent_ino, components.last().unwrap().clone()))
+    }
+
+    async fn rename_path_via_trait(fs: &AgentFS, from: &str, to: &str) -> Result<()> {
+        let (oldparent_ino, oldname) = parent_and_name_for_test(fs, from).await?;
+        let (newparent_ino, newname) = parent_and_name_for_test(fs, to).await?;
+        FileSystem::rename(fs, oldparent_ino, &oldname, newparent_ino, &newname).await
+    }
+
+    #[tokio::test]
+    async fn path_api_delegates_to_trait_semantics() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+
+        fs.mkdir("/live", 42, 43).await?;
+        let live = fs.stat("/live").await?.unwrap();
+        assert!(live.is_directory());
+        assert_eq!((live.uid, live.gid), (42, 43));
+
+        let (created, file) = fs
+            .create_file("/live/pending.txt", DEFAULT_FILE_MODE, 7, 9)
+            .await?;
+        assert_eq!((created.uid, created.gid), (7, 9));
+        file.pwrite(0, b"pending bytes").await?;
+
+        let pending = fs.stat("/live/pending.txt").await?.unwrap();
+        assert_eq!(
+            pending.size, 13,
+            "path stat must observe pending batched writes before drain"
+        );
+        assert_eq!(
+            fs.read_file("/live/pending.txt").await?.unwrap(),
+            b"pending bytes"
+        );
+
+        let (doomed, doomed_file) = fs
+            .create_file("/live/doomed.txt", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        doomed_file
+            .pwrite(0, b"discard these pending bytes")
+            .await?;
+        drop(doomed_file);
+
+        fs.remove("/live/doomed.txt").await?;
+        fs.drain_all().await?;
+        assert!(fs.stat("/live/doomed.txt").await?.is_none());
+        assert_eq!(
+            count_rows(&fs, "fs_data", doomed.ino).await?,
+            0,
+            "path remove must discard pending writes for the deleted inode"
+        );
+
+        fs.remove("/live/pending.txt").await?;
+        fs.remove("/live").await?;
+        assert!(fs.stat("/live").await?.is_none());
+
+        let missing = fs.remove("/missing.txt").await.unwrap_err();
+        assert!(matches!(missing, Error::Fs(FsError::NotFound)));
+
+        fs.fsync().await?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn import_entries_builds_tree_with_correct_content_and_stats() -> Result<()> {
         let (fs, _dir) = create_test_fs().await?;
@@ -7552,8 +6453,7 @@ mod tests {
 
         // Overwrite with smaller file (1 chunk)
         let new_data = vec![42u8; 100];
-        fs.truncate("/overwrite.txt", 0).await?;
-        let file = fs.open("/overwrite.txt").await?;
+        file.truncate(0).await?;
         file.pwrite(0, &new_data).await?;
 
         // Verify old chunks are gone and new data is correct
@@ -7590,8 +6490,7 @@ mod tests {
 
         // Overwrite with larger file (3 chunks)
         let new_data: Vec<u8> = (0..chunk_size * 3).map(|i| (i % 256) as u8).collect();
-        fs.truncate("/grow.txt", 0).await?;
-        let file = fs.open("/grow.txt").await?;
+        file.truncate(0).await?;
         file.pwrite(0, &new_data).await?;
 
         // Verify data is correct
@@ -8023,7 +6922,7 @@ mod tests {
         conn.execute("PRAGMA synchronous = OFF", ()).await?;
         drop(conn);
 
-        fs.fsync("/").await?;
+        fs.fsync().await?;
 
         let conn = fs.pool.get_connection().await?;
         assert_eq!(
@@ -8290,198 +7189,148 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_pread_basic() -> Result<()> {
+    async fn file_pread_basic() -> Result<()> {
         let (fs, _dir) = create_test_fs().await?;
-
-        // Write a file with known content
         let data: Vec<u8> = (0..100).collect();
         let (_, file) = fs.create_file("/test.txt", DEFAULT_FILE_MODE, 0, 0).await?;
         file.pwrite(0, &data).await?;
 
-        // Read from the beginning
-        let result = fs.pread("/test.txt", 0, 10).await?.unwrap();
-        assert_eq!(result, &data[0..10]);
-
-        // Read from the middle
-        let result = fs.pread("/test.txt", 50, 20).await?.unwrap();
-        assert_eq!(result, &data[50..70]);
-
-        // Read from near the end
-        let result = fs.pread("/test.txt", 90, 10).await?.unwrap();
-        assert_eq!(result, &data[90..100]);
-
+        assert_eq!(file.pread(0, 10).await?, &data[0..10]);
+        assert_eq!(file.pread(50, 20).await?, &data[50..70]);
+        assert_eq!(file.pread(90, 10).await?, &data[90..100]);
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_pread_past_eof() -> Result<()> {
+    async fn file_pread_past_eof() -> Result<()> {
         let (fs, _dir) = create_test_fs().await?;
-
         let data: Vec<u8> = (0..50).collect();
         let (_, file) = fs.create_file("/test.txt", DEFAULT_FILE_MODE, 0, 0).await?;
         file.pwrite(0, &data).await?;
 
-        // Read starting past EOF should return empty
-        let result = fs.pread("/test.txt", 100, 10).await?.unwrap();
-        assert!(result.is_empty());
-
-        // Read that extends past EOF should return only available data
-        let result = fs.pread("/test.txt", 40, 20).await?.unwrap();
-        assert_eq!(result, &data[40..50]);
-
+        assert!(file.pread(100, 10).await?.is_empty());
+        assert_eq!(file.pread(40, 20).await?, &data[40..50]);
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_pread_nonexistent_file() -> Result<()> {
+    async fn file_open_nonexistent_fails() -> Result<()> {
         let (fs, _dir) = create_test_fs().await?;
-
-        let result = fs.pread("/nonexistent.txt", 0, 10).await?;
-        assert!(result.is_none());
-
+        let result = fs.open("/nonexistent.txt").await;
+        assert!(matches!(result, Err(Error::Fs(FsError::NotFound))));
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_pread_across_chunks() -> Result<()> {
+    async fn file_pread_across_chunks() -> Result<()> {
         let (fs, _dir) = create_test_fs().await?;
         let chunk_size = fs.chunk_size();
-
-        // Create data spanning multiple chunks
         let data: Vec<u8> = (0..(chunk_size * 3)).map(|i| (i % 256) as u8).collect();
         let (_, file) = fs.create_file("/test.txt", DEFAULT_FILE_MODE, 0, 0).await?;
         file.pwrite(0, &data).await?;
 
-        // Read across chunk boundary
         let start = chunk_size - 10;
-        let result = fs.pread("/test.txt", start as u64, 20).await?.unwrap();
-        assert_eq!(result, &data[start..start + 20]);
+        assert_eq!(
+            file.pread(start as u64, 20).await?,
+            &data[start..start + 20]
+        );
 
-        // Read spanning multiple chunks
         let start = chunk_size / 2;
         let size = chunk_size * 2;
-        let result = fs
-            .pread("/test.txt", start as u64, size as u64)
-            .await?
-            .unwrap();
-        assert_eq!(result, &data[start..start + size]);
-
+        assert_eq!(
+            file.pread(start as u64, size as u64).await?,
+            &data[start..start + size]
+        );
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_pwrite_basic() -> Result<()> {
+    async fn file_pwrite_basic() -> Result<()> {
         let (fs, _dir) = create_test_fs().await?;
-
-        // Write initial data
-        let data: Vec<u8> = vec![0; 100];
+        let data = vec![0; 100];
         let (_, file) = fs.create_file("/test.txt", DEFAULT_FILE_MODE, 0, 0).await?;
         file.pwrite(0, &data).await?;
-
-        // Overwrite in the middle
-        fs.pwrite("/test.txt", 50, &[1, 2, 3, 4, 5]).await?;
+        file.pwrite(50, &[1, 2, 3, 4, 5]).await?;
 
         let result = fs.read_file("/test.txt").await?.unwrap();
         assert_eq!(result.len(), 100);
         assert_eq!(&result[50..55], &[1, 2, 3, 4, 5]);
         assert_eq!(&result[0..50], &vec![0u8; 50][..]);
         assert_eq!(&result[55..100], &vec![0u8; 45][..]);
-
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_pwrite_extend_file() -> Result<()> {
+    async fn file_pwrite_extend_file() -> Result<()> {
         let (fs, _dir) = create_test_fs().await?;
-
-        // Write initial data
-        let data: Vec<u8> = vec![1; 50];
+        let data = vec![1; 50];
         let (_, file) = fs.create_file("/test.txt", DEFAULT_FILE_MODE, 0, 0).await?;
         file.pwrite(0, &data).await?;
-
-        // Write past EOF - should extend with zeros
-        fs.pwrite("/test.txt", 100, &[2, 2, 2, 2, 2]).await?;
+        file.pwrite(100, &[2, 2, 2, 2, 2]).await?;
 
         let result = fs.read_file("/test.txt").await?.unwrap();
         assert_eq!(result.len(), 105);
         assert_eq!(&result[0..50], &vec![1u8; 50][..]);
         assert_eq!(&result[50..100], &vec![0u8; 50][..]);
         assert_eq!(&result[100..105], &[2, 2, 2, 2, 2]);
-
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_pwrite_creates_file() -> Result<()> {
+    async fn file_create_then_pwrite_writes_file() -> Result<()> {
         let (fs, _dir) = create_test_fs().await?;
+        let (_, file) = fs.create_file("/new.txt", DEFAULT_FILE_MODE, 0, 0).await?;
+        file.pwrite(0, &[1, 2, 3]).await?;
 
-        // pwrite to a non-existent file should create it
-        fs.pwrite("/new.txt", 0, &[1, 2, 3]).await?;
-
-        let result = fs.read_file("/new.txt").await?.unwrap();
-        assert_eq!(result, &[1, 2, 3]);
-
+        assert_eq!(fs.read_file("/new.txt").await?.unwrap(), &[1, 2, 3]);
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_pwrite_across_chunks() -> Result<()> {
+    async fn file_pwrite_across_chunks() -> Result<()> {
         let (fs, _dir) = create_test_fs().await?;
         let chunk_size = fs.chunk_size();
-
-        // Create initial data spanning multiple chunks
-        let data: Vec<u8> = vec![0; chunk_size * 3];
+        let data = vec![0; chunk_size * 3];
         let (_, file) = fs.create_file("/test.txt", DEFAULT_FILE_MODE, 0, 0).await?;
         file.pwrite(0, &data).await?;
 
-        // Write across chunk boundary
         let write_data: Vec<u8> = (0..20).collect();
         let start = chunk_size - 10;
-        fs.pwrite("/test.txt", start as u64, &write_data).await?;
+        file.pwrite(start as u64, &write_data).await?;
 
         let result = fs.read_file("/test.txt").await?.unwrap();
         assert_eq!(&result[start..start + 20], &write_data[..]);
-
-        // Verify surrounding data is unchanged
         assert_eq!(&result[0..start], &vec![0u8; start][..]);
         assert_eq!(
             &result[start + 20..],
             &vec![0u8; chunk_size * 3 - start - 20][..]
         );
-
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_pread_pwrite_roundtrip() -> Result<()> {
+    async fn file_pread_pwrite_roundtrip() -> Result<()> {
         let (fs, _dir) = create_test_fs().await?;
         let chunk_size = fs.chunk_size();
-
-        // Create a file
         let initial: Vec<u8> = (0..(chunk_size * 2)).map(|i| (i % 256) as u8).collect();
         let (_, file) = fs.create_file("/test.txt", DEFAULT_FILE_MODE, 0, 0).await?;
         file.pwrite(0, &initial).await?;
 
-        // Write some data at various offsets
-        let patches = vec![
+        let patches = [
             (0u64, vec![0xAAu8; 10]),
             (chunk_size as u64 - 5, vec![0xBB; 10]),
             (chunk_size as u64 * 2 - 1, vec![0xCC; 1]),
         ];
 
         for (offset, data) in &patches {
-            fs.pwrite("/test.txt", *offset, data).await?;
+            file.pwrite(*offset, data).await?;
         }
-
-        // Verify with pread
         for (offset, expected) in &patches {
-            let result = fs
-                .pread("/test.txt", *offset, expected.len() as u64)
-                .await?
-                .unwrap();
-            assert_eq!(&result, expected);
+            assert_eq!(
+                file.pread(*offset, expected.len() as u64).await?,
+                expected.as_slice()
+            );
         }
-
         Ok(())
     }
 
@@ -8934,286 +7783,174 @@ mod tests {
         Ok(())
     }
 
-    // ─────────────────────────────────────────────────────────────
-    // Truncate Tests
-    // ─────────────────────────────────────────────────────────────
-
     #[tokio::test]
-    async fn test_truncate_to_zero() -> Result<()> {
+    async fn file_truncate_to_zero() -> Result<()> {
         let (fs, _dir) = create_test_fs().await?;
-
-        // Create a file with some data
         let data: Vec<u8> = (0..100).collect();
         let (_, file) = fs.create_file("/test.txt", DEFAULT_FILE_MODE, 0, 0).await?;
         file.pwrite(0, &data).await?;
+        file.truncate(0).await?;
 
-        // Truncate to zero
-        fs.truncate("/test.txt", 0).await?;
-
-        // Verify file is empty
-        let result = fs.read_file("/test.txt").await?.unwrap();
-        assert!(result.is_empty());
-
-        // Verify stat shows size 0
-        let stats = fs.stat("/test.txt").await?.unwrap();
-        assert_eq!(stats.size, 0);
-
+        assert!(fs.read_file("/test.txt").await?.unwrap().is_empty());
+        assert_eq!(fs.stat("/test.txt").await?.unwrap().size, 0);
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_truncate_smaller_within_chunk() -> Result<()> {
+    async fn file_truncate_smaller_within_chunk() -> Result<()> {
         let (fs, _dir) = create_test_fs().await?;
-
-        // Create a file smaller than chunk size
         let data: Vec<u8> = (0..100).collect();
         let (_, file) = fs.create_file("/test.txt", DEFAULT_FILE_MODE, 0, 0).await?;
         file.pwrite(0, &data).await?;
+        file.truncate(50).await?;
 
-        // Truncate to 50 bytes
-        fs.truncate("/test.txt", 50).await?;
-
-        // Verify data is truncated correctly
         let result = fs.read_file("/test.txt").await?.unwrap();
         assert_eq!(result.len(), 50);
         assert_eq!(result, &data[..50]);
-
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_truncate_across_chunk_boundary() -> Result<()> {
+    async fn file_truncate_across_chunk_boundary() -> Result<()> {
         let (fs, _dir) = create_test_fs().await?;
         let chunk_size = fs.chunk_size();
-
-        // Create a file spanning multiple chunks
         let data: Vec<u8> = (0..(chunk_size * 3)).map(|i| (i % 256) as u8).collect();
         let (_, file) = fs.create_file("/test.txt", DEFAULT_FILE_MODE, 0, 0).await?;
         file.pwrite(0, &data).await?;
-
-        // Truncate to middle of second chunk
         let new_size = chunk_size + chunk_size / 2;
-        fs.truncate("/test.txt", new_size as u64).await?;
+        file.truncate(new_size as u64).await?;
 
-        // Verify data
         let result = fs.read_file("/test.txt").await?.unwrap();
         assert_eq!(result.len(), new_size);
         assert_eq!(result, &data[..new_size]);
-
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_truncate_extend_file() -> Result<()> {
+    async fn file_truncate_extend_file() -> Result<()> {
         let (fs, _dir) = create_test_fs().await?;
-
-        // Create a small file
         let data: Vec<u8> = (0..50).collect();
         let (_, file) = fs.create_file("/test.txt", DEFAULT_FILE_MODE, 0, 0).await?;
         file.pwrite(0, &data).await?;
+        file.truncate(100).await?;
 
-        // Extend to 100 bytes
-        fs.truncate("/test.txt", 100).await?;
-
-        // Verify size increased
         let stats = fs.stat("/test.txt").await?.unwrap();
         assert_eq!(stats.size, 100);
-
-        // Original data should be preserved, rest should be zeros (sparse)
         let result = fs.read_file("/test.txt").await?.unwrap();
         assert_eq!(result.len(), 100);
         assert_eq!(&result[..50], &data[..]);
-
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_truncate_nonexistent_file() -> Result<()> {
+    async fn file_truncate_nonexistent_open_fails() -> Result<()> {
         let (fs, _dir) = create_test_fs().await?;
-
-        // Truncate non-existent file should fail
-        let result = fs.truncate("/nonexistent.txt", 100).await;
-        assert!(result.is_err());
-
+        let result = fs.open("/nonexistent.txt").await;
+        assert!(matches!(result, Err(Error::Fs(FsError::NotFound))));
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_truncate_at_chunk_boundary() -> Result<()> {
+    async fn file_truncate_at_chunk_boundary() -> Result<()> {
         let (fs, _dir) = create_test_fs().await?;
         let chunk_size = fs.chunk_size();
-
-        // Create a file spanning multiple chunks
         let data: Vec<u8> = (0..(chunk_size * 3)).map(|i| (i % 256) as u8).collect();
         let (_, file) = fs.create_file("/test.txt", DEFAULT_FILE_MODE, 0, 0).await?;
         file.pwrite(0, &data).await?;
+        file.truncate(chunk_size as u64).await?;
 
-        // Truncate exactly at chunk boundary
-        fs.truncate("/test.txt", chunk_size as u64).await?;
-
-        // Verify
         let result = fs.read_file("/test.txt").await?.unwrap();
         assert_eq!(result.len(), chunk_size);
         assert_eq!(result, &data[..chunk_size]);
-
         Ok(())
     }
 
-    // ─────────────────────────────────────────────────────────────
-    // Rename Tests
-    // ─────────────────────────────────────────────────────────────
-
     #[tokio::test]
-    async fn test_rename_file_same_directory() -> Result<()> {
+    async fn trait_rename_file_same_directory() -> Result<()> {
         let (fs, _dir) = create_test_fs().await?;
-
-        // Create a file
         let data = b"hello world";
         let (_, file) = fs.create_file("/old.txt", DEFAULT_FILE_MODE, 0, 0).await?;
         file.pwrite(0, data).await?;
+        rename_path_via_trait(&fs, "/old.txt", "/new.txt").await?;
 
-        // Rename it
-        fs.rename("/old.txt", "/new.txt").await?;
-
-        // Old path should not exist
         assert!(fs.stat("/old.txt").await?.is_none());
-
-        // New path should exist with same data
-        let result = fs.read_file("/new.txt").await?.unwrap();
-        assert_eq!(result, data);
-
+        assert_eq!(fs.read_file("/new.txt").await?.unwrap(), data);
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_rename_file_to_different_directory() -> Result<()> {
+    async fn trait_rename_file_to_different_directory() -> Result<()> {
         let (fs, _dir) = create_test_fs().await?;
-
-        // Create directory and file
         fs.mkdir("/subdir", 0, 0).await?;
         let data = b"test data";
         let (_, file) = fs.create_file("/file.txt", DEFAULT_FILE_MODE, 0, 0).await?;
         file.pwrite(0, data).await?;
+        rename_path_via_trait(&fs, "/file.txt", "/subdir/file.txt").await?;
 
-        // Move file to subdirectory
-        fs.rename("/file.txt", "/subdir/file.txt").await?;
-
-        // Old path should not exist
         assert!(fs.stat("/file.txt").await?.is_none());
-
-        // New path should exist
-        let result = fs.read_file("/subdir/file.txt").await?.unwrap();
-        assert_eq!(result, data);
-
+        assert_eq!(fs.read_file("/subdir/file.txt").await?.unwrap(), data);
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_rename_overwrite_existing_file() -> Result<()> {
+    async fn trait_rename_overwrite_existing_file() -> Result<()> {
         let (fs, _dir) = create_test_fs().await?;
-
-        // Create two files
         let (_, file) = fs.create_file("/src.txt", DEFAULT_FILE_MODE, 0, 0).await?;
         file.pwrite(0, b"source").await?;
         let (_, file) = fs.create_file("/dst.txt", DEFAULT_FILE_MODE, 0, 0).await?;
         file.pwrite(0, b"destination").await?;
+        rename_path_via_trait(&fs, "/src.txt", "/dst.txt").await?;
 
-        // Rename src to dst (overwrites dst)
-        fs.rename("/src.txt", "/dst.txt").await?;
-
-        // Only dst should exist with src's content
         assert!(fs.stat("/src.txt").await?.is_none());
-        let result = fs.read_file("/dst.txt").await?.unwrap();
-        assert_eq!(result, b"source");
-
+        assert_eq!(fs.read_file("/dst.txt").await?.unwrap(), b"source");
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_rename_directory() -> Result<()> {
+    async fn trait_rename_directory() -> Result<()> {
         let (fs, _dir) = create_test_fs().await?;
-
-        // Create directory with a file inside
         fs.mkdir("/olddir", 0, 0).await?;
         let (_, file) = fs
             .create_file("/olddir/file.txt", DEFAULT_FILE_MODE, 0, 0)
             .await?;
         file.pwrite(0, b"content").await?;
+        rename_path_via_trait(&fs, "/olddir", "/newdir").await?;
 
-        // Rename directory
-        fs.rename("/olddir", "/newdir").await?;
-
-        // Old path should not exist
         assert!(fs.stat("/olddir").await?.is_none());
-
-        // New path should exist and contain the file
         assert!(fs.stat("/newdir").await?.is_some());
-        let result = fs.read_file("/newdir/file.txt").await?.unwrap();
-        assert_eq!(result, b"content");
-
+        assert_eq!(fs.read_file("/newdir/file.txt").await?.unwrap(), b"content");
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_rename_directory_into_own_subtree_fails() -> Result<()> {
+    async fn trait_rename_root_fails() -> Result<()> {
         let (fs, _dir) = create_test_fs().await?;
-
-        // Create nested directories
-        fs.mkdir("/parent", 0, 0).await?;
-        fs.mkdir("/parent/child", 0, 0).await?;
-
-        // Try to rename parent into its child - should fail
-        let result = fs.rename("/parent", "/parent/child/parent").await;
-        assert!(result.is_err());
-
-        // Original structure should be intact
-        assert!(fs.stat("/parent").await?.is_some());
-        assert!(fs.stat("/parent/child").await?.is_some());
-
+        let result = rename_path_via_trait(&fs, "/", "/newroot").await;
+        assert!(matches!(result, Err(Error::Fs(FsError::RootOperation))));
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_rename_root_fails() -> Result<()> {
+    async fn trait_rename_to_root_fails() -> Result<()> {
         let (fs, _dir) = create_test_fs().await?;
-
-        // Try to rename root - should fail
-        let result = fs.rename("/", "/newroot").await;
-        assert!(result.is_err());
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_rename_to_root_fails() -> Result<()> {
-        let (fs, _dir) = create_test_fs().await?;
-
         let (_, file) = fs.create_file("/file.txt", DEFAULT_FILE_MODE, 0, 0).await?;
         file.pwrite(0, b"data").await?;
-
-        // Try to rename to root - should fail
-        let result = fs.rename("/file.txt", "/").await;
-        assert!(result.is_err());
-
+        let result = rename_path_via_trait(&fs, "/file.txt", "/").await;
+        assert!(matches!(result, Err(Error::Fs(FsError::RootOperation))));
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_rename_nonexistent_source_fails() -> Result<()> {
+    async fn trait_rename_nonexistent_source_fails() -> Result<()> {
         let (fs, _dir) = create_test_fs().await?;
-
-        // Try to rename non-existent file
-        let result = fs.rename("/nonexistent.txt", "/new.txt").await;
-        assert!(result.is_err());
-
+        let result = rename_path_via_trait(&fs, "/nonexistent.txt", "/new.txt").await;
+        assert!(matches!(result, Err(Error::Fs(FsError::NotFound))));
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_rename_overwrite_nonempty_directory_fails() -> Result<()> {
+    async fn trait_rename_overwrite_nonempty_directory_fails() -> Result<()> {
         let (fs, _dir) = create_test_fs().await?;
-
-        // Create source directory and target directory with content
         fs.mkdir("/src", 0, 0).await?;
         fs.mkdir("/dst", 0, 0).await?;
         let (_, file) = fs
@@ -9221,69 +7958,49 @@ mod tests {
             .await?;
         file.pwrite(0, b"content").await?;
 
-        // Try to rename src to dst (dst is not empty) - should fail
-        let result = fs.rename("/src", "/dst").await;
-        assert!(result.is_err());
-
-        // Both directories should still exist
+        let result = rename_path_via_trait(&fs, "/src", "/dst").await;
+        assert!(matches!(result, Err(Error::Fs(FsError::NotEmpty))));
         assert!(fs.stat("/src").await?.is_some());
         assert!(fs.stat("/dst").await?.is_some());
         assert!(fs.stat("/dst/file.txt").await?.is_some());
-
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_rename_file_to_directory_fails() -> Result<()> {
+    async fn trait_rename_file_to_directory_fails() -> Result<()> {
         let (fs, _dir) = create_test_fs().await?;
-
-        // Create a file and an empty directory
         let (_, file) = fs.create_file("/file.txt", DEFAULT_FILE_MODE, 0, 0).await?;
         file.pwrite(0, b"data").await?;
         fs.mkdir("/dir", 0, 0).await?;
 
-        // Try to rename file over directory - should fail
-        let result = fs.rename("/file.txt", "/dir").await;
-        assert!(result.is_err());
-
+        let result = rename_path_via_trait(&fs, "/file.txt", "/dir").await;
+        assert!(matches!(result, Err(Error::Fs(FsError::IsADirectory))));
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_rename_directory_to_file_fails() -> Result<()> {
+    async fn trait_rename_directory_to_file_fails() -> Result<()> {
         let (fs, _dir) = create_test_fs().await?;
-
-        // Create a directory and a file
         fs.mkdir("/dir", 0, 0).await?;
         let (_, file) = fs.create_file("/file.txt", DEFAULT_FILE_MODE, 0, 0).await?;
         file.pwrite(0, b"data").await?;
 
-        // Try to rename directory over file - should fail
-        let result = fs.rename("/dir", "/file.txt").await;
-        assert!(result.is_err());
-
+        let result = rename_path_via_trait(&fs, "/dir", "/file.txt").await;
+        assert!(matches!(result, Err(Error::Fs(FsError::NotADirectory))));
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_rename_updates_ctime() -> Result<()> {
+    async fn trait_rename_updates_ctime() -> Result<()> {
         let (fs, _dir) = create_test_fs().await?;
-
-        // Create a file
         let (_, file) = fs.create_file("/old.txt", DEFAULT_FILE_MODE, 0, 0).await?;
         file.pwrite(0, b"data").await?;
         let stats_before = fs.stat("/old.txt").await?.unwrap();
-
-        // Small delay to ensure time changes
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        rename_path_via_trait(&fs, "/old.txt", "/new.txt").await?;
 
-        // Rename it
-        fs.rename("/old.txt", "/new.txt").await?;
-
-        // ctime should be updated
         let stats_after = fs.stat("/new.txt").await?.unwrap();
         assert!(stats_after.ctime >= stats_before.ctime);
-
         Ok(())
     }
 
@@ -9372,13 +8089,17 @@ mod tests {
             .create_file("/target.txt", DEFAULT_FILE_MODE, 0, 0)
             .await?;
         file.pwrite(0, b"content").await?;
-        fs.symlink("/target.txt", "/link.txt", 0, 0).await?;
-        let link_stats = fs.lstat("/link.txt").await?.unwrap();
+        FileSystem::symlink(&fs, ROOT_INO, "link.txt", "/target.txt", 0, 0).await?;
+        let link_stats = FileSystem::lookup(&fs, ROOT_INO, "link.txt")
+            .await?
+            .unwrap();
 
         // chmod the symlink (should work on the symlink inode)
         fs.chmod(link_stats.ino, 0o755).await?;
 
-        let stats = fs.lstat("/link.txt").await?.unwrap();
+        let stats = FileSystem::lookup(&fs, ROOT_INO, "link.txt")
+            .await?
+            .unwrap();
         assert!(stats.is_symlink(), "Should still be a symlink");
 
         Ok(())
