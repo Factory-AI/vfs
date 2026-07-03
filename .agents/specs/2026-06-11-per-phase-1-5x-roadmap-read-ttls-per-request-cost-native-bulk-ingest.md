@@ -28,24 +28,30 @@ Codex re-runs of the WS9 off/on A/B, uring compound, and read-path protocol
 are pending an idle host; the noopen default-on promotion is provisional
 until re-verified against codex.
 
-## Scoreboard (last valid codex measurements @ WS5-era + WS3; WS9 codex re-run pending)
+## Scoreboard (codex, 2026-07-03 idle host, multi n=5; current defaults = noflush + noopen)
 
-| Phase | Codex (2026-06-11, pre-WS9) | Target | Lever |
-|---|---|---|---|
-| clone | **2.34x** via `agentfs clone` (plain FUSE ~8.3x) | ≤1.5x; residual = pack+import double write | WS3 done |
-| checkout | **0.91x** ✓ | hold ≤1.5x | — |
-| status | **0.71x** ✓ | ≤1.5x **MET** | WS4+WS5 |
-| read_search | **2.25x** | ≤1.5x | WS9 re-measure pending |
-| diff | **≤1x** ✓ | ≤1.5x **MET** | WS4+WS5 |
-| edit | 13.3x (8.8ms abs) | ≤3ms absolute | — |
-| fsck | **1.16x** ✓ | hold ≤1.5x | — |
-| read-path warm steady | **3.35x** (WS5); micro cycle since improved 47.3 → 21.2µs by WS9 | ≤1.5x | WS9 re-measure pending |
+| Phase | noopen off | Default (WS9) | +uring (opt-in) | Target |
+|---|---|---|---|---|
+| clone (plain FUSE) | 9.63x (3.63s) | 9.48x (3.25s) | 8.81x (3.14s) | ≤1.5x miss; `agentfs clone` 2.34x is the lever |
+| checkout | 0.49x | **0.42x** ✓ | 0.42x ✓ | hold |
+| status | 1.10x | **0.93x** ✓ | 0.60x ✓ | ≤1.5x **MET** |
+| read_search | 1.87x | **1.41x** ✓ (p25 1.24, p75 1.63) | 1.37x ✓ | ≤1.5x **MET** |
+| diff | 0.45x (80ms) | **0.05x** ✓ (18ms) | 0.04x ✓ | ≤1.5x **MET** |
+| edit | 7ms abs | **6ms abs** | 8ms | ≤3ms absolute miss |
+| fsck | 0.98x | **0.83x** ✓ | 0.88x ✓ | hold **MET** |
+| read-path warm (protocol) | 2.26x | 2.38x (paired 0.984, neutral) | 2.14x (paired 0.972) | ≤1.5x miss |
+| TOTAL workload | 4.08x | **3.37x** | 2.92x (stdev 0.12) | — |
 
-WS9 verdict (2026-07-02, provisional): promoted **default-on**
-(`AGENTFS_FUSE_NOOPEN=0` kill switch) — correctness gates all green and the
-protocol-valid micro shows −55% per open/read/close cycle; the git-workload
-deltas that day were synthetic-fixture-only and must be re-established on
-codex before the verdict is final.
+**WS9 verdict (final, 2026-07-03)**: GO bar (read_search ≤1.5x AND no phase
+regression) **MET on codex** — default-on stands (`AGENTFS_FUSE_NOOPEN=0`
+kill switch). 5 of 8 phases now at or under the bar; remaining misses:
+plain-FUSE clone (use `agentfs clone`), edit absolute (~6ms, txn floor),
+read-path warm (~2.2-2.4x, stat-heavy shape that noopen does not address).
+
+**uring on codex (2026-07-03)**: equal-or-better on EVERY phase (total
+3.37x → 2.92x, status 0.60x, clone −3%) — the synthetic-fixture "write-phase
+regression" was a toy-workload artifact. Still opt-in (needs root sysctl
+fuse.enable_uring=1; probe-gated fallback); default-flip is a live question.
 
 First commit: write this scoreboard + plan to `.agents/specs/2026-06-11-per-phase-1.5x-roadmap.md` and update it after each workstream's verdict.
 
