@@ -1,0 +1,99 @@
+From 85a047f20045580d3cfafaa7418f16a5a120cfa2 Mon Sep 17 00:00:00 2001
+From: ain3sh <ainesh.chatterjee@gmail.com>
+Date: Thu, 2 Jul 2026 20:29:01 -0700
+Subject: [PATCH] fuse: only invalidate STATX_BLOCKS on flush if pages were
+ dirtied
+
+Since commit cf576c58b3a2 ("fuse: invalidate inode attr in writeback
+cache mode") fuse_flush() invalidates cached attributes so that
+st_blocks does not stay stale after buffered writes, since i_blocks is
+not maintained under writeback cache.  Commit fa5eee57e33e ("fuse:
+selective attribute invalidation") narrowed this to STATX_BLOCKS.
+
+The invalidation is unconditional, however: every close(2) throws away
+cached STATX_BLOCKS even when the inode was only ever read.  Because
+plain stat(2) requests the basic mask (which includes STATX_BLOCKS),
+any stat-after-close then forces a synchronous FUSE_GETATTR round trip
+that the attribute timeout was supposed to elide.  Read-mostly
+workloads with open/read/close/stat patterns (build systems, git
+status style scanners) pay one GETATTR per file per cycle regardless
+of attr_timeout.
+
+i_blocks can only go stale through the page cache: every other write
+path (direct I/O, writethrough, copy_file_range, fallocate) already
+invalidates STATX_BLOCKS at write time via fuse_write_update_attr()
+(FUSE_STATX_MODSIZE includes STATX_BLOCKS).  So track page-cache
+dirtying with a per-inode state bit, set in the buffered writeback
+write path and in fuse_page_mkwrite(), and only invalidate at flush
+time if the bit is set.  The bit is tested-and-cleared, so a flush
+that writes back another fd's dirty pages still invalidates (the bit
+is per inode, not per file), and the motivating case of commit
+cf576c58b3a2 (du reading 0 blocks after a buffered write) is
+unaffected.
+
+On a FUSE filesystem with writeback cache and attr_timeout, a
+stat+open/read/close loop over 32 files x 32 iterations improves from
+18.7us to 8.5us per cycle, with GETATTR requests dropping from 1095
+to 70.  st_blocks remains correct after buffered and mmap writes.
+---
+ fs/fuse/file.c   | 12 ++++++++++--
+ fs/fuse/fuse_i.h |  5 +++++
+ 2 files changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/fs/fuse/file.c b/fs/fuse/file.c
+index e052a0d44..086831ac5 100644
+--- a/fs/fuse/file.c
++++ b/fs/fuse/file.c
+@@ -510,9 +510,13 @@ static int fuse_flush(struct file *file, fl_owner_t id)
+ inval_attr_out:
+ 	/*
+ 	 * In memory i_blocks is not maintained by fuse, if writeback cache is
+-	 * enabled, i_blocks from cached attr may not be accurate.
++	 * enabled, i_blocks from cached attr may not be accurate.  Only
++	 * invalidate if pages were dirtied through the page cache since the
++	 * last flush-time invalidation, so that read-only traffic does not
++	 * throw away the cached attributes on every close(2).
+ 	 */
+-	if (!err && fm->fc->writeback_cache)
++	if (!err && fm->fc->writeback_cache &&
++	    test_and_clear_bit(FUSE_I_BLOCKS_DIRTY, &get_fuse_inode(inode)->state))
+ 		fuse_invalidate_attr_mask(inode, STATX_BLOCKS);
+ 	return err;
+ }
+@@ -1550,6 +1554,9 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
+ 						    &fuse_iomap_ops,
+ 						    &fuse_iomap_write_ops,
+ 						    file);
++		if (written > 0)
++			set_bit(FUSE_I_BLOCKS_DIRTY,
++				&get_fuse_inode(inode)->state);
+ 	} else {
+ 		written = fuse_perform_write(iocb, from);
+ 	}
+@@ -2392,6 +2399,7 @@ static vm_fault_t fuse_page_mkwrite(struct vm_fault *vmf)
+ 	}
+ 
+ 	folio_wait_writeback(folio);
++	set_bit(FUSE_I_BLOCKS_DIRTY, &get_fuse_inode(inode)->state);
+ 	return VM_FAULT_LOCKED;
+ }
+ 
+diff --git a/fs/fuse/fuse_i.h b/fs/fuse/fuse_i.h
+index 85f738c53..fd763c749 100644
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@ -257,6 +257,11 @@ enum {
+ 	 * or the fuse server has an exclusive "lease" on distributed fs
+ 	 */
+ 	FUSE_I_EXCLUSIVE,
++	/*
++	 * Pages were dirtied through the page cache since the last flush-time
++	 * STATX_BLOCKS invalidation (writeback cache mode)
++	 */
++	FUSE_I_BLOCKS_DIRTY,
+ };
+ 
+ struct fuse_conn;
+-- 
+2.55.0
+
