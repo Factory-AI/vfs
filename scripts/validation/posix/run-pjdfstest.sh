@@ -12,7 +12,6 @@
 #   AGENTFS_BIN    agentfs executable to invoke (default: agentfs).
 #   PJDFSTEST_PROFILE   test profile to run (default: full).
 #   PJDFSTEST_MANIFEST  explicit manifest overriding --profile.
-#   AGENTFS_OVERLAY_PARTIAL_ORIGIN  enable partial-origin overlay mode when true/1.
 #   REPORT_DIR     directory where logs should be written.
 #   SKIP_CODE      exit code for missing prerequisites (default: 77).
 #
@@ -24,7 +23,7 @@ PJDFSTEST_DIR="${PJDFSTEST_DIR:-}"
 PJDFSTEST_PROFILE="${PJDFSTEST_PROFILE:-full}"
 PJDFSTEST_MANIFEST="${PJDFSTEST_MANIFEST:-}"
 PJDFSTEST_KNOWN_UNSUPPORTED="${PJDFSTEST_KNOWN_UNSUPPORTED:-}"
-PARTIAL_ORIGIN="${AGENTFS_OVERLAY_PARTIAL_ORIGIN:-}"
+PARTIAL_ORIGIN=""
 REPORT_DIR="${REPORT_DIR:-}"
 KEEP_WORK=0
 
@@ -378,16 +377,14 @@ printf 'pjdfstest binary: %s\n' "$PJDFSTEST_RESOLVED"
 printf 'pjdfstest tests: %s\n' "$PJDFSTEST_TESTS"
 printf 'pjdfstest profile: %s\n' "$PJDFSTEST_PROFILE"
 if env_flag_enabled "$PARTIAL_ORIGIN"; then
-    export AGENTFS_OVERLAY_PARTIAL_ORIGIN=1
-    printf 'partial-origin overlay: enabled\n'
+    printf 'partial-origin overlay: enabled via --partial-origin on\n'
 else
-    unset AGENTFS_OVERLAY_PARTIAL_ORIGIN
     printf 'partial-origin overlay: disabled\n'
 fi
 printf 'Report directory: %s\n' "$REPORT_DIR"
 
 printf '%s\n' "$PJDFSTEST_PROFILE" >"$REPORT_DIR/selected-profile.txt"
-printf '%s\n' "${AGENTFS_OVERLAY_PARTIAL_ORIGIN:-}" >"$REPORT_DIR/partial-origin-env.txt"
+printf '%s\n' "$(env_flag_enabled "$PARTIAL_ORIGIN" && printf 'on' || printf 'off')" >"$REPORT_DIR/partial-origin-cli.txt"
 if [[ -n "$PJDFSTEST_RESOLVED_MANIFEST" ]]; then
     {
         printf 'path\t%s\n' "$PJDFSTEST_RESOLVED_MANIFEST"
@@ -422,7 +419,11 @@ if [[ ! -f "$DB_PATH" ]]; then
     exit 1
 fi
 
-"$AGENTFS_RESOLVED" mount "$DB_PATH" "$MOUNT_DIR" --foreground >"$REPORT_DIR/mount.log" 2>&1 &
+MOUNT_CMD=("$AGENTFS_RESOLVED" mount "$DB_PATH" "$MOUNT_DIR" --foreground)
+if env_flag_enabled "$PARTIAL_ORIGIN"; then
+    MOUNT_CMD+=(--partial-origin on)
+fi
+"${MOUNT_CMD[@]}" >"$REPORT_DIR/mount.log" 2>&1 &
 MOUNT_PID=$!
 
 mounted=0

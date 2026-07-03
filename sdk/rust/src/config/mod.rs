@@ -15,7 +15,8 @@ pub use env::EnvReader;
 
 #[cfg(test)]
 mod tests {
-    use super::EnvReader;
+    use super::{CoreConfig, EnvReader};
+    use crate::filesystem::PartialOriginMode;
     use std::path::Path;
 
     #[test]
@@ -114,5 +115,25 @@ mod tests {
                 offenders.push(format!("{}:{}", rel.display(), line_idx + 1));
             }
         }
+    }
+
+    #[test]
+    fn core_config_ignores_legacy_partial_origin_env() {
+        let key = concat!("AGENTFS_OVERLAY_", "PARTIAL_ORIGIN");
+        let previous = std::env::var(key).ok();
+        std::env::set_var(key, "1");
+
+        let config = CoreConfig::from_env();
+
+        match previous {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+
+        eprintln!(
+            "legacy partial-origin env ignored; resolved policy is {:?}",
+            config.partial_origin.mode
+        );
+        assert_eq!(config.partial_origin.mode, PartialOriginMode::Off);
     }
 }

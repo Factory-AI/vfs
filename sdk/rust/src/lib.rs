@@ -18,7 +18,11 @@ use turso::{Builder, EncryptionOpts, Value};
 pub use turso::sync::{DatabaseSyncStats, PartialBootstrapStrategy, PartialSyncOpts};
 
 // Re-export filesystem types
-pub use config::{BatcherConfig, CoreConfig, EnvReader, Geometry};
+pub use config::{
+    BatcherConfig, CoreConfig, EnvReader, Geometry, DEFAULT_WRITE_BATCH_BYTES,
+    DEFAULT_WRITE_BATCH_GLOBAL_BYTES, DEFAULT_WRITE_BATCH_MS, DEFAULT_WRITE_BATCH_TXN_BYTES,
+    DEFAULT_WRITE_BATCH_TXN_INODES,
+};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use filesystem::HostFS;
 pub use filesystem::{

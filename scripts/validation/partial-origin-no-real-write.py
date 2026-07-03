@@ -21,7 +21,6 @@ from typing import Any, Optional
 
 OUTPUT_TAIL_CHARS = 4000
 ONE_MIB = 1024 * 1024
-PARTIAL_ORIGIN_ENV = "AGENTFS_OVERLAY_PARTIAL_ORIGIN"
 
 
 WRITE_WORKLOAD = r'''
@@ -437,7 +436,6 @@ def prepare_environment(temp_root: Path, profile: bool) -> dict[str, str]:
     env.setdefault("NO_COLOR", "1")
     if profile:
         env["AGENTFS_PROFILE"] = "1"
-    env[PARTIAL_ORIGIN_ENV] = "1"
 
     home = temp_root / "home"
     for path in (home, home / ".config", home / ".cache", home / ".local" / "share"):
@@ -487,6 +485,8 @@ def main(argv: list[str]) -> int:
             "--session",
             session,
             "--no-default-allows",
+            "--partial-origin",
+            "on",
             "--",
             sys.executable,
             "-c",
@@ -536,8 +536,8 @@ def main(argv: list[str]) -> int:
                 "session": session,
                 "db_path": str(db_path),
                 "profile_enabled": args.profile,
+                "partial_origin_cli": "on",
                 "partial_origin_enabled": True,
-                "env_flags": {PARTIAL_ORIGIN_ENV: env.get(PARTIAL_ORIGIN_ENV)},
                 "profile_summary_count": len(run["profile_summaries"]),
             },
             "database": {

@@ -716,9 +716,9 @@ If a mapping exists, return `base_ino` instead of `delta_ino` in stat results.
 
 ### Partial-Origin Overlay Mode
 
-Partial-origin copy-up is an experimental opt-in overlay mode enabled with
-`AGENTFS_OVERLAY_PARTIAL_ORIGIN=1`. The default overlay behavior remains
-whole-file copy-up. In opt-in mode, write-opening a regular base-layer file
+Partial-origin copy-up is an experimental opt-in overlay mode enabled by the
+CLI `--partial-origin` policy. The default overlay behavior remains whole-file
+copy-up. In opt-in mode, write-opening a regular base-layer file
 creates a delta inode with the original size and metadata, records the base
 path/fingerprint in `fs_partial_origin`, and stores only changed chunk indexes
 in `fs_data` plus `fs_chunk_override`. Reads merge changed chunks from the

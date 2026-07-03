@@ -336,11 +336,10 @@ stored chunk bytes, inline inode rows, origin rows, partial-origin rows,
 chunk-override rows, and `fs_config`.
 
 Partial-origin overlay copy-up remains opt-in for Phase 5.5. Use
-`--partial-origin` or `AGENTFS_OVERLAY_PARTIAL_ORIGIN=1` to enable it; use
-`--no-partial-origin` to force the default whole-file copy-up path even when the
-environment variable is set. The JSON output reports the selected mode as
-`agentfs.partial_origin_enabled` and echoes the effective env flag under
-`agentfs.env_flags.AGENTFS_OVERLAY_PARTIAL_ORIGIN`.
+`--partial-origin` to pass `--partial-origin on` to AgentFS, or
+`--no-partial-origin` to force the default whole-file copy-up path. The JSON
+output reports the selected mode as `agentfs.partial_origin_enabled` and echoes
+the effective CLI mode under `agentfs.partial_origin_cli`.
 
 Machine-readable schema (`schema_version: 1`):
 
@@ -361,7 +360,7 @@ Machine-readable schema (`schema_version: 1`):
     "db_path": "/tmp/.../home/.agentfs/run/.../delta.db",
     "profile_enabled": true,
     "partial_origin_enabled": false,
-    "env_flags": {"AGENTFS_OVERLAY_PARTIAL_ORIGIN": null},
+    "partial_origin_cli": "omitted",
     "profile_summary_count": 2
   },
   "database": {

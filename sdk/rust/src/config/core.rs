@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::filesystem::{PartialOriginMode, PartialOriginPolicy};
+use crate::filesystem::PartialOriginPolicy;
 
 use super::EnvReader;
 
@@ -20,7 +20,6 @@ const WRITE_BATCHER_TXN_BYTES_ENV: &str = "AGENTFS_BATCH_TXN_BYTES";
 const OVERLAY_READS_ENV: &str = "AGENTFS_OVERLAY_READS";
 const DRAIN_ON_SETATTR_ENV: &str = "AGENTFS_DRAIN_ON_SETATTR";
 const KEEPCACHE_DELTA_ENV: &str = "AGENTFS_KEEPCACHE_DELTA";
-const PARTIAL_ORIGIN_ENV: &str = "AGENTFS_OVERLAY_PARTIAL_ORIGIN";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Geometry {
@@ -112,11 +111,7 @@ impl CoreConfig {
             overlay_reads: reader.bool(OVERLAY_READS_ENV, default.overlay_reads),
             drain_on_setattr: reader.bool(DRAIN_ON_SETATTR_ENV, default.drain_on_setattr),
             keepcache_delta: reader.bool(KEEPCACHE_DELTA_ENV, default.keepcache_delta),
-            partial_origin: if reader.bool(PARTIAL_ORIGIN_ENV, false) {
-                PartialOriginPolicy::new(PartialOriginMode::On)
-            } else {
-                default.partial_origin
-            },
+            partial_origin: default.partial_origin,
         }
     }
 }

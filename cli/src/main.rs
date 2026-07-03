@@ -487,3 +487,52 @@ fn default_shell() -> std::path::PathBuf {
         std::path::PathBuf::from("bash")
     }
 }
+
+#[cfg(test)]
+mod partial_origin {
+    use super::partial_origin_policy;
+    use agentfs::opts::{Args, Command, PartialOriginMode};
+    use clap::Parser;
+
+    #[test]
+    fn legacy_env_does_not_override_cli_off() {
+        let key = concat!("AGENTFS_OVERLAY_", "PARTIAL_ORIGIN");
+        let previous = std::env::var(key).ok();
+        std::env::set_var(key, "1");
+
+        let args = Args::try_parse_from([
+            "agentfs",
+            "run",
+            "--partial-origin",
+            "off",
+            "--",
+            "sh",
+            "-c",
+            "true",
+        ])
+        .expect("run args with --partial-origin off should parse");
+
+        let (mode, threshold_bytes) = match args.command {
+            Command::Run {
+                partial_origin,
+                partial_origin_threshold_bytes,
+                ..
+            } => (partial_origin, partial_origin_threshold_bytes),
+            other => panic!("expected run command, got {other:?}"),
+        };
+        let policy = partial_origin_policy(mode, threshold_bytes)
+            .expect("--partial-origin off should resolve an explicit policy");
+
+        match previous {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+
+        eprintln!(
+            "legacy partial-origin env set; CLI policy resolved to {:?}",
+            policy.mode
+        );
+        assert_eq!(mode, Some(PartialOriginMode::Off));
+        assert_eq!(policy.mode, agentfs_sdk::PartialOriginMode::Off);
+    }
+}

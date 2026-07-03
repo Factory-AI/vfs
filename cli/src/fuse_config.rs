@@ -23,16 +23,16 @@ pub(crate) const FUSE_REQUEST_BUFFER_SIZE: usize = (16 * 1024 * 1024) + 4096;
 /// session DB (`agentfs run --session` from another terminal), which now see
 /// attribute/namespace changes within 10s. Override with
 /// `AGENTFS_FUSE_ENTRY_TTL_MS` / `AGENTFS_FUSE_ATTR_TTL_MS`.
-const DEFAULT_FUSE_POSITIVE_TTL_MS: u64 = 10_000;
+pub(crate) const DEFAULT_FUSE_POSITIVE_TTL_MS: u64 = 10_000;
 /// Default kernel TTL for negative dentries. Kept at 1s: a file created by a
 /// second mount stays invisible to this mount for the negative TTL, and
 /// lookup-miss caching is the most surprising staleness to debug. Override
 /// with `AGENTFS_FUSE_NEG_TTL_MS`.
-const DEFAULT_FUSE_NEG_TTL_MS: u64 = 1000;
-const DEFAULT_AUTO_PERCENT: u8 = 50;
-const DEFAULT_QUEUE_MEMORY_PERCENT: u8 = 25;
-const DEFAULT_INO_FILES_CAP: usize = 65_536;
-const DEFAULT_URING_DEPTH: usize = 4;
+pub(crate) const DEFAULT_FUSE_NEG_TTL_MS: u64 = 1000;
+pub(crate) const DEFAULT_AUTO_PERCENT: u8 = 50;
+pub(crate) const DEFAULT_QUEUE_MEMORY_PERCENT: u8 = 25;
+pub(crate) const DEFAULT_INO_FILES_CAP: usize = 65_536;
+pub(crate) const DEFAULT_URING_DEPTH: usize = 4;
 const MAX_URING_DEPTH: usize = 64;
 const MAX_URING_SPIN_US: u64 = 1000;
 

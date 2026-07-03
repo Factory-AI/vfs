@@ -1,5 +1,6 @@
 pub mod cmd;
 pub mod config;
+pub mod knobs;
 pub mod opts;
 pub mod sandbox;
 
