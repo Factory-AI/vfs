@@ -10,9 +10,6 @@ pub mod timeline;
 
 #[cfg(unix)]
 pub mod mount;
-#[cfg(not(unix))]
-#[path = "mount_stub.rs"]
-pub mod mount;
 
 #[cfg(unix)]
 pub(crate) mod supervise;
@@ -31,5 +28,6 @@ pub mod exec;
 #[cfg(unix)]
 pub mod clone;
 
+#[cfg(unix)]
 pub use mount::{mount, MountArgs, MountBackend};
 pub use run::handle_run_command;
