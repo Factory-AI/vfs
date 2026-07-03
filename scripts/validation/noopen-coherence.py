@@ -108,15 +108,22 @@ mm.close()
 os.close(fd)
 check("mmap_content", open(m, "rb").read()[:6], b"mapped")
 
-# 5. unlink must not wedge later operations. (I/O on an unlinked-but-open
-# inode is a pre-existing SDK gap — the inode is reaped immediately, so even
-# the close-time writeback mtime SETATTR errors. Identical under the legacy
-# fh path; tracked as a followup, not asserted here.)
+# 5. POSIX unlink-while-open: the fd must stay readable and writable after
+# the unlink, fsync must drain, and the close-time writeback mtime SETATTR
+# must not error (the SDK defers inode reaping until the last handle drops).
 u = os.path.join(root, "unlinked.bin")
-with open(u, "wb") as handle:
-    handle.write(b"ghost")
+fd = os.open(u, os.O_RDWR | os.O_CREAT, 0o644)
+os.write(fd, b"ghost")
 os.unlink(u)
 check("unlinked_gone", os.path.exists(u), False)
+os.lseek(fd, 0, 0)
+check("unlinked_read", os.read(fd, 5), b"ghost")
+os.write(fd, b"-more")
+os.fsync(fd)
+os.lseek(fd, 0, 0)
+check("unlinked_rw", os.read(fd, 10), b"ghost-more")
+check("unlinked_nlink", os.fstat(fd).st_nlink, 0)
+os.close(fd)
 after = os.path.join(root, "after-unlink.bin")
 with open(after, "wb") as handle:
     handle.write(b"still-works")

@@ -9,9 +9,9 @@ use std::{
 };
 use turso::value::Value;
 
-use crate::mount::{mount_fs, MountOpts};
 #[cfg(target_os = "linux")]
 use crate::mount::unmount;
+use crate::mount::{mount_fs, MountOpts};
 use crate::nfs::AgentNFS;
 use crate::nfsserve::tcp::NFSTcp;
 

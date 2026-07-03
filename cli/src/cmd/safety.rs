@@ -1026,9 +1026,13 @@ async fn check_namespace_invariants(
         conn,
         report,
         "namespace.non_root_inode_has_dentry",
+        // nlink = 0 rows are POSIX orphans: files unlinked while open, whose
+        // reap is deferred until the last handle closes (and swept at the
+        // next mount after a crash). Dentry-less is legal only in that state.
         "SELECT COUNT(*)
          FROM fs_inode i
          WHERE i.ino != 1
+           AND i.nlink != 0
            AND NOT EXISTS (SELECT 1 FROM fs_dentry d WHERE d.ino = i.ino)",
     )
     .await?;

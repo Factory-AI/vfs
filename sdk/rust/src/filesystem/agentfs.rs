@@ -2,7 +2,7 @@ use crate::error::{Error, Result};
 use async_trait::async_trait;
 use lru::LruCache;
 use parking_lot::RwLock;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -934,6 +934,7 @@ impl AgentFSWriteBatcher {
                     attr_cache: self.attr_cache.clone(),
                     write_batcher: None,
                     overlay_reads: true,
+                    _open_guard: None,
                 };
                 match file
                     .pwrite_ranges_inode_with_conn(
@@ -1142,6 +1143,7 @@ impl AgentFSWriteBatcher {
             attr_cache: self.attr_cache.clone(),
             write_batcher: None,
             overlay_reads: true,
+            _open_guard: None,
         };
         let normalized_refs: Vec<_> = normalized
             .iter()
@@ -1522,8 +1524,93 @@ pub struct AgentFS {
     /// behaves like Tier 3 — every pwrite drains, every pread drains,
     /// `merge_pending_view` is a no-op. ON by default.
     overlay_reads: bool,
+    /// Live open-handle registry for deferred orphan reaping (see
+    /// [`OpenInodes`]).
+    open_inodes: Arc<OpenInodes>,
     /// Emits a profiling summary when the final filesystem clone is dropped.
     _profile_report: Arc<crate::profiling::ProfileReportGuard>,
+}
+
+/// Tracks inodes with live `AgentFSFile` handles so unlink and
+/// rename-replace can defer row deletion: POSIX requires an
+/// unlinked-but-open file to stay readable and writable until its last
+/// handle closes. `nlink = 0` in `fs_inode` is the crash-safe orphan
+/// marker — deferred inodes are queued here when their last handle drops
+/// and reaped by `process_deferred_reaps` (unlink/rename/finalize) or, after
+/// a crash, by the mount-time sweep.
+#[derive(Default)]
+pub(crate) struct OpenInodes {
+    inner: Mutex<OpenInodesInner>,
+}
+
+#[derive(Default)]
+struct OpenInodesInner {
+    counts: HashMap<i64, u32>,
+    orphaned: HashSet<i64>,
+    reap_queue: Vec<i64>,
+}
+
+impl OpenInodes {
+    fn guard(self: &Arc<Self>, ino: i64) -> OpenInodeGuard {
+        let mut inner = self.inner.lock().unwrap();
+        *inner.counts.entry(ino).or_insert(0) += 1;
+        OpenInodeGuard {
+            registry: Arc::clone(self),
+            ino,
+        }
+    }
+
+    /// Marks the inode for deferred reaping when handles are live.
+    /// Returns true when the caller must NOT delete the rows yet.
+    fn defer_reap_if_open(&self, ino: i64) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.counts.contains_key(&ino) {
+            inner.orphaned.insert(ino);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn release(&self, ino: i64) {
+        let mut inner = self.inner.lock().unwrap();
+        match inner.counts.get_mut(&ino) {
+            Some(count) if *count > 1 => *count -= 1,
+            Some(_) => {
+                inner.counts.remove(&ino);
+                if inner.orphaned.remove(&ino) {
+                    inner.reap_queue.push(ino);
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn take_reap_queue(&self) -> Vec<i64> {
+        let mut inner = self.inner.lock().unwrap();
+        std::mem::take(&mut inner.reap_queue)
+    }
+
+    fn requeue_reaps(&self, inos: Vec<i64>) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.reap_queue.extend(inos);
+    }
+
+    fn has_pending_reaps(&self) -> bool {
+        !self.inner.lock().unwrap().reap_queue.is_empty()
+    }
+}
+
+/// RAII registration of one `AgentFSFile` in [`OpenInodes`].
+pub(crate) struct OpenInodeGuard {
+    registry: Arc<OpenInodes>,
+    ino: i64,
+}
+
+impl Drop for OpenInodeGuard {
+    fn drop(&mut self) {
+        self.registry.release(self.ino);
+    }
 }
 
 /// An open file handle for AgentFS.
@@ -1540,6 +1627,9 @@ pub struct AgentFSFile {
     /// Same semantics as the field on `AgentFS`; cloned at open time so the
     /// hot read/write path doesn't have to chase an extra indirection.
     overlay_reads: bool,
+    /// None only for the batcher's ephemeral internal handles; user-visible
+    /// handles register so unlink defers inode reaping while they live.
+    _open_guard: Option<OpenInodeGuard>,
 }
 
 struct FileStorage {
@@ -2576,6 +2666,22 @@ impl AgentFS {
             None
         };
 
+        // Sweep POSIX orphans a crash stranded: nlink = 0 rows are files that
+        // were unlinked while open (reap deferred) and never reaped. They are
+        // invisible (no dentry), so deleting them before serving is safe.
+        conn.execute(
+            "DELETE FROM fs_data WHERE ino IN (SELECT ino FROM fs_inode WHERE nlink = 0)",
+            (),
+        )
+        .await?;
+        conn.execute(
+            "DELETE FROM fs_symlink WHERE ino IN (SELECT ino FROM fs_inode WHERE nlink = 0)",
+            (),
+        )
+        .await?;
+        conn.execute("DELETE FROM fs_inode WHERE nlink = 0", ())
+            .await?;
+
         let overlay_reads = env_flag_default(OVERLAY_READS_ENV, true);
         let fs = Self {
             pool,
@@ -2589,6 +2695,7 @@ impl AgentFS {
             attr_cache,
             write_batcher,
             overlay_reads,
+            open_inodes: Arc::new(OpenInodes::default()),
             _profile_report: Arc::new(crate::profiling::ProfileReportGuard::new("agentfs")),
         };
         Ok(fs)
@@ -3030,11 +3137,60 @@ impl AgentFS {
 
     /// Drain all writes and leave the database in single-file journal mode for clean shutdown.
     pub async fn finalize(&self) -> Result<()> {
+        self.process_deferred_reaps().await?;
         self.drain_all().await?;
         if let Some(path) = &self.db_path {
             remove_checkpointed_sidecars(path.as_ref())?;
         }
         Ok(())
+    }
+
+    /// Reap inodes whose deletion unlink/rename deferred because open
+    /// handles existed (POSIX unlink-while-open). Runs opportunistically at
+    /// namespace mutations and at finalize; a crash is covered by the
+    /// nlink=0 sweep at mount.
+    pub async fn process_deferred_reaps(&self) -> Result<()> {
+        if !self.open_inodes.has_pending_reaps() {
+            return Ok(());
+        }
+        let inos = self.open_inodes.take_reap_queue();
+        let conn = self.pool.get_connection().await?;
+        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+        let result: Result<()> = async {
+            for ino in &inos {
+                // The nlink=0 guard makes a stale queue entry (row already
+                // reaped, or the rowid reused by a live file) a no-op.
+                let changed = conn
+                    .execute("DELETE FROM fs_inode WHERE ino = ? AND nlink = 0", (*ino,))
+                    .await?;
+                if changed == 0 {
+                    continue;
+                }
+                if let Some(batcher) = &self.write_batcher {
+                    batcher.discard_pending(*ino);
+                }
+                conn.execute("DELETE FROM fs_data WHERE ino = ?", (*ino,))
+                    .await?;
+                conn.execute("DELETE FROM fs_symlink WHERE ino = ?", (*ino,))
+                    .await?;
+            }
+            Ok(())
+        }
+        .await;
+        match result {
+            Ok(()) => {
+                txn.commit().await?;
+                for ino in &inos {
+                    self.invalidate_attr(*ino);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                let _ = txn.rollback().await;
+                self.open_inodes.requeue_reaps(inos);
+                Err(error)
+            }
+        }
     }
 
     fn invalidate_parent_attr(&self, parent_ino: i64) {
@@ -3845,6 +4001,7 @@ impl AgentFS {
             attr_cache: self.attr_cache.clone(),
             write_batcher: self.write_batcher.clone(),
             overlay_reads: self.overlay_reads,
+            _open_guard: Some(self.open_inodes.guard(ino)),
         });
 
         Ok((stats, file))
@@ -3869,6 +4026,7 @@ impl AgentFS {
             attr_cache: self.attr_cache.clone(),
             write_batcher: self.write_batcher.clone(),
             overlay_reads: self.overlay_reads,
+            _open_guard: None,
         };
         Ok(Some(file.read_inode_with_conn(&conn, 0, u64::MAX).await?))
     }
@@ -3897,6 +4055,7 @@ impl AgentFS {
             attr_cache: self.attr_cache.clone(),
             write_batcher: self.write_batcher.clone(),
             overlay_reads: self.overlay_reads,
+            _open_guard: None,
         };
         Ok(Some(file.read_inode_with_conn(&conn, offset, size).await?))
     }
@@ -3995,6 +4154,7 @@ impl AgentFS {
                 attr_cache: self.attr_cache.clone(),
                 write_batcher: self.write_batcher.clone(),
                 overlay_reads: self.overlay_reads,
+                _open_guard: None,
             };
             let ranges = [WriteRangeRef { offset, data }];
             file.pwrite_ranges_inode_with_conn(&conn, &ranges, false, None)
@@ -4046,6 +4206,7 @@ impl AgentFS {
             attr_cache: self.attr_cache.clone(),
             write_batcher: self.write_batcher.clone(),
             overlay_reads: self.overlay_reads,
+            _open_guard: None,
         };
         let result = file.truncate_inode_with_conn(&conn, new_size).await;
 
@@ -4511,9 +4672,11 @@ impl AgentFS {
                 .await?;
         }
 
-        // Check if this was the last link to the inode
+        // Check if this was the last link to the inode. POSIX: while open
+        // handles exist the nlink=0 rows stay alive (readable and writable);
+        // the last handle drop queues the orphan for process_deferred_reaps.
         let link_count = self.get_link_count(&conn, ino).await?;
-        if link_count == 0 {
+        if link_count == 0 && !self.open_inodes.defer_reap_if_open(ino) {
             // Tier Four: drop any pending batched writes — see the matching
             // hook in the trait-method `unlink` and in `rename` overwrite.
             if let Some(batcher) = &self.write_batcher {
@@ -4697,9 +4860,10 @@ impl AgentFS {
                     .await?;
                 stmt.execute((dst_ino,)).await?;
 
-                // Clean up destination inode if no more links
+                // Clean up destination inode if no more links (deferred while
+                // open handles exist — see OpenInodes)
                 let link_count = self.get_link_count(&conn, dst_ino).await?;
-                if link_count == 0 {
+                if link_count == 0 && !self.open_inodes.defer_reap_if_open(dst_ino) {
                     // Tier Four: drop pending batched writes for the
                     // soon-to-be-deleted inode. Without this, a later
                     // drain (Explicit drains run drain_pending_batched
@@ -4885,6 +5049,7 @@ impl AgentFS {
             attr_cache: self.attr_cache.clone(),
             write_batcher: self.write_batcher.clone(),
             overlay_reads: self.overlay_reads,
+            _open_guard: Some(self.open_inodes.guard(ino)),
         }))
     }
 
@@ -5542,6 +5707,7 @@ impl FileSystem for AgentFS {
             attr_cache: self.attr_cache.clone(),
             write_batcher: self.write_batcher.clone(),
             overlay_reads: self.overlay_reads,
+            _open_guard: Some(self.open_inodes.guard(ino)),
         }))
     }
 
@@ -5775,6 +5941,7 @@ impl FileSystem for AgentFS {
             attr_cache: self.attr_cache.clone(),
             write_batcher: self.write_batcher.clone(),
             overlay_reads: self.overlay_reads,
+            _open_guard: Some(self.open_inodes.guard(ino)),
         });
 
         Ok((stats, file))
@@ -5999,6 +6166,7 @@ impl FileSystem for AgentFS {
         if name.len() > MAX_NAME_LEN {
             return Err(FsError::NameTooLong.into());
         }
+        self.process_deferred_reaps().await?;
         let conn = self.pool.get_connection().await?;
         // BEGIN IMMEDIATE: this is the path that intermittently failed with
         // "database snapshot is stale" -> EIO when its autocommit statements
@@ -6055,9 +6223,11 @@ impl FileSystem for AgentFS {
                 .await?;
             stmt.execute((now_secs, now_nsec, ino)).await?;
 
-            // Check if this was the last link to the inode
+            // Check if this was the last link to the inode. POSIX: while
+            // open handles exist the nlink=0 rows stay alive; the last
+            // handle drop queues the orphan for process_deferred_reaps.
             let link_count = self.get_link_count(&conn, ino).await?;
-            let removed = link_count == 0;
+            let removed = link_count == 0 && !self.open_inodes.defer_reap_if_open(ino);
             if removed {
                 // Delete data blocks
                 let mut stmt = conn
@@ -6113,6 +6283,7 @@ impl FileSystem for AgentFS {
         if name.len() > MAX_NAME_LEN {
             return Err(FsError::NameTooLong.into());
         }
+        self.process_deferred_reaps().await?;
         let conn = self.pool.get_connection().await?;
         // BEGIN IMMEDIATE: see `unlink` — never race the batcher's drain
         // transactions with autocommit metadata writes.
@@ -6316,6 +6487,7 @@ impl FileSystem for AgentFS {
         if newname.len() > MAX_NAME_LEN {
             return Err(FsError::NameTooLong.into());
         }
+        self.process_deferred_reaps().await?;
         let conn = self.pool.get_connection().await?;
 
         // Get source inode
@@ -6389,9 +6561,10 @@ impl FileSystem for AgentFS {
                     .await?;
                 stmt.execute((now_dec, now_dec_nsec, dst_ino)).await?;
 
-                // Clean up destination inode if no more links
+                // Clean up destination inode if no more links (deferred while
+                // open handles exist — see OpenInodes)
                 let link_count = self.get_link_count(&conn, dst_ino).await?;
-                if link_count == 0 {
+                if link_count == 0 && !self.open_inodes.defer_reap_if_open(dst_ino) {
                     // Tier Four: see public `rename` for rationale — drop
                     // pending batched writes for the deleted inode so a
                     // subsequent batched drain doesn't INSERT into a
@@ -7608,6 +7781,10 @@ mod tests {
         let ino = fs.resolve_path("/deleteme.txt").await?.unwrap();
         assert_eq!(fs.get_chunk_count(ino).await?, 4);
 
+        // Close the handle first: with it open, deletion is deferred (POSIX
+        // unlink-while-open) and the chunks legitimately survive the remove.
+        drop(file);
+
         // Delete the file
         fs.remove("/deleteme.txt").await?;
 
@@ -7624,6 +7801,78 @@ mod tests {
             .unwrap_or(-1);
 
         assert_eq!(count, 0, "All chunks should be deleted");
+
+        Ok(())
+    }
+
+    async fn count_rows(fs: &AgentFS, table: &str, ino: i64) -> Result<i64> {
+        let conn = fs.pool.get_connection().await?;
+        let mut rows = conn
+            .query(
+                &format!("SELECT COUNT(*) FROM {table} WHERE ino = ?"),
+                (ino,),
+            )
+            .await?;
+        Ok(rows
+            .next()
+            .await?
+            .and_then(|r| r.get_value(0).ok().and_then(|v| v.as_integer().copied()))
+            .unwrap_or(-1))
+    }
+
+    #[tokio::test]
+    async fn test_unlink_while_open_defers_reap() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+
+        let (stats, file) = fs
+            .create_file("/ghost.bin", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        let ino = stats.ino;
+        file.pwrite(0, b"ghost").await?;
+
+        FileSystem::unlink(&fs, ROOT_INO, "ghost.bin").await?;
+
+        // POSIX: the open handle keeps the inode readable and writable.
+        assert!(fs.resolve_path("/ghost.bin").await?.is_none());
+        assert_eq!(file.pread(0, 5).await?, b"ghost");
+        file.pwrite(5, b"-more").await?;
+        assert_eq!(file.pread(0, 10).await?, b"ghost-more");
+        assert_eq!(file.fstat().await?.nlink, 0);
+        assert_eq!(count_rows(&fs, "fs_inode", ino).await?, 1);
+
+        // Last handle drop queues the reap; the next namespace mutation
+        // (or finalize) executes it.
+        drop(file);
+        fs.process_deferred_reaps().await?;
+        assert_eq!(count_rows(&fs, "fs_inode", ino).await?, 0);
+        assert_eq!(count_rows(&fs, "fs_data", ino).await?, 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_mount_sweep_reaps_crashed_orphans() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db_path = dir.path().join("sweep.db");
+        let db_path = db_path.to_str().unwrap();
+
+        let ino = {
+            let fs = AgentFS::new(db_path).await?;
+            let (stats, file) = fs
+                .create_file("/ghost.bin", DEFAULT_FILE_MODE, 0, 0)
+                .await?;
+            file.pwrite(0, b"ghost").await?;
+            file.drain_writes().await?;
+            FileSystem::unlink(&fs, ROOT_INO, "ghost.bin").await?;
+            // Simulate a crash: the guard never releases, so the orphan is
+            // neither queued nor reaped before the process "dies".
+            std::mem::forget(file);
+            stats.ino
+        };
+
+        let fs = AgentFS::new(db_path).await?;
+        assert_eq!(count_rows(&fs, "fs_inode", ino).await?, 0);
+        assert_eq!(count_rows(&fs, "fs_data", ino).await?, 0);
 
         Ok(())
     }
