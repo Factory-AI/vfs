@@ -34,8 +34,6 @@ const DEFAULT_NFS_PORT: u32 = 11111;
 pub async fn run(
     allow: Vec<PathBuf>,
     no_default_allows: bool,
-    _experimental_sandbox: bool,
-    _strace: bool,
     session_id: Option<String>,
     _system: bool,
     encryption: Option<(String, String)>,

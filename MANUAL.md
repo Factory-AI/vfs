@@ -101,8 +101,6 @@ agentfs run [OPTIONS] <COMMAND> [ARGS]...
 - `--no-default-allows` - Disable default allowed directories
 - `--key <KEY>` - Hex-encoded encryption key for delta layer
 - `--cipher <CIPHER>` - Cipher algorithm (required with `--key`)
-- `--experimental-sandbox` - Use ptrace-based syscall interception (Linux only)
-- `--strace` - Show intercepted syscalls (requires `--experimental-sandbox`)
 
 **Platform behavior:**
 

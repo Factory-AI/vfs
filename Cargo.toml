@@ -1,5 +1,5 @@
 [workspace]
-members = ["cli", "sdk/rust", "sandbox"]
+members = ["cli", "sdk/rust"]
 resolver = "2"
 
 [workspace.package]
@@ -10,7 +10,6 @@ repository = "https://github.com/tursodatabase/agentfs"
 
 [workspace.dependencies]
 agentfs-sdk = { path = "sdk/rust" }
-agentfs-sandbox = { path = "sandbox" }
 
 anyhow = "1.0"
 async-trait = "0.1"
@@ -52,13 +51,6 @@ zerocopy = { version = "0.8", features = ["derive"] }
 # forcing the `pure-rust` feature, which skips the C/NEON backend that fails
 # with Apple clang (`veor3q_u8` in `aegis128l_neon_sha3.c`).
 aegis = { version = "0.9.6", features = ["pure-rust"] }
-
-# Linux-only ptrace sandbox dependencies. The sandbox crate is still a workspace
-# member until the dedicated M1 deletion feature removes it.
-reverie = { git = "https://github.com/facebookexperimental/reverie" }
-reverie-ptrace = { git = "https://github.com/facebookexperimental/reverie" }
-reverie-process = { git = "https://github.com/facebookexperimental/reverie" }
-reverie-util = { git = "https://github.com/facebookexperimental/reverie" }
 
 # The profile that `dist` will build with.
 [profile.dist]

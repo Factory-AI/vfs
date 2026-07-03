@@ -1,16 +1,19 @@
 //! Run command - common entry point.
 //!
 //! Dispatches to platform-specific implementations:
-//! - Linux: FUSE + namespace sandbox (or experimental ptrace)
+//! - Linux: FUSE + namespace sandbox
 //! - Darwin: NFS + sandbox-exec
 
 use agentfs_sdk::PartialOriginPolicy;
 use anyhow::Result;
 use std::path::PathBuf;
 
-#[cfg_attr(all(target_os = "linux", feature = "sandbox"), path = "run_linux.rs")]
-#[cfg_attr(all(target_os = "macos", feature = "sandbox"), path = "run_darwin.rs")]
-#[cfg_attr(not(feature = "sandbox"), path = "run_not_supported.rs")]
+#[cfg_attr(target_os = "linux", path = "run_linux.rs")]
+#[cfg_attr(target_os = "macos", path = "run_darwin.rs")]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos")),
+    path = "run_not_supported.rs"
+)]
 mod sys;
 
 /// Handle the `run` command, dispatching to the platform-specific implementation.
@@ -18,8 +21,6 @@ mod sys;
 pub async fn handle_run_command(
     allow: Vec<PathBuf>,
     no_default_allows: bool,
-    experimental_sandbox: bool,
-    strace: bool,
     session: Option<String>,
     system: bool,
     encryption: Option<(String, String)>,
@@ -30,8 +31,6 @@ pub async fn handle_run_command(
     sys::run(
         allow,
         no_default_allows,
-        experimental_sandbox,
-        strace,
         session,
         system,
         encryption,

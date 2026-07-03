@@ -124,8 +124,6 @@ fn main() {
         Command::Run {
             allow,
             no_default_allows,
-            experimental_sandbox,
-            strace,
             session,
             system,
             partial_origin,
@@ -143,8 +141,6 @@ fn main() {
             if let Err(e) = rt.block_on(cmd::handle_run_command(
                 allow,
                 no_default_allows,
-                experimental_sandbox,
-                strace,
                 session,
                 system,
                 encryption,

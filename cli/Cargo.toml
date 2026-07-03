@@ -14,14 +14,8 @@ name = "agentfs"
 path = "src/main.rs"
 
 [features]
-default = ["sandbox", "fuse-modern"]
+default = ["fuse-modern"]
 strict = []
-sandbox = [
-    "dep:agentfs-sandbox",
-    "dep:reverie",
-    "dep:reverie-ptrace",
-    "dep:reverie-process",
-]
 
 # Vendored fuser is gated per protocol minor version. Enable the full cascade up
 # to ABI 7.31 so we can both negotiate the kernel protocol that supports the
@@ -109,13 +103,8 @@ filetime = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
-# Linux-only dependencies for FUSE and sandbox functionality
+# Linux-only dependencies for FUSE functionality
 [target.'cfg(target_os = "linux")'.dependencies]
-# Sandbox dependencies - (requires libunwind-dev on ARM)
-agentfs-sandbox = { workspace = true, optional = true }
-reverie = { workspace = true, optional = true }
-reverie-ptrace = { workspace = true, optional = true }
-reverie-process = { workspace = true, optional = true }
 # Vendored fuser dependencies (pure-Rust FUSE implementation)
 log = { workspace = true }
 memchr = { workspace = true }

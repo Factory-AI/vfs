@@ -165,15 +165,6 @@ pub enum Command {
         #[arg(long = "no-default-allows")]
         no_default_allows: bool,
 
-        /// Use experimental ptrace-based syscall interception sandbox
-        #[arg(long = "experimental-sandbox")]
-        experimental_sandbox: bool,
-
-        /// Enable strace-like output for system calls
-        /// Only used with --experimental-sandbox
-        #[arg(long = "strace")]
-        strace: bool,
-
         /// Session identifier for sharing delta layer across multiple runs.
         /// If not provided, a unique session ID is generated for each run.
         /// Use the same session ID to share the delta layer between runs.

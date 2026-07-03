@@ -2,19 +2,15 @@
 //!
 //! This module provides platform-specific sandbox approaches:
 //! - `linux`: FUSE + namespace-based sandbox with copy-on-write filesystem
-//! - `linux_ptrace`: ptrace-based syscall interception sandbox (experimental)
 //! - `darwin`: Kernel-enforced sandbox using sandbox-exec
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-#[cfg(all(target_os = "linux", feature = "sandbox"))]
+#[cfg(target_os = "linux")]
 pub mod linux;
 
-#[cfg(all(target_os = "linux", feature = "sandbox"))]
-pub mod linux_ptrace;
-
-#[cfg(all(target_os = "macos", feature = "sandbox"))]
+#[cfg(target_os = "macos")]
 pub mod darwin;
 
 /// Group paths by parent directory and format using brace expansion.
