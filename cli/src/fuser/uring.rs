@@ -61,6 +61,7 @@ const IORING_ENTER_GETEVENTS: u32 = 1;
 
 const IORING_OP_NOP: u8 = 0;
 const IORING_OP_URING_CMD: u8 = 46;
+const SHUTDOWN_WAKE_USER_DATA: u64 = u64::MAX;
 
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
@@ -506,11 +507,29 @@ impl UringQueueControl {
 fn wake_queue(queue: &Arc<QueueShared>) {
     let ring_fd = {
         let mut ring = queue.ring.lock().unwrap();
-        ring.push_sqe(&build_nop_sqe(u64::MAX));
+        ring.push_sqe(&build_nop_sqe(SHUTDOWN_WAKE_USER_DATA));
         ring.fd.as_raw_fd()
     };
     if let Err(e) = enter(ring_fd, 1, 0) {
         debug!("fuse-uring: shutdown wake failed on qid={}: {e}", queue.qid);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CqeUserData {
+    Slot(usize),
+    ShutdownWake,
+    Invalid(u64),
+}
+
+fn classify_cqe_user_data(user_data: u64, depth: usize) -> CqeUserData {
+    if user_data == SHUTDOWN_WAKE_USER_DATA {
+        return CqeUserData::ShutdownWake;
+    }
+
+    match usize::try_from(user_data) {
+        Ok(slot) if slot < depth => CqeUserData::Slot(slot),
+        _ => CqeUserData::Invalid(user_data),
     }
 }
 
@@ -768,7 +787,19 @@ fn queue_thread<FS: Filesystem>(
         loop {
             let cqe = queue.ring.lock().unwrap().pop_cqe();
             let Some(cqe) = cqe else { break };
-            let slot = cqe.user_data as usize;
+            let slot = match classify_cqe_user_data(cqe.user_data, depth) {
+                CqeUserData::Slot(slot) => slot,
+                CqeUserData::ShutdownWake => {
+                    debug!("fuse-uring: queue {qid} received shutdown wake");
+                    return;
+                }
+                CqeUserData::Invalid(user_data) => {
+                    warn!(
+                        "fuse-uring: queue {qid} received CQE with invalid user_data={user_data} depth={depth}"
+                    );
+                    continue;
+                }
+            };
             if cqe.res < 0 {
                 match -cqe.res {
                     libc::EAGAIN if register_retries < 10_000 => {
@@ -891,5 +922,25 @@ fn reply_error_raw(queue: &Arc<QueueShared>, slot: usize, commit_id: u64, unique
     };
     if let Err(e) = sender.send_reply(&[io::IoSlice::new(&out)]) {
         error!("fuse-uring: failed to commit error reply: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_cqe_user_data, CqeUserData, SHUTDOWN_WAKE_USER_DATA};
+
+    #[test]
+    fn shutdown_wake_user_data_is_not_a_ring_slot() {
+        assert_eq!(
+            classify_cqe_user_data(SHUTDOWN_WAKE_USER_DATA, 4),
+            CqeUserData::ShutdownWake
+        );
+    }
+
+    #[test]
+    fn cqe_user_data_must_name_registered_ring_slot() {
+        assert_eq!(classify_cqe_user_data(0, 4), CqeUserData::Slot(0));
+        assert_eq!(classify_cqe_user_data(3, 4), CqeUserData::Slot(3));
+        assert_eq!(classify_cqe_user_data(4, 4), CqeUserData::Invalid(4));
     }
 }

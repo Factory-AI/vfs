@@ -87,6 +87,7 @@ run_test "run-syscalls" "$DIR/test-run-syscalls.sh"
 run_test "run-bash" "$DIR/test-run-bash.sh"
 run_test "run-git" "$DIR/test-run-git.sh"
 run_test "teardown-bounded" "$DIR/test-teardown-bounded.sh"
+run_test "fuse-sigint-panic-census" "$DIR/test-fuse-sigint-panic-census.sh"
 run_test "signal-teardown" env \
     SIGNAL_TEARDOWN_SIGNAL_DELAY="${SIGNAL_TEARDOWN_SIGNAL_DELAY:-8s}" \
     "$DIR/test-signal-teardown.sh"
