@@ -2395,6 +2395,14 @@ impl FileSystem for OverlayFS {
             .get_inode_info(src_stats.ino)
             .ok_or(FsError::NotFound)?;
 
+        // A base-layer directory copy-up only creates the directory itself,
+        // not its subtree. Renaming that partial copy-up would hide the source
+        // base path with a whiteout and expose an empty destination. Return
+        // EXDEV so user-space callers such as `mv` perform copy+delete.
+        if src_info.layer == Layer::Base && src_stats.is_directory() {
+            return Err(FsError::CrossDevice.into());
+        }
+
         // Ensure source is in delta first.
         let delta_src_ino = if src_info.layer == Layer::Base {
             self.copy_up(&old_path, src_info.underlying_ino).await?
@@ -3589,6 +3597,52 @@ mod tests {
         assert_eq!(
             content, b"base content",
             "content should be preserved after rename"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overlay_rename_base_directory_returns_exdev_and_preserves_contents() -> Result<()>
+    {
+        let (overlay, base_dir, _delta_dir) = create_test_overlay().await?;
+
+        let subdir_stats = overlay.lookup(ROOT_INO, "subdir").await?.unwrap();
+        assert!(
+            subdir_stats.is_directory(),
+            "test fixture subdir should be a base-layer directory"
+        );
+
+        let err = overlay
+            .rename(ROOT_INO, "subdir", ROOT_INO, "renamed_subdir")
+            .await
+            .expect_err("renaming a base-layer directory must return EXDEV");
+        match err {
+            Error::Fs(FsError::CrossDevice) => {}
+            other => panic!("expected CrossDevice/EXDEV, got {other:?}"),
+        }
+        assert_eq!(FsError::CrossDevice.to_errno(), libc::EXDEV);
+
+        let original_stats = overlay
+            .lookup(ROOT_INO, "subdir")
+            .await?
+            .expect("source directory must remain visible after EXDEV");
+        assert!(original_stats.is_directory());
+        assert!(
+            overlay.lookup(ROOT_INO, "renamed_subdir").await?.is_none(),
+            "failed rename must not create the destination"
+        );
+
+        let nested_stats = overlay
+            .lookup(original_stats.ino, "nested.txt")
+            .await?
+            .expect("base child must remain visible at original path");
+        let nested_file = overlay.open(nested_stats.ino, libc::O_RDONLY).await?;
+        assert_eq!(nested_file.pread(0, 100).await?, b"nested");
+        assert_eq!(
+            std::fs::read(base_dir.path().join("subdir/nested.txt"))?,
+            b"nested",
+            "base backing file must remain unchanged"
         );
 
         Ok(())

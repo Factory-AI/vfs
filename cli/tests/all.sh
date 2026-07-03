@@ -30,5 +30,6 @@ CORRUPTION_TORTURE_INTEGRITY_INTERVAL="${CORRUPTION_TORTURE_INTEGRITY_INTERVAL:-
 "$DIR/test-mount.sh"
 "$DIR/test-overlay-whiteout.sh"
 "$DIR/test-overlay-delta-in-base-dir.sh"
+"$DIR/test-overlay-base-dir-rename-exdev.sh"
 "$DIR/test-fuse-cache-invalidation.sh"
 "$DIR/test-symlinks.sh" || true  # Requires user namespaces (may fail in CI)

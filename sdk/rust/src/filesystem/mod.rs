@@ -55,6 +55,9 @@ pub enum FsError {
     #[error("Cannot rename directory into its own subdirectory")]
     InvalidRename,
 
+    #[error("Cross-device link")]
+    CrossDevice,
+
     #[error("Filename too long")]
     NameTooLong,
 }
@@ -73,6 +76,7 @@ impl FsError {
             FsError::RootOperation => libc::EPERM,
             FsError::SymlinkLoop => libc::ELOOP,
             FsError::InvalidRename => libc::EINVAL,
+            FsError::CrossDevice => libc::EXDEV,
             FsError::NameTooLong => libc::ENAMETOOLONG,
         }
     }
