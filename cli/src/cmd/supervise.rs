@@ -21,7 +21,13 @@ pub(crate) async fn supervise_command(
 
     let mut child = command.spawn()?;
     let signo = tokio::select! {
-        status = child.wait() => return Ok(ChildOutcome::Exited(status?)),
+        status = child.wait() => {
+            let status = status?;
+            if let Some(signo) = signal_from_status(&status) {
+                return Ok(ChildOutcome::Interrupted(signo));
+            }
+            return Ok(ChildOutcome::Exited(status));
+        },
         signal = crate::mount::termination_signal() => signal?,
     };
 
@@ -35,6 +41,18 @@ pub(crate) async fn supervise_command(
         let _ = child.kill().await;
     }
     Ok(ChildOutcome::Interrupted(signo))
+}
+
+#[cfg(unix)]
+fn signal_from_status(status: &ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+
+    status.signal()
+}
+
+#[cfg(not(unix))]
+fn signal_from_status(_status: &ExitStatus) -> Option<i32> {
+    None
 }
 
 #[cfg(target_os = "linux")]

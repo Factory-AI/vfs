@@ -242,7 +242,7 @@ run_init_signal_case() {
             RUSTUP_HOME="$RUSTUP_HOME_FOR_TEST" \
             RUSTUP_TOOLCHAIN="$RUSTUP_TOOLCHAIN_FOR_TEST" \
             AGENTFS_FUSE_URING=0 \
-            timeout --preserve-status -s "$signal" "$SIGNAL_DELAY" \
+            timeout --preserve-status --foreground -s "$signal" "$SIGNAL_DELAY" \
             "$AGENTFS_BIN" init "$id" --backend fuse -c 'exec sleep 30'
 
     assert_no_mount "init -c $signal" "agentfs:$id"
@@ -286,7 +286,7 @@ run_clone_signal_case() {
             AGENTFS_FUSE_URING=0 \
             REAL_GIT="$REAL_GIT" \
             PATH="$wrapper_dir:$PATH" \
-            timeout --preserve-status -s "$signal" "$SIGNAL_DELAY" \
+            timeout --preserve-status --foreground -s "$signal" "$SIGNAL_DELAY" \
             "$AGENTFS_BIN" clone "$db" "$source" repo --backend fuse
 
     assert_no_mount "clone $signal" "$db"
@@ -309,7 +309,7 @@ run_exec_signal_case() {
             RUSTUP_HOME="$RUSTUP_HOME_FOR_TEST" \
             RUSTUP_TOOLCHAIN="$RUSTUP_TOOLCHAIN_FOR_TEST" \
             AGENTFS_FUSE_URING=0 \
-            timeout --preserve-status -s "$signal" "$SIGNAL_DELAY" \
+            timeout --preserve-status --foreground -s "$signal" "$SIGNAL_DELAY" \
             "$AGENTFS_BIN" exec "$id" --backend fuse sh -c 'exec sleep 30'
 
     assert_no_mount "exec $signal" "agentfs:.*$id"
@@ -333,7 +333,7 @@ run_mount_foreground_signal_case() {
             RUSTUP_HOME="$RUSTUP_HOME_FOR_TEST" \
             RUSTUP_TOOLCHAIN="$RUSTUP_TOOLCHAIN_FOR_TEST" \
             AGENTFS_FUSE_URING=0 \
-            timeout --preserve-status -s "$signal" "$SIGNAL_DELAY" \
+            timeout --preserve-status --foreground -s "$signal" "$SIGNAL_DELAY" \
             "$AGENTFS_BIN" mount "$id" "$mountpoint" --backend fuse --foreground
 
     assert_no_mount "mount --foreground $signal" "$mountpoint"

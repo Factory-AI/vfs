@@ -123,6 +123,25 @@ before the FUSE reply, catching missed invalidations during development.
 
 ## Phase 5.5 read-path benchmark and profiling
 
+## Codex workload benchmark policy
+
+The codex workload benchmark is a local-only performance gate, not a CI job.
+Run it serialized on a quiet machine with a freshly built release binary, and
+use the median-of-5 result set as the comparison unit:
+
+```bash
+cargo +nightly build --release --workspace --bins
+scripts/validation/git-workload-benchmark-multi.py \
+  --source .agents/benchmarks/fixtures/codex \
+  --read-files 64 \
+  --read-bytes 4096 \
+  --edit-files 8
+```
+
+CI must not invoke the codex fixture or publish benchmark medians. Benchmark
+results belong in the mission benchmark artifacts and handoff evidence for
+BENCH-marked features.
+
 Use `scripts/validation/read-path-benchmark.py` to capture reproducible
 native-vs-AgentFS read-path baselines before and after read-path changes. The
 script creates a deterministic temporary fixture, runs identical read-only

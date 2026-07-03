@@ -22,6 +22,7 @@ RUSTUP_TOOLCHAIN_FOR_TEST="${RUSTUP_TOOLCHAIN:-nightly}"
 WORKERS="${CORRUPTION_TORTURE_WORKERS:-4}"
 ITERATIONS="${CORRUPTION_TORTURE_ITERATIONS:-3}"
 TEST_TIMEOUT="${CORRUPTION_TORTURE_TIMEOUT:-90}"
+TEARDOWN_TIMEOUT="${CORRUPTION_TORTURE_TEARDOWN_TIMEOUT:-10}"
 INTEGRITY_INTERVAL="${CORRUPTION_TORTURE_INTEGRITY_INTERVAL:-1}"
 INTEGRITY_TIMEOUT="${CORRUPTION_TORTURE_INTEGRITY_TIMEOUT:-5}"
 START_TIMEOUT="${CORRUPTION_TORTURE_START_TIMEOUT:-30}"
@@ -45,6 +46,7 @@ MONITOR_OVERLAP_COUNT=""
 OWNER_LOG=""
 MONITOR_LOG=""
 TIMEOUT_FLAG=""
+OWNER_TEARDOWN_MS=""
 
 skip() {
     echo "SKIP: $*"
@@ -80,6 +82,7 @@ validate_positive_integer() {
 validate_positive_integer CORRUPTION_TORTURE_WORKERS "$WORKERS"
 validate_positive_integer CORRUPTION_TORTURE_ITERATIONS "$ITERATIONS"
 validate_positive_integer CORRUPTION_TORTURE_TIMEOUT "$TEST_TIMEOUT"
+validate_positive_integer CORRUPTION_TORTURE_TEARDOWN_TIMEOUT "$TEARDOWN_TIMEOUT"
 validate_positive_integer CORRUPTION_TORTURE_INTEGRITY_TIMEOUT "$INTEGRITY_TIMEOUT"
 validate_positive_integer CORRUPTION_TORTURE_START_TIMEOUT "$START_TIMEOUT"
 
@@ -531,8 +534,19 @@ done
 terminate_owner() {
     if [ -n "$OWNER_PID" ]; then
         kill "$OWNER_PID" 2>/dev/null || true
+        start_ms="$(date +%s%3N)"
+        deadline_ms=$((start_ms + TEARDOWN_TIMEOUT * 1000))
+        while kill -0 "$OWNER_PID" 2>/dev/null; do
+            now_ms="$(date +%s%3N)"
+            if [ "$now_ms" -ge "$deadline_ms" ]; then
+                fail "owner did not exit within ${TEARDOWN_TIMEOUT}s after SIGTERM"
+            fi
+            sleep 0.1
+        done
         wait "$OWNER_PID" 2>/dev/null || true
         OWNER_PID=""
+        end_ms="$(date +%s%3N)"
+        OWNER_TEARDOWN_MS=$((end_ms - start_ms))
     fi
 }
 
@@ -569,4 +583,14 @@ integrity_check "$DELTA_DB" "$INTEGRITY_TIMEOUT" >>"$MONITOR_LOG" 2>&1 ||
 run_final_session_checks
 terminate_owner
 
-echo "OK (workers=$WORKERS iterations=$ITERATIONS)"
+if [ "${AGENTFS_FUSE_URING:-}" = "1" ] && [ -r /sys/module/fuse/parameters/enable_uring ] &&
+    [ "$(cat /sys/module/fuse/parameters/enable_uring)" = "Y" ] &&
+    ! grep -q "advertising FUSE_OVER_IO_URING" "$OWNER_LOG"; then
+    fail "uring leg did not advertise FUSE_OVER_IO_URING"
+fi
+
+if [ "${AGENTFS_FUSE_URING:-}" = "0" ] && grep -q "advertising FUSE_OVER_IO_URING" "$OWNER_LOG"; then
+    fail "legacy leg unexpectedly used FUSE_OVER_IO_URING"
+fi
+
+echo "OK (workers=$WORKERS iterations=$ITERATIONS owner_teardown_ms=$OWNER_TEARDOWN_MS)"
