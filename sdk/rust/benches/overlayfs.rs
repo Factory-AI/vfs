@@ -7,6 +7,8 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use std::sync::Arc;
 use tempfile::tempdir;
 
+const ROOT_INO: i64 = 1;
+
 fn bench_remove_file(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
@@ -40,7 +42,7 @@ fn bench_remove_file(c: &mut Criterion) {
             },
             |(overlay, _base_dir, _delta_dir)| {
                 rt.block_on(async {
-                    let _ = overlay.remove("/test.txt").await;
+                    let _ = overlay.unlink(ROOT_INO, "test.txt").await;
                 });
             },
             criterion::BatchSize::SmallInput,

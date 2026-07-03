@@ -638,7 +638,7 @@ mod prop_tests {
                     }
                     // Sometimes intentionally *don't* pick an existing fd, so we also exercise
                     // error paths (e.g., dup/dealloc on non-existent fd).
-                    if (seed.unsigned_abs() % 3) != 0 {
+                    if !seed.unsigned_abs().is_multiple_of(3) {
                         return fallback;
                     }
                     let idx = (seed.unsigned_abs() as usize) % model.len();

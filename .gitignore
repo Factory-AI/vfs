@@ -26,6 +26,7 @@ Temporary Items
 .apdisk
 
 .agentfs
+target/
 
 # Python bytecode cache
 __pycache__/

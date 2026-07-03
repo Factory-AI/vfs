@@ -8637,7 +8637,7 @@ mod tests {
             &fs,
             stats.ino,
             TimeChange::Omit,
-            TimeChange::Set(explicit_secs, explicit_nsec as u32),
+            TimeChange::Set(explicit_secs, explicit_nsec),
         )
         .await?;
 

@@ -985,9 +985,7 @@ pub async fn handle_getdents64<T: Guest<Sandbox>>(
                         let count = args.count() as usize;
 
                         let mut buf = Vec::new();
-                        let mut offset = 1i64;
-
-                        for (ino, name, d_type) in entries {
+                        for (offset, (ino, name, d_type)) in (1i64..).zip(entries) {
                             // Calculate record length (aligned to 8 bytes)
                             let name_len = name.len() + 1; // +1 for null terminator
                             let reclen = (19 + name_len).div_ceil(8) * 8; // 19 = sizeof(ino + off + reclen + type)
@@ -1008,8 +1006,6 @@ pub async fn handle_getdents64<T: Guest<Sandbox>>(
                             while buf.len() % 8 != 0 {
                                 buf.push(0);
                             }
-
-                            offset += 1;
                         }
 
                         // Write to guest memory

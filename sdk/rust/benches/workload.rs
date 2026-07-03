@@ -5,12 +5,16 @@
 //!
 //! Run with: cargo bench --bench workload
 
-use agentfs_sdk::filesystem::{AgentFS, FileSystem, HostFS, OverlayFS};
+use agentfs_sdk::filesystem::{
+    AgentFS, FileSystem, HostFS, OverlayFS, DEFAULT_DIR_MODE, DEFAULT_FILE_MODE,
+};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rand::distributions::WeightedIndex;
 use rand::prelude::*;
 use std::sync::Arc;
 use tempfile::tempdir;
+
+const ROOT_INO: i64 = 1;
 
 /// Operation types that can be performed on the filesystem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -302,27 +306,80 @@ impl WorkloadGenerator {
     }
 }
 
+async fn resolve_path(overlay: &OverlayFS, path: &str) -> agentfs_sdk::error::Result<Option<i64>> {
+    let mut ino = ROOT_INO;
+    for component in path.trim_matches('/').split('/').filter(|c| !c.is_empty()) {
+        let Some(stats) = overlay.lookup(ino, component).await? else {
+            return Ok(None);
+        };
+        ino = stats.ino;
+    }
+    Ok(Some(ino))
+}
+
+fn split_parent_name(path: &str) -> Option<(String, String)> {
+    let mut components: Vec<&str> = path
+        .trim_matches('/')
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .collect();
+    let name = components.pop()?.to_string();
+    let parent = if components.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", components.join("/"))
+    };
+    Some((parent, name))
+}
+
+async fn resolve_parent(
+    overlay: &OverlayFS,
+    path: &str,
+) -> agentfs_sdk::error::Result<Option<(i64, String)>> {
+    let Some((parent, name)) = split_parent_name(path) else {
+        return Ok(None);
+    };
+    let Some(parent_ino) = resolve_path(overlay, &parent).await? else {
+        return Ok(None);
+    };
+    Ok(Some((parent_ino, name)))
+}
+
 /// Execute a single operation on the overlay filesystem.
 async fn execute_operation(overlay: &OverlayFS, op: Operation, path: &str) {
     match op {
         Operation::CreateFile => {
             // Ignore errors - path may not exist, which is expected
-            let _ = overlay.create_file(path, 0o100644, 0, 0).await;
+            if let Ok(Some((parent_ino, name))) = resolve_parent(overlay, path).await {
+                let _ = overlay
+                    .create_file(parent_ino, &name, DEFAULT_FILE_MODE, 0, 0)
+                    .await;
+            }
         }
         Operation::Lstat => {
-            let _ = overlay.lstat(path).await;
+            let _ = resolve_path(overlay, path).await;
         }
         Operation::Mkdir => {
-            let _ = overlay.mkdir(path, 0, 0).await;
+            if let Ok(Some((parent_ino, name))) = resolve_parent(overlay, path).await {
+                let _ = overlay
+                    .mkdir(parent_ino, &name, DEFAULT_DIR_MODE, 0, 0)
+                    .await;
+            }
         }
         Operation::Open => {
-            let _ = overlay.open(path).await;
+            if let Ok(Some(ino)) = resolve_path(overlay, path).await {
+                let _ = overlay.open(ino, libc::O_RDONLY).await;
+            }
         }
         Operation::ReaddirPlus => {
-            let _ = overlay.readdir_plus(path).await;
+            if let Ok(Some(ino)) = resolve_path(overlay, path).await {
+                let _ = overlay.readdir_plus(ino).await;
+            }
         }
         Operation::Stat => {
-            let _ = overlay.stat(path).await;
+            if let Ok(Some(ino)) = resolve_path(overlay, path).await {
+                let _ = overlay.getattr(ino).await;
+            }
         }
     }
 }

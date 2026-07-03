@@ -1,23 +1,24 @@
 [package]
 name = "agentfs-sandbox"
-version = "0.6.4"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
-agentfs-sdk = { path = "../sdk/rust" }
-tokio = { version = "1", features = ["full"] }
-anyhow = "1.0"
-async-trait = "0.1"
-serde = { version = "1.0", features = ["derive"] }
-libc = "0.2"
+agentfs-sdk = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+libc = { workspace = true }
 
 # Linux-only dependencies for sandbox functionality
 [target.'cfg(target_os = "linux")'.dependencies]
-reverie = { git = "https://github.com/facebookexperimental/reverie" }
-reverie-ptrace = { git = "https://github.com/facebookexperimental/reverie" }
-reverie-process = { git = "https://github.com/facebookexperimental/reverie" }
-reverie-util = { git = "https://github.com/facebookexperimental/reverie" }
+reverie = { workspace = true }
+reverie-ptrace = { workspace = true }
+reverie-process = { workspace = true }
+reverie-util = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3"
-proptest = "1.4"
+tempfile = { workspace = true }
+proptest = { workspace = true }
