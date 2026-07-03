@@ -21,7 +21,10 @@ use tokio_util::sync::CancellationToken;
 use crate::nfs::AgentNFS;
 use crate::nfsserve::tcp::NFSTcp;
 
-use crate::cmd::supervise::{supervise_command, ChildOutcome};
+use crate::cmd::supervise::{
+    supervise_command, supervise_mounted_command, ChildOutcome, MountedCommandBackend,
+    ShutdownFuture,
+};
 
 #[cfg(target_os = "macos")]
 use crate::sandbox::darwin::{generate_sandbox_profile, SandboxConfig};
@@ -122,26 +125,16 @@ pub async fn run(
 
     print_welcome_banner(&session, encrypted);
 
-    // Run the command
-    let outcome = run_command_in_mount(&session, command, args).await;
-
-    // Unmount
-    unmount(&session.mountpoint)?;
-
-    shutdown.cancel();
-    server_handle
+    let mount_backend = DarwinNfsRunMount {
+        mountpoint: session.mountpoint.clone(),
+        shutdown,
+        server_handle: Some(server_handle),
+    };
+    let command_display = command.display().to_string();
+    let child_command = command_in_mount(&session, command, args);
+    let outcome = supervise_mounted_command(child_command, mount_backend)
         .await
-        .context("NFS server task failed to join")?
-        .context("NFS server shutdown failed")?;
-
-    // Clean up mountpoint directory (but keep the delta database)
-    if let Err(e) = std::fs::remove_dir(&session.mountpoint) {
-        eprintln!(
-            "Warning: Failed to clean up mountpoint {}: {}",
-            session.mountpoint.display(),
-            e
-        );
-    }
+        .with_context(|| format!("Darwin/NFS run supervision failed for {command_display}"));
 
     // Print session info for the user
     eprintln!();
@@ -154,6 +147,48 @@ pub async fn run(
     eprintln!("  agentfs diff {}", session.session_id);
 
     std::process::exit(exit_code_for_outcome(outcome?));
+}
+
+struct DarwinNfsRunMount {
+    mountpoint: PathBuf,
+    shutdown: CancellationToken,
+    server_handle: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
+}
+
+impl MountedCommandBackend for DarwinNfsRunMount {
+    fn mountpoint(&self) -> &Path {
+        &self.mountpoint
+    }
+
+    fn unmount(&mut self) -> Result<()> {
+        unmount(&self.mountpoint)
+    }
+
+    fn shutdown_server(&mut self) -> ShutdownFuture<'_> {
+        let shutdown = self.shutdown.clone();
+        let server_handle = self.server_handle.take();
+        Box::pin(async move {
+            shutdown.cancel();
+            if let Some(handle) = server_handle {
+                handle
+                    .await
+                    .context("NFS server task failed to join")?
+                    .context("NFS server shutdown failed")?;
+            }
+            Ok(())
+        })
+    }
+
+    fn remove_mountpoint(&mut self) -> Result<()> {
+        if let Err(e) = std::fs::remove_dir(&self.mountpoint) {
+            eprintln!(
+                "Warning: Failed to clean up mountpoint {}: {}",
+                self.mountpoint.display(),
+                e
+            );
+        }
+        Ok(())
+    }
 }
 
 fn exit_code_for_outcome(outcome: ChildOutcome) -> i32 {
@@ -379,11 +414,11 @@ fn mount_nfs(port: u32, mountpoint: &Path) -> Result<()> {
 /// The mountpoint overlays CWD, and additional paths in HOME are made writable
 /// through the allow_paths configuration.
 #[cfg(target_os = "macos")]
-async fn run_command_in_mount(
+fn command_in_mount(
     session: &RunSession,
     command: PathBuf,
     args: Vec<String>,
-) -> Result<ChildOutcome> {
+) -> tokio::process::Command {
     // Generate the Sandbox profile
     let config = SandboxConfig {
         mountpoint: session.mountpoint.clone(),
@@ -408,9 +443,7 @@ async fn run_command_in_mount(
         // Zsh: use custom ZDOTDIR to override prompt
         .env("ZDOTDIR", session.run_dir.join("zsh"));
 
-    supervise_command(cmd)
-        .await
-        .with_context(|| format!("Failed to execute command: {}", command.display()))
+    cmd
 }
 
 /// Run a command with the working directory set to the mounted filesystem (Linux).
@@ -418,11 +451,11 @@ async fn run_command_in_mount(
 /// On Linux, the command runs without additional sandboxing (NFS provides
 /// copy-on-write for the working directory).
 #[cfg(target_os = "linux")]
-async fn run_command_in_mount(
+fn command_in_mount(
     session: &RunSession,
     command: PathBuf,
     args: Vec<String>,
-) -> Result<ChildOutcome> {
+) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(&command);
     cmd.args(&args)
         .current_dir(&session.mountpoint)
@@ -432,9 +465,19 @@ async fn run_command_in_mount(
         // Zsh: use custom ZDOTDIR to override prompt
         .env("ZDOTDIR", session.run_dir.join("zsh"));
 
-    supervise_command(cmd)
+    cmd
+}
+
+async fn run_command_in_mount(
+    session: &RunSession,
+    command: PathBuf,
+    args: Vec<String>,
+) -> Result<ChildOutcome> {
+    let command_display = command.display().to_string();
+    let child_command = command_in_mount(session, command, args);
+    supervise_command(child_command)
         .await
-        .with_context(|| format!("Failed to execute command: {}", command.display()))
+        .with_context(|| format!("Failed to execute command: {command_display}"))
 }
 
 /// Unmount the NFS filesystem (macOS version).
