@@ -750,74 +750,11 @@ impl AgentFSWriteBatcher {
         if drain_all_now {
             self.drain_all(AgentFSWriteBatchDrainReason::Bytes).await?;
         } else if drain_now {
-            self.drain_inode(ino, AgentFSWriteBatchDrainReason::Bytes)
+            self.drain_pending_batched(AgentFSWriteBatchDrainReason::Bytes, Some(ino))
                 .await?;
         }
 
         Ok(())
-    }
-
-    async fn drain_inode(
-        self: &Arc<Self>,
-        ino: i64,
-        reason: AgentFSWriteBatchDrainReason,
-    ) -> Result<()> {
-        // Explicit drains (fsync / kill-switch release/forget/setattr paths)
-        // happen on every file close during git-clone-style workloads when the
-        // legacy switches are enabled. Each one used to take its own SQLite
-        // transaction; when many inodes are pending simultaneously, bundling
-        // them into a single BEGIN IMMEDIATE / COMMIT pair amortises the
-        // write-lock acquisition across all pending inodes. The Bytes trigger
-        // keeps its per-inode behaviour (it fires when ONE inode's pending
-        // exceeds the per-inode cap); group commits are the scheduler's job
-        // (`run_drain_scheduler`).
-        if matches!(reason, AgentFSWriteBatchDrainReason::Explicit) {
-            return self
-                .drain_pending_batched(reason, Some(ino))
-                .await
-                .map(|_| ());
-        }
-
-        let _commit_guard = self.commit_lock.lock().await;
-        loop {
-            // Commit-then-remove (see drain_pending_batched): snapshot this
-            // inode's ranges by cloning WITHOUT removing them, so a concurrent
-            // reader never observes a gap where the write is in neither the
-            // overlay nor committed SQLite.
-            let snapshot = {
-                let state = self.state.read();
-                state
-                    .pending
-                    .get(&ino)
-                    .filter(|batch| !batch.ranges.is_empty())
-                    .map(|batch| batch.ranges.clone())
-            };
-
-            let Some(ranges) = snapshot else {
-                self.cleanup_empty_pending();
-                return Ok(());
-            };
-
-            match reason {
-                AgentFSWriteBatchDrainReason::Timer => {
-                    crate::profiling::record_agentfs_batcher_drain_timer();
-                }
-                AgentFSWriteBatchDrainReason::Bytes => {
-                    crate::profiling::record_agentfs_batcher_drain_bytes();
-                }
-                AgentFSWriteBatchDrainReason::Explicit => {
-                    crate::profiling::record_agentfs_batcher_drain_explicit();
-                }
-            }
-
-            // On error the overlay is intact (nothing removed) — retried later.
-            self.commit_inode_ranges(ino, &ranges).await?;
-
-            self.remove_committed_prefix(&[(ino, ranges.len())]);
-            // Anything still pending (ranges enqueued during the commit, other
-            // inodes, stashed times) is the coalescing scheduler's job.
-            self.ensure_drain_scheduled();
-        }
     }
 
     async fn drain_all(self: &Arc<Self>, reason: AgentFSWriteBatchDrainReason) -> Result<()> {
@@ -836,8 +773,8 @@ impl AgentFSWriteBatcher {
 
     /// Drain currently-pending inode batches inside a single SQLite
     /// transaction. Holds one connection and one `BEGIN IMMEDIATE` / `COMMIT`
-    /// pair across all per-inode chunk writes, instead of paying one
-    /// transaction per inode like `commit_batch` does.
+    /// pair across all per-inode chunk writes, so every drain trigger shares
+    /// the same commit-then-remove discipline.
     ///
     /// One transaction is bounded by `txn_max_inodes` / `txn_max_bytes`
     /// (`AGENTFS_BATCH_TXN_INODES` / `AGENTFS_BATCH_TXN_BYTES`); when the
@@ -847,12 +784,13 @@ impl AgentFSWriteBatcher {
     /// Returns `Ok(false)` when everything that was pending at snapshot time
     /// has been committed.
     ///
-    /// `required_ino` lets `drain_inode(_, Explicit)` express its caller
-    /// contract: "the writes queued for this inode must be durable when this
-    /// returns". If the inode is not in pending when we take the snapshot, it
-    /// was committed by a concurrent drain and the contract is already met.
-    /// If it IS pending, it is always selected into this transaction
-    /// regardless of the per-transaction bounds.
+    /// `required_ino` lets per-inode drains (Bytes cap / explicit fsync,
+    /// release, forget, setattr paths) express their caller contract: "the
+    /// writes queued for this inode must be durable when this returns". If the
+    /// inode is not in pending when we take the snapshot, it was committed by a
+    /// concurrent drain and the contract is already met. If it IS pending, it
+    /// is always selected into this transaction regardless of the
+    /// per-transaction bounds.
     async fn drain_pending_batched(
         self: &Arc<Self>,
         reason: AgentFSWriteBatchDrainReason,
@@ -874,7 +812,7 @@ impl AgentFSWriteBatcher {
             let mut selected: Vec<(i64, Vec<WriteRange>)> = Vec::new();
             let mut selected_bytes = 0usize;
             let mut truncated = false;
-            // The explicit-drain contract inode is always part of this
+            // The per-inode drain contract inode is always part of this
             // transaction, independent of the bounds.
             if let Some(req) = required_ino {
                 if let Some(batch) = state.pending.get(&req) {
@@ -961,8 +899,7 @@ impl AgentFSWriteBatcher {
         let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
 
         // Read times_explicit and the stashed explicit times only AFTER the
-        // IMMEDIATE transaction holds the SQLite write lock (see
-        // `commit_inode_ranges` for the interleaving argument): explicit
+        // IMMEDIATE transaction holds the SQLite write lock: explicit
         // chmod/chown/utimens that already landed marked the flag / stash
         // before their effect, later ones are blocked behind us (or stay
         // stashed for the next drain).
@@ -1182,103 +1119,6 @@ impl AgentFSWriteBatcher {
         }
     }
 
-    async fn commit_inode_ranges(&self, ino: i64, ranges: &[WriteRange]) -> Result<()> {
-        let range_refs: Vec<_> = ranges
-            .iter()
-            .map(|range| WriteRangeRef {
-                offset: range.offset,
-                data: range.data.as_slice(),
-            })
-            .collect();
-        let normalized = normalize_write_ranges(&range_refs)?;
-        if normalized.is_empty() {
-            return Ok(());
-        }
-
-        crate::profiling::record_agentfs_batcher_coalesced_ranges(
-            ranges.len().saturating_sub(normalized.len()) as u64,
-        );
-
-        let started = Instant::now();
-        let conn = self.pool.get_connection().await?;
-        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
-        // Read the times_explicit flag and the stashed explicit times only
-        // AFTER the IMMEDIATE transaction holds the SQLite write lock: any
-        // chmod/chown/utimens that already applied its effect marked the flag
-        // / stash before that, and any later one is now blocked behind this
-        // transaction (or stays stashed for the next drain). Reading here
-        // therefore gives the correct preserve-vs-stamp decision for every
-        // interleaving (see `mark_times_explicit` / `stash_pending_times`).
-        let (preserve_times, pending_times) = {
-            let state = self.state.read();
-            let entry = state.pending.get(&ino);
-            (
-                entry.map(|batch| batch.times_explicit).unwrap_or(false),
-                entry.and_then(|batch| batch.pending_times),
-            )
-        };
-        let file = AgentFSFile {
-            pool: self.pool.clone(),
-            ino,
-            chunk_size: self.chunk_size,
-            inline_threshold: self.inline_threshold,
-            attr_cache: self.attr_cache.clone(),
-            write_batcher: None,
-            overlay_reads: true,
-            _open_guard: None,
-        };
-        let normalized_refs: Vec<_> = normalized
-            .iter()
-            .map(|range| WriteRangeRef {
-                offset: range.offset,
-                data: range.data.as_slice(),
-            })
-            .collect();
-        let mut result = file
-            .pwrite_ranges_inode_with_conn(
-                &conn,
-                &normalized_refs,
-                preserve_times,
-                pending_times.as_ref(),
-            )
-            .await;
-        // Stashed explicit times ride the data UPDATE (`write_commit_time_sets`);
-        // only a time-only commit (no data ranges) needs a standalone UPDATE in
-        // this same transaction.
-        if result.is_ok() && normalized_refs.is_empty() {
-            if let Some(times) = &pending_times {
-                result = apply_pending_times_with_conn(&conn, ino, times).await;
-            }
-        }
-
-        match result {
-            Ok(()) => {
-                txn.commit().await?;
-                if let Some(times) = &pending_times {
-                    self.clear_applied_times(ino, times);
-                }
-                self.attr_cache.remove(ino);
-                crate::profiling::record_agentfs_batcher_commit_latency(started.elapsed());
-                crate::profiling::record_agentfs_batcher_commit_txn(1);
-                Ok(())
-            }
-            // Deleted while pending (see drain_pending_batched): treat as
-            // committed so the caller drops the moot ranges from the overlay.
-            Err(Error::Fs(FsError::NotFound)) => {
-                let _ = txn.rollback().await;
-                tracing::debug!(
-                    "AgentFS write batcher: dropping pending writes for deleted inode {}",
-                    ino
-                );
-                Ok(())
-            }
-            Err(error) => {
-                let _ = txn.rollback().await;
-                Err(error)
-            }
-        }
-    }
-
     /// Tier 4 corruption fix: after a drain has durably committed a snapshot of
     /// pending ranges to SQLite, drop exactly those ranges from the overlay.
     /// Snapshots are taken from the front of each inode's append-only `ranges`
@@ -1432,7 +1272,7 @@ impl AgentFSWriteBatcher {
     /// Record that an explicit attribute change (chmod / chown / utimens) was
     /// applied to fs_inode for `ino` after the writes currently pending for
     /// it. The eventual data commit must then preserve mtime/ctime instead of
-    /// stamping the commit time (see `commit_inode_ranges`). No-op when the
+    /// stamping the commit time (see `drain_pending_batched`). No-op when the
     /// inode has nothing pending — there is no deferred commit to clobber the
     /// attributes in that case.
     fn mark_times_explicit(&self, ino: i64) {
@@ -2131,7 +1971,7 @@ impl File for AgentFSFile {
     async fn drain_writes(&self) -> Result<()> {
         if let Some(batcher) = &self.write_batcher {
             batcher
-                .drain_inode(self.ino, AgentFSWriteBatchDrainReason::Explicit)
+                .drain_pending_batched(AgentFSWriteBatchDrainReason::Explicit, Some(self.ino))
                 .await?;
         }
         Ok(())
@@ -3207,7 +3047,7 @@ impl AgentFS {
     pub async fn drain_inode_writes(&self, ino: i64) -> Result<()> {
         if let Some(batcher) = &self.write_batcher {
             batcher
-                .drain_inode(ino, AgentFSWriteBatchDrainReason::Explicit)
+                .drain_pending_batched(AgentFSWriteBatchDrainReason::Explicit, Some(ino))
                 .await?;
         }
         Ok(())
@@ -7699,6 +7539,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_batcher_bytes_trigger_restamps_after_explicit_times() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        let (stats, _file) = fs
+            .create_file("/bytes-trigger-times.txt", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+
+        // Long timer and huge global cap make the per-inode byte cap the only
+        // reachable synchronous drain trigger in this test.
+        let batcher = test_batcher(&fs, 600, 8, 1 << 30);
+
+        batcher
+            .enqueue(
+                stats.ino,
+                vec![WriteRange {
+                    offset: 0,
+                    data: b"abcd".to_vec(),
+                }],
+            )
+            .await?;
+        assert!(
+            batcher.has_pending(stats.ino),
+            "below the per-inode byte cap, the write must stay pending"
+        );
+
+        let explicit_secs = 1_345_678_901;
+        let explicit_nsec = 123;
+        let conn = fs.pool.get_connection().await?;
+        conn.execute(
+            "UPDATE fs_inode SET mtime = ?, mtime_nsec = ?, ctime = ?, ctime_nsec = ? WHERE ino = ?",
+            (
+                explicit_secs,
+                explicit_nsec,
+                explicit_secs,
+                explicit_nsec,
+                stats.ino,
+            ),
+        )
+        .await?;
+        batcher.mark_times_explicit(stats.ino);
+
+        batcher
+            .enqueue(
+                stats.ino,
+                vec![WriteRange {
+                    offset: 4,
+                    data: b"efgh".to_vec(),
+                }],
+            )
+            .await?;
+        assert!(
+            !batcher.has_pending(stats.ino),
+            "crossing the per-inode byte cap must drain this inode"
+        );
+
+        let after = FileSystem::getattr(&fs, stats.ino).await?.unwrap();
+        assert_eq!(after.size, 8);
+        assert!(
+            after.mtime > explicit_secs,
+            "the second write crosses the Bytes cap after the explicit setattr, \
+             so the drain must stamp a fresh mtime (got {}, explicit was {})",
+            after.mtime,
+            explicit_secs
+        );
+        assert_eq!(
+            fs.read_file("/bytes-trigger-times.txt").await?.unwrap(),
+            b"abcdefgh"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_batcher_global_cap_triggers_full_drain_and_tracks_total() -> Result<()> {
         let (fs, _dir) = create_test_fs().await?;
         let (sa, _fa) = fs.create_file("/a.bin", DEFAULT_FILE_MODE, 0, 0).await?;
@@ -8217,8 +8128,8 @@ mod tests {
         file.pwrite(0, b"these bytes never reach SQLite").await?;
         // Unlink before any drain. Tier 4 hooks discard_pending here.
         fs.remove("/doomed.txt").await?;
-        // Force a batched drain. If pending was not discarded, we'd hit
-        // NotFound when commit_inode_ranges looks up fs_inode for the
+        // Force a batched drain. If pending was not discarded, the drain
+        // would hit NotFound while looking up fs_inode for the
         // unlinked ino. The drain must therefore succeed.
         fs.drain_all().await?;
         // And the row truly is gone.
