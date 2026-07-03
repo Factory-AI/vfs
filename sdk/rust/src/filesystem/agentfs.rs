@@ -111,6 +111,80 @@ fn remove_checkpointed_sidecars(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn is_duplicate_column_error(err: &turso::Error) -> bool {
+    err.to_string()
+        .to_ascii_lowercase()
+        .contains("duplicate column")
+}
+
+#[derive(Clone, Copy)]
+struct ColumnSpec {
+    table_name: &'static str,
+    column_name: &'static str,
+    type_name: &'static str,
+    not_null: bool,
+    default_value: Option<&'static str>,
+}
+
+async fn add_column_idempotent(conn: &Connection, spec: ColumnSpec, sql: &str) -> Result<()> {
+    match conn.execute(sql, ()).await {
+        Ok(_) => Ok(()),
+        Err(err) if is_duplicate_column_error(&err) => ensure_column_matches(conn, spec).await,
+        Err(err) => Err(Error::Internal(format!(
+            "schema ALTER failed while adding {}.{}: {err}",
+            spec.table_name, spec.column_name
+        ))),
+    }
+}
+
+async fn ensure_column_matches(conn: &Connection, spec: ColumnSpec) -> Result<()> {
+    let mut rows = conn
+        .query(&format!("PRAGMA table_info({})", spec.table_name), ())
+        .await?;
+
+    while let Some(row) = rows.next().await? {
+        let column_name: String = row.get(1)?;
+        if column_name != spec.column_name {
+            continue;
+        }
+
+        let type_name: String = row.get(2)?;
+        let not_null: i64 = row.get(3)?;
+        let default_value = match row.get_value(4).ok() {
+            Some(Value::Text(value)) => Some(value.clone()),
+            Some(Value::Integer(value)) => Some(value.to_string()),
+            Some(Value::Null) | None => None,
+            Some(value) => Some(format!("{value:?}")),
+        };
+        let type_matches = type_name.eq_ignore_ascii_case(spec.type_name);
+        let not_null_matches = (not_null != 0) == spec.not_null;
+        let default_matches = default_value.as_deref() == spec.default_value;
+
+        if type_matches && not_null_matches && default_matches {
+            return Ok(());
+        }
+
+        return Err(Error::Internal(format!(
+            "schema column {}.{} already exists with incompatible definition: \
+             expected type={} not_null={} default={:?}; \
+             found type={} not_null={} default={:?}",
+            spec.table_name,
+            spec.column_name,
+            spec.type_name,
+            spec.not_null,
+            spec.default_value,
+            type_name,
+            not_null != 0,
+            default_value
+        )));
+    }
+
+    Err(Error::Internal(format!(
+        "schema ALTER reported duplicate column {}.{}, but PRAGMA table_info did not find it",
+        spec.table_name, spec.column_name
+    )))
+}
+
 /// Returns the value of an env-var boolean flag, falling back to `default`
 /// when the variable is unset. Mirrors `env_flag_default` in `cli/src/fuse.rs`
 /// so the SDK can agree with the cli on shared env vars (notably
@@ -2794,34 +2868,69 @@ impl AgentFS {
         )
         .await?;
 
-        // Add nanosecond timestamp columns (backward compatible migration)
-        conn.execute(
+        // Add columns idempotently for already-upgraded databases. Only the
+        // duplicate-column case is safe to ignore; every other ALTER failure
+        // indicates schema corruption or an environmental database error.
+        add_column_idempotent(
+            conn,
+            ColumnSpec {
+                table_name: "fs_inode",
+                column_name: "atime_nsec",
+                type_name: "INTEGER",
+                not_null: true,
+                default_value: Some("0"),
+            },
             "ALTER TABLE fs_inode ADD COLUMN atime_nsec INTEGER NOT NULL DEFAULT 0",
-            (),
         )
-        .await
-        .ok();
-        conn.execute(
+        .await?;
+        add_column_idempotent(
+            conn,
+            ColumnSpec {
+                table_name: "fs_inode",
+                column_name: "mtime_nsec",
+                type_name: "INTEGER",
+                not_null: true,
+                default_value: Some("0"),
+            },
             "ALTER TABLE fs_inode ADD COLUMN mtime_nsec INTEGER NOT NULL DEFAULT 0",
-            (),
         )
-        .await
-        .ok();
-        conn.execute(
+        .await?;
+        add_column_idempotent(
+            conn,
+            ColumnSpec {
+                table_name: "fs_inode",
+                column_name: "ctime_nsec",
+                type_name: "INTEGER",
+                not_null: true,
+                default_value: Some("0"),
+            },
             "ALTER TABLE fs_inode ADD COLUMN ctime_nsec INTEGER NOT NULL DEFAULT 0",
-            (),
         )
-        .await
-        .ok();
-        conn.execute("ALTER TABLE fs_inode ADD COLUMN data_inline BLOB", ())
-            .await
-            .ok();
-        conn.execute(
+        .await?;
+        add_column_idempotent(
+            conn,
+            ColumnSpec {
+                table_name: "fs_inode",
+                column_name: "data_inline",
+                type_name: "BLOB",
+                not_null: false,
+                default_value: None,
+            },
+            "ALTER TABLE fs_inode ADD COLUMN data_inline BLOB",
+        )
+        .await?;
+        add_column_idempotent(
+            conn,
+            ColumnSpec {
+                table_name: "fs_inode",
+                column_name: "storage_kind",
+                type_name: "INTEGER",
+                not_null: true,
+                default_value: Some("0"),
+            },
             "ALTER TABLE fs_inode ADD COLUMN storage_kind INTEGER NOT NULL DEFAULT 0",
-            (),
         )
-        .await
-        .ok();
+        .await?;
 
         // Create directory entry table
         conn.execute(
@@ -3654,7 +3763,7 @@ impl AgentFS {
             // parent ino -> nlink bump from new subdirectories ("..").
             let mut parent_bumps: HashMap<i64, i64> = HashMap::new();
 
-            let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+            let txn = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).await?;
             for entry in &entries[idx..batch_end] {
                 let (parent_path, name) = match entry.path.rsplit_once('/') {
                     Some((parent, name)) => (parent, name),
@@ -6783,6 +6892,20 @@ mod tests {
         Ok((fs, dir))
     }
 
+    async fn fs_inode_column_count(conn: &Connection, column_name: &str) -> Result<usize> {
+        let mut rows = conn.query("PRAGMA table_info(fs_inode)", ()).await?;
+        let mut count = 0;
+
+        while let Some(row) = rows.next().await? {
+            let name: String = row.get(1)?;
+            if name == column_name {
+                count += 1;
+            }
+        }
+
+        Ok(count)
+    }
+
     fn cached_attr(fs: &AgentFS, ino: i64) -> Option<Stats> {
         fs.attr_cache.get(ino)
     }
@@ -7595,6 +7718,167 @@ mod tests {
             .expect("schema_version should be a text value");
 
         assert_eq!(value, "0.5");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn schema_alter_non_duplicate_errors_propagate() -> Result<()> {
+        let dir = tempdir()?;
+        let db_path = dir.path().join("malformed-view.db");
+        let db = Builder::new_local(db_path.to_str().unwrap())
+            .build()
+            .await?;
+        let conn = db.connect()?;
+
+        conn.execute("CREATE VIEW fs_inode AS SELECT 1 AS ino", ())
+            .await?;
+
+        let err = match add_column_idempotent(
+            &conn,
+            ColumnSpec {
+                table_name: "fs_inode",
+                column_name: "atime_nsec",
+                type_name: "INTEGER",
+                not_null: true,
+                default_value: Some("0"),
+            },
+            "ALTER TABLE fs_inode ADD COLUMN atime_nsec INTEGER NOT NULL DEFAULT 0",
+        )
+        .await
+        {
+            Ok(_) => panic!("non-duplicate schema ALTER errors must propagate"),
+            Err(err) => err,
+        };
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("fs_inode.atime_nsec") && err_msg.contains("no such table: fs_inode"),
+            "error should preserve the failed ALTER reason, got: {err_msg}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn schema_alter_conflicting_column_definition_is_rejected() -> Result<()> {
+        let dir = tempdir()?;
+        let db_path = dir.path().join("malformed-conflicting-column.db");
+
+        {
+            let db = Builder::new_local(db_path.to_str().unwrap())
+                .build()
+                .await?;
+            let conn = db.connect()?;
+
+            conn.execute(
+                "CREATE TABLE fs_config (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+                (),
+            )
+            .await?;
+            conn.execute(
+                "INSERT INTO fs_config (key, value) VALUES
+                    ('schema_version', '0.5'),
+                    ('inline_threshold', '16384')",
+                (),
+            )
+            .await?;
+            conn.execute(
+                "CREATE TABLE fs_inode (
+                    ino INTEGER PRIMARY KEY,
+                    mode INTEGER NOT NULL,
+                    nlink INTEGER NOT NULL DEFAULT 0,
+                    uid INTEGER NOT NULL DEFAULT 0,
+                    gid INTEGER NOT NULL DEFAULT 0,
+                    size INTEGER NOT NULL DEFAULT 0,
+                    atime INTEGER NOT NULL,
+                    mtime INTEGER NOT NULL,
+                    ctime INTEGER NOT NULL,
+                    rdev INTEGER NOT NULL DEFAULT 0,
+                    atime_nsec TEXT NOT NULL DEFAULT 'bad',
+                    mtime_nsec INTEGER NOT NULL DEFAULT 0,
+                    ctime_nsec INTEGER NOT NULL DEFAULT 0,
+                    data_inline BLOB,
+                    storage_kind INTEGER NOT NULL DEFAULT 0
+                )",
+                (),
+            )
+            .await?;
+            conn.execute(
+                "INSERT INTO fs_inode
+                    (ino, mode, nlink, uid, gid, size, atime, mtime, ctime, rdev,
+                     atime_nsec, mtime_nsec, ctime_nsec, storage_kind)
+                 VALUES (?, ?, 2, 0, 0, 0, 1, 1, 1, 0, 'bad', 0, 0, 0)",
+                (ROOT_INO, DEFAULT_DIR_MODE as i64),
+            )
+            .await?;
+        }
+
+        let err = match AgentFS::new(db_path.to_str().unwrap()).await {
+            Ok(_) => panic!("opening a database with a conflicting schema column must fail"),
+            Err(err) => err,
+        };
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("fs_inode.atime_nsec") && err_msg.contains("incompatible definition"),
+            "error should name the incompatible schema column, got: {err_msg}"
+        );
+
+        let db = Builder::new_local(db_path.to_str().unwrap())
+            .build()
+            .await?;
+        let conn = db.connect()?;
+        let mut rows = conn.query("PRAGMA table_info(fs_inode)", ()).await?;
+        let mut found_conflicting_column = false;
+        while let Some(row) = rows.next().await? {
+            let name: String = row.get(1)?;
+            if name == "atime_nsec" {
+                let type_name: String = row.get(2)?;
+                assert_eq!(type_name, "TEXT");
+                found_conflicting_column = true;
+            }
+        }
+        assert!(found_conflicting_column);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn schema_alter_duplicate_columns_are_idempotent_on_reopen() -> Result<()> {
+        let dir = tempdir()?;
+        let db_path = dir.path().join("already-upgraded.db");
+
+        let first = AgentFS::new(db_path.to_str().unwrap()).await?;
+        drop(first);
+
+        let reopened = AgentFS::new(db_path.to_str().unwrap()).await?;
+        let conn = reopened.pool.get_connection().await?;
+
+        for column_name in [
+            "atime_nsec",
+            "mtime_nsec",
+            "ctime_nsec",
+            "data_inline",
+            "storage_kind",
+        ] {
+            assert_eq!(
+                fs_inode_column_count(&conn, column_name).await?,
+                1,
+                "fs_inode should contain exactly one {column_name} column"
+            );
+        }
+
+        let mut rows = conn
+            .query(
+                "SELECT value FROM fs_config WHERE key = 'schema_version'",
+                (),
+            )
+            .await?;
+        let version: String = rows
+            .next()
+            .await?
+            .expect("schema_version config should exist")
+            .get(0)?;
+        assert_eq!(version, AGENTFS_SCHEMA_VERSION);
 
         Ok(())
     }
