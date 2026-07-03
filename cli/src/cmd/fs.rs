@@ -159,6 +159,11 @@ pub async fn write_filesystem(
     }
     let (_, file) = agentfs.fs.create_file(path, S_IFREG | 0o644, 0, 0).await?;
     file.pwrite(0, content.as_bytes()).await?;
+    // Tier Four: writes go into the in-memory batcher first. This CLI is a
+    // one-shot operation — flush so the bytes are durable in SQLite before
+    // we drop the AgentFS, otherwise a subsequent process or `cat` against
+    // the same path would see only the pre-write state.
+    agentfs.fs.drain_all().await?;
     Ok(())
 }
 
@@ -473,6 +478,10 @@ f d/e/3.md
         }
         let (_, file) = fs.create_file(path, S_IFREG | 0o644, uid, gid).await?;
         file.pwrite(0, data).await?;
+        // Tier Four: cat_filesystem opens a fresh AgentFS at the same path.
+        // That second instance only sees what's durable in SQLite, so the
+        // writer must flush its batcher before another opener can read.
+        fs.drain_all().await?;
         Ok(())
     }
 }

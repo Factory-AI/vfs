@@ -110,6 +110,44 @@ Linux uses FUSE + overlay filesystem with user namespaces. macOS uses NFS + over
 
 Default allowed directories (macOS): `~/.claude`, `~/.codex`, `~/.config`, `~/.cache`, `~/.local`, `~/.npm`, `/tmp`
 
+**Linux FUSE performance and cache controls:**
+
+AgentFS uses a bounded FUSE worker pool on Linux. The pool removes the old
+global backend mutex from read paths while preserving copy-on-write isolation:
+reads are admitted through a shared read lane, and metadata/content mutations
+are admitted through an exclusive write lane before reaching the SQLite-backed
+delta.
+
+| Variable | Default | Description |
+|---|---:|---|
+| `AGENTFS_FUSE_WORKERS` | `auto` | `serial`, `auto`, an integer worker count, or a percent such as `25%`. Defaults to `auto` (~`AGENTFS_FUSE_CPU_PERCENT`% of host CPUs). Set to `serial` to fall back to single-threaded dispatch. |
+| `AGENTFS_FUSE_QUEUE` | derived | Request queue capacity. Accepts an integer or memory percent. |
+| `AGENTFS_FUSE_CPU_PERCENT` | `25` | Target CPU fraction when `AGENTFS_FUSE_WORKERS=auto`. |
+| `AGENTFS_FUSE_MEMORY_PERCENT` | `25` | Target memory fraction for derived queue sizing. |
+| `AGENTFS_FUSE_SYNC_INVAL` | `0` | Opt-in synchronous kernel cache invalidation. Default uses deferred (off-thread) invalidation which is safer under parallel workers: synchronous notifies issued from a request handler can block waiting for inline `FUSE_FORGET` traffic that the session thread cannot deliver while every dispatch lane is busy, so combining `AGENTFS_FUSE_SYNC_INVAL=1` with parallel `AGENTFS_FUSE_WORKERS` can deadlock under git workloads. The kernel cache fast path no longer requires this flag. |
+| `AGENTFS_FUSE_ENTRY_TTL_MS` | `1000` | Kernel dentry TTL when the kernel cache fast path is active (parallel workers); otherwise forced to `0`. |
+| `AGENTFS_FUSE_ATTR_TTL_MS` | `1000` | Kernel attribute TTL when the kernel cache fast path is active (parallel workers); otherwise forced to `0`. |
+| `AGENTFS_FUSE_NEG_TTL_MS` | `1000` | Kernel negative-entry TTL when the kernel cache fast path is active (parallel workers); otherwise forced to `0`. |
+| `AGENTFS_FUSE_READDIRPLUS` | `auto` | `off`, `auto`, or `always`; accepted when the kernel cache fast path is active (parallel workers). |
+| `AGENTFS_FUSE_WRITEBACK` | `1` | Requests FUSE writeback cache; accepted when the kernel cache fast path is active (parallel workers). |
+| `AGENTFS_FUSE_KEEPCACHE` | `1` | Requests `FOPEN_KEEP_CACHE` for eligible read-only base files; accepted when the kernel cache fast path is active (parallel workers). |
+
+By default (no env vars set), AgentFS runs with parallel FUSE dispatch and
+deferred kernel-cache invalidation, which enables the kernel cache fast path:
+1 s TTLs on dentries/attrs/negative lookups, writeback cache, `FOPEN_KEEP_CACHE`
+on eligible reads, and readdirplus auto. Each mutation path (`create`, `mkdir`,
+`mknod`, `symlink`, `link`, `unlink`, `rmdir`, `rename`, `write`, `flush`,
+`setattr`) is audited in debug builds to confirm a kernel cache invalidation
+(synchronous or deferred) is queued before any success reply.
+
+Override to `AGENTFS_FUSE_WORKERS=serial` to fall back to the pre-Phase-8
+behavior where the kernel cache fast path is fully disabled (TTLs=0, no
+writeback, no keepcache, no readdirplus). Setting `AGENTFS_FUSE_SYNC_INVAL=1`
+re-enables synchronous invalidation; use it only with `AGENTFS_FUSE_WORKERS=serial`
+to avoid the parallel-dispatch deadlock described above. All copy-on-write
+writes remain in the AgentFS database; no sandbox write is applied to the base
+filesystem regardless of the cache configuration.
+
 ### agentfs mount
 
 Mount an agent filesystem or list mounted filesystems.
@@ -130,6 +168,23 @@ Without arguments, lists all mounted agentfs filesystems.
 **Unmounting:**
 - Linux: `fusermount -u <MOUNT_POINT>`
 - macOS: `umount <MOUNT_POINT>`
+
+**macOS NFS git validation (#333):**
+
+To manually validate the macOS NFS path used by git loose-object writes, run the
+repository harness on a macOS host:
+
+```bash
+cargo build --manifest-path cli/Cargo.toml --no-default-features
+scripts/validation/macos-nfs-git-validation.sh \
+  --agentfs-bin "$PWD/cli/target/debug/agentfs"
+```
+
+The script initializes a temporary AgentFS database, mounts it via
+`agentfs mount --backend nfs`, runs `git init`, `git add`, `git commit`, and
+`git fsck --strict`, then unmounts and cleans up. A passing run ends with
+`macOS NFS git validation passed` and a nonzero loose-object count. On non-macOS
+hosts the script exits `77` to report an intentional skip.
 
 ### agentfs serve mcp
 
@@ -179,15 +234,79 @@ agentfs sync <ID_OR_PATH> <SUBCOMMAND>
 - `stats` - View sync statistics
 - `checkpoint` - Create checkpoint
 
+### agentfs integrity
+
+Run SQLite and AgentFS schema-invariant checks against a local database.
+
+```
+agentfs integrity [OPTIONS] <ID_OR_PATH>
+```
+
+**Arguments:**
+- `ID_OR_PATH` - Agent identifier or database path
+
+**Options:**
+- `--json` - Emit a machine-readable report
+- `--key <KEY>` - Hex-encoded encryption key for encrypted databases
+- `--cipher <CIPHER>` - Cipher algorithm (required with `--key`)
+
+**Examples:**
+
+```bash
+# Check by agent ID
+agentfs integrity my-agent --json
+
+# Check by database path
+agentfs integrity .agentfs/my-agent.db --json
+```
+
+The command runs `PRAGMA integrity_check`, validates required AgentFS tables and
+v0.5 config, checks inline/chunk storage invariants, verifies namespace
+references, and checks overlay metadata tables when present. It exits nonzero if
+any check fails.
+
+### agentfs backup
+
+Create a portable main-database snapshot for a local AgentFS database.
+
+```
+agentfs backup <ID_OR_PATH> <TARGET_DB> [OPTIONS]
+```
+
+**Arguments:**
+- `ID_OR_PATH` - Agent identifier or database path
+- `TARGET_DB` - New database path to create
+
+**Options:**
+- `--verify` - Reopen the copied main database and run integrity checks
+- `--key <KEY>` - Hex-encoded encryption key for encrypted databases
+- `--cipher <CIPHER>` - Cipher algorithm (required with `--key`)
+
+**Examples:**
+
+```bash
+# Checkpoint, copy, reopen, and verify a portable backup
+agentfs backup my-agent /tmp/my-agent-backup.db --verify
+
+# Backup using database paths
+agentfs backup .agentfs/my-agent.db ./my-agent-backup.db --verify
+```
+
+The command checkpoints and truncates the source WAL before copying only the
+main database file. The target must not already exist. Databases with
+partial-origin overlay rows are rejected because their file contents still
+depend on the external base tree; keep the base tree with the database or
+materialize the overlay before creating a portable backup.
+
 ### agentfs migrate
 
-Migrate database schema to the current version.
+Migrate historical database schemas through the legacy v0.4 layout.
 
 ```
 agentfs migrate [OPTIONS] <ID_OR_PATH>
 ```
 
-Upgrades an AgentFS database schema to the latest version. This is necessary when using databases created with older versions of AgentFS.
+Upgrades an AgentFS database schema through the legacy v0.4 layout. v0.5 is a layout-changing schema and uses the copy-based `agentfs migrate-v0-5` command instead of in-place mutation.
 
 **Arguments:**
 - `ID_OR_PATH` - Agent identifier or database path
@@ -230,7 +349,42 @@ Migration completed successfully.
 
 **Notes:**
 - Migrations are idempotent and safe to run multiple times
+- This command does not convert v0.4 databases to v0.5
 - Always backup your database before running migrations on production data
+
+### agentfs migrate-v0-5
+
+Copy a v0.4 database into a new v0.5 database.
+
+```
+agentfs migrate-v0-5 [OPTIONS] <SOURCE> <TARGET>
+```
+
+v0.5 changes the file-content layout by defaulting to 64 KiB chunks and storing dense regular files at or below 4 KiB inline in `fs_inode`. Because this is a layout change, migration is copy-only: the source database is opened for verification and copied into a separate target database.
+
+**Arguments:**
+- `SOURCE` - Source v0.4 database path
+- `TARGET` - Target v0.5 database path
+
+**Options:**
+- `--verify` - Verify migrated filesystem, KV, tool-call, and overlay state equivalence
+- `--overwrite-target` - Replace an existing target database
+
+**Examples:**
+
+```bash
+# Copy and verify a v0.4 database into v0.5
+agentfs migrate-v0-5 .agentfs/my-agent.db .agentfs/my-agent-v05.db --verify
+
+# Replace an existing target
+agentfs migrate-v0-5 old.db new.db --verify --overwrite-target
+```
+
+**Notes:**
+- The source database is never migrated in place
+- Overlay tables (`fs_whiteout`, `fs_origin`, and `fs_overlay_config`) are preserved
+- Sparse and large files are streamed during copy/verification rather than materialized whole-file
+- Verification includes a checkpointed single-file snapshot check for the target database
 
 ### agentfs fs
 

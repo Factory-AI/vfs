@@ -9,12 +9,13 @@
 
 #![cfg(unix)]
 
-use agentfs_sdk::{AgentFS, AgentFSOptions, EncryptionConfig, FileSystem, HostFS, OverlayFS};
+use agentfs_sdk::{
+    AgentFS, AgentFSOptions, EncryptionConfig, FileSystem, HostFS, OverlayFS, PartialOriginPolicy,
+};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
 use crate::nfs::AgentNFS;
 use crate::nfsserve::tcp::NFSTcp;
@@ -35,6 +36,7 @@ pub async fn run(
     session_id: Option<String>,
     _system: bool,
     encryption: Option<(String, String)>,
+    partial_origin_policy: Option<PartialOriginPolicy>,
     command: PathBuf,
     args: Vec<String>,
 ) -> Result<()> {
@@ -79,7 +81,11 @@ pub async fn run(
     // Create overlay filesystem with CWD as base
     let base_str = cwd.to_string_lossy().to_string();
     let hostfs = HostFS::new(&base_str).context("Failed to create HostFS")?;
-    let overlay = OverlayFS::new(Arc::new(hostfs), agentfs.fs);
+    let overlay = if let Some(policy) = partial_origin_policy {
+        OverlayFS::new_with_partial_origin_policy(Arc::new(hostfs), agentfs.fs, policy)
+    } else {
+        OverlayFS::new(Arc::new(hostfs), agentfs.fs)
+    };
 
     // Initialize the overlay (copies directory structure)
     overlay
@@ -87,7 +93,7 @@ pub async fn run(
         .await
         .context("Failed to initialize overlay")?;
 
-    let fs: Arc<Mutex<dyn FileSystem>> = Arc::new(Mutex::new(overlay));
+    let fs: Arc<dyn FileSystem> = Arc::new(overlay);
 
     // Create NFS adapter
     let nfs = AgentNFS::new(fs);
@@ -310,7 +316,7 @@ fn mount_nfs(port: u32, mountpoint: &Path) -> Result<()> {
         .args([
             "-o",
             &format!(
-                "locallocks,vers=3,tcp,port={},mountport={},soft,timeo=100,retrans=5",
+                "locallocks,vers=3,tcp,port={},mountport={},wsize=1048576,rsize=1048576,soft,timeo=100,retrans=5",
                 port, port
             ),
             "127.0.0.1:/",

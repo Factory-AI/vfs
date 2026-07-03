@@ -4,13 +4,15 @@
 //! FileSystem trait, enabling systems to mount AgentFS via NFS without requiring
 //! FUSE or other system extensions.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use libc::{O_RDONLY, O_RDWR};
 
 use crate::nfsserve::nfs::{
-    fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfstime3, sattr3, set_atime, set_gid3,
-    set_mode3, set_mtime, set_size3, set_uid3, specdata3,
+    fattr3, fileid3, filename3, ftype3, nfs_fh3, nfspath3, nfsstat3, nfstime3, sattr3, set_atime,
+    set_gid3, set_mode3, set_mtime, set_size3, set_uid3, specdata3,
 };
 use crate::nfsserve::vfs::{auth_unix, DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 use agentfs_sdk::error::Error as SdkError;
@@ -20,14 +22,23 @@ use agentfs_sdk::{
     S_IFSOCK,
 };
 use async_trait::async_trait;
-use tokio::sync::Mutex;
+use uuid::Uuid;
 
 /// Root directory inode number
 const ROOT_INO: fileid3 = 1;
+const WRITE_HANDLE_MAGIC: &[u8; 8] = b"AFSWRIT\0";
+const PLAIN_HANDLE_LEN: usize = 16;
+const WRITE_HANDLE_LEN: usize = 32;
+const MAX_WRITE_HANDLE_TOKENS: usize = 16384;
 
 /// Convert a fileid3 to a filesystem inode number.
 fn id_to_fs_ino(id: fileid3) -> i64 {
     id as i64
+}
+
+fn random_write_handle_token() -> u64 {
+    let bytes = *Uuid::new_v4().as_bytes();
+    u64::from_le_bytes(bytes[0..8].try_into().expect("uuid slice length is fixed"))
 }
 
 /// Convert an SDK error to an NFS status code.
@@ -53,14 +64,68 @@ fn error_to_nfsstat(e: SdkError) -> nfsstat3 {
 
 /// NFS adapter that wraps an AgentFS FileSystem.
 pub struct AgentNFS {
-    /// The underlying filesystem (wrapped in Mutex to serialize operations)
-    fs: Arc<Mutex<dyn FileSystem>>,
+    /// The underlying concurrency-safe filesystem.
+    fs: Arc<dyn FileSystem>,
+    /// Server-local generation number embedded in opaque file handles.
+    fh_generation: u64,
+    /// CREATE-returned file-handle tokens that retain open-time write authority.
+    write_handle_tokens: StdMutex<HashMap<u64, fileid3>>,
 }
 
 impl AgentNFS {
     /// Create a new NFS adapter wrapping the given filesystem.
-    pub fn new(fs: Arc<Mutex<dyn FileSystem>>) -> Self {
-        AgentNFS { fs }
+    pub fn new(fs: Arc<dyn FileSystem>) -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let seed = (now.as_secs() << 32) ^ u64::from(now.subsec_nanos());
+        AgentNFS {
+            fs,
+            fh_generation: seed,
+            write_handle_tokens: StdMutex::new(HashMap::new()),
+        }
+    }
+
+    fn encode_plain_fh(&self, id: fileid3) -> nfs_fh3 {
+        let mut ret = Vec::with_capacity(PLAIN_HANDLE_LEN);
+        ret.extend_from_slice(&self.fh_generation.to_le_bytes());
+        ret.extend_from_slice(&id.to_le_bytes());
+        nfs_fh3 { data: ret }
+    }
+
+    fn parse_fh(&self, fh: &nfs_fh3) -> Result<(fileid3, Option<u64>), nfsstat3> {
+        if fh.data.len() != PLAIN_HANDLE_LEN && fh.data.len() != WRITE_HANDLE_LEN {
+            return Err(nfsstat3::NFS3ERR_BADHANDLE);
+        }
+
+        let generation = u64::from_le_bytes(
+            fh.data[0..8]
+                .try_into()
+                .map_err(|_| nfsstat3::NFS3ERR_BADHANDLE)?,
+        );
+        if generation != self.fh_generation {
+            return Err(nfsstat3::NFS3ERR_STALE);
+        }
+
+        let id = u64::from_le_bytes(
+            fh.data[8..16]
+                .try_into()
+                .map_err(|_| nfsstat3::NFS3ERR_BADHANDLE)?,
+        );
+
+        if fh.data.len() == PLAIN_HANDLE_LEN {
+            return Ok((id, None));
+        }
+
+        if &fh.data[16..24] != WRITE_HANDLE_MAGIC {
+            return Err(nfsstat3::NFS3ERR_BADHANDLE);
+        }
+        let token = u64::from_le_bytes(
+            fh.data[24..32]
+                .try_into()
+                .map_err(|_| nfsstat3::NFS3ERR_BADHANDLE)?,
+        );
+        Ok((id, Some(token)))
     }
 
     /// Convert AgentFS Stats to NFS fattr3.
@@ -119,6 +184,51 @@ impl NFSFileSystem for AgentNFS {
         VFSCapabilities::ReadWrite
     }
 
+    fn id_to_fh(&self, id: fileid3) -> nfs_fh3 {
+        self.encode_plain_fh(id)
+    }
+
+    fn id_to_write_fh(&self, id: fileid3) -> nfs_fh3 {
+        let mut tokens = self.write_handle_tokens.lock().unwrap();
+        if tokens.len() >= MAX_WRITE_HANDLE_TOKENS {
+            if let Some(oldest) = tokens.keys().next().copied() {
+                tokens.remove(&oldest);
+            }
+        }
+        let mut token = random_write_handle_token();
+        while tokens.contains_key(&token) {
+            token = random_write_handle_token();
+        }
+        tokens.insert(token, id);
+        drop(tokens);
+
+        let mut ret = Vec::with_capacity(WRITE_HANDLE_LEN);
+        ret.extend_from_slice(&self.fh_generation.to_le_bytes());
+        ret.extend_from_slice(&id.to_le_bytes());
+        ret.extend_from_slice(WRITE_HANDLE_MAGIC);
+        ret.extend_from_slice(&token.to_le_bytes());
+        nfs_fh3 { data: ret }
+    }
+
+    fn fh_has_write_authority(&self, fh: &nfs_fh3, id: fileid3) -> bool {
+        let Ok((handle_id, Some(token))) = self.parse_fh(fh) else {
+            return false;
+        };
+        if handle_id != id {
+            return false;
+        }
+        self.write_handle_tokens
+            .lock()
+            .unwrap()
+            .get(&token)
+            .copied()
+            == Some(id)
+    }
+
+    fn fh_to_id(&self, fh: &nfs_fh3) -> Result<fileid3, nfsstat3> {
+        self.parse_fh(fh).map(|(id, _)| id)
+    }
+
     async fn lookup(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3> {
         let name = std::str::from_utf8(filename).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
 
@@ -127,7 +237,7 @@ impl NFSFileSystem for AgentNFS {
             return Ok(dirid);
         }
 
-        let fs = self.fs.lock().await;
+        let fs = self.fs.clone();
 
         // Handle .. via filesystem lookup
         if name == ".." {
@@ -161,7 +271,7 @@ impl NFSFileSystem for AgentNFS {
     }
 
     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
-        let fs = self.fs.lock().await;
+        let fs = self.fs.clone();
         let stats = fs
             .getattr(id_to_fs_ino(id))
             .await
@@ -173,7 +283,7 @@ impl NFSFileSystem for AgentNFS {
 
     async fn setattr(&self, id: fileid3, setattr: sattr3) -> Result<fattr3, nfsstat3> {
         let fs_ino = id_to_fs_ino(id);
-        let fs = self.fs.lock().await;
+        let fs = self.fs.clone();
 
         // Handle chmod (mode change)
         if let set_mode3::mode(mode) = setattr.mode {
@@ -236,7 +346,7 @@ impl NFSFileSystem for AgentNFS {
         offset: u64,
         count: u32,
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
-        let fs = self.fs.lock().await;
+        let fs = self.fs.clone();
 
         let file = fs
             .open(id_to_fs_ino(id), O_RDONLY)
@@ -255,7 +365,7 @@ impl NFSFileSystem for AgentNFS {
     }
 
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
-        let fs = self.fs.lock().await;
+        let fs = self.fs.clone();
 
         let file = fs
             .open(id_to_fs_ino(id), O_RDWR)
@@ -288,7 +398,7 @@ impl NFSFileSystem for AgentNFS {
             set_mode3::Void => 0o644,
         };
 
-        let fs = self.fs.lock().await;
+        let fs = self.fs.clone();
         let (stats, _file) = fs
             .create_file(dir_fs_ino, name, S_IFREG | mode, auth.uid, auth.gid)
             .await
@@ -308,7 +418,7 @@ impl NFSFileSystem for AgentNFS {
         let dir_fs_ino = id_to_fs_ino(dirid);
         let name = std::str::from_utf8(filename).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
 
-        let fs = self.fs.lock().await;
+        let fs = self.fs.clone();
 
         // Check if file already exists
         if fs
@@ -345,7 +455,7 @@ impl NFSFileSystem for AgentNFS {
             set_mode3::Void => 0o755,
         };
 
-        let fs = self.fs.lock().await;
+        let fs = self.fs.clone();
 
         let stats = fs
             .mkdir(dir_fs_ino, name, mode, auth.uid, auth.gid)
@@ -387,7 +497,7 @@ impl NFSFileSystem for AgentNFS {
         // Convert rdev from specdata3 (major/minor) to u64
         let rdev_val = libc::makedev(rdev.specdata1 as _, rdev.specdata2 as _) as u64;
 
-        let fs = self.fs.lock().await;
+        let fs = self.fs.clone();
 
         let stats = fs
             .mknod(
@@ -410,7 +520,7 @@ impl NFSFileSystem for AgentNFS {
         let dir_fs_ino = id_to_fs_ino(dirid);
         let name = std::str::from_utf8(filename).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
 
-        let fs = self.fs.lock().await;
+        let fs = self.fs.clone();
 
         // Check if it's a file or directory and use appropriate method
         let stats = fs
@@ -442,7 +552,7 @@ impl NFSFileSystem for AgentNFS {
         let from_name = std::str::from_utf8(from_filename).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
         let to_name = std::str::from_utf8(to_filename).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
 
-        let fs = self.fs.lock().await;
+        let fs = self.fs.clone();
 
         fs.rename(from_dir_fs_ino, from_name, to_dir_fs_ino, to_name)
             .await
@@ -461,7 +571,7 @@ impl NFSFileSystem for AgentNFS {
         let dir_fs_ino = id_to_fs_ino(dirid);
         let name = std::str::from_utf8(filename).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
 
-        let fs = self.fs.lock().await;
+        let fs = self.fs.clone();
         let stats = fs
             .link(fs_ino, dir_fs_ino, name)
             .await
@@ -478,7 +588,7 @@ impl NFSFileSystem for AgentNFS {
     ) -> Result<ReadDirResult, nfsstat3> {
         let dir_fs_ino = id_to_fs_ino(dirid);
 
-        let fs = self.fs.lock().await;
+        let fs = self.fs.clone();
 
         let entries = fs
             .readdir_plus(dir_fs_ino)
@@ -537,7 +647,7 @@ impl NFSFileSystem for AgentNFS {
         let name = std::str::from_utf8(linkname).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
         let target = std::str::from_utf8(symlink).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
 
-        let fs = self.fs.lock().await;
+        let fs = self.fs.clone();
 
         let stats = fs
             .symlink(dir_fs_ino, name, target, auth.uid, auth.gid)
@@ -550,7 +660,7 @@ impl NFSFileSystem for AgentNFS {
     }
 
     async fn readlink(&self, id: fileid3) -> Result<nfspath3, nfsstat3> {
-        let fs = self.fs.lock().await;
+        let fs = self.fs.clone();
 
         let target = fs
             .readlink(id_to_fs_ino(id))
@@ -559,5 +669,69 @@ impl NFSFileSystem for AgentNFS {
             .ok_or(nfsstat3::NFS3ERR_NOENT)?;
 
         Ok(target.into_bytes().into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nfsserve::vfs::NFSFileSystem;
+    use agentfs_sdk::{AgentFS, AgentFSOptions};
+    use std::sync::Arc;
+
+    async fn test_nfs() -> AgentNFS {
+        let agent = AgentFS::open(AgentFSOptions::ephemeral())
+            .await
+            .expect("ephemeral AgentFS opens");
+        let fs: Arc<dyn FileSystem> = Arc::new(agent.fs);
+        AgentNFS::new(fs)
+    }
+
+    #[tokio::test]
+    async fn write_handle_grants_exact_authority_but_plain_lookup_handle_does_not() {
+        let nfs = test_nfs().await;
+
+        let write_fh = nfs.id_to_write_fh(42);
+        assert_eq!(write_fh.data.len(), WRITE_HANDLE_LEN);
+        assert!(matches!(nfs.fh_to_id(&write_fh), Ok(42)));
+        assert!(nfs.fh_has_write_authority(&write_fh, 42));
+        assert!(!nfs.fh_has_write_authority(&write_fh, 43));
+
+        let plain_fh = nfs.id_to_fh(42);
+        assert_eq!(plain_fh.data.len(), PLAIN_HANDLE_LEN);
+        assert!(matches!(nfs.fh_to_id(&plain_fh), Ok(42)));
+        assert!(!nfs.fh_has_write_authority(&plain_fh, 42));
+    }
+
+    #[tokio::test]
+    async fn write_handle_rejects_stale_bad_and_forged_tokens() {
+        let nfs = test_nfs().await;
+        let write_fh = nfs.id_to_write_fh(7);
+
+        let mut stale_fh = write_fh.clone();
+        stale_fh.data[0] ^= 0x80;
+        assert!(matches!(
+            nfs.fh_to_id(&stale_fh),
+            Err(nfsstat3::NFS3ERR_STALE)
+        ));
+        assert!(!nfs.fh_has_write_authority(&stale_fh, 7));
+
+        let mut bad_magic_fh = write_fh.clone();
+        bad_magic_fh.data[16] ^= 0xff;
+        assert!(matches!(
+            nfs.fh_to_id(&bad_magic_fh),
+            Err(nfsstat3::NFS3ERR_BADHANDLE)
+        ));
+        assert!(!nfs.fh_has_write_authority(&bad_magic_fh, 7));
+
+        let mut forged_token_fh = write_fh.clone();
+        let token = u64::from_le_bytes(
+            forged_token_fh.data[24..32]
+                .try_into()
+                .expect("write handle token length"),
+        );
+        forged_token_fh.data[24..32].copy_from_slice(&token.wrapping_add(1).to_le_bytes());
+        assert!(matches!(nfs.fh_to_id(&forged_token_fh), Ok(7)));
+        assert!(!nfs.fh_has_write_authority(&forged_token_fh, 7));
     }
 }

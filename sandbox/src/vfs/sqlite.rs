@@ -78,7 +78,10 @@ impl SqliteVfs {
 
         let mut current_ino = ROOT_INO;
         for component in path.split('/').filter(|s| !s.is_empty()) {
-            let stats = self.fs.lookup(current_ino, component).await
+            let stats = self
+                .fs
+                .lookup(current_ino, component)
+                .await
                 .map_err(|e| VfsError::Other(format!("Failed to lookup: {}", e)))?
                 .ok_or(VfsError::NotFound)?;
             current_ino = stats.ino;
@@ -140,8 +143,7 @@ impl Vfs for SqliteVfs {
             self.fs.lookup(parent_ino, &name).await
         };
 
-        let stats = stats_result
-            .map_err(|e| VfsError::Other(format!("Failed to stat: {}", e)))?;
+        let stats = stats_result.map_err(|e| VfsError::Other(format!("Failed to stat: {}", e)))?;
 
         match stats {
             Some(stats) => {
@@ -160,9 +162,12 @@ impl Vfs for SqliteVfs {
                         Vec::new()
                     } else {
                         // Read file content using open + pread
-                        let file = self.fs.open(stats.ino, libc::O_RDONLY).await
-                            .map_err(|e| VfsError::Other(format!("Failed to open file: {}", e)))?;
-                        file.pread(0, stats.size as u64).await
+                        let file =
+                            self.fs.open(stats.ino, libc::O_RDONLY).await.map_err(|e| {
+                                VfsError::Other(format!("Failed to open file: {}", e))
+                            })?;
+                        file.pread(0, stats.size as u64)
+                            .await
                             .map_err(|e| VfsError::Other(format!("Failed to read file: {}", e)))?
                     };
                     Ok(Arc::new(SqliteFileOps {
@@ -204,7 +209,10 @@ impl Vfs for SqliteVfs {
         let relative_path = self.translate_to_relative(path)?;
 
         let ino = self.resolve_path(&relative_path).await?;
-        let stats = self.fs.getattr(ino).await
+        let stats = self
+            .fs
+            .getattr(ino)
+            .await
             .map_err(|e| VfsError::Other(format!("Failed to getattr: {}", e)))?
             .ok_or(VfsError::NotFound)?;
 
@@ -237,13 +245,17 @@ impl Vfs for SqliteVfs {
 
         // For lstat, we use lookup which doesn't follow symlinks
         let stats = if relative_path == "/" {
-            self.fs.getattr(ROOT_INO).await
+            self.fs
+                .getattr(ROOT_INO)
+                .await
                 .map_err(|e| VfsError::Other(format!("Failed to getattr: {}", e)))?
                 .ok_or(VfsError::NotFound)?
         } else {
             let (parent_path, name) = Self::split_path(&relative_path)?;
             let parent_ino = self.resolve_path(&parent_path).await?;
-            self.fs.lookup(parent_ino, &name).await
+            self.fs
+                .lookup(parent_ino, &name)
+                .await
                 .map_err(|e| VfsError::Other(format!("Failed to lookup: {}", e)))?
                 .ok_or(VfsError::NotFound)?
         };
@@ -318,18 +330,21 @@ impl Vfs for SqliteVfs {
         let (new_parent_path, new_name) = Self::split_path(&newpath_rel)?;
         let new_parent_ino = self.resolve_path(&new_parent_path).await?;
 
-        self.fs.link(old_ino, new_parent_ino, &new_name).await.map_err(|e| {
-            let err_msg = e.to_string();
-            if err_msg.contains("does not exist") {
-                VfsError::NotFound
-            } else if err_msg.contains("already exists") {
-                VfsError::AlreadyExists
-            } else if err_msg.contains("directory") {
-                VfsError::PermissionDenied
-            } else {
-                VfsError::Other(format!("Failed to create hard link: {}", e))
-            }
-        })?;
+        self.fs
+            .link(old_ino, new_parent_ino, &new_name)
+            .await
+            .map_err(|e| {
+                let err_msg = e.to_string();
+                if err_msg.contains("does not exist") {
+                    VfsError::NotFound
+                } else if err_msg.contains("already exists") {
+                    VfsError::AlreadyExists
+                } else if err_msg.contains("directory") {
+                    VfsError::PermissionDenied
+                } else {
+                    VfsError::Other(format!("Failed to create hard link: {}", e))
+                }
+            })?;
 
         Ok(())
     }
@@ -359,14 +374,20 @@ impl SqliteFileOps {
         // Walk to parent
         let mut parent_ino = ROOT_INO;
         for component in parent_path.split('/').filter(|s| !s.is_empty()) {
-            let stats = self.fs.lookup(parent_ino, component).await
+            let stats = self
+                .fs
+                .lookup(parent_ino, component)
+                .await
                 .map_err(|e| VfsError::Other(format!("Failed to lookup: {}", e)))?
                 .ok_or(VfsError::NotFound)?;
             parent_ino = stats.ino;
         }
 
         // Create the file
-        let (stats, _file) = self.fs.create_file(parent_ino, &name, 0o644, 0, 0).await
+        let (stats, _file) = self
+            .fs
+            .create_file(parent_ino, &name, 0o644, 0, 0)
+            .await
             .map_err(|e| VfsError::Other(format!("Failed to create file: {}", e)))?;
 
         Ok(stats.ino)
@@ -484,7 +505,8 @@ impl FileOps for SqliteFileOps {
         let ino = self.get_or_create_ino().await?;
 
         // Write the data to the database
-        let file = self.fs
+        let file = self
+            .fs
             .open(ino, libc::O_RDWR)
             .await
             .map_err(|e| VfsError::Other(format!("Failed to open file: {}", e)))?;
@@ -694,13 +716,21 @@ impl FileOps for SqliteDirectoryOps {
                     .parent()
                     .map(|p| p.to_str().unwrap_or("/").to_string())
                     .unwrap_or("/".to_string());
-                let parent_path = if parent_path.is_empty() { "/" } else { &parent_path };
+                let parent_path = if parent_path.is_empty() {
+                    "/"
+                } else {
+                    &parent_path
+                };
 
                 // Walk to find parent inode
                 let mut ino = ROOT_INO;
                 for component in parent_path.split('/').filter(|s| !s.is_empty()) {
-                    if let Some(stats) = self.fs.lookup(ino, component).await
-                        .map_err(|e| VfsError::Other(format!("Failed to lookup: {}", e)))? {
+                    if let Some(stats) = self
+                        .fs
+                        .lookup(ino, component)
+                        .await
+                        .map_err(|e| VfsError::Other(format!("Failed to lookup: {}", e)))?
+                    {
                         ino = stats.ino;
                     }
                 }

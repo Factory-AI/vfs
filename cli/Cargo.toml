@@ -13,7 +13,7 @@ name = "agentfs"
 path = "src/main.rs"
 
 [features]
-default = ["sandbox"]
+default = ["sandbox", "fuse-modern"]
 strict = []
 sandbox = [
     "dep:agentfs-sandbox",
@@ -22,12 +22,66 @@ sandbox = [
     "dep:reverie-process",
 ]
 
+# Vendored fuser is gated per protocol minor version. Enable the full cascade up
+# to ABI 7.31 so we can both negotiate the kernel protocol that supports the
+# capabilities init() already advertises (FUSE_DO_READDIRPLUS, FUSE_WRITEBACK_CACHE,
+# FUSE_PARALLEL_DIROPS, FUSE_CACHE_SYMLINKS, FUSE_NO_OPENDIR_SUPPORT, FUSE_MAX_PAGES,
+# FUSE_EXPLICIT_INVAL_DATA, etc.) and actually decode the opcodes the kernel sends
+# when those capabilities are negotiated (FUSE_READDIRPLUS=44, FUSE_RENAME2=45,
+# FUSE_LSEEK=46, FUSE_COPY_FILE_RANGE=47). Without these, the kernel may issue
+# opcode 44 and the dispatcher returns ENOSYS, breaking readdir on the mount.
+fuse-modern = [
+    "abi-7-19",
+    "abi-7-20",
+    "abi-7-21",
+    "abi-7-22",
+    "abi-7-23",
+    "abi-7-24",
+    "abi-7-25",
+    "abi-7-26",
+    "abi-7-27",
+    "abi-7-28",
+    "abi-7-29",
+    "abi-7-30",
+    "abi-7-31",
+    "abi-7-36",
+    "abi-7-41",
+    "abi-7-42",
+]
+abi-7-19 = []
+abi-7-20 = []
+abi-7-21 = []
+abi-7-22 = []
+abi-7-23 = []
+abi-7-24 = []
+abi-7-25 = []
+abi-7-26 = []
+abi-7-27 = []
+abi-7-28 = []
+abi-7-29 = []
+abi-7-30 = []
+abi-7-31 = []
+# ABI 7.36-7.42 uplift. The vendored fuser carries a distinct init-struct delta
+# only at 7.36 (adds flags2). 7.40 additionally pulls in FUSE_PASSTHROUGH
+# scaffolding (FOPEN_PASSTHROUGH / BackingId / open_backing) that is not
+# implemented here, so it is intentionally NOT enabled. 7.41/7.42 add no
+# init-struct fields — 7.42 only adds the FUSE_OVER_IO_URING capability bit — and
+# the 7.36 fuse_init_out is already a kernel-compatible 64 bytes (the trailing
+# reserved[7] covers max_stack_depth + request_timeout + unused), so minor 42 is
+# advertised on the 7.36 layout, skipping 7.40's passthrough.
+abi-7-36 = []
+abi-7-40 = ["abi-7-36"]
+abi-7-41 = ["abi-7-36"]
+abi-7-42 = ["abi-7-41"]
+
 [dependencies]
 agentfs-sdk = { path = "../sdk/rust" }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1.0"
-turso = { version = "0.4.4", features = ["sync"] }
+hex = "0.4"
+sha1 = "0.10"
+turso = { version = "0.5", features = ["sync"] }
 serde = { version = "1.0", features = ["derive"] }
 parking_lot = "0.12.5"
 clap_complete = { version = "=4.5.61", features = ["unstable-dynamic"] }

@@ -1,3 +1,4 @@
+use agentfs_sdk::PartialOriginPolicy;
 use anyhow::Result;
 use std::{io::Write, path::PathBuf};
 
@@ -25,6 +26,8 @@ pub struct MountArgs {
     pub gid: Option<u32>,
     /// The mount backend to use (fuse or nfs).
     pub backend: MountBackend,
+    /// Partial-origin policy for overlay copy-up.
+    pub partial_origin_policy: Option<PartialOriginPolicy>,
 }
 
 /// List all currently mounted agentfs filesystems

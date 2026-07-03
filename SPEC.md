@@ -1,16 +1,43 @@
 # Agent Filesystem Specification
 
-**Version:** 0.4
+**Version:** 0.5
 
 ## Introduction
 
-The Agent Filesystem Specification defines a SQLite schema for representing agent filesystem state. The specification consists of three main components:
+The Agent Filesystem Specification defines a SQLite schema for representing agent filesystem state. The current v0.5 format adds 64 KiB default chunks, inline storage for dense files at or below 4 KiB, and copy-only migration from v0.4 databases. The specification consists of three main components:
 
 1. **Tool Call Audit Trail**: Captures tool invocations, parameters, and results for debugging, auditing, and performance analysis
 2. **Virtual Filesystem**: Stores agent artifacts (files, documents, outputs) using a Unix-like inode design with support for hard links, proper metadata, and efficient file operations
 3. **Key-Value Store**: Provides simple get/set operations for agent context, preferences, and structured state that doesn't fit into the filesystem model
 
 All timestamps in this specification use Unix epoch format (seconds since 1970-01-01 00:00:00 UTC) with optional nanosecond precision via separate `_nsec` columns.
+
+## Runtime Architecture and Safety Invariants
+
+The persistent AgentFS authority is the SQLite database described by this
+specification. Runtime mounts, caches, file handles, FUSE lookup references, and
+overlay inode maps are acceleration structures only; they MUST be reconstructible
+from the database plus the configured read-only base path and MUST NOT become
+the only source of virtual filesystem state.
+
+AgentFS sandboxing is built around two invariants:
+
+1. A portable AgentFS database contains all writable virtual filesystem state.
+   Clean shutdown SHOULD checkpoint transient SQLite sidecars so backups and
+   materialized copies can be represented as a single main database file.
+2. Copy-on-write sandbox writes MUST NOT modify the real filesystem. Overlay
+   backends MAY read from an explicitly scoped base directory, but file creates,
+   writes, truncates, chmod/chown/utimens, links, renames, and deletes are
+   represented in the AgentFS delta database and overlay metadata.
+
+Implementations MAY use kernel caches, positive/negative lookup caches,
+attribute caches, read-dir caches, and parallel FUSE dispatch, provided they
+preserve POSIX lookup reference accounting. In particular, any cached positive
+lookup reply that creates a kernel lookup reference MUST either reach the backing
+filesystem lookup path or explicitly retain the backing inode reference before
+replying; later `FORGET` requests must release the same reference count.
+Namespace mutations MUST invalidate affected cached dentries and attributes
+before the mutation is considered visible to the caller.
 
 ## Tool Calls
 
@@ -147,12 +174,15 @@ CREATE TABLE fs_config (
 
 | Key | Description | Default |
 |-----|-------------|---------|
-| `chunk_size` | Size of data chunks in bytes | `4096` |
+| `schema_version` | On-disk schema version | `0.5` |
+| `chunk_size` | Size of data chunks in bytes | `65536` |
+| `inline_threshold` | Maximum dense regular-file size stored inline in `fs_inode.data_inline` | `4096` |
 
 **Notes:**
 
 - `chunk_size` determines the fixed size of data chunks in `fs_data`
-- All chunks except the last chunk of a file are exactly `chunk_size` bytes
+- New v0.5 filesystems use 64 KiB chunks by default; legacy v0.4 databases used 4 KiB chunks until copy-migrated
+- `inline_threshold` determines when dense regular files may avoid `fs_data` rows entirely
 - Configuration is immutable after filesystem initialization
 - Implementations MAY define additional configuration keys
 
@@ -174,7 +204,9 @@ CREATE TABLE fs_inode (
   rdev INTEGER NOT NULL DEFAULT 0,
   atime_nsec INTEGER NOT NULL DEFAULT 0,
   mtime_nsec INTEGER NOT NULL DEFAULT 0,
-  ctime_nsec INTEGER NOT NULL DEFAULT 0
+  ctime_nsec INTEGER NOT NULL DEFAULT 0,
+  data_inline BLOB,
+  storage_kind INTEGER NOT NULL DEFAULT 0
 )
 ```
 
@@ -193,6 +225,17 @@ CREATE TABLE fs_inode (
 - `atime_nsec` - Nanosecond component of last access time (0–999999999)
 - `mtime_nsec` - Nanosecond component of last modification time (0–999999999)
 - `ctime_nsec` - Nanosecond component of creation/change time (0–999999999)
+- `data_inline` - Optional inline content for dense small regular files
+- `storage_kind` - Storage layout marker: `0` for chunked data in `fs_data`, `1` for inline data in `data_inline`
+
+**Storage Layout Rules:**
+
+- Directories and symlinks MUST use `storage_kind = 0` and `data_inline IS NULL`
+- Inline regular files MUST use `storage_kind = 1`, store all bytes in `data_inline`, and have no `fs_data` rows
+- Chunked regular files MUST use `storage_kind = 0` and `data_inline IS NULL`
+- `size` is authoritative for both layouts
+- Inline files represent dense content only; sparse writes MUST transition to chunked storage
+- Implementations MAY transition chunked files back to inline after truncation only when the resulting file is dense and at or below `inline_threshold`
 
 **Mode Encoding:**
 
@@ -271,14 +314,18 @@ CREATE TABLE fs_data (
 
 - `ino` - Inode number
 - `chunk_index` - Zero-based chunk index (chunk 0 contains bytes 0 to chunk_size-1)
-- `data` - Binary content (BLOB), exactly `chunk_size` bytes except for the last chunk
+- `data` - Binary content (BLOB), up to `chunk_size` bytes
 
 **Notes:**
 
 - Directories MUST NOT have data chunks
+- Inline regular files MUST NOT have data chunks
 - Chunk size is determined by the `chunk_size` value in `fs_config`
-- All chunks except the last chunk of a file MUST be exactly `chunk_size` bytes
+- New v0.5 filesystems default to 64 KiB chunks
+- All chunks except the last chunk of a dense chunked file SHOULD be exactly `chunk_size` bytes
 - The last chunk MAY be smaller than `chunk_size`
+- Sparse holes MAY be represented by missing chunk rows and MUST read back as zero bytes
+- All-zero chunk rows MAY be omitted when doing so preserves read semantics
 - Byte offset for a chunk = `chunk_index * chunk_size`
 - To read at byte offset `N`: `chunk_index = N / chunk_size`, `offset_in_chunk = N % chunk_size`
 
@@ -334,26 +381,37 @@ To resolve a path to an inode:
    ```sql
    UPDATE fs_inode SET nlink = nlink + 1 WHERE ino = ?
    ```
-6. Split data into chunks and insert each:
+6. If initial content is dense and `size <= inline_threshold`, store it inline:
+   ```sql
+   UPDATE fs_inode
+   SET size = ?, data_inline = ?, storage_kind = 1, mtime = ?
+   WHERE ino = ?
+   ```
+7. Otherwise, split data into chunks and insert each:
    ```sql
    INSERT INTO fs_data (ino, chunk_index, data)
    VALUES (?, ?, ?)
    ```
    Where `chunk_index` starts at 0 and increments for each chunk.
-7. Update inode size:
+8. Update inode size and mark chunked storage:
    ```sql
-   UPDATE fs_inode SET size = ?, mtime = ? WHERE ino = ?
+   UPDATE fs_inode SET size = ?, data_inline = NULL, storage_kind = 0, mtime = ? WHERE ino = ?
    ```
 
 #### Reading a File
 
 1. Resolve path to inode
-2. Fetch all chunks in order:
+2. Fetch inode size and storage layout:
+   ```sql
+   SELECT size, storage_kind, data_inline FROM fs_inode WHERE ino = ?
+   ```
+3. If `storage_kind = 1`, return `data_inline` truncated to `size`
+4. Otherwise, fetch all chunks in order:
    ```sql
    SELECT data FROM fs_data WHERE ino = ? ORDER BY chunk_index ASC
    ```
-3. Concatenate chunks in order
-4. Update access time:
+5. Concatenate chunks in order, treating missing sparse chunks as zeroes up to `size`
+6. Update access time:
    ```sql
    UPDATE fs_inode SET atime = ? WHERE ino = ?
    ```
@@ -363,23 +421,29 @@ To resolve a path to an inode:
 To read `length` bytes starting at byte offset `offset`:
 
 1. Resolve path to inode
-2. Get chunk size from config:
+2. Fetch inode size and storage layout:
+   ```sql
+   SELECT size, storage_kind, data_inline FROM fs_inode WHERE ino = ?
+   ```
+3. If `storage_kind = 1`, slice `data_inline` according to `offset` and `length`
+4. Otherwise, get chunk size from config:
    ```sql
    SELECT value FROM fs_config WHERE key = 'chunk_size'
    ```
-3. Calculate chunk range:
+5. Calculate chunk range:
    - `start_chunk = offset / chunk_size`
    - `end_chunk = (offset + length - 1) / chunk_size`
-4. Fetch required chunks:
+6. Fetch required chunks:
    ```sql
    SELECT chunk_index, data FROM fs_data
    WHERE ino = ? AND chunk_index >= ? AND chunk_index <= ?
    ORDER BY chunk_index ASC
    ```
-5. Extract the requested byte range from the chunks:
+7. Extract the requested byte range from the chunks:
    - `offset_in_first_chunk = offset % chunk_size`
    - Skip first `offset_in_first_chunk` bytes of first chunk
    - Take `length` total bytes across chunks
+   - Fill missing sparse chunks with zeroes up to EOF
 
 #### Listing a Directory
 
@@ -440,7 +504,9 @@ When creating a new agent database, initialize the filesystem configuration and 
 
 ```sql
 -- Initialize filesystem configuration
-INSERT INTO fs_config (key, value) VALUES ('chunk_size', '4096');
+INSERT INTO fs_config (key, value) VALUES ('schema_version', '0.5');
+INSERT INTO fs_config (key, value) VALUES ('chunk_size', '65536');
+INSERT INTO fs_config (key, value) VALUES ('inline_threshold', '4096');
 
 -- Initialize root directory
 INSERT INTO fs_inode (ino, mode, nlink, uid, gid, size, atime, mtime, ctime)
@@ -449,7 +515,28 @@ VALUES (1, 16877, 1, 0, 0, 0, unixepoch(), unixepoch(), unixepoch());
 
 Where `16877` = `0o040755` (directory with rwxr-xr-x permissions)
 
-**Note:** The `chunk_size` value can be customized at filesystem creation time but MUST NOT be changed afterward. The root directory has `nlink=1` as it has no parent directory entry.
+**Note:** The `chunk_size` and `inline_threshold` values can be customized at filesystem creation time but MUST NOT be changed afterward. The root directory has `nlink=1` as it has no parent directory entry.
+
+### Schema Migration
+
+v0.5 is a layout-changing schema version. Databases created with v0.4 remain valid v0.4 databases until they are copied into a new v0.5 database:
+
+```bash
+agentfs migrate-v0-5 <source-v0.4.db> <target-v0.5.db> --verify
+```
+
+Migration requirements:
+
+1. The source database MUST NOT be modified in place.
+2. The target database MUST be newly created unless an explicit overwrite option is used.
+3. The migration MUST preserve inode numbers, dentries, symlinks, KV rows, tool-call rows, overlay whiteouts, overlay origin mappings, and overlay configuration.
+4. Small dense regular files MAY be converted to inline storage.
+5. Chunked files MUST be re-chunked using the target `chunk_size`.
+6. Sparse holes MUST preserve read-back semantics.
+7. Verification MUST run integrity checks and compare source/target metadata and file contents.
+8. After checkpointing the target, copying only the main `.db` file MUST be sufficient to reopen and verify the target state.
+
+The legacy `agentfs migrate` command is reserved for historical in-place upgrades through v0.4. It MUST NOT label a database as v0.5 without performing the copy-based v0.5 migration.
 
 ### Consistency Rules
 
@@ -459,8 +546,10 @@ Where `16877` = `0o040755` (directory with rwxr-xr-x permissions)
 4. No directory MAY contain duplicate names
 5. Directories MUST have mode with S_IFDIR bit set
 6. Regular files MUST have mode with S_IFREG bit set
-7. File size MUST match total size of all data chunks
-8. Every inode MUST have at least one dentry (except root)
+7. Inline regular files MUST have `storage_kind = 1`, `data_inline` length equal to `size`, and no `fs_data` rows
+8. Chunked regular files MUST have `storage_kind = 0` and `data_inline IS NULL`
+9. File reads MUST return exactly `size` bytes regardless of sparse missing chunks
+10. Every inode MUST have at least one dentry (except root)
 
 ### Implementation Notes
 
@@ -517,6 +606,27 @@ CREATE INDEX idx_fs_whiteout_parent ON fs_whiteout(parent_path)
 - The `parent_path` column enables O(1) lookups of whiteouts within a directory, avoiding expensive `LIKE` pattern matching
 - For the root directory `/`, `parent_path` is `/`
 - For other paths, `parent_path` is the path with the final component removed (e.g., `/foo/bar` has parent `/foo`)
+
+### Overlay Configuration
+
+Overlay databases persist the base layer they were initialized with so an existing database can be reopened with the same overlay semantics.
+
+#### Table: `fs_overlay_config`
+
+```sql
+CREATE TABLE fs_overlay_config (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+)
+```
+
+**Required Configuration:**
+
+| Key | Description |
+|-----|-------------|
+| `base_path` | Canonical path to the read-only base directory |
+
+v0.5 copy migration MUST preserve this table when migrating an overlay delta database. Without it, a migrated overlay database would mount as a plain AgentFS database and lose base-layer visibility.
 
 ### Operations
 
@@ -604,6 +714,51 @@ SELECT base_ino FROM fs_origin WHERE delta_ino = ?
 
 If a mapping exists, return `base_ino` instead of `delta_ino` in stat results.
 
+### Partial-Origin Overlay Mode
+
+Partial-origin copy-up is an experimental opt-in overlay mode enabled with
+`AGENTFS_OVERLAY_PARTIAL_ORIGIN=1`. The default overlay behavior remains
+whole-file copy-up. In opt-in mode, write-opening a regular base-layer file
+creates a delta inode with the original size and metadata, records the base
+path/fingerprint in `fs_partial_origin`, and stores only changed chunk indexes
+in `fs_data` plus `fs_chunk_override`. Reads merge changed chunks from the
+delta layer with unchanged chunks from the base layer.
+
+The base fallback is part of the file's integrity contract. Implementations MUST
+fail reads of partial-origin files if the recorded base size or modification
+metadata no longer matches the current base file. Snapshot/restore of the main
+delta database is supported only when the same unchanged base path is available.
+
+#### Tables: `fs_partial_origin` and `fs_chunk_override`
+
+```sql
+CREATE TABLE fs_partial_origin (
+  delta_ino INTEGER PRIMARY KEY,
+  base_ino INTEGER NOT NULL,
+  base_path TEXT NOT NULL,
+  base_size INTEGER NOT NULL,
+  base_fingerprint_size INTEGER NOT NULL DEFAULT -1,
+  base_mtime INTEGER NOT NULL DEFAULT 0,
+  base_mtime_nsec INTEGER NOT NULL DEFAULT 0,
+  base_ctime INTEGER NOT NULL DEFAULT 0,
+  base_ctime_nsec INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL
+)
+
+CREATE TABLE fs_chunk_override (
+  delta_ino INTEGER NOT NULL,
+  chunk_index INTEGER NOT NULL,
+  PRIMARY KEY (delta_ino, chunk_index)
+)
+```
+
+Phase 5.5 evidence keeps this mode opt-in: SDK coverage now includes remount,
+main-DB snapshot restore, unlink cleanup/whiteout behavior, hardlink survival,
+rename plus `readdir_plus`, truncate shrink/extend, base drift detection, and
+large-edit smoke output that reports whether the env flag was enabled. It SHOULD
+NOT be defaulted until the broader FUSE/CLI torture and POSIX gates pass with
+the flag enabled.
+
 ### Consistency Rules
 
 1. A whiteout MUST be removed when a new file is created at that path
@@ -612,6 +767,8 @@ If a mapping exists, return `base_ino` instead of `delta_ino` in stat results.
 4. Whiteouts only affect overlay lookups, not the underlying base filesystem
 5. When copying a file from base to delta, the origin mapping MUST be stored
 6. When stat'ing a delta file with an origin mapping, the base inode MUST be returned
+7. Existing overlay databases with legacy `fs_whiteout(path, created_at)` rows MUST synthesize `parent_path` before using the v0.5 whiteout schema
+8. Partial-origin files MUST remove `fs_partial_origin`, `fs_chunk_override`, and `fs_origin` rows when the last delta link is unlinked
 
 ## Key-Value Data
 

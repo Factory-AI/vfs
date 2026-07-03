@@ -132,7 +132,7 @@ impl ToolCalls {
         let started_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
 
         let mut stmt = conn
-            .prepare(
+            .prepare_cached(
                 "INSERT INTO tool_calls (name, parameters, status, started_at)
                 VALUES (?, ?, 'pending', ?) RETURNING id",
             )
@@ -156,9 +156,10 @@ impl ToolCalls {
         let completed_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
 
         // Get the started_at time to calculate duration
-        let mut rows = conn
-            .query("SELECT started_at FROM tool_calls WHERE id = ?", (id,))
+        let mut stmt = conn
+            .prepare_cached("SELECT started_at FROM tool_calls WHERE id = ?")
             .await?;
+        let mut rows = stmt.query((id,)).await?;
 
         let started_at = if let Some(row) = rows.next().await? {
             row.get_value(0)
@@ -171,17 +172,19 @@ impl ToolCalls {
 
         let duration_ms = (completed_at - started_at) * 1000;
 
-        conn.execute(
-            "UPDATE tool_calls
+        let mut stmt = conn
+            .prepare_cached(
+                "UPDATE tool_calls
             SET result = ?, status = 'success', completed_at = ?, duration_ms = ?
             WHERE id = ?",
-            (
-                serialized_result.as_deref().unwrap_or(""),
-                completed_at,
-                duration_ms,
-                id,
-            ),
-        )
+            )
+            .await?;
+        stmt.execute((
+            serialized_result.as_deref().unwrap_or(""),
+            completed_at,
+            duration_ms,
+            id,
+        ))
         .await?;
 
         Ok(())
@@ -206,7 +209,7 @@ impl ToolCalls {
         let status = if error.is_some() { "error" } else { "success" };
 
         let mut stmt = conn
-            .prepare(
+            .prepare_cached(
                 "INSERT INTO tool_calls (name, parameters, result, error, status, started_at, completed_at, duration_ms)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id"
             )
@@ -238,9 +241,10 @@ impl ToolCalls {
         let completed_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
 
         // Get the started_at time to calculate duration
-        let mut rows = conn
-            .query("SELECT started_at FROM tool_calls WHERE id = ?", (id,))
+        let mut stmt = conn
+            .prepare_cached("SELECT started_at FROM tool_calls WHERE id = ?")
             .await?;
+        let mut rows = stmt.query((id,)).await?;
 
         let started_at = if let Some(row) = rows.next().await? {
             row.get_value(0)
@@ -253,13 +257,14 @@ impl ToolCalls {
 
         let duration_ms = (completed_at - started_at) * 1000;
 
-        conn.execute(
-            "UPDATE tool_calls
+        let mut stmt = conn
+            .prepare_cached(
+                "UPDATE tool_calls
             SET error = ?, status = 'error', completed_at = ?, duration_ms = ?
             WHERE id = ?",
-            (error, completed_at, duration_ms, id),
-        )
-        .await?;
+            )
+            .await?;
+        stmt.execute((error, completed_at, duration_ms, id)).await?;
 
         Ok(())
     }
@@ -267,13 +272,13 @@ impl ToolCalls {
     /// Get a tool call by ID
     pub async fn get(&self, id: i64) -> Result<Option<ToolCall>> {
         let conn = self.pool.get_connection().await?;
-        let mut rows = conn
-            .query(
+        let mut stmt = conn
+            .prepare_cached(
                 "SELECT id, name, parameters, result, error, status, started_at, completed_at, duration_ms
                 FROM tool_calls WHERE id = ?",
-                (id,),
             )
             .await?;
+        let mut rows = stmt.query((id,)).await?;
 
         if let Some(row) = rows.next().await? {
             Ok(Some(Self::row_to_tool_call(&row)?))
@@ -286,15 +291,15 @@ impl ToolCalls {
     pub async fn recent(&self, limit: Option<i64>) -> Result<Vec<ToolCall>> {
         let conn = self.pool.get_connection().await?;
         let limit = limit.unwrap_or(100);
-        let mut rows = conn
-            .query(
+        let mut stmt = conn
+            .prepare_cached(
                 "SELECT id, name, parameters, result, error, status, started_at, completed_at, duration_ms
                 FROM tool_calls
                 ORDER BY started_at DESC
                 LIMIT ?",
-                (limit,),
             )
             .await?;
+        let mut rows = stmt.query((limit,)).await?;
 
         let mut calls = Vec::new();
         while let Some(row) = rows.next().await? {
@@ -307,8 +312,8 @@ impl ToolCalls {
     /// Get statistics for a specific tool
     pub async fn stats_for(&self, name: &str) -> Result<Option<ToolCallStats>> {
         let conn = self.pool.get_connection().await?;
-        let mut rows = conn
-            .query(
+        let mut stmt = conn
+            .prepare_cached(
                 "SELECT
                     name,
                     COUNT(*) as total_calls,
@@ -318,9 +323,9 @@ impl ToolCalls {
                 FROM tool_calls
                 WHERE name = ?
                 GROUP BY name",
-                (name,),
             )
             .await?;
+        let mut rows = stmt.query((name,)).await?;
 
         if let Some(row) = rows.next().await? {
             Ok(Some(Self::row_to_stats(&row)?))
@@ -332,8 +337,8 @@ impl ToolCalls {
     /// Get statistics for all tools
     pub async fn stats(&self) -> Result<Vec<ToolCallStats>> {
         let conn = self.pool.get_connection().await?;
-        let mut rows = conn
-            .query(
+        let mut stmt = conn
+            .prepare_cached(
                 "SELECT
                     name,
                     COUNT(*) as total_calls,
@@ -343,9 +348,9 @@ impl ToolCalls {
                 FROM tool_calls
                 GROUP BY name
                 ORDER BY total_calls DESC",
-                (),
             )
             .await?;
+        let mut rows = stmt.query(()).await?;
 
         let mut stats = Vec::new();
         while let Some(row) = rows.next().await? {

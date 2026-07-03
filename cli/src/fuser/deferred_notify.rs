@@ -8,6 +8,7 @@ use std::{
 #[derive(Debug)]
 pub enum NotifyOp {
     InvalEntry { parent: u64, name: OsString },
+    InvalInode { ino: u64, offset: i64, len: i64 },
 }
 
 /// Queues kernel cache invalidation requests for deferred execution.
@@ -38,6 +39,12 @@ impl DeferredNotifier {
             name: name.to_os_string(),
         }) {
             debug!("deferred inval_entry send failed (notify thread gone?): {e}");
+        }
+    }
+
+    pub fn inval_inode(&self, ino: u64, offset: i64, len: i64) {
+        if let Err(e) = self.tx.send(NotifyOp::InvalInode { ino, offset, len }) {
+            debug!("deferred inval_inode send failed (notify thread gone?): {e}");
         }
     }
 }

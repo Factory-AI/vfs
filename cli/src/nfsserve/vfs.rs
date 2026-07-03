@@ -282,6 +282,24 @@ pub trait NFSFileSystem: Sync {
         ret.extend_from_slice(&id.to_le_bytes());
         nfs_fh3 { data: ret }
     }
+
+    /// Converts the fileid to an opaque NFS file handle that carries write
+    /// authority captured by a successful CREATE response.
+    ///
+    /// NFSv3 has no OPEN/CLOSE RPC, so clients commonly continue writing
+    /// through the file handle returned by CREATE. Implementations that can
+    /// encode per-handle authority should override this method and
+    /// `fh_has_write_authority`; the default preserves stateless NFS behavior.
+    fn id_to_write_fh(&self, id: fileid3) -> nfs_fh3 {
+        self.id_to_fh(id)
+    }
+
+    /// Returns whether this exact opaque file handle carries write authority
+    /// captured at CREATE time for the resolved fileid.
+    fn fh_has_write_authority(&self, _fh: &nfs_fh3, _id: fileid3) -> bool {
+        false
+    }
+
     /// Converts an opaque NFS file handle to a fileid.  Optional.
     fn fh_to_id(&self, id: &nfs_fh3) -> Result<fileid3, nfsstat3> {
         if id.data.len() != 16 {

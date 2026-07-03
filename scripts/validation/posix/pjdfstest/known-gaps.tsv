@@ -1,0 +1,98 @@
+# target	reason
+mknod/	Unprivileged FUSE runs cannot create block/char device nodes; these failures are environment/contract gaps until AgentFS defines privileged-node support.
+chown/00.t	Successful ownership mutation requires root/CAP_CHOWN or a stronger AgentFS privilege model; keep only error-path chown tests in supported profiles.
+chown/01.t	Depends on block/char mknod cases and cascades into ENOENT when device nodes are rejected.
+chown/02.t	Depends on successful uid/gid changes requiring root/CAP_CHOWN.
+chown/03.t	Depends on successful uid/gid changes requiring root/CAP_CHOWN.
+chown/05.t	Depends on chown/lchown and alternate uid/gid execution.
+chown/07.t	Depends on ownership-change denial matrices with chown/lchown, alternate uid/gid execution, and device nodes.
+chmod/00.t	Mixes regular-file chmod with device-node and alternate-uid cases; split before it can enter a supported gate.
+chmod/01.t	Depends on block/char mknod and cascades into ENOENT when device nodes are rejected.
+chmod/05.t	Depends on chown and alternate uid/gid execution.
+chmod/07.t	Depends on owner/non-owner permission checks using alternate uid/gid execution.
+chmod/11.t	Mixes device nodes, owner cases, and sticky/special mode semantics.
+chmod/12.t	Depends on SUID/SGID clearing with non-owner writes.
+ftruncate/00.t	Core truncate mostly works, but this file includes alternate-user cases that cannot run unprivileged.
+ftruncate/05.t	Depends on chown and alternate uid/gid permission checks.
+ftruncate/06.t	Depends on chown and alternate uid/gid permission checks.
+ftruncate/12.t	Core large-length ftruncate behavior needs Phase 5 triage.
+ftruncate/13.t	Core negative-length ftruncate path currently cascades from create/EIO and needs Phase 5 triage.
+link/00.t	Mixes hard-link behavior with device-node and alternate-user permission cases; split before gating.
+link/01.t	Depends on block/char mknod cases and cascades into ENOENT when device nodes are rejected.
+link/06.t	Depends on chown and alternate uid/gid permission checks.
+link/07.t	Depends on chown and alternate uid/gid permission checks.
+link/10.t	Mixes EEXIST coverage with block/char mknod cases that cascade after device-node creation is rejected.
+link/11.t	Depends on chown and alternate uid/gid directory ownership checks.
+mkdir/00.t	Includes alternate-user permission cases that cannot run unprivileged.
+mkdir/01.t	Includes alternate-user permission cases that cannot run unprivileged.
+mkdir/05.t	Depends on chown and alternate uid/gid search/write permission checks.
+mkdir/06.t	Depends on chown and alternate uid/gid search/write permission checks.
+mkdir/10.t	Mixes EEXIST coverage with block/char mknod cases that cascade after device-node creation is rejected.
+mkfifo/00.t	Core FIFO creation mostly works, but this file includes chown and alternate uid/gid ownership cases.
+mkfifo/01.t	Depends on block/char mknod cases and cascades into ENOENT when device nodes are rejected.
+mkfifo/05.t	Depends on chown and alternate uid/gid search permission checks.
+mkfifo/06.t	Depends on chown and alternate uid/gid search permission checks.
+mkfifo/09.t	Mixes EEXIST coverage with block/char mknod cases that cascade after device-node creation is rejected.
+open/00.t	Includes alternate-user permission cases that cannot run unprivileged.
+open/01.t	Includes alternate-user permission cases that cannot run unprivileged.
+open/05.t	Depends on chown and alternate uid/gid search permission checks.
+open/06.t	Depends on chown and alternate uid/gid read/write permission matrix coverage.
+open/07.t	Depends on chown and alternate uid/gid O_TRUNC permission checks.
+open/08.t	Needs Phase 5 triage before gating.
+open/22.t	Mixes O_EXCL/EEXIST coverage with block/char mknod cases that cascade after device-node creation is rejected.
+rename/00.t	Mixes core rename coverage with device-node and alternate-user permission cases; split before gating.
+rename/04.t	Depends on chown and alternate uid/gid search permission checks.
+rename/05.t	Depends on chown and alternate uid/gid directory write permission checks.
+rename/09.t	Depends on chown, alternate uid/gid execution, and block/char device cases in the sticky-directory matrix.
+rename/10.t	Full matrix has broad failures and needs Phase 5 triage after unsupported uid/device cases are separated.
+rename/11.t	Core rename gap in full run; needs Phase 5 triage.
+rename/12.t	Core rename gap in full run; needs Phase 5 triage.
+rename/13.t	Core rename gap in full run; needs Phase 5 triage.
+rename/14.t	Core rename gap in full run; needs Phase 5 triage.
+rename/17.t	Core rename gap in full run; needs Phase 5 triage.
+rename/20.t	Core rename gap in full run; needs Phase 5 triage.
+rename/21.t	Core rename gap in full run; needs Phase 5 triage.
+rename/23.t	Core rename gap in full run; needs Phase 5 triage.
+rename/24.t	Core rename gap in full run; needs Phase 5 triage.
+rmdir/01.t	Core rmdir gap in full run; needs Phase 5 triage.
+rmdir/05.t	Core rmdir gap in full run; needs Phase 5 triage.
+rmdir/06.t	Core rmdir gap in full run; needs Phase 5 triage.
+rmdir/07.t	Core rmdir gap in full run; needs Phase 5 triage.
+rmdir/08.t	Core rmdir gap in full run; needs Phase 5 triage.
+rmdir/11.t	Core rmdir gap in full run; needs Phase 5 triage.
+symlink/00.t	Core symlink gap in full run; needs Phase 5 triage.
+symlink/01.t	Core symlink gap in full run; needs Phase 5 triage.
+symlink/02.t	Core symlink gap in full run; needs Phase 5 triage.
+symlink/03.t	Core symlink gap in full run; needs Phase 5 triage.
+symlink/05.t	Core symlink gap in full run; needs Phase 5 triage.
+symlink/06.t	Core symlink gap in full run; needs Phase 5 triage.
+symlink/07.t	Core symlink gap in full run; needs Phase 5 triage.
+symlink/08.t	Core symlink gap in full run; needs Phase 5 triage.
+truncate/00.t	Core truncate gap in full run; needs Phase 5 triage.
+truncate/01.t	Core truncate gap in full run; needs Phase 5 triage.
+truncate/02.t	Core truncate gap in full run; needs Phase 5 triage.
+truncate/03.t	Core truncate gap in full run; needs Phase 5 triage.
+truncate/05.t	Core truncate gap in full run; needs Phase 5 triage.
+truncate/06.t	Core truncate gap in full run; needs Phase 5 triage.
+truncate/07.t	Core truncate gap in full run; needs Phase 5 triage.
+truncate/12.t	Core truncate gap in full run; needs Phase 5 triage.
+truncate/13.t	Core truncate gap in full run; needs Phase 5 triage.
+unlink/00.t	Core unlink gap in full run; needs Phase 5 triage after unsupported cases are separated.
+unlink/01.t	Core unlink gap in full run; needs Phase 5 triage.
+unlink/02.t	Core unlink gap in full run; needs Phase 5 triage.
+unlink/03.t	Core unlink gap in full run; needs Phase 5 triage.
+unlink/04.t	Core unlink gap in full run; needs Phase 5 triage.
+unlink/05.t	Core unlink gap in full run; needs Phase 5 triage.
+unlink/06.t	Core unlink gap in full run; needs Phase 5 triage.
+unlink/07.t	Core unlink gap in full run; needs Phase 5 triage.
+unlink/11.t	Core unlink gap in full run; needs Phase 5 triage.
+unlink/14.t	Core unlink gap in full run; needs Phase 5 triage.
+utimensat/00.t	Core timestamp gap in full run; needs Phase 5 triage.
+utimensat/01.t	Core timestamp gap in full run; needs Phase 5 triage.
+utimensat/02.t	Core timestamp gap in full run; needs Phase 5 triage.
+utimensat/04.t	Core timestamp gap in full run; needs Phase 5 triage.
+utimensat/05.t	Core timestamp gap in full run; needs Phase 5 triage.
+utimensat/06.t	Core timestamp gap in full run; needs Phase 5 triage.
+utimensat/07.t	Core timestamp gap in full run; needs Phase 5 triage.
+utimensat/08.t	Core timestamp gap in full run; needs Phase 5 triage.
+utimensat/09.t	Core timestamp gap in full run; needs Phase 5 triage.

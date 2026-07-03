@@ -1,0 +1,966 @@
+{
+  "agentfs": {
+    "bin": "/home/ain3sh/factory/vfs-bench-phase0/cli/target/release/agentfs",
+    "db_path": "/tmp/agentfs-git-workload-0wpgk6vq/home/.agentfs/run/git-workload-d6c2c5cb776c4aaea77f8daab1d832a5/delta.db",
+    "profile_counters": {
+      "last_by_source": {},
+      "max_counters": {},
+      "summary_count": 0
+    },
+    "profile_enabled": true,
+    "profile_summary_count": 0,
+    "session": "git-workload-d6c2c5cb776c4aaea77f8daab1d832a5"
+  },
+  "agentfs_overlay": {
+    "profile_summaries": [],
+    "run": {
+      "argv": [
+        "/home/ain3sh/factory/vfs-bench-phase0/cli/target/release/agentfs",
+        "run",
+        "--session",
+        "git-workload-d6c2c5cb776c4aaea77f8daab1d832a5",
+        "--no-default-allows",
+        "--",
+        "/usr/bin/python3",
+        "-c",
+        "\nimport argparse\nimport hashlib\nimport json\nimport os\nimport subprocess\nimport sys\nimport time\nfrom pathlib import Path\n\n\nOUTPUT_TAIL_CHARS = 4000\n\n\ndef tail_text(value):\n    if value is None:\n        return \"\"\n    if isinstance(value, bytes):\n        text = value.decode(\"utf-8\", errors=\"replace\")\n    else:\n        text = str(value)\n    if len(text) <= OUTPUT_TAIL_CHARS:\n        return text\n    return text[-OUTPUT_TAIL_CHARS:]\n\n\ndef git_env():\n    env = os.environ.copy()\n    env.setdefault(\"GIT_CONFIG_NOSYSTEM\", \"1\")\n    env.setdefault(\"GIT_TERMINAL_PROMPT\", \"0\")\n    env.setdefault(\"NO_COLOR\", \"1\")\n    env.setdefault(\"LC_ALL\", \"C\")\n    return env\n\n\ndef run_git(argv, cwd):\n    started = time.perf_counter()\n    proc = subprocess.run(\n        [\"git\"] + argv,\n        cwd=str(cwd),\n        env=git_env(),\n        text=True,\n        stdout=subprocess.PIPE,\n        stderr=subprocess.PIPE,\n    )\n    return {\n        \"argv\": [\"git\"] + argv,\n        \"cwd\": str(cwd),\n        \"duration_seconds\": time.perf_counter() - started,\n        \"returncode\": proc.returncode,\n        \"stdout_tail\": tail_text(proc.stdout),\n        \"stderr_tail\": tail_text(proc.stderr),\n        \"stdout_bytes\": len((proc.stdout or \"\").encode(\"utf-8\", errors=\"replace\")),\n        \"stderr_bytes\": len((proc.stderr or \"\").encode(\"utf-8\", errors=\"replace\")),\n        \"stdout\": proc.stdout,\n    }\n\n\ndef require_ok(record, phase):\n    if record[\"returncode\"] != 0:\n        raise RuntimeError(\n            f\"{phase} failed with exit {record['returncode']}: {record['stderr_tail']}\"\n        )\n\n\ndef bounded_read_search(workdir, max_files, read_bytes, token):\n    started = time.perf_counter()\n    ls_files = run_git([\"ls-files\", \"-z\"], workdir)\n    require_ok(ls_files, \"ls-files\")\n    paths = [item for item in ls_files[\"stdout\"].split(\"\\0\") if item]\n    digest = hashlib.sha256()\n    scanned = 0\n    bytes_read = 0\n    matches = 0\n    selected = []\n    for rel in paths:\n        if scanned >= max_files:\n            break\n        path = workdir / rel\n        if not path.is_file():\n            continue\n        data = path.read_bytes()[:read_bytes]\n        digest.update(rel.encode(\"utf-8\"))\n        digest.update(b\"\\0\")\n        digest.update(str(path.stat().st_size).encode(\"ascii\"))\n        digest.update(b\"\\0\")\n        digest.update(data)\n        matches += data.count(token.encode(\"utf-8\"))\n        bytes_read += len(data)\n        scanned += 1\n        selected.append(rel)\n    return {\n        \"duration_seconds\": time.perf_counter() - started,\n        \"ls_files_run\": {key: value for key, value in ls_files.items() if key != \"stdout\"},\n        \"digest\": digest.hexdigest(),\n        \"files_total\": len(paths),\n        \"files_scanned\": scanned,\n        \"bytes_read\": bytes_read,\n        \"token\": token,\n        \"matches\": matches,\n        \"selected_files\": selected,\n        \"all_files\": paths,\n    }\n\n\ndef representative_edit_paths(paths, limit):\n    preferred_prefixes = (\"src/\", \"tests/\", \"docs/\")\n    selected = []\n    for prefix in preferred_prefixes:\n        for rel in paths:\n            if rel.startswith(prefix) and rel not in selected:\n                selected.append(rel)\n                if len(selected) >= limit:\n                    return selected\n    for rel in paths:\n        if rel not in selected:\n            selected.append(rel)\n            if len(selected) >= limit:\n                return selected\n    return selected\n\n\ndef edit_files(workdir, paths, limit):\n    started = time.perf_counter()\n    selected = representative_edit_paths(paths, limit)\n    edits = []\n    for index, rel in enumerate(selected):\n        path = workdir / rel\n        before_size = path.stat().st_size\n        payload = f\"\\nAgentFS Git benchmark edit {index:02d} for {rel}\\n\".encode(\"utf-8\")\n        with path.open(\"ab\", buffering=0) as handle:\n            handle.write(payload)\n            handle.flush()\n            os.fsync(handle.fileno())\n        edits.append(\n            {\n                \"path\": rel,\n                \"size_before\": before_size,\n                \"size_after\": path.stat().st_size,\n                \"appended_bytes\": len(payload),\n            }\n        )\n    return {\"duration_seconds\": time.perf_counter() - started, \"changed_files\": selected, \"edits\": edits}\n\n\ndef diff_summary(workdir):\n    started = time.perf_counter()\n    name_only = run_git([\"diff\", \"--name-only\", \"--\"], workdir)\n    require_ok(name_only, \"diff --name-only\")\n    stat = run_git([\"diff\", \"--stat\", \"--\"], workdir)\n    require_ok(stat, \"diff --stat\")\n    patch = run_git([\"diff\", \"--\", \".\"], workdir)\n    require_ok(patch, \"diff\")\n    changed = [line for line in name_only[\"stdout\"].splitlines() if line]\n    patch_bytes = patch[\"stdout\"].encode(\"utf-8\", errors=\"replace\")\n    return {\n        \"duration_seconds\": time.perf_counter() - started,\n        \"changed_files\": changed,\n        \"changed_file_count\": len(changed),\n        \"stat_stdout\": stat[\"stdout_tail\"],\n        \"patch_sha256\": hashlib.sha256(patch_bytes).hexdigest(),\n        \"patch_bytes\": len(patch_bytes),\n        \"runs\": {\n            \"name_only\": {key: value for key, value in name_only.items() if key != \"stdout\"},\n            \"stat\": {key: value for key, value in stat.items() if key != \"stdout\"},\n            \"patch\": {key: value for key, value in patch.items() if key != \"stdout\"},\n        },\n    }\n\n\ndef main(argv):\n    parser = argparse.ArgumentParser()\n    parser.add_argument(\"--mirror\", default=\"mirror.git\")\n    parser.add_argument(\"--work-dir\", default=\"work\")\n    parser.add_argument(\"--read-files\", type=int, required=True)\n    parser.add_argument(\"--read-bytes\", type=int, required=True)\n    parser.add_argument(\"--edit-files\", type=int, required=True)\n    parser.add_argument(\"--search-token\", default=\"AGENTFS_TOKEN\")\n    parser.add_argument(\"--skip-fsck\", action=\"store_true\")\n    args = parser.parse_args(argv)\n\n    root = Path.cwd()\n    mirror = root / args.mirror\n    workdir = root / args.work_dir\n    phase_seconds = {}\n    phase_runs = {}\n    started_total = time.perf_counter()\n\n    started = time.perf_counter()\n    clone = run_git([\"clone\", \"--local\", \"--no-hardlinks\", str(mirror), str(workdir)], root)\n    require_ok(clone, \"clone\")\n    phase_seconds[\"clone\"] = time.perf_counter() - started\n    phase_runs[\"clone\"] = {key: value for key, value in clone.items() if key != \"stdout\"}\n\n    started = time.perf_counter()\n    checkout = run_git([\"checkout\", \"-B\", \"agentfs-benchmark\"], workdir)\n    require_ok(checkout, \"checkout\")\n    head = run_git([\"rev-parse\", \"HEAD\"], workdir)\n    require_ok(head, \"rev-parse\")\n    phase_seconds[\"checkout\"] = time.perf_counter() - started\n    phase_runs[\"checkout\"] = {key: value for key, value in checkout.items() if key != \"stdout\"}\n\n    started = time.perf_counter()\n    status_initial = run_git([\"status\", \"--short\"], workdir)\n    require_ok(status_initial, \"status\")\n    branch_status = run_git([\"status\", \"--short\", \"--branch\"], workdir)\n    require_ok(branch_status, \"status --branch\")\n    phase_seconds[\"status\"] = time.perf_counter() - started\n    phase_runs[\"status\"] = {\n        \"short\": {key: value for key, value in status_initial.items() if key != \"stdout\"},\n        \"branch\": {key: value for key, value in branch_status.items() if key != \"stdout\"},\n    }\n\n    read_search = bounded_read_search(workdir, args.read_files, args.read_bytes, args.search_token)\n    phase_seconds[\"read_search\"] = read_search[\"duration_seconds\"]\n\n    edits = edit_files(workdir, read_search[\"all_files\"], args.edit_files)\n    phase_seconds[\"edit\"] = edits[\"duration_seconds\"]\n\n    diff = diff_summary(workdir)\n    phase_seconds[\"diff\"] = diff[\"duration_seconds\"]\n\n    fsck = {\"ran\": False, \"ok\": None, \"run\": None}\n    if not args.skip_fsck:\n        started = time.perf_counter()\n        fsck_run = run_git([\"fsck\", \"--strict\"], workdir)\n        phase_seconds[\"fsck\"] = time.perf_counter() - started\n        fsck = {\n            \"ran\": True,\n            \"ok\": fsck_run[\"returncode\"] == 0,\n            \"run\": {key: value for key, value in fsck_run.items() if key != \"stdout\"},\n        }\n        require_ok(fsck_run, \"fsck\")\n    else:\n        phase_seconds[\"fsck\"] = 0.0\n\n    total_seconds = time.perf_counter() - started_total\n    print(\n        json.dumps(\n            {\n                \"head_commit\": head[\"stdout\"].strip(),\n                \"phase_seconds\": phase_seconds,\n                \"total_seconds\": total_seconds,\n                \"phase_runs\": phase_runs,\n                \"initial_status\": status_initial[\"stdout\"],\n                \"branch_status\": branch_status[\"stdout\"],\n                \"read_search\": {\n                    key: value\n                    for key, value in read_search.items()\n                    if key not in {\"duration_seconds\", \"all_files\"}\n                },\n                \"edits\": edits,\n                \"diff\": diff,\n                \"fsck\": fsck,\n            },\n            sort_keys=True,\n        )\n    )\n\n\ntry:\n    main(sys.argv[1:])\nexcept Exception as exc:\n    print(json.dumps({\"error\": str(exc)}, sort_keys=True))\n    raise\n",
+        "--read-files",
+        "32",
+        "--read-bytes",
+        "4096",
+        "--edit-files",
+        "4",
+        "--search-token",
+        "AGENTFS_TOKEN",
+        "--skip-fsck"
+      ],
+      "cwd": "/tmp/agentfs-git-workload-0wpgk6vq/agentfs-base",
+      "duration_seconds": 2.5617292759707198,
+      "profile_summaries": [],
+      "returncode": 0,
+      "stderr_bytes": 527,
+      "stderr_tail": "Welcome to AgentFS!\n\nThe following directories are writable:\n\n  - /tmp/agentfs-git-workload-0wpgk6vq/agentfs-base (copy-on-write)\n\n\ud83d\udd12 Everything else is read-only.\n\nTo join this session from another terminal:\n\n  agentfs run --session git-workload-d6c2c5cb776c4aaea77f8daab1d832a5 <command>\n\n\nSession: git-workload-d6c2c5cb776c4aaea77f8daab1d832a5\n\nTo resume this session:\n  agentfs run --session git-workload-d6c2c5cb776c4aaea77f8daab1d832a5\n\nTo see what changed:\n  agentfs diff git-workload-d6c2c5cb776c4aaea77f8daab1d832a5\n",
+      "stdout_bytes": 13083,
+      "stdout_tail": "{\"branch_status\": \"## agentfs-benchmark\\n\", \"diff\": {\"changed_file_count\": 4, \"changed_files\": [\"docs/CLA.md\", \"docs/agents_md.md\", \"docs/authentication.md\", \"docs/config.md\"], \"duration_seconds\": 0.29552334401523694, \"patch_bytes\": 1786, \"patch_sha256\": \"cff609abc3a92f6dfb55c6da3cbf0e06c321ccfac3bfb6e767894ece6cf273be\", \"runs\": {\"name_only\": {\"argv\": [\"git\", \"diff\", \"--name-only\", \"--\"], \"cwd\": \"/tmp/agentfs-git-workload-0wpgk6vq/agentfs-base/work\", \"duration_seconds\": 0.10441129800165072, \"returncode\": 0, \"stderr_bytes\": 0, \"stderr_tail\": \"\", \"stdout_bytes\": 68, \"stdout_tail\": \"docs/CLA.md\\ndocs/agents_md.md\\ndocs/authentication.md\\ndocs/config.md\\n\"}, \"patch\": {\"argv\": [\"git\", \"diff\", \"--\", \".\"], \"cwd\": \"/tmp/agentfs-git-workload-0wpgk6vq/agentfs-base/work\", \"duration_seconds\": 0.09391447296366096, \"returncode\": 0, \"stderr_bytes\": 0, \"stderr_tail\": \"\", \"stdout_bytes\": 1786, \"stdout_tail\": \"diff --git a/docs/CLA.md b/docs/CLA.md\\nindex 804f202..3495ac9 100644\\n--- a/docs/CLA.md\\n+++ b/docs/CLA.md\\n@@ -47,3 +47,5 @@ entity under this CLA terminate.\\n This Agreement is governed by the laws of the **State of California**, USA,\\n excluding its conflict\\u2011of\\u2011laws rules. If any provision is held unenforceable,\\n the remaining provisions remain in force.\\n+\\n+AgentFS Git benchmark edit 00 for docs/CLA.md\\ndiff --git a/docs/agents_md.md b/docs/agents_md.md\\nindex 3df0fac..b8b063d 100644\\n--- a/docs/agents_md.md\\n+++ b/docs/agents_md.md\\n@@ -5,3 +5,5 @@ For information about AGENTS.md, see [this documentation](https://developers.ope\\n ## Hierarchical agents message\\n \\n When the `child_agents_md` feature flag is enabled (via `[features]` in `config.toml`), Codex appends additional guidance about AGENTS.md scope and precedence to the user instructions message and emits that message even when no AGENTS.md is present.\\n+\\n+AgentFS Git benchmark edit 01 for docs/agents_md.md\\ndiff --git a/docs/authentication.md b/docs/authentication.md\\nindex c307349..b3bc9dc 100644\\n--- a/docs/authentication.md\\n+++ b/docs/authentication.md\\n@@ -1,3 +1,5 @@\\n # Authentication\\n \\n For information about Codex CLI authentication, see [this documentation](https://developers.openai.com/codex/auth).\\n+\\n+AgentFS Git benchmark edit 02 for docs/authentication.md\\ndiff --git a/docs/config.md b/docs/config.md\\nindex d35b0a8..030e278 100644\\n--- a/docs/config.md\\n+++ b/docs/config.md\\n@@ -13,3 +13,5 @@ Admins can set top-level `allow_managed_hooks_only = true` in\\n still allowing managed hooks from requirements and managed config layers. This\\n setting is only supported in `requirements.toml`; putting it in `config.toml`\\n does not enable managed-hooks-only mode.\\n+\\n+AgentFS Git benchmark edit 03 for docs/config.md\\n\"}, \"stat\": {\"argv\": [\"git\", \"diff\", \"--stat\", \"--\"], \"cwd\": \"/tmp/agentfs-git-workload-0wpgk6vq/agentfs-base/work\", \"duration_seconds\": 0.09716634999495, \"returncode\": 0, \"stderr_bytes\": 0, \"stderr_tail\": \"\", \"stdout_bytes\": 158, \"stdout_tail\": \" docs/CLA.md            | 2 ++\\n docs/agents_md.md      | 2 ++\\n docs/authentication.md | 2 ++\\n docs/config.md         | 2 ++\\n 4 files changed, 8 insertions(+)\\n\"}}, \"stat_stdout\": \" docs/CLA.md            | 2 ++\\n docs/agents_md.md      | 2 ++\\n docs/authentication.md | 2 ++\\n docs/config.md         | 2 ++\\n 4 files changed, 8 insertions(+)\\n\"}, \"edits\": {\"changed_files\": [\"docs/CLA.md\", \"docs/agents_md.md\", \"docs/authentication.md\", \"docs/config.md\"], \"duration_seconds\": 0.0010691990028135478, \"edits\": [{\"appended_bytes\": 47, \"path\": \"docs/CLA.md\", \"size_after\": 2106, \"size_before\": 2059}, {\"appended_bytes\": 53, \"path\": \"docs/agents_md.md\", \"size_after\": 462, \"size_before\": 409}, {\"appended_bytes\": 58, \"path\": \"docs/authentication.md\", \"size_after\": 192, \"size_before\": 134}, {\"appended_bytes\": 50, \"path\": \"docs/config.md\", \"size_after\": 776, \"size_before\": 726}]}, \"fsck\": {\"ok\": null, \"ran\": false, \"run\": null}, \"head_commit\": \"7d47056ea42636271ac020b86347fbbef49490aa\", \"initial_status\": \"\", \"phase_runs\": {\"checkout\": {\"argv\": [\"git\", \"checkout\", \"-B\", \"agentfs-benchmark\"], \"cwd\": \"/tmp/agentfs-git-workload-0wpgk6vq/agentfs-base/work\", \"duration_seconds\": 0.1445034240023233, \"returncode\": 0, \"stderr_bytes\": 45, \"stderr_tail\": \"Switched to a new branch 'agentfs-benchmark'\\n\", \"stdout_bytes\": 0, \"stdout_tail\": \"\"}, \"clone\": {\"argv\": [\"git\", \"clone\", \"--local\", \"--no-hardlinks\", \"/tmp/agentfs-git-workload-0wpgk6vq/agentfs-base/mirror.git\", \"/tmp/agentfs-git-workload-0wpgk6vq/agentfs-base/work\"], \"cwd\": \"/tmp/agentfs-git-workload-0wpgk6vq/agentfs-base\", \"duration_seconds\": 1.6518768139649183, \"returncode\": 0, \"stderr_bytes\": 1251, \"stderr_tail\": \"Cloning into '/tmp/agentfs-git-workload-0wpgk6vq/agentfs-base/work'...\\nwarning: source repository is shallow, ignoring --local\\nwarning: --local is ignored\\nUpdating files:  69% (3232/4644)\\nUpdating files:  70% (3251/4644)\\nUpdating files:  71% (3298/4644)\\nUpdating files:  72% (3344/4644)\\nUpdating files:  73% (3391/4644)\\nUpdating files:  74% (3437/4644)\\nUpdating files:  75% (3483/4644)\\nUpdating files:  76% (3530/4644)\\nUpdating files:  77% (3576/4644)\\nUpdating files:  78% (3623/4644)\\nUpdating files:  79% (3669/4644)\\nUpdating files:  80% (3716/4644)\\nUpdating files:  81% (3762/4644)\\nUpdating files:  82% (3809/4644)\\nUpdating files:  83% (3855/4644)\\nUpdating files:  84% (3901/4644)\\nUpdating files:  85% (3948/4644)\\nUpdating files:  86% (3994/4644)\\nUpdating files:  87% (4041/4644)\\nUpdating files:  88% (4087/4644)\\nUpdating files:  89% (4134/4644)\\nUpdating files:  90% (4180/4644)\\nUpdating files:  91% (4227/4644)\\nUpdating files:  92% (4273/4644)\\nUpdating files:  93% (4319/4644)\\nUpdating files:  94% (4366/4644)\\nUpdating files:  95% (4412/4644)\\nUpdating files:  96% (4459/4644)\\nUpdating files:  97% (4505/4644)\\nUpdating files:  98% (4552/4644)\\nUpdating files:  99% (4598/4644)\\nUpdating files: 100% (4644/4644)\\nUpdating files: 100% (4644/4644), done.\\n\", \"stdout_bytes\": 0, \"stdout_tail\": \"\"}, \"status\": {\"branch\": {\"argv\": [\"git\", \"status\", \"--short\", \"--branch\"], \"cwd\": \"/tmp/agentfs-git-workload-0wpgk6vq/agentfs-base/work\", \"duration_seconds\": 0.1542241770075634, \"returncode\": 0, \"stderr_bytes\": 0, \"stderr_tail\": \"\", \"stdout_bytes\": 21, \"stdout_tail\": \"## agentfs-benchmark\\n\"}, \"short\": {\"argv\": [\"git\", \"status\", \"--short\"], \"cwd\": \"/tmp/agentfs-git-workload-0wpgk6vq/agentfs-base/work\", \"duration_seconds\": 0.1875410020002164, \"returncode\": 0, \"stderr_bytes\": 0, \"stderr_tail\": \"\", \"stdout_bytes\": 0, \"stdout_tail\": \"\"}}}, \"phase_seconds\": {\"checkout\": 0.14689449104480445, \"clone\": 1.6519066839828156, \"diff\": 0.29552334401523694, \"edit\": 0.0010691990028135478, \"fsck\": 0.0, \"read_search\": 0.0059385119820944965, \"status\": 0.3417817280278541}, \"read_search\": {\"bytes_read\": 60315, \"digest\": \"a1e64893e4779f5d09d0408777c2a9aa38fd104ccfb850858c413e514d788e91\", \"files_scanned\": 32, \"files_total\": 4644, \"ls_files_run\": {\"argv\": [\"git\", \"ls-files\", \"-z\"], \"cwd\": \"/tmp/agentfs-git-workload-0wpgk6vq/agentfs-base/work\", \"duration_seconds\": 0.003662956994958222, \"returncode\": 0, \"stderr_bytes\": 0, \"stderr_tail\": \"\", \"stdout_bytes\": 263077, \"stdout_tail\": \"i_codex/api.py\\u0000sdk/python/src/openai_codex/async_client.py\\u0000sdk/python/src/openai_codex/client.py\\u0000sdk/python/src/openai_codex/errors.py\\u0000sdk/python/src/openai_codex/generated/__init__.py\\u0000sdk/python/src/openai_codex/generated/notification_registry.py\\u0000sdk/python/src/openai_codex/generated/v2_all.py\\u0000sdk/python/src/openai_codex/models.py\\u0000sdk/python/src/openai_codex/py.typed\\u0000sdk/python/src/openai_codex/retry.py\\u0000sdk/python/src/openai_codex/types.py\\u0000sdk/python/tests/app_server_harness.py\\u0000sdk/python/tests/app_server_helpers.py\\u0000sdk/python/tests/conftest.py\\u0000sdk/python/tests/test_app_server_approvals.py\\u0000sdk/python/tests/test_app_server_inputs.py\\u0000sdk/python/tests/test_app_server_lifecycle.py\\u0000sdk/python/tests/test_app_server_login.py\\u0000sdk/python/tests/test_app_server_run.py\\u0000sdk/python/tests/test_app_server_streaming.py\\u0000sdk/python/tests/test_app_server_turn_controls.py\\u0000sdk/python/tests/test_artifact_workflow_and_binaries.py\\u0000sdk/python/tests/test_async_client_behavior.py\\u0000sdk/python/tests/test_client_rpc_methods.py\\u0000sdk/python/tests/test_contract_generation.py\\u0000sdk/python/tests/test_public_api_runtime_behavior.py\\u0000sdk/python/tests/test_public_api_signatures.py\\u0000sdk/python/tests/test_real_app_server_integration.py\\u0000sdk/python/uv.lock\\u0000sdk/typescript/.prettierignore\\u0000sdk/typescript/.prettierrc\\u0000sdk/typescript/README.md\\u0000sdk/typescript/eslint.config.js\\u0000sdk/typescript/jest.config.cjs\\u0000sdk/typescript/package.json\\u0000sdk/typescript/samples/basic_streaming.ts\\u0000sdk/typescript/samples/helpers.ts\\u0000sdk/typescript/samples/structured_output.ts\\u0000sdk/typescript/samples/structured_output_zod.ts\\u0000sdk/typescript/src/codex.ts\\u0000sdk/typescript/src/codexOptions.ts\\u0000sdk/typescript/src/events.ts\\u0000sdk/typescript/src/exec.ts\\u0000sdk/typescript/src/index.ts\\u0000sdk/typescript/src/items.ts\\u0000sdk/typescript/src/outputSchemaFile.ts\\u0000sdk/typescript/src/thread.ts\\u0000sdk/typescript/src/threadOptions.ts\\u0000sdk/typescript/src/turnOptions.ts\\u0000sdk/typescript/tests/abort.test.ts\\u0000sdk/typescript/tests/codexExecSpy.ts\\u0000sdk/typescript/tests/exec.test.ts\\u0000sdk/typescript/tests/responsesProxy.ts\\u0000sdk/typescript/tests/run.test.ts\\u0000sdk/typescript/tests/runStreamed.test.ts\\u0000sdk/typescript/tests/setupCodexHome.ts\\u0000sdk/typescript/tests/testCodex.ts\\u0000sdk/typescript/tsconfig.json\\u0000sdk/typescript/tsup.config.ts\\u0000third_party/v8/BUILD.bazel\\u0000third_party/v8/README.md\\u0000third_party/v8/libcxx.BUILD.bazel\\u0000third_party/v8/libcxx_config/BUILD.bazel\\u0000third_party/v8/libcxx_config/__assertion_handler\\u0000third_party/v8/libcxx_config/__config_site\\u0000third_party/v8/libcxxabi.BUILD.bazel\\u0000third_party/v8/llvm_libc.BUILD.bazel\\u0000third_party/v8/rusty_v8_147_4_0.sha256\\u0000third_party/v8/v8_crate.BUILD.bazel\\u0000third_party/wezterm/LICENSE\\u0000tools/argument-comment-lint/.cargo/config.toml\\u0000tools/argument-comment-lint/.gitignore\\u0000tools/argument-comment-lint/BUILD.bazel\\u0000tools/argument-comment-lint/Cargo.lock\\u0000tools/argument-comment-lint/Cargo.toml\\u0000tools/argument-comment-lint/README.md\\u0000tools/argument-comment-lint/argument-comment-lint\\u0000tools/argument-comment-lint/driver.rs\\u0000tools/argument-comment-lint/lint_aspect.bzl\\u0000tools/argument-comment-lint/list-bazel-targets.sh\\u0000tools/argument-comment-lint/run-prebuilt-linter.py\\u0000tools/argument-comment-lint/run.py\\u0000tools/argument-comment-lint/rust-toolchain\\u0000tools/argument-comment-lint/src/bin/argument-comment-lint.rs\\u0000tools/argument-comment-lint/src/comment_parser.rs\\u0000tools/argument-comment-lint/src/lib.rs\\u0000tools/argument-comment-lint/test_wrapper_common.py\\u0000tools/argument-comment-lint/ui/allow_char_literals.rs\\u0000tools/argument-comment-lint/ui/allow_string_literals.rs\\u0000tools/argument-comment-lint/ui/comment_matches.rs\\u0000tools/argument-comment-lint/ui/comment_matches_multiline.rs\\u0000tools/argument-comment-lint/ui/comment_mismatch.rs\\u0000tools/argument-comment-lint/ui/comment_mismatch.stderr\\u0000tools/argument-comment-lint/ui/ignore_external_methods.rs\\u0000tools/argument-comment-lint/ui/uncommented_literal.rs\\u0000tools/argument-comment-lint/ui/uncommented_literal.stderr\\u0000tools/argument-comment-lint/wrapper_common.py\\u0000workspace_root_test_launcher.bat.tpl\\u0000workspace_root_test_launcher.sh.tpl\\u0000\"}, \"matches\": 0, \"selected_files\": [\".bazelignore\", \".bazelrc\", \".bazelversion\", \".codespellignore\", \".codespellrc\", \".codex/environments/environment.toml\", \".codex/skills/babysit-pr/SKILL.md\", \".codex/skills/babysit-pr/agents/openai.yaml\", \".codex/skills/babysit-pr/references/github-api-notes.md\", \".codex/skills/babysit-pr/references/heuristics.md\", \".codex/skills/babysit-pr/scripts/gh_pr_watch.py\", \".codex/skills/babysit-pr/scripts/test_gh_pr_watch.py\", \".codex/skills/code-review-breaking-changes/SKILL.md\", \".codex/skills/code-review-change-size/SKILL.md\", \".codex/skills/code-review-context/SKILL.md\", \".codex/skills/code-review-testing/SKILL.md\", \".codex/skills/code-review/SKILL.md\", \".codex/skills/codex-bug/SKILL.md\", \".codex/skills/codex-issue-digest/SKILL.md\", \".codex/skills/codex-issue-digest/agents/openai.yaml\", \".codex/skills/codex-issue-digest/scripts/collect_issue_digest.py\", \".codex/skills/codex-issue-digest/scripts/test_collect_issue_digest.py\", \".codex/skills/codex-pr-body/SKILL.md\", \".codex/skills/remote-tests/SKILL.md\", \".codex/skills/test-tui/SKILL.md\", \".codex/skills/update-v8-version/SKILL.md\", \".codex/skills/update-v8-version/agents/openai.yaml\", \".devcontainer/Dockerfile\", \".devcontainer/Dockerfile.secure\", \".devcontainer/README.md\", \".devcontainer/codex-install/package.json\", \".devcontainer/codex-install/pnpm-lock.yaml\"], \"token\": \"AGENTFS_TOKEN\"}, \"total_seconds\": 2.443190918012988}\n",
+      "timed_out": false
+    },
+    "workload": {
+      "branch_status": "## agentfs-benchmark\n",
+      "diff": {
+        "changed_file_count": 4,
+        "changed_files": [
+          "docs/CLA.md",
+          "docs/agents_md.md",
+          "docs/authentication.md",
+          "docs/config.md"
+        ],
+        "duration_seconds": 0.29552334401523694,
+        "patch_bytes": 1786,
+        "patch_sha256": "cff609abc3a92f6dfb55c6da3cbf0e06c321ccfac3bfb6e767894ece6cf273be",
+        "runs": {
+          "name_only": {
+            "argv": [
+              "git",
+              "diff",
+              "--name-only",
+              "--"
+            ],
+            "cwd": "/tmp/agentfs-git-workload-0wpgk6vq/agentfs-base/work",
+            "duration_seconds": 0.10441129800165072,
+            "returncode": 0,
+            "stderr_bytes": 0,
+            "stderr_tail": "",
+            "stdout_bytes": 68,
+            "stdout_tail": "docs/CLA.md\ndocs/agents_md.md\ndocs/authentication.md\ndocs/config.md\n"
+          },
+          "patch": {
+            "argv": [
+              "git",
+              "diff",
+              "--",
+              "."
+            ],
+            "cwd": "/tmp/agentfs-git-workload-0wpgk6vq/agentfs-base/work",
+            "duration_seconds": 0.09391447296366096,
+            "returncode": 0,
+            "stderr_bytes": 0,
+            "stderr_tail": "",
+            "stdout_bytes": 1786,
+            "stdout_tail": "diff --git a/docs/CLA.md b/docs/CLA.md\nindex 804f202..3495ac9 100644\n--- a/docs/CLA.md\n+++ b/docs/CLA.md\n@@ -47,3 +47,5 @@ entity under this CLA terminate.\n This Agreement is governed by the laws of the **State of California**, USA,\n excluding its conflict\u2011of\u2011laws rules. If any provision is held unenforceable,\n the remaining provisions remain in force.\n+\n+AgentFS Git benchmark edit 00 for docs/CLA.md\ndiff --git a/docs/agents_md.md b/docs/agents_md.md\nindex 3df0fac..b8b063d 100644\n--- a/docs/agents_md.md\n+++ b/docs/agents_md.md\n@@ -5,3 +5,5 @@ For information about AGENTS.md, see [this documentation](https://developers.ope\n ## Hierarchical agents message\n \n When the `child_agents_md` feature flag is enabled (via `[features]` in `config.toml`), Codex appends additional guidance about AGENTS.md scope and precedence to the user instructions message and emits that message even when no AGENTS.md is present.\n+\n+AgentFS Git benchmark edit 01 for docs/agents_md.md\ndiff --git a/docs/authentication.md b/docs/authentication.md\nindex c307349..b3bc9dc 100644\n--- a/docs/authentication.md\n+++ b/docs/authentication.md\n@@ -1,3 +1,5 @@\n # Authentication\n \n For information about Codex CLI authentication, see [this documentation](https://developers.openai.com/codex/auth).\n+\n+AgentFS Git benchmark edit 02 for docs/authentication.md\ndiff --git a/docs/config.md b/docs/config.md\nindex d35b0a8..030e278 100644\n--- a/docs/config.md\n+++ b/docs/config.md\n@@ -13,3 +13,5 @@ Admins can set top-level `allow_managed_hooks_only = true` in\n still allowing managed hooks from requirements and managed config layers. This\n setting is only supported in `requirements.toml`; putting it in `config.toml`\n does not enable managed-hooks-only mode.\n+\n+AgentFS Git benchmark edit 03 for docs/config.md\n"
+          },
+          "stat": {
+            "argv": [
+              "git",
+              "diff",
+              "--stat",
+              "--"
+            ],
+            "cwd": "/tmp/agentfs-git-workload-0wpgk6vq/agentfs-base/work",
+            "duration_seconds": 0.09716634999495,
+            "returncode": 0,
+            "stderr_bytes": 0,
+            "stderr_tail": "",
+            "stdout_bytes": 158,
+            "stdout_tail": " docs/CLA.md            | 2 ++\n docs/agents_md.md      | 2 ++\n docs/authentication.md | 2 ++\n docs/config.md         | 2 ++\n 4 files changed, 8 insertions(+)\n"
+          }
+        },
+        "stat_stdout": " docs/CLA.md            | 2 ++\n docs/agents_md.md      | 2 ++\n docs/authentication.md | 2 ++\n docs/config.md         | 2 ++\n 4 files changed, 8 insertions(+)\n"
+      },
+      "edits": {
+        "changed_files": [
+          "docs/CLA.md",
+          "docs/agents_md.md",
+          "docs/authentication.md",
+          "docs/config.md"
+        ],
+        "duration_seconds": 0.0010691990028135478,
+        "edits": [
+          {
+            "appended_bytes": 47,
+            "path": "docs/CLA.md",
+            "size_after": 2106,
+            "size_before": 2059
+          },
+          {
+            "appended_bytes": 53,
+            "path": "docs/agents_md.md",
+            "size_after": 462,
+            "size_before": 409
+          },
+          {
+            "appended_bytes": 58,
+            "path": "docs/authentication.md",
+            "size_after": 192,
+            "size_before": 134
+          },
+          {
+            "appended_bytes": 50,
+            "path": "docs/config.md",
+            "size_after": 776,
+            "size_before": 726
+          }
+        ]
+      },
+      "fsck": {
+        "ok": null,
+        "ran": false,
+        "run": null
+      },
+      "head_commit": "7d47056ea42636271ac020b86347fbbef49490aa",
+      "initial_status": "",
+      "phase_runs": {
+        "checkout": {
+          "argv": [
+            "git",
+            "checkout",
+            "-B",
+            "agentfs-benchmark"
+          ],
+          "cwd": "/tmp/agentfs-git-workload-0wpgk6vq/agentfs-base/work",
+          "duration_seconds": 0.1445034240023233,
+          "returncode": 0,
+          "stderr_bytes": 45,
+          "stderr_tail": "Switched to a new branch 'agentfs-benchmark'\n",
+          "stdout_bytes": 0,
+          "stdout_tail": ""
+        },
+        "clone": {
+          "argv": [
+            "git",
+            "clone",
+            "--local",
+            "--no-hardlinks",
+            "/tmp/agentfs-git-workload-0wpgk6vq/agentfs-base/mirror.git",
+            "/tmp/agentfs-git-workload-0wpgk6vq/agentfs-base/work"
+          ],
+          "cwd": "/tmp/agentfs-git-workload-0wpgk6vq/agentfs-base",
+          "duration_seconds": 1.6518768139649183,
+          "returncode": 0,
+          "stderr_bytes": 1251,
+          "stderr_tail": "Cloning into '/tmp/agentfs-git-workload-0wpgk6vq/agentfs-base/work'...\nwarning: source repository is shallow, ignoring --local\nwarning: --local is ignored\nUpdating files:  69% (3232/4644)\nUpdating files:  70% (3251/4644)\nUpdating files:  71% (3298/4644)\nUpdating files:  72% (3344/4644)\nUpdating files:  73% (3391/4644)\nUpdating files:  74% (3437/4644)\nUpdating files:  75% (3483/4644)\nUpdating files:  76% (3530/4644)\nUpdating files:  77% (3576/4644)\nUpdating files:  78% (3623/4644)\nUpdating files:  79% (3669/4644)\nUpdating files:  80% (3716/4644)\nUpdating files:  81% (3762/4644)\nUpdating files:  82% (3809/4644)\nUpdating files:  83% (3855/4644)\nUpdating files:  84% (3901/4644)\nUpdating files:  85% (3948/4644)\nUpdating files:  86% (3994/4644)\nUpdating files:  87% (4041/4644)\nUpdating files:  88% (4087/4644)\nUpdating files:  89% (4134/4644)\nUpdating files:  90% (4180/4644)\nUpdating files:  91% (4227/4644)\nUpdating files:  92% (4273/4644)\nUpdating files:  93% (4319/4644)\nUpdating files:  94% (4366/4644)\nUpdating files:  95% (4412/4644)\nUpdating files:  96% (4459/4644)\nUpdating files:  97% (4505/4644)\nUpdating files:  98% (4552/4644)\nUpdating files:  99% (4598/4644)\nUpdating files: 100% (4644/4644)\nUpdating files: 100% (4644/4644), done.\n",
+          "stdout_bytes": 0,
+          "stdout_tail": ""
+        },
+        "status": {
+          "branch": {
+            "argv": [
+              "git",
+              "status",
+              "--short",
+              "--branch"
+            ],
+            "cwd": "/tmp/agentfs-git-workload-0wpgk6vq/agentfs-base/work",
+            "duration_seconds": 0.1542241770075634,
+            "returncode": 0,
+            "stderr_bytes": 0,
+            "stderr_tail": "",
+            "stdout_bytes": 21,
+            "stdout_tail": "## agentfs-benchmark\n"
+          },
+          "short": {
+            "argv": [
+              "git",
+              "status",
+              "--short"
+            ],
+            "cwd": "/tmp/agentfs-git-workload-0wpgk6vq/agentfs-base/work",
+            "duration_seconds": 0.1875410020002164,
+            "returncode": 0,
+            "stderr_bytes": 0,
+            "stderr_tail": "",
+            "stdout_bytes": 0,
+            "stdout_tail": ""
+          }
+        }
+      },
+      "phase_seconds": {
+        "checkout": 0.14689449104480445,
+        "clone": 1.6519066839828156,
+        "diff": 0.29552334401523694,
+        "edit": 0.0010691990028135478,
+        "fsck": 0.0,
+        "read_search": 0.0059385119820944965,
+        "status": 0.3417817280278541
+      },
+      "read_search": {
+        "bytes_read": 60315,
+        "digest": "a1e64893e4779f5d09d0408777c2a9aa38fd104ccfb850858c413e514d788e91",
+        "files_scanned": 32,
+        "files_total": 4644,
+        "ls_files_run": {
+          "argv": [
+            "git",
+            "ls-files",
+            "-z"
+          ],
+          "cwd": "/tmp/agentfs-git-workload-0wpgk6vq/agentfs-base/work",
+          "duration_seconds": 0.003662956994958222,
+          "returncode": 0,
+          "stderr_bytes": 0,
+          "stderr_tail": "",
+          "stdout_bytes": 263077,
+          "stdout_tail": "i_codex/api.py\u0000sdk/python/src/openai_codex/async_client.py\u0000sdk/python/src/openai_codex/client.py\u0000sdk/python/src/openai_codex/errors.py\u0000sdk/python/src/openai_codex/generated/__init__.py\u0000sdk/python/src/openai_codex/generated/notification_registry.py\u0000sdk/python/src/openai_codex/generated/v2_all.py\u0000sdk/python/src/openai_codex/models.py\u0000sdk/python/src/openai_codex/py.typed\u0000sdk/python/src/openai_codex/retry.py\u0000sdk/python/src/openai_codex/types.py\u0000sdk/python/tests/app_server_harness.py\u0000sdk/python/tests/app_server_helpers.py\u0000sdk/python/tests/conftest.py\u0000sdk/python/tests/test_app_server_approvals.py\u0000sdk/python/tests/test_app_server_inputs.py\u0000sdk/python/tests/test_app_server_lifecycle.py\u0000sdk/python/tests/test_app_server_login.py\u0000sdk/python/tests/test_app_server_run.py\u0000sdk/python/tests/test_app_server_streaming.py\u0000sdk/python/tests/test_app_server_turn_controls.py\u0000sdk/python/tests/test_artifact_workflow_and_binaries.py\u0000sdk/python/tests/test_async_client_behavior.py\u0000sdk/python/tests/test_client_rpc_methods.py\u0000sdk/python/tests/test_contract_generation.py\u0000sdk/python/tests/test_public_api_runtime_behavior.py\u0000sdk/python/tests/test_public_api_signatures.py\u0000sdk/python/tests/test_real_app_server_integration.py\u0000sdk/python/uv.lock\u0000sdk/typescript/.prettierignore\u0000sdk/typescript/.prettierrc\u0000sdk/typescript/README.md\u0000sdk/typescript/eslint.config.js\u0000sdk/typescript/jest.config.cjs\u0000sdk/typescript/package.json\u0000sdk/typescript/samples/basic_streaming.ts\u0000sdk/typescript/samples/helpers.ts\u0000sdk/typescript/samples/structured_output.ts\u0000sdk/typescript/samples/structured_output_zod.ts\u0000sdk/typescript/src/codex.ts\u0000sdk/typescript/src/codexOptions.ts\u0000sdk/typescript/src/events.ts\u0000sdk/typescript/src/exec.ts\u0000sdk/typescript/src/index.ts\u0000sdk/typescript/src/items.ts\u0000sdk/typescript/src/outputSchemaFile.ts\u0000sdk/typescript/src/thread.ts\u0000sdk/typescript/src/threadOptions.ts\u0000sdk/typescript/src/turnOptions.ts\u0000sdk/typescript/tests/abort.test.ts\u0000sdk/typescript/tests/codexExecSpy.ts\u0000sdk/typescript/tests/exec.test.ts\u0000sdk/typescript/tests/responsesProxy.ts\u0000sdk/typescript/tests/run.test.ts\u0000sdk/typescript/tests/runStreamed.test.ts\u0000sdk/typescript/tests/setupCodexHome.ts\u0000sdk/typescript/tests/testCodex.ts\u0000sdk/typescript/tsconfig.json\u0000sdk/typescript/tsup.config.ts\u0000third_party/v8/BUILD.bazel\u0000third_party/v8/README.md\u0000third_party/v8/libcxx.BUILD.bazel\u0000third_party/v8/libcxx_config/BUILD.bazel\u0000third_party/v8/libcxx_config/__assertion_handler\u0000third_party/v8/libcxx_config/__config_site\u0000third_party/v8/libcxxabi.BUILD.bazel\u0000third_party/v8/llvm_libc.BUILD.bazel\u0000third_party/v8/rusty_v8_147_4_0.sha256\u0000third_party/v8/v8_crate.BUILD.bazel\u0000third_party/wezterm/LICENSE\u0000tools/argument-comment-lint/.cargo/config.toml\u0000tools/argument-comment-lint/.gitignore\u0000tools/argument-comment-lint/BUILD.bazel\u0000tools/argument-comment-lint/Cargo.lock\u0000tools/argument-comment-lint/Cargo.toml\u0000tools/argument-comment-lint/README.md\u0000tools/argument-comment-lint/argument-comment-lint\u0000tools/argument-comment-lint/driver.rs\u0000tools/argument-comment-lint/lint_aspect.bzl\u0000tools/argument-comment-lint/list-bazel-targets.sh\u0000tools/argument-comment-lint/run-prebuilt-linter.py\u0000tools/argument-comment-lint/run.py\u0000tools/argument-comment-lint/rust-toolchain\u0000tools/argument-comment-lint/src/bin/argument-comment-lint.rs\u0000tools/argument-comment-lint/src/comment_parser.rs\u0000tools/argument-comment-lint/src/lib.rs\u0000tools/argument-comment-lint/test_wrapper_common.py\u0000tools/argument-comment-lint/ui/allow_char_literals.rs\u0000tools/argument-comment-lint/ui/allow_string_literals.rs\u0000tools/argument-comment-lint/ui/comment_matches.rs\u0000tools/argument-comment-lint/ui/comment_matches_multiline.rs\u0000tools/argument-comment-lint/ui/comment_mismatch.rs\u0000tools/argument-comment-lint/ui/comment_mismatch.stderr\u0000tools/argument-comment-lint/ui/ignore_external_methods.rs\u0000tools/argument-comment-lint/ui/uncommented_literal.rs\u0000tools/argument-comment-lint/ui/uncommented_literal.stderr\u0000tools/argument-comment-lint/wrapper_common.py\u0000workspace_root_test_launcher.bat.tpl\u0000workspace_root_test_launcher.sh.tpl\u0000"
+        },
+        "matches": 0,
+        "selected_files": [
+          ".bazelignore",
+          ".bazelrc",
+          ".bazelversion",
+          ".codespellignore",
+          ".codespellrc",
+          ".codex/environments/environment.toml",
+          ".codex/skills/babysit-pr/SKILL.md",
+          ".codex/skills/babysit-pr/agents/openai.yaml",
+          ".codex/skills/babysit-pr/references/github-api-notes.md",
+          ".codex/skills/babysit-pr/references/heuristics.md",
+          ".codex/skills/babysit-pr/scripts/gh_pr_watch.py",
+          ".codex/skills/babysit-pr/scripts/test_gh_pr_watch.py",
+          ".codex/skills/code-review-breaking-changes/SKILL.md",
+          ".codex/skills/code-review-change-size/SKILL.md",
+          ".codex/skills/code-review-context/SKILL.md",
+          ".codex/skills/code-review-testing/SKILL.md",
+          ".codex/skills/code-review/SKILL.md",
+          ".codex/skills/codex-bug/SKILL.md",
+          ".codex/skills/codex-issue-digest/SKILL.md",
+          ".codex/skills/codex-issue-digest/agents/openai.yaml",
+          ".codex/skills/codex-issue-digest/scripts/collect_issue_digest.py",
+          ".codex/skills/codex-issue-digest/scripts/test_collect_issue_digest.py",
+          ".codex/skills/codex-pr-body/SKILL.md",
+          ".codex/skills/remote-tests/SKILL.md",
+          ".codex/skills/test-tui/SKILL.md",
+          ".codex/skills/update-v8-version/SKILL.md",
+          ".codex/skills/update-v8-version/agents/openai.yaml",
+          ".devcontainer/Dockerfile",
+          ".devcontainer/Dockerfile.secure",
+          ".devcontainer/README.md",
+          ".devcontainer/codex-install/package.json",
+          ".devcontainer/codex-install/pnpm-lock.yaml"
+        ],
+        "token": "AGENTFS_TOKEN"
+      },
+      "total_seconds": 2.443190918012988
+    }
+  },
+  "base_tree": {
+    "after": {
+      "bytes": 9207621,
+      "directories": 10,
+      "files": 23,
+      "sha256": "6b77d3d519fcfe14792ffbe32553135d7e7d3e204b6965f7ba06a14f9ecf781c",
+      "symlinks": 0
+    },
+    "before": {
+      "bytes": 9207621,
+      "directories": 10,
+      "files": 23,
+      "sha256": "6b77d3d519fcfe14792ffbe32553135d7e7d3e204b6965f7ba06a14f9ecf781c",
+      "symlinks": 0
+    },
+    "unchanged": true
+  },
+  "benchmark": "phase7-git-workload",
+  "command": {
+    "agentfs_prefix": [
+      "/home/ain3sh/factory/vfs-bench-phase0/cli/target/release/agentfs",
+      "run",
+      "--session",
+      "git-workload-d6c2c5cb776c4aaea77f8daab1d832a5",
+      "--no-default-allows",
+      "--"
+    ],
+    "argv": [
+      "/home/ain3sh/factory/vfs/scripts/validation/git-workload-benchmark.py",
+      "--timeout",
+      "900",
+      "--source",
+      "/home/ain3sh/factory/vfs/.agents/benchmarks/fixtures/codex",
+      "--read-files",
+      "32",
+      "--read-bytes",
+      "4096",
+      "--edit-files",
+      "4",
+      "--skip-fsck",
+      "--output",
+      "/home/ain3sh/factory/vfs/.agents/benchmarks/baseline-main-codex.json"
+    ],
+    "workload_argv": [
+      "/usr/bin/python3",
+      "-c",
+      "\nimport argparse\nimport hashlib\nimport json\nimport os\nimport subprocess\nimport sys\nimport time\nfrom pathlib import Path\n\n\nOUTPUT_TAIL_CHARS = 4000\n\n\ndef tail_text(value):\n    if value is None:\n        return \"\"\n    if isinstance(value, bytes):\n        text = value.decode(\"utf-8\", errors=\"replace\")\n    else:\n        text = str(value)\n    if len(text) <= OUTPUT_TAIL_CHARS:\n        return text\n    return text[-OUTPUT_TAIL_CHARS:]\n\n\ndef git_env():\n    env = os.environ.copy()\n    env.setdefault(\"GIT_CONFIG_NOSYSTEM\", \"1\")\n    env.setdefault(\"GIT_TERMINAL_PROMPT\", \"0\")\n    env.setdefault(\"NO_COLOR\", \"1\")\n    env.setdefault(\"LC_ALL\", \"C\")\n    return env\n\n\ndef run_git(argv, cwd):\n    started = time.perf_counter()\n    proc = subprocess.run(\n        [\"git\"] + argv,\n        cwd=str(cwd),\n        env=git_env(),\n        text=True,\n        stdout=subprocess.PIPE,\n        stderr=subprocess.PIPE,\n    )\n    return {\n        \"argv\": [\"git\"] + argv,\n        \"cwd\": str(cwd),\n        \"duration_seconds\": time.perf_counter() - started,\n        \"returncode\": proc.returncode,\n        \"stdout_tail\": tail_text(proc.stdout),\n        \"stderr_tail\": tail_text(proc.stderr),\n        \"stdout_bytes\": len((proc.stdout or \"\").encode(\"utf-8\", errors=\"replace\")),\n        \"stderr_bytes\": len((proc.stderr or \"\").encode(\"utf-8\", errors=\"replace\")),\n        \"stdout\": proc.stdout,\n    }\n\n\ndef require_ok(record, phase):\n    if record[\"returncode\"] != 0:\n        raise RuntimeError(\n            f\"{phase} failed with exit {record['returncode']}: {record['stderr_tail']}\"\n        )\n\n\ndef bounded_read_search(workdir, max_files, read_bytes, token):\n    started = time.perf_counter()\n    ls_files = run_git([\"ls-files\", \"-z\"], workdir)\n    require_ok(ls_files, \"ls-files\")\n    paths = [item for item in ls_files[\"stdout\"].split(\"\\0\") if item]\n    digest = hashlib.sha256()\n    scanned = 0\n    bytes_read = 0\n    matches = 0\n    selected = []\n    for rel in paths:\n        if scanned >= max_files:\n            break\n        path = workdir / rel\n        if not path.is_file():\n            continue\n        data = path.read_bytes()[:read_bytes]\n        digest.update(rel.encode(\"utf-8\"))\n        digest.update(b\"\\0\")\n        digest.update(str(path.stat().st_size).encode(\"ascii\"))\n        digest.update(b\"\\0\")\n        digest.update(data)\n        matches += data.count(token.encode(\"utf-8\"))\n        bytes_read += len(data)\n        scanned += 1\n        selected.append(rel)\n    return {\n        \"duration_seconds\": time.perf_counter() - started,\n        \"ls_files_run\": {key: value for key, value in ls_files.items() if key != \"stdout\"},\n        \"digest\": digest.hexdigest(),\n        \"files_total\": len(paths),\n        \"files_scanned\": scanned,\n        \"bytes_read\": bytes_read,\n        \"token\": token,\n        \"matches\": matches,\n        \"selected_files\": selected,\n        \"all_files\": paths,\n    }\n\n\ndef representative_edit_paths(paths, limit):\n    preferred_prefixes = (\"src/\", \"tests/\", \"docs/\")\n    selected = []\n    for prefix in preferred_prefixes:\n        for rel in paths:\n            if rel.startswith(prefix) and rel not in selected:\n                selected.append(rel)\n                if len(selected) >= limit:\n                    return selected\n    for rel in paths:\n        if rel not in selected:\n            selected.append(rel)\n            if len(selected) >= limit:\n                return selected\n    return selected\n\n\ndef edit_files(workdir, paths, limit):\n    started = time.perf_counter()\n    selected = representative_edit_paths(paths, limit)\n    edits = []\n    for index, rel in enumerate(selected):\n        path = workdir / rel\n        before_size = path.stat().st_size\n        payload = f\"\\nAgentFS Git benchmark edit {index:02d} for {rel}\\n\".encode(\"utf-8\")\n        with path.open(\"ab\", buffering=0) as handle:\n            handle.write(payload)\n            handle.flush()\n            os.fsync(handle.fileno())\n        edits.append(\n            {\n                \"path\": rel,\n                \"size_before\": before_size,\n                \"size_after\": path.stat().st_size,\n                \"appended_bytes\": len(payload),\n            }\n        )\n    return {\"duration_seconds\": time.perf_counter() - started, \"changed_files\": selected, \"edits\": edits}\n\n\ndef diff_summary(workdir):\n    started = time.perf_counter()\n    name_only = run_git([\"diff\", \"--name-only\", \"--\"], workdir)\n    require_ok(name_only, \"diff --name-only\")\n    stat = run_git([\"diff\", \"--stat\", \"--\"], workdir)\n    require_ok(stat, \"diff --stat\")\n    patch = run_git([\"diff\", \"--\", \".\"], workdir)\n    require_ok(patch, \"diff\")\n    changed = [line for line in name_only[\"stdout\"].splitlines() if line]\n    patch_bytes = patch[\"stdout\"].encode(\"utf-8\", errors=\"replace\")\n    return {\n        \"duration_seconds\": time.perf_counter() - started,\n        \"changed_files\": changed,\n        \"changed_file_count\": len(changed),\n        \"stat_stdout\": stat[\"stdout_tail\"],\n        \"patch_sha256\": hashlib.sha256(patch_bytes).hexdigest(),\n        \"patch_bytes\": len(patch_bytes),\n        \"runs\": {\n            \"name_only\": {key: value for key, value in name_only.items() if key != \"stdout\"},\n            \"stat\": {key: value for key, value in stat.items() if key != \"stdout\"},\n            \"patch\": {key: value for key, value in patch.items() if key != \"stdout\"},\n        },\n    }\n\n\ndef main(argv):\n    parser = argparse.ArgumentParser()\n    parser.add_argument(\"--mirror\", default=\"mirror.git\")\n    parser.add_argument(\"--work-dir\", default=\"work\")\n    parser.add_argument(\"--read-files\", type=int, required=True)\n    parser.add_argument(\"--read-bytes\", type=int, required=True)\n    parser.add_argument(\"--edit-files\", type=int, required=True)\n    parser.add_argument(\"--search-token\", default=\"AGENTFS_TOKEN\")\n    parser.add_argument(\"--skip-fsck\", action=\"store_true\")\n    args = parser.parse_args(argv)\n\n    root = Path.cwd()\n    mirror = root / args.mirror\n    workdir = root / args.work_dir\n    phase_seconds = {}\n    phase_runs = {}\n    started_total = time.perf_counter()\n\n    started = time.perf_counter()\n    clone = run_git([\"clone\", \"--local\", \"--no-hardlinks\", str(mirror), str(workdir)], root)\n    require_ok(clone, \"clone\")\n    phase_seconds[\"clone\"] = time.perf_counter() - started\n    phase_runs[\"clone\"] = {key: value for key, value in clone.items() if key != \"stdout\"}\n\n    started = time.perf_counter()\n    checkout = run_git([\"checkout\", \"-B\", \"agentfs-benchmark\"], workdir)\n    require_ok(checkout, \"checkout\")\n    head = run_git([\"rev-parse\", \"HEAD\"], workdir)\n    require_ok(head, \"rev-parse\")\n    phase_seconds[\"checkout\"] = time.perf_counter() - started\n    phase_runs[\"checkout\"] = {key: value for key, value in checkout.items() if key != \"stdout\"}\n\n    started = time.perf_counter()\n    status_initial = run_git([\"status\", \"--short\"], workdir)\n    require_ok(status_initial, \"status\")\n    branch_status = run_git([\"status\", \"--short\", \"--branch\"], workdir)\n    require_ok(branch_status, \"status --branch\")\n    phase_seconds[\"status\"] = time.perf_counter() - started\n    phase_runs[\"status\"] = {\n        \"short\": {key: value for key, value in status_initial.items() if key != \"stdout\"},\n        \"branch\": {key: value for key, value in branch_status.items() if key != \"stdout\"},\n    }\n\n    read_search = bounded_read_search(workdir, args.read_files, args.read_bytes, args.search_token)\n    phase_seconds[\"read_search\"] = read_search[\"duration_seconds\"]\n\n    edits = edit_files(workdir, read_search[\"all_files\"], args.edit_files)\n    phase_seconds[\"edit\"] = edits[\"duration_seconds\"]\n\n    diff = diff_summary(workdir)\n    phase_seconds[\"diff\"] = diff[\"duration_seconds\"]\n\n    fsck = {\"ran\": False, \"ok\": None, \"run\": None}\n    if not args.skip_fsck:\n        started = time.perf_counter()\n        fsck_run = run_git([\"fsck\", \"--strict\"], workdir)\n        phase_seconds[\"fsck\"] = time.perf_counter() - started\n        fsck = {\n            \"ran\": True,\n            \"ok\": fsck_run[\"returncode\"] == 0,\n            \"run\": {key: value for key, value in fsck_run.items() if key != \"stdout\"},\n        }\n        require_ok(fsck_run, \"fsck\")\n    else:\n        phase_seconds[\"fsck\"] = 0.0\n\n    total_seconds = time.perf_counter() - started_total\n    print(\n        json.dumps(\n            {\n                \"head_commit\": head[\"stdout\"].strip(),\n                \"phase_seconds\": phase_seconds,\n                \"total_seconds\": total_seconds,\n                \"phase_runs\": phase_runs,\n                \"initial_status\": status_initial[\"stdout\"],\n                \"branch_status\": branch_status[\"stdout\"],\n                \"read_search\": {\n                    key: value\n                    for key, value in read_search.items()\n                    if key not in {\"duration_seconds\", \"all_files\"}\n                },\n                \"edits\": edits,\n                \"diff\": diff,\n                \"fsck\": fsck,\n            },\n            sort_keys=True,\n        )\n    )\n\n\ntry:\n    main(sys.argv[1:])\nexcept Exception as exc:\n    print(json.dumps({\"error\": str(exc)}, sort_keys=True))\n    raise\n",
+      "--read-files",
+      "32",
+      "--read-bytes",
+      "4096",
+      "--edit-files",
+      "4",
+      "--search-token",
+      "AGENTFS_TOKEN",
+      "--skip-fsck"
+    ]
+  },
+  "correctness": {
+    "agentfs_backup_verify": false,
+    "agentfs_base_unchanged": true,
+    "agentfs_db_inspectable": false,
+    "agentfs_integrity_require_portable": false,
+    "agentfs_no_nonempty_sidecars": false,
+    "agentfs_portable": false,
+    "agentfs_returncode_zero": true,
+    "equivalence": {
+      "agentfs": {
+        "diff": {
+          "changed_file_count": 4,
+          "changed_files": [
+            "docs/CLA.md",
+            "docs/agents_md.md",
+            "docs/authentication.md",
+            "docs/config.md"
+          ],
+          "patch_bytes": 1786,
+          "patch_sha256": "cff609abc3a92f6dfb55c6da3cbf0e06c321ccfac3bfb6e767894ece6cf273be"
+        },
+        "edits": {
+          "changed_files": [
+            "docs/CLA.md",
+            "docs/agents_md.md",
+            "docs/authentication.md",
+            "docs/config.md"
+          ],
+          "edits": [
+            {
+              "appended_bytes": 47,
+              "path": "docs/CLA.md",
+              "size_after": 2106,
+              "size_before": 2059
+            },
+            {
+              "appended_bytes": 53,
+              "path": "docs/agents_md.md",
+              "size_after": 462,
+              "size_before": 409
+            },
+            {
+              "appended_bytes": 58,
+              "path": "docs/authentication.md",
+              "size_after": 192,
+              "size_before": 134
+            },
+            {
+              "appended_bytes": 50,
+              "path": "docs/config.md",
+              "size_after": 776,
+              "size_before": 726
+            }
+          ]
+        },
+        "fsck": {
+          "ok": null,
+          "ran": false
+        },
+        "head_commit": "7d47056ea42636271ac020b86347fbbef49490aa",
+        "initial_status": "",
+        "read_search": {
+          "bytes_read": 60315,
+          "digest": "a1e64893e4779f5d09d0408777c2a9aa38fd104ccfb850858c413e514d788e91",
+          "files_scanned": 32,
+          "files_total": 4644,
+          "matches": 0,
+          "selected_files": [
+            ".bazelignore",
+            ".bazelrc",
+            ".bazelversion",
+            ".codespellignore",
+            ".codespellrc",
+            ".codex/environments/environment.toml",
+            ".codex/skills/babysit-pr/SKILL.md",
+            ".codex/skills/babysit-pr/agents/openai.yaml",
+            ".codex/skills/babysit-pr/references/github-api-notes.md",
+            ".codex/skills/babysit-pr/references/heuristics.md",
+            ".codex/skills/babysit-pr/scripts/gh_pr_watch.py",
+            ".codex/skills/babysit-pr/scripts/test_gh_pr_watch.py",
+            ".codex/skills/code-review-breaking-changes/SKILL.md",
+            ".codex/skills/code-review-change-size/SKILL.md",
+            ".codex/skills/code-review-context/SKILL.md",
+            ".codex/skills/code-review-testing/SKILL.md",
+            ".codex/skills/code-review/SKILL.md",
+            ".codex/skills/codex-bug/SKILL.md",
+            ".codex/skills/codex-issue-digest/SKILL.md",
+            ".codex/skills/codex-issue-digest/agents/openai.yaml",
+            ".codex/skills/codex-issue-digest/scripts/collect_issue_digest.py",
+            ".codex/skills/codex-issue-digest/scripts/test_collect_issue_digest.py",
+            ".codex/skills/codex-pr-body/SKILL.md",
+            ".codex/skills/remote-tests/SKILL.md",
+            ".codex/skills/test-tui/SKILL.md",
+            ".codex/skills/update-v8-version/SKILL.md",
+            ".codex/skills/update-v8-version/agents/openai.yaml",
+            ".devcontainer/Dockerfile",
+            ".devcontainer/Dockerfile.secure",
+            ".devcontainer/README.md",
+            ".devcontainer/codex-install/package.json",
+            ".devcontainer/codex-install/pnpm-lock.yaml"
+          ]
+        }
+      },
+      "checked": true,
+      "equivalent": true,
+      "native": {
+        "diff": {
+          "changed_file_count": 4,
+          "changed_files": [
+            "docs/CLA.md",
+            "docs/agents_md.md",
+            "docs/authentication.md",
+            "docs/config.md"
+          ],
+          "patch_bytes": 1786,
+          "patch_sha256": "cff609abc3a92f6dfb55c6da3cbf0e06c321ccfac3bfb6e767894ece6cf273be"
+        },
+        "edits": {
+          "changed_files": [
+            "docs/CLA.md",
+            "docs/agents_md.md",
+            "docs/authentication.md",
+            "docs/config.md"
+          ],
+          "edits": [
+            {
+              "appended_bytes": 47,
+              "path": "docs/CLA.md",
+              "size_after": 2106,
+              "size_before": 2059
+            },
+            {
+              "appended_bytes": 53,
+              "path": "docs/agents_md.md",
+              "size_after": 462,
+              "size_before": 409
+            },
+            {
+              "appended_bytes": 58,
+              "path": "docs/authentication.md",
+              "size_after": 192,
+              "size_before": 134
+            },
+            {
+              "appended_bytes": 50,
+              "path": "docs/config.md",
+              "size_after": 776,
+              "size_before": 726
+            }
+          ]
+        },
+        "fsck": {
+          "ok": null,
+          "ran": false
+        },
+        "head_commit": "7d47056ea42636271ac020b86347fbbef49490aa",
+        "initial_status": "",
+        "read_search": {
+          "bytes_read": 60315,
+          "digest": "a1e64893e4779f5d09d0408777c2a9aa38fd104ccfb850858c413e514d788e91",
+          "files_scanned": 32,
+          "files_total": 4644,
+          "matches": 0,
+          "selected_files": [
+            ".bazelignore",
+            ".bazelrc",
+            ".bazelversion",
+            ".codespellignore",
+            ".codespellrc",
+            ".codex/environments/environment.toml",
+            ".codex/skills/babysit-pr/SKILL.md",
+            ".codex/skills/babysit-pr/agents/openai.yaml",
+            ".codex/skills/babysit-pr/references/github-api-notes.md",
+            ".codex/skills/babysit-pr/references/heuristics.md",
+            ".codex/skills/babysit-pr/scripts/gh_pr_watch.py",
+            ".codex/skills/babysit-pr/scripts/test_gh_pr_watch.py",
+            ".codex/skills/code-review-breaking-changes/SKILL.md",
+            ".codex/skills/code-review-change-size/SKILL.md",
+            ".codex/skills/code-review-context/SKILL.md",
+            ".codex/skills/code-review-testing/SKILL.md",
+            ".codex/skills/code-review/SKILL.md",
+            ".codex/skills/codex-bug/SKILL.md",
+            ".codex/skills/codex-issue-digest/SKILL.md",
+            ".codex/skills/codex-issue-digest/agents/openai.yaml",
+            ".codex/skills/codex-issue-digest/scripts/collect_issue_digest.py",
+            ".codex/skills/codex-issue-digest/scripts/test_collect_issue_digest.py",
+            ".codex/skills/codex-pr-body/SKILL.md",
+            ".codex/skills/remote-tests/SKILL.md",
+            ".codex/skills/test-tui/SKILL.md",
+            ".codex/skills/update-v8-version/SKILL.md",
+            ".codex/skills/update-v8-version/agents/openai.yaml",
+            ".devcontainer/Dockerfile",
+            ".devcontainer/Dockerfile.secure",
+            ".devcontainer/README.md",
+            ".devcontainer/codex-install/package.json",
+            ".devcontainer/codex-install/pnpm-lock.yaml"
+          ]
+        }
+      }
+    },
+    "native_returncode_zero": true,
+    "passed": false,
+    "performance_passed": false
+  },
+  "database": {
+    "after": {
+      "artifacts": [
+        {
+          "bytes": 72740864,
+          "path": "/tmp/agentfs-git-workload-0wpgk6vq/home/.agentfs/run/git-workload-d6c2c5cb776c4aaea77f8daab1d832a5/delta.db"
+        },
+        {
+          "bytes": 22948432,
+          "path": "/tmp/agentfs-git-workload-0wpgk6vq/home/.agentfs/run/git-workload-d6c2c5cb776c4aaea77f8daab1d832a5/delta.db-wal"
+        }
+      ],
+      "path": "/tmp/agentfs-git-workload-0wpgk6vq/home/.agentfs/run/git-workload-d6c2c5cb776c4aaea77f8daab1d832a5/delta.db",
+      "total_bytes": 95689296
+    },
+    "backup": {
+      "artifacts": {
+        "artifacts": [],
+        "path": "/tmp/agentfs-git-workload-0wpgk6vq/git-workload-backup.db",
+        "total_bytes": 0
+      },
+      "inspect": {
+        "inspectable": false,
+        "reason": "database file does not exist"
+      },
+      "path": "/tmp/agentfs-git-workload-0wpgk6vq/git-workload-backup.db",
+      "run": {
+        "argv": [
+          "/home/ain3sh/factory/vfs-bench-phase0/cli/target/release/agentfs",
+          "backup",
+          "/tmp/agentfs-git-workload-0wpgk6vq/home/.agentfs/run/git-workload-d6c2c5cb776c4aaea77f8daab1d832a5/delta.db",
+          "/tmp/agentfs-git-workload-0wpgk6vq/git-workload-backup.db",
+          "--verify"
+        ],
+        "cwd": "/tmp/agentfs-git-workload-0wpgk6vq",
+        "duration_seconds": 0.002646894019562751,
+        "profile_summaries": [],
+        "returncode": 2,
+        "stderr_bytes": 103,
+        "stderr_tail": "error: unrecognized subcommand 'backup'\n\nUsage: agentfs <COMMAND>\n\nFor more information, try '--help'.\n",
+        "stdout_bytes": 0,
+        "stdout_tail": "",
+        "timed_out": false
+      }
+    },
+    "inspect_after": {
+      "inspectable": false,
+      "reason": "no such column: storage_kind"
+    },
+    "integrity": {
+      "result": null,
+      "run": {
+        "argv": [
+          "/home/ain3sh/factory/vfs-bench-phase0/cli/target/release/agentfs",
+          "integrity",
+          "/tmp/agentfs-git-workload-0wpgk6vq/home/.agentfs/run/git-workload-d6c2c5cb776c4aaea77f8daab1d832a5/delta.db",
+          "--json",
+          "--require-portable"
+        ],
+        "cwd": "/tmp/agentfs-git-workload-0wpgk6vq",
+        "duration_seconds": 0.0033583890181034803,
+        "profile_summaries": [],
+        "returncode": 2,
+        "stderr_bytes": 106,
+        "stderr_tail": "error: unrecognized subcommand 'integrity'\n\nUsage: agentfs <COMMAND>\n\nFor more information, try '--help'.\n",
+        "stdout_bytes": 0,
+        "stdout_tail": "",
+        "timed_out": false
+      }
+    },
+    "nonempty_sidecars": true
+  },
+  "environment": {
+    "AGENTFS_BIN": "/home/ain3sh/factory/vfs-bench-phase0/cli/target/release/agentfs",
+    "AGENTFS_PROFILE": "1"
+  },
+  "git_commit": "caf308a6a1994e0b0ab5dbaf022fe83eb3fa84eb",
+  "kept_temp": false,
+  "native": {
+    "run": {
+      "argv": [
+        "/usr/bin/python3",
+        "-c",
+        "\nimport argparse\nimport hashlib\nimport json\nimport os\nimport subprocess\nimport sys\nimport time\nfrom pathlib import Path\n\n\nOUTPUT_TAIL_CHARS = 4000\n\n\ndef tail_text(value):\n    if value is None:\n        return \"\"\n    if isinstance(value, bytes):\n        text = value.decode(\"utf-8\", errors=\"replace\")\n    else:\n        text = str(value)\n    if len(text) <= OUTPUT_TAIL_CHARS:\n        return text\n    return text[-OUTPUT_TAIL_CHARS:]\n\n\ndef git_env():\n    env = os.environ.copy()\n    env.setdefault(\"GIT_CONFIG_NOSYSTEM\", \"1\")\n    env.setdefault(\"GIT_TERMINAL_PROMPT\", \"0\")\n    env.setdefault(\"NO_COLOR\", \"1\")\n    env.setdefault(\"LC_ALL\", \"C\")\n    return env\n\n\ndef run_git(argv, cwd):\n    started = time.perf_counter()\n    proc = subprocess.run(\n        [\"git\"] + argv,\n        cwd=str(cwd),\n        env=git_env(),\n        text=True,\n        stdout=subprocess.PIPE,\n        stderr=subprocess.PIPE,\n    )\n    return {\n        \"argv\": [\"git\"] + argv,\n        \"cwd\": str(cwd),\n        \"duration_seconds\": time.perf_counter() - started,\n        \"returncode\": proc.returncode,\n        \"stdout_tail\": tail_text(proc.stdout),\n        \"stderr_tail\": tail_text(proc.stderr),\n        \"stdout_bytes\": len((proc.stdout or \"\").encode(\"utf-8\", errors=\"replace\")),\n        \"stderr_bytes\": len((proc.stderr or \"\").encode(\"utf-8\", errors=\"replace\")),\n        \"stdout\": proc.stdout,\n    }\n\n\ndef require_ok(record, phase):\n    if record[\"returncode\"] != 0:\n        raise RuntimeError(\n            f\"{phase} failed with exit {record['returncode']}: {record['stderr_tail']}\"\n        )\n\n\ndef bounded_read_search(workdir, max_files, read_bytes, token):\n    started = time.perf_counter()\n    ls_files = run_git([\"ls-files\", \"-z\"], workdir)\n    require_ok(ls_files, \"ls-files\")\n    paths = [item for item in ls_files[\"stdout\"].split(\"\\0\") if item]\n    digest = hashlib.sha256()\n    scanned = 0\n    bytes_read = 0\n    matches = 0\n    selected = []\n    for rel in paths:\n        if scanned >= max_files:\n            break\n        path = workdir / rel\n        if not path.is_file():\n            continue\n        data = path.read_bytes()[:read_bytes]\n        digest.update(rel.encode(\"utf-8\"))\n        digest.update(b\"\\0\")\n        digest.update(str(path.stat().st_size).encode(\"ascii\"))\n        digest.update(b\"\\0\")\n        digest.update(data)\n        matches += data.count(token.encode(\"utf-8\"))\n        bytes_read += len(data)\n        scanned += 1\n        selected.append(rel)\n    return {\n        \"duration_seconds\": time.perf_counter() - started,\n        \"ls_files_run\": {key: value for key, value in ls_files.items() if key != \"stdout\"},\n        \"digest\": digest.hexdigest(),\n        \"files_total\": len(paths),\n        \"files_scanned\": scanned,\n        \"bytes_read\": bytes_read,\n        \"token\": token,\n        \"matches\": matches,\n        \"selected_files\": selected,\n        \"all_files\": paths,\n    }\n\n\ndef representative_edit_paths(paths, limit):\n    preferred_prefixes = (\"src/\", \"tests/\", \"docs/\")\n    selected = []\n    for prefix in preferred_prefixes:\n        for rel in paths:\n            if rel.startswith(prefix) and rel not in selected:\n                selected.append(rel)\n                if len(selected) >= limit:\n                    return selected\n    for rel in paths:\n        if rel not in selected:\n            selected.append(rel)\n            if len(selected) >= limit:\n                return selected\n    return selected\n\n\ndef edit_files(workdir, paths, limit):\n    started = time.perf_counter()\n    selected = representative_edit_paths(paths, limit)\n    edits = []\n    for index, rel in enumerate(selected):\n        path = workdir / rel\n        before_size = path.stat().st_size\n        payload = f\"\\nAgentFS Git benchmark edit {index:02d} for {rel}\\n\".encode(\"utf-8\")\n        with path.open(\"ab\", buffering=0) as handle:\n            handle.write(payload)\n            handle.flush()\n            os.fsync(handle.fileno())\n        edits.append(\n            {\n                \"path\": rel,\n                \"size_before\": before_size,\n                \"size_after\": path.stat().st_size,\n                \"appended_bytes\": len(payload),\n            }\n        )\n    return {\"duration_seconds\": time.perf_counter() - started, \"changed_files\": selected, \"edits\": edits}\n\n\ndef diff_summary(workdir):\n    started = time.perf_counter()\n    name_only = run_git([\"diff\", \"--name-only\", \"--\"], workdir)\n    require_ok(name_only, \"diff --name-only\")\n    stat = run_git([\"diff\", \"--stat\", \"--\"], workdir)\n    require_ok(stat, \"diff --stat\")\n    patch = run_git([\"diff\", \"--\", \".\"], workdir)\n    require_ok(patch, \"diff\")\n    changed = [line for line in name_only[\"stdout\"].splitlines() if line]\n    patch_bytes = patch[\"stdout\"].encode(\"utf-8\", errors=\"replace\")\n    return {\n        \"duration_seconds\": time.perf_counter() - started,\n        \"changed_files\": changed,\n        \"changed_file_count\": len(changed),\n        \"stat_stdout\": stat[\"stdout_tail\"],\n        \"patch_sha256\": hashlib.sha256(patch_bytes).hexdigest(),\n        \"patch_bytes\": len(patch_bytes),\n        \"runs\": {\n            \"name_only\": {key: value for key, value in name_only.items() if key != \"stdout\"},\n            \"stat\": {key: value for key, value in stat.items() if key != \"stdout\"},\n            \"patch\": {key: value for key, value in patch.items() if key != \"stdout\"},\n        },\n    }\n\n\ndef main(argv):\n    parser = argparse.ArgumentParser()\n    parser.add_argument(\"--mirror\", default=\"mirror.git\")\n    parser.add_argument(\"--work-dir\", default=\"work\")\n    parser.add_argument(\"--read-files\", type=int, required=True)\n    parser.add_argument(\"--read-bytes\", type=int, required=True)\n    parser.add_argument(\"--edit-files\", type=int, required=True)\n    parser.add_argument(\"--search-token\", default=\"AGENTFS_TOKEN\")\n    parser.add_argument(\"--skip-fsck\", action=\"store_true\")\n    args = parser.parse_args(argv)\n\n    root = Path.cwd()\n    mirror = root / args.mirror\n    workdir = root / args.work_dir\n    phase_seconds = {}\n    phase_runs = {}\n    started_total = time.perf_counter()\n\n    started = time.perf_counter()\n    clone = run_git([\"clone\", \"--local\", \"--no-hardlinks\", str(mirror), str(workdir)], root)\n    require_ok(clone, \"clone\")\n    phase_seconds[\"clone\"] = time.perf_counter() - started\n    phase_runs[\"clone\"] = {key: value for key, value in clone.items() if key != \"stdout\"}\n\n    started = time.perf_counter()\n    checkout = run_git([\"checkout\", \"-B\", \"agentfs-benchmark\"], workdir)\n    require_ok(checkout, \"checkout\")\n    head = run_git([\"rev-parse\", \"HEAD\"], workdir)\n    require_ok(head, \"rev-parse\")\n    phase_seconds[\"checkout\"] = time.perf_counter() - started\n    phase_runs[\"checkout\"] = {key: value for key, value in checkout.items() if key != \"stdout\"}\n\n    started = time.perf_counter()\n    status_initial = run_git([\"status\", \"--short\"], workdir)\n    require_ok(status_initial, \"status\")\n    branch_status = run_git([\"status\", \"--short\", \"--branch\"], workdir)\n    require_ok(branch_status, \"status --branch\")\n    phase_seconds[\"status\"] = time.perf_counter() - started\n    phase_runs[\"status\"] = {\n        \"short\": {key: value for key, value in status_initial.items() if key != \"stdout\"},\n        \"branch\": {key: value for key, value in branch_status.items() if key != \"stdout\"},\n    }\n\n    read_search = bounded_read_search(workdir, args.read_files, args.read_bytes, args.search_token)\n    phase_seconds[\"read_search\"] = read_search[\"duration_seconds\"]\n\n    edits = edit_files(workdir, read_search[\"all_files\"], args.edit_files)\n    phase_seconds[\"edit\"] = edits[\"duration_seconds\"]\n\n    diff = diff_summary(workdir)\n    phase_seconds[\"diff\"] = diff[\"duration_seconds\"]\n\n    fsck = {\"ran\": False, \"ok\": None, \"run\": None}\n    if not args.skip_fsck:\n        started = time.perf_counter()\n        fsck_run = run_git([\"fsck\", \"--strict\"], workdir)\n        phase_seconds[\"fsck\"] = time.perf_counter() - started\n        fsck = {\n            \"ran\": True,\n            \"ok\": fsck_run[\"returncode\"] == 0,\n            \"run\": {key: value for key, value in fsck_run.items() if key != \"stdout\"},\n        }\n        require_ok(fsck_run, \"fsck\")\n    else:\n        phase_seconds[\"fsck\"] = 0.0\n\n    total_seconds = time.perf_counter() - started_total\n    print(\n        json.dumps(\n            {\n                \"head_commit\": head[\"stdout\"].strip(),\n                \"phase_seconds\": phase_seconds,\n                \"total_seconds\": total_seconds,\n                \"phase_runs\": phase_runs,\n                \"initial_status\": status_initial[\"stdout\"],\n                \"branch_status\": branch_status[\"stdout\"],\n                \"read_search\": {\n                    key: value\n                    for key, value in read_search.items()\n                    if key not in {\"duration_seconds\", \"all_files\"}\n                },\n                \"edits\": edits,\n                \"diff\": diff,\n                \"fsck\": fsck,\n            },\n            sort_keys=True,\n        )\n    )\n\n\ntry:\n    main(sys.argv[1:])\nexcept Exception as exc:\n    print(json.dumps({\"error\": str(exc)}, sort_keys=True))\n    raise\n",
+        "--read-files",
+        "32",
+        "--read-bytes",
+        "4096",
+        "--edit-files",
+        "4",
+        "--search-token",
+        "AGENTFS_TOKEN",
+        "--skip-fsck"
+      ],
+      "cwd": "/tmp/agentfs-git-workload-0wpgk6vq/native",
+      "duration_seconds": 0.8760354300029576,
+      "profile_summaries": [],
+      "returncode": 0,
+      "stderr_bytes": 0,
+      "stderr_tail": "",
+      "stdout_bytes": 11897,
+      "stdout_tail": "{\"branch_status\": \"## agentfs-benchmark\\n\", \"diff\": {\"changed_file_count\": 4, \"changed_files\": [\"docs/CLA.md\", \"docs/agents_md.md\", \"docs/authentication.md\", \"docs/config.md\"], \"duration_seconds\": 0.24908075400162488, \"patch_bytes\": 1786, \"patch_sha256\": \"cff609abc3a92f6dfb55c6da3cbf0e06c321ccfac3bfb6e767894ece6cf273be\", \"runs\": {\"name_only\": {\"argv\": [\"git\", \"diff\", \"--name-only\", \"--\"], \"cwd\": \"/tmp/agentfs-git-workload-0wpgk6vq/native/work\", \"duration_seconds\": 0.0828525919932872, \"returncode\": 0, \"stderr_bytes\": 0, \"stderr_tail\": \"\", \"stdout_bytes\": 68, \"stdout_tail\": \"docs/CLA.md\\ndocs/agents_md.md\\ndocs/authentication.md\\ndocs/config.md\\n\"}, \"patch\": {\"argv\": [\"git\", \"diff\", \"--\", \".\"], \"cwd\": \"/tmp/agentfs-git-workload-0wpgk6vq/native/work\", \"duration_seconds\": 0.08327719895169139, \"returncode\": 0, \"stderr_bytes\": 0, \"stderr_tail\": \"\", \"stdout_bytes\": 1786, \"stdout_tail\": \"diff --git a/docs/CLA.md b/docs/CLA.md\\nindex 804f202..3495ac9 100644\\n--- a/docs/CLA.md\\n+++ b/docs/CLA.md\\n@@ -47,3 +47,5 @@ entity under this CLA terminate.\\n This Agreement is governed by the laws of the **State of California**, USA,\\n excluding its conflict\\u2011of\\u2011laws rules. If any provision is held unenforceable,\\n the remaining provisions remain in force.\\n+\\n+AgentFS Git benchmark edit 00 for docs/CLA.md\\ndiff --git a/docs/agents_md.md b/docs/agents_md.md\\nindex 3df0fac..b8b063d 100644\\n--- a/docs/agents_md.md\\n+++ b/docs/agents_md.md\\n@@ -5,3 +5,5 @@ For information about AGENTS.md, see [this documentation](https://developers.ope\\n ## Hierarchical agents message\\n \\n When the `child_agents_md` feature flag is enabled (via `[features]` in `config.toml`), Codex appends additional guidance about AGENTS.md scope and precedence to the user instructions message and emits that message even when no AGENTS.md is present.\\n+\\n+AgentFS Git benchmark edit 01 for docs/agents_md.md\\ndiff --git a/docs/authentication.md b/docs/authentication.md\\nindex c307349..b3bc9dc 100644\\n--- a/docs/authentication.md\\n+++ b/docs/authentication.md\\n@@ -1,3 +1,5 @@\\n # Authentication\\n \\n For information about Codex CLI authentication, see [this documentation](https://developers.openai.com/codex/auth).\\n+\\n+AgentFS Git benchmark edit 02 for docs/authentication.md\\ndiff --git a/docs/config.md b/docs/config.md\\nindex d35b0a8..030e278 100644\\n--- a/docs/config.md\\n+++ b/docs/config.md\\n@@ -13,3 +13,5 @@ Admins can set top-level `allow_managed_hooks_only = true` in\\n still allowing managed hooks from requirements and managed config layers. This\\n setting is only supported in `requirements.toml`; putting it in `config.toml`\\n does not enable managed-hooks-only mode.\\n+\\n+AgentFS Git benchmark edit 03 for docs/config.md\\n\"}, \"stat\": {\"argv\": [\"git\", \"diff\", \"--stat\", \"--\"], \"cwd\": \"/tmp/agentfs-git-workload-0wpgk6vq/native/work\", \"duration_seconds\": 0.08291632798500359, \"returncode\": 0, \"stderr_bytes\": 0, \"stderr_tail\": \"\", \"stdout_bytes\": 158, \"stdout_tail\": \" docs/CLA.md            | 2 ++\\n docs/agents_md.md      | 2 ++\\n docs/authentication.md | 2 ++\\n docs/config.md         | 2 ++\\n 4 files changed, 8 insertions(+)\\n\"}}, \"stat_stdout\": \" docs/CLA.md            | 2 ++\\n docs/agents_md.md      | 2 ++\\n docs/authentication.md | 2 ++\\n docs/config.md         | 2 ++\\n 4 files changed, 8 insertions(+)\\n\"}, \"edits\": {\"changed_files\": [\"docs/CLA.md\", \"docs/agents_md.md\", \"docs/authentication.md\", \"docs/config.md\"], \"duration_seconds\": 0.00024023698642849922, \"edits\": [{\"appended_bytes\": 47, \"path\": \"docs/CLA.md\", \"size_after\": 2106, \"size_before\": 2059}, {\"appended_bytes\": 53, \"path\": \"docs/agents_md.md\", \"size_after\": 462, \"size_before\": 409}, {\"appended_bytes\": 58, \"path\": \"docs/authentication.md\", \"size_after\": 192, \"size_before\": 134}, {\"appended_bytes\": 50, \"path\": \"docs/config.md\", \"size_after\": 776, \"size_before\": 726}]}, \"fsck\": {\"ok\": null, \"ran\": false, \"run\": null}, \"head_commit\": \"7d47056ea42636271ac020b86347fbbef49490aa\", \"initial_status\": \"\", \"phase_runs\": {\"checkout\": {\"argv\": [\"git\", \"checkout\", \"-B\", \"agentfs-benchmark\"], \"cwd\": \"/tmp/agentfs-git-workload-0wpgk6vq/native/work\", \"duration_seconds\": 0.13929257699055597, \"returncode\": 0, \"stderr_bytes\": 45, \"stderr_tail\": \"Switched to a new branch 'agentfs-benchmark'\\n\", \"stdout_bytes\": 0, \"stdout_tail\": \"\"}, \"clone\": {\"argv\": [\"git\", \"clone\", \"--local\", \"--no-hardlinks\", \"/tmp/agentfs-git-workload-0wpgk6vq/native/mirror.git\", \"/tmp/agentfs-git-workload-0wpgk6vq/native/work\"], \"cwd\": \"/tmp/agentfs-git-workload-0wpgk6vq/native\", \"duration_seconds\": 0.2689640619792044, \"returncode\": 0, \"stderr_bytes\": 149, \"stderr_tail\": \"Cloning into '/tmp/agentfs-git-workload-0wpgk6vq/native/work'...\\nwarning: source repository is shallow, ignoring --local\\nwarning: --local is ignored\\n\", \"stdout_bytes\": 0, \"stdout_tail\": \"\"}, \"status\": {\"branch\": {\"argv\": [\"git\", \"status\", \"--short\", \"--branch\"], \"cwd\": \"/tmp/agentfs-git-workload-0wpgk6vq/native/work\", \"duration_seconds\": 0.0855211479938589, \"returncode\": 0, \"stderr_bytes\": 0, \"stderr_tail\": \"\", \"stdout_bytes\": 21, \"stdout_tail\": \"## agentfs-benchmark\\n\"}, \"short\": {\"argv\": [\"git\", \"status\", \"--short\"], \"cwd\": \"/tmp/agentfs-git-workload-0wpgk6vq/native/work\", \"duration_seconds\": 0.09200344199780375, \"returncode\": 0, \"stderr_bytes\": 0, \"stderr_tail\": \"\", \"stdout_bytes\": 0, \"stdout_tail\": \"\"}}}, \"phase_seconds\": {\"checkout\": 0.14135848497971892, \"clone\": 0.26900622696848586, \"diff\": 0.24908075400162488, \"edit\": 0.00024023698642849922, \"fsck\": 0.0, \"read_search\": 0.0035219070268794894, \"status\": 0.17754377197707072}, \"read_search\": {\"bytes_read\": 60315, \"digest\": \"a1e64893e4779f5d09d0408777c2a9aa38fd104ccfb850858c413e514d788e91\", \"files_scanned\": 32, \"files_total\": 4644, \"ls_files_run\": {\"argv\": [\"git\", \"ls-files\", \"-z\"], \"cwd\": \"/tmp/agentfs-git-workload-0wpgk6vq/native/work\", \"duration_seconds\": 0.0028335030074231327, \"returncode\": 0, \"stderr_bytes\": 0, \"stderr_tail\": \"\", \"stdout_bytes\": 263077, \"stdout_tail\": \"i_codex/api.py\\u0000sdk/python/src/openai_codex/async_client.py\\u0000sdk/python/src/openai_codex/client.py\\u0000sdk/python/src/openai_codex/errors.py\\u0000sdk/python/src/openai_codex/generated/__init__.py\\u0000sdk/python/src/openai_codex/generated/notification_registry.py\\u0000sdk/python/src/openai_codex/generated/v2_all.py\\u0000sdk/python/src/openai_codex/models.py\\u0000sdk/python/src/openai_codex/py.typed\\u0000sdk/python/src/openai_codex/retry.py\\u0000sdk/python/src/openai_codex/types.py\\u0000sdk/python/tests/app_server_harness.py\\u0000sdk/python/tests/app_server_helpers.py\\u0000sdk/python/tests/conftest.py\\u0000sdk/python/tests/test_app_server_approvals.py\\u0000sdk/python/tests/test_app_server_inputs.py\\u0000sdk/python/tests/test_app_server_lifecycle.py\\u0000sdk/python/tests/test_app_server_login.py\\u0000sdk/python/tests/test_app_server_run.py\\u0000sdk/python/tests/test_app_server_streaming.py\\u0000sdk/python/tests/test_app_server_turn_controls.py\\u0000sdk/python/tests/test_artifact_workflow_and_binaries.py\\u0000sdk/python/tests/test_async_client_behavior.py\\u0000sdk/python/tests/test_client_rpc_methods.py\\u0000sdk/python/tests/test_contract_generation.py\\u0000sdk/python/tests/test_public_api_runtime_behavior.py\\u0000sdk/python/tests/test_public_api_signatures.py\\u0000sdk/python/tests/test_real_app_server_integration.py\\u0000sdk/python/uv.lock\\u0000sdk/typescript/.prettierignore\\u0000sdk/typescript/.prettierrc\\u0000sdk/typescript/README.md\\u0000sdk/typescript/eslint.config.js\\u0000sdk/typescript/jest.config.cjs\\u0000sdk/typescript/package.json\\u0000sdk/typescript/samples/basic_streaming.ts\\u0000sdk/typescript/samples/helpers.ts\\u0000sdk/typescript/samples/structured_output.ts\\u0000sdk/typescript/samples/structured_output_zod.ts\\u0000sdk/typescript/src/codex.ts\\u0000sdk/typescript/src/codexOptions.ts\\u0000sdk/typescript/src/events.ts\\u0000sdk/typescript/src/exec.ts\\u0000sdk/typescript/src/index.ts\\u0000sdk/typescript/src/items.ts\\u0000sdk/typescript/src/outputSchemaFile.ts\\u0000sdk/typescript/src/thread.ts\\u0000sdk/typescript/src/threadOptions.ts\\u0000sdk/typescript/src/turnOptions.ts\\u0000sdk/typescript/tests/abort.test.ts\\u0000sdk/typescript/tests/codexExecSpy.ts\\u0000sdk/typescript/tests/exec.test.ts\\u0000sdk/typescript/tests/responsesProxy.ts\\u0000sdk/typescript/tests/run.test.ts\\u0000sdk/typescript/tests/runStreamed.test.ts\\u0000sdk/typescript/tests/setupCodexHome.ts\\u0000sdk/typescript/tests/testCodex.ts\\u0000sdk/typescript/tsconfig.json\\u0000sdk/typescript/tsup.config.ts\\u0000third_party/v8/BUILD.bazel\\u0000third_party/v8/README.md\\u0000third_party/v8/libcxx.BUILD.bazel\\u0000third_party/v8/libcxx_config/BUILD.bazel\\u0000third_party/v8/libcxx_config/__assertion_handler\\u0000third_party/v8/libcxx_config/__config_site\\u0000third_party/v8/libcxxabi.BUILD.bazel\\u0000third_party/v8/llvm_libc.BUILD.bazel\\u0000third_party/v8/rusty_v8_147_4_0.sha256\\u0000third_party/v8/v8_crate.BUILD.bazel\\u0000third_party/wezterm/LICENSE\\u0000tools/argument-comment-lint/.cargo/config.toml\\u0000tools/argument-comment-lint/.gitignore\\u0000tools/argument-comment-lint/BUILD.bazel\\u0000tools/argument-comment-lint/Cargo.lock\\u0000tools/argument-comment-lint/Cargo.toml\\u0000tools/argument-comment-lint/README.md\\u0000tools/argument-comment-lint/argument-comment-lint\\u0000tools/argument-comment-lint/driver.rs\\u0000tools/argument-comment-lint/lint_aspect.bzl\\u0000tools/argument-comment-lint/list-bazel-targets.sh\\u0000tools/argument-comment-lint/run-prebuilt-linter.py\\u0000tools/argument-comment-lint/run.py\\u0000tools/argument-comment-lint/rust-toolchain\\u0000tools/argument-comment-lint/src/bin/argument-comment-lint.rs\\u0000tools/argument-comment-lint/src/comment_parser.rs\\u0000tools/argument-comment-lint/src/lib.rs\\u0000tools/argument-comment-lint/test_wrapper_common.py\\u0000tools/argument-comment-lint/ui/allow_char_literals.rs\\u0000tools/argument-comment-lint/ui/allow_string_literals.rs\\u0000tools/argument-comment-lint/ui/comment_matches.rs\\u0000tools/argument-comment-lint/ui/comment_matches_multiline.rs\\u0000tools/argument-comment-lint/ui/comment_mismatch.rs\\u0000tools/argument-comment-lint/ui/comment_mismatch.stderr\\u0000tools/argument-comment-lint/ui/ignore_external_methods.rs\\u0000tools/argument-comment-lint/ui/uncommented_literal.rs\\u0000tools/argument-comment-lint/ui/uncommented_literal.stderr\\u0000tools/argument-comment-lint/wrapper_common.py\\u0000workspace_root_test_launcher.bat.tpl\\u0000workspace_root_test_launcher.sh.tpl\\u0000\"}, \"matches\": 0, \"selected_files\": [\".bazelignore\", \".bazelrc\", \".bazelversion\", \".codespellignore\", \".codespellrc\", \".codex/environments/environment.toml\", \".codex/skills/babysit-pr/SKILL.md\", \".codex/skills/babysit-pr/agents/openai.yaml\", \".codex/skills/babysit-pr/references/github-api-notes.md\", \".codex/skills/babysit-pr/references/heuristics.md\", \".codex/skills/babysit-pr/scripts/gh_pr_watch.py\", \".codex/skills/babysit-pr/scripts/test_gh_pr_watch.py\", \".codex/skills/code-review-breaking-changes/SKILL.md\", \".codex/skills/code-review-change-size/SKILL.md\", \".codex/skills/code-review-context/SKILL.md\", \".codex/skills/code-review-testing/SKILL.md\", \".codex/skills/code-review/SKILL.md\", \".codex/skills/codex-bug/SKILL.md\", \".codex/skills/codex-issue-digest/SKILL.md\", \".codex/skills/codex-issue-digest/agents/openai.yaml\", \".codex/skills/codex-issue-digest/scripts/collect_issue_digest.py\", \".codex/skills/codex-issue-digest/scripts/test_collect_issue_digest.py\", \".codex/skills/codex-pr-body/SKILL.md\", \".codex/skills/remote-tests/SKILL.md\", \".codex/skills/test-tui/SKILL.md\", \".codex/skills/update-v8-version/SKILL.md\", \".codex/skills/update-v8-version/agents/openai.yaml\", \".devcontainer/Dockerfile\", \".devcontainer/Dockerfile.secure\", \".devcontainer/README.md\", \".devcontainer/codex-install/package.json\", \".devcontainer/codex-install/pnpm-lock.yaml\"], \"token\": \"AGENTFS_TOKEN\"}, \"total_seconds\": 0.8408271949738264}\n",
+      "timed_out": false
+    },
+    "workload": {
+      "branch_status": "## agentfs-benchmark\n",
+      "diff": {
+        "changed_file_count": 4,
+        "changed_files": [
+          "docs/CLA.md",
+          "docs/agents_md.md",
+          "docs/authentication.md",
+          "docs/config.md"
+        ],
+        "duration_seconds": 0.24908075400162488,
+        "patch_bytes": 1786,
+        "patch_sha256": "cff609abc3a92f6dfb55c6da3cbf0e06c321ccfac3bfb6e767894ece6cf273be",
+        "runs": {
+          "name_only": {
+            "argv": [
+              "git",
+              "diff",
+              "--name-only",
+              "--"
+            ],
+            "cwd": "/tmp/agentfs-git-workload-0wpgk6vq/native/work",
+            "duration_seconds": 0.0828525919932872,
+            "returncode": 0,
+            "stderr_bytes": 0,
+            "stderr_tail": "",
+            "stdout_bytes": 68,
+            "stdout_tail": "docs/CLA.md\ndocs/agents_md.md\ndocs/authentication.md\ndocs/config.md\n"
+          },
+          "patch": {
+            "argv": [
+              "git",
+              "diff",
+              "--",
+              "."
+            ],
+            "cwd": "/tmp/agentfs-git-workload-0wpgk6vq/native/work",
+            "duration_seconds": 0.08327719895169139,
+            "returncode": 0,
+            "stderr_bytes": 0,
+            "stderr_tail": "",
+            "stdout_bytes": 1786,
+            "stdout_tail": "diff --git a/docs/CLA.md b/docs/CLA.md\nindex 804f202..3495ac9 100644\n--- a/docs/CLA.md\n+++ b/docs/CLA.md\n@@ -47,3 +47,5 @@ entity under this CLA terminate.\n This Agreement is governed by the laws of the **State of California**, USA,\n excluding its conflict\u2011of\u2011laws rules. If any provision is held unenforceable,\n the remaining provisions remain in force.\n+\n+AgentFS Git benchmark edit 00 for docs/CLA.md\ndiff --git a/docs/agents_md.md b/docs/agents_md.md\nindex 3df0fac..b8b063d 100644\n--- a/docs/agents_md.md\n+++ b/docs/agents_md.md\n@@ -5,3 +5,5 @@ For information about AGENTS.md, see [this documentation](https://developers.ope\n ## Hierarchical agents message\n \n When the `child_agents_md` feature flag is enabled (via `[features]` in `config.toml`), Codex appends additional guidance about AGENTS.md scope and precedence to the user instructions message and emits that message even when no AGENTS.md is present.\n+\n+AgentFS Git benchmark edit 01 for docs/agents_md.md\ndiff --git a/docs/authentication.md b/docs/authentication.md\nindex c307349..b3bc9dc 100644\n--- a/docs/authentication.md\n+++ b/docs/authentication.md\n@@ -1,3 +1,5 @@\n # Authentication\n \n For information about Codex CLI authentication, see [this documentation](https://developers.openai.com/codex/auth).\n+\n+AgentFS Git benchmark edit 02 for docs/authentication.md\ndiff --git a/docs/config.md b/docs/config.md\nindex d35b0a8..030e278 100644\n--- a/docs/config.md\n+++ b/docs/config.md\n@@ -13,3 +13,5 @@ Admins can set top-level `allow_managed_hooks_only = true` in\n still allowing managed hooks from requirements and managed config layers. This\n setting is only supported in `requirements.toml`; putting it in `config.toml`\n does not enable managed-hooks-only mode.\n+\n+AgentFS Git benchmark edit 03 for docs/config.md\n"
+          },
+          "stat": {
+            "argv": [
+              "git",
+              "diff",
+              "--stat",
+              "--"
+            ],
+            "cwd": "/tmp/agentfs-git-workload-0wpgk6vq/native/work",
+            "duration_seconds": 0.08291632798500359,
+            "returncode": 0,
+            "stderr_bytes": 0,
+            "stderr_tail": "",
+            "stdout_bytes": 158,
+            "stdout_tail": " docs/CLA.md            | 2 ++\n docs/agents_md.md      | 2 ++\n docs/authentication.md | 2 ++\n docs/config.md         | 2 ++\n 4 files changed, 8 insertions(+)\n"
+          }
+        },
+        "stat_stdout": " docs/CLA.md            | 2 ++\n docs/agents_md.md      | 2 ++\n docs/authentication.md | 2 ++\n docs/config.md         | 2 ++\n 4 files changed, 8 insertions(+)\n"
+      },
+      "edits": {
+        "changed_files": [
+          "docs/CLA.md",
+          "docs/agents_md.md",
+          "docs/authentication.md",
+          "docs/config.md"
+        ],
+        "duration_seconds": 0.00024023698642849922,
+        "edits": [
+          {
+            "appended_bytes": 47,
+            "path": "docs/CLA.md",
+            "size_after": 2106,
+            "size_before": 2059
+          },
+          {
+            "appended_bytes": 53,
+            "path": "docs/agents_md.md",
+            "size_after": 462,
+            "size_before": 409
+          },
+          {
+            "appended_bytes": 58,
+            "path": "docs/authentication.md",
+            "size_after": 192,
+            "size_before": 134
+          },
+          {
+            "appended_bytes": 50,
+            "path": "docs/config.md",
+            "size_after": 776,
+            "size_before": 726
+          }
+        ]
+      },
+      "fsck": {
+        "ok": null,
+        "ran": false,
+        "run": null
+      },
+      "head_commit": "7d47056ea42636271ac020b86347fbbef49490aa",
+      "initial_status": "",
+      "phase_runs": {
+        "checkout": {
+          "argv": [
+            "git",
+            "checkout",
+            "-B",
+            "agentfs-benchmark"
+          ],
+          "cwd": "/tmp/agentfs-git-workload-0wpgk6vq/native/work",
+          "duration_seconds": 0.13929257699055597,
+          "returncode": 0,
+          "stderr_bytes": 45,
+          "stderr_tail": "Switched to a new branch 'agentfs-benchmark'\n",
+          "stdout_bytes": 0,
+          "stdout_tail": ""
+        },
+        "clone": {
+          "argv": [
+            "git",
+            "clone",
+            "--local",
+            "--no-hardlinks",
+            "/tmp/agentfs-git-workload-0wpgk6vq/native/mirror.git",
+            "/tmp/agentfs-git-workload-0wpgk6vq/native/work"
+          ],
+          "cwd": "/tmp/agentfs-git-workload-0wpgk6vq/native",
+          "duration_seconds": 0.2689640619792044,
+          "returncode": 0,
+          "stderr_bytes": 149,
+          "stderr_tail": "Cloning into '/tmp/agentfs-git-workload-0wpgk6vq/native/work'...\nwarning: source repository is shallow, ignoring --local\nwarning: --local is ignored\n",
+          "stdout_bytes": 0,
+          "stdout_tail": ""
+        },
+        "status": {
+          "branch": {
+            "argv": [
+              "git",
+              "status",
+              "--short",
+              "--branch"
+            ],
+            "cwd": "/tmp/agentfs-git-workload-0wpgk6vq/native/work",
+            "duration_seconds": 0.0855211479938589,
+            "returncode": 0,
+            "stderr_bytes": 0,
+            "stderr_tail": "",
+            "stdout_bytes": 21,
+            "stdout_tail": "## agentfs-benchmark\n"
+          },
+          "short": {
+            "argv": [
+              "git",
+              "status",
+              "--short"
+            ],
+            "cwd": "/tmp/agentfs-git-workload-0wpgk6vq/native/work",
+            "duration_seconds": 0.09200344199780375,
+            "returncode": 0,
+            "stderr_bytes": 0,
+            "stderr_tail": "",
+            "stdout_bytes": 0,
+            "stdout_tail": ""
+          }
+        }
+      },
+      "phase_seconds": {
+        "checkout": 0.14135848497971892,
+        "clone": 0.26900622696848586,
+        "diff": 0.24908075400162488,
+        "edit": 0.00024023698642849922,
+        "fsck": 0.0,
+        "read_search": 0.0035219070268794894,
+        "status": 0.17754377197707072
+      },
+      "read_search": {
+        "bytes_read": 60315,
+        "digest": "a1e64893e4779f5d09d0408777c2a9aa38fd104ccfb850858c413e514d788e91",
+        "files_scanned": 32,
+        "files_total": 4644,
+        "ls_files_run": {
+          "argv": [
+            "git",
+            "ls-files",
+            "-z"
+          ],
+          "cwd": "/tmp/agentfs-git-workload-0wpgk6vq/native/work",
+          "duration_seconds": 0.0028335030074231327,
+          "returncode": 0,
+          "stderr_bytes": 0,
+          "stderr_tail": "",
+          "stdout_bytes": 263077,
+          "stdout_tail": "i_codex/api.py\u0000sdk/python/src/openai_codex/async_client.py\u0000sdk/python/src/openai_codex/client.py\u0000sdk/python/src/openai_codex/errors.py\u0000sdk/python/src/openai_codex/generated/__init__.py\u0000sdk/python/src/openai_codex/generated/notification_registry.py\u0000sdk/python/src/openai_codex/generated/v2_all.py\u0000sdk/python/src/openai_codex/models.py\u0000sdk/python/src/openai_codex/py.typed\u0000sdk/python/src/openai_codex/retry.py\u0000sdk/python/src/openai_codex/types.py\u0000sdk/python/tests/app_server_harness.py\u0000sdk/python/tests/app_server_helpers.py\u0000sdk/python/tests/conftest.py\u0000sdk/python/tests/test_app_server_approvals.py\u0000sdk/python/tests/test_app_server_inputs.py\u0000sdk/python/tests/test_app_server_lifecycle.py\u0000sdk/python/tests/test_app_server_login.py\u0000sdk/python/tests/test_app_server_run.py\u0000sdk/python/tests/test_app_server_streaming.py\u0000sdk/python/tests/test_app_server_turn_controls.py\u0000sdk/python/tests/test_artifact_workflow_and_binaries.py\u0000sdk/python/tests/test_async_client_behavior.py\u0000sdk/python/tests/test_client_rpc_methods.py\u0000sdk/python/tests/test_contract_generation.py\u0000sdk/python/tests/test_public_api_runtime_behavior.py\u0000sdk/python/tests/test_public_api_signatures.py\u0000sdk/python/tests/test_real_app_server_integration.py\u0000sdk/python/uv.lock\u0000sdk/typescript/.prettierignore\u0000sdk/typescript/.prettierrc\u0000sdk/typescript/README.md\u0000sdk/typescript/eslint.config.js\u0000sdk/typescript/jest.config.cjs\u0000sdk/typescript/package.json\u0000sdk/typescript/samples/basic_streaming.ts\u0000sdk/typescript/samples/helpers.ts\u0000sdk/typescript/samples/structured_output.ts\u0000sdk/typescript/samples/structured_output_zod.ts\u0000sdk/typescript/src/codex.ts\u0000sdk/typescript/src/codexOptions.ts\u0000sdk/typescript/src/events.ts\u0000sdk/typescript/src/exec.ts\u0000sdk/typescript/src/index.ts\u0000sdk/typescript/src/items.ts\u0000sdk/typescript/src/outputSchemaFile.ts\u0000sdk/typescript/src/thread.ts\u0000sdk/typescript/src/threadOptions.ts\u0000sdk/typescript/src/turnOptions.ts\u0000sdk/typescript/tests/abort.test.ts\u0000sdk/typescript/tests/codexExecSpy.ts\u0000sdk/typescript/tests/exec.test.ts\u0000sdk/typescript/tests/responsesProxy.ts\u0000sdk/typescript/tests/run.test.ts\u0000sdk/typescript/tests/runStreamed.test.ts\u0000sdk/typescript/tests/setupCodexHome.ts\u0000sdk/typescript/tests/testCodex.ts\u0000sdk/typescript/tsconfig.json\u0000sdk/typescript/tsup.config.ts\u0000third_party/v8/BUILD.bazel\u0000third_party/v8/README.md\u0000third_party/v8/libcxx.BUILD.bazel\u0000third_party/v8/libcxx_config/BUILD.bazel\u0000third_party/v8/libcxx_config/__assertion_handler\u0000third_party/v8/libcxx_config/__config_site\u0000third_party/v8/libcxxabi.BUILD.bazel\u0000third_party/v8/llvm_libc.BUILD.bazel\u0000third_party/v8/rusty_v8_147_4_0.sha256\u0000third_party/v8/v8_crate.BUILD.bazel\u0000third_party/wezterm/LICENSE\u0000tools/argument-comment-lint/.cargo/config.toml\u0000tools/argument-comment-lint/.gitignore\u0000tools/argument-comment-lint/BUILD.bazel\u0000tools/argument-comment-lint/Cargo.lock\u0000tools/argument-comment-lint/Cargo.toml\u0000tools/argument-comment-lint/README.md\u0000tools/argument-comment-lint/argument-comment-lint\u0000tools/argument-comment-lint/driver.rs\u0000tools/argument-comment-lint/lint_aspect.bzl\u0000tools/argument-comment-lint/list-bazel-targets.sh\u0000tools/argument-comment-lint/run-prebuilt-linter.py\u0000tools/argument-comment-lint/run.py\u0000tools/argument-comment-lint/rust-toolchain\u0000tools/argument-comment-lint/src/bin/argument-comment-lint.rs\u0000tools/argument-comment-lint/src/comment_parser.rs\u0000tools/argument-comment-lint/src/lib.rs\u0000tools/argument-comment-lint/test_wrapper_common.py\u0000tools/argument-comment-lint/ui/allow_char_literals.rs\u0000tools/argument-comment-lint/ui/allow_string_literals.rs\u0000tools/argument-comment-lint/ui/comment_matches.rs\u0000tools/argument-comment-lint/ui/comment_matches_multiline.rs\u0000tools/argument-comment-lint/ui/comment_mismatch.rs\u0000tools/argument-comment-lint/ui/comment_mismatch.stderr\u0000tools/argument-comment-lint/ui/ignore_external_methods.rs\u0000tools/argument-comment-lint/ui/uncommented_literal.rs\u0000tools/argument-comment-lint/ui/uncommented_literal.stderr\u0000tools/argument-comment-lint/wrapper_common.py\u0000workspace_root_test_launcher.bat.tpl\u0000workspace_root_test_launcher.sh.tpl\u0000"
+        },
+        "matches": 0,
+        "selected_files": [
+          ".bazelignore",
+          ".bazelrc",
+          ".bazelversion",
+          ".codespellignore",
+          ".codespellrc",
+          ".codex/environments/environment.toml",
+          ".codex/skills/babysit-pr/SKILL.md",
+          ".codex/skills/babysit-pr/agents/openai.yaml",
+          ".codex/skills/babysit-pr/references/github-api-notes.md",
+          ".codex/skills/babysit-pr/references/heuristics.md",
+          ".codex/skills/babysit-pr/scripts/gh_pr_watch.py",
+          ".codex/skills/babysit-pr/scripts/test_gh_pr_watch.py",
+          ".codex/skills/code-review-breaking-changes/SKILL.md",
+          ".codex/skills/code-review-change-size/SKILL.md",
+          ".codex/skills/code-review-context/SKILL.md",
+          ".codex/skills/code-review-testing/SKILL.md",
+          ".codex/skills/code-review/SKILL.md",
+          ".codex/skills/codex-bug/SKILL.md",
+          ".codex/skills/codex-issue-digest/SKILL.md",
+          ".codex/skills/codex-issue-digest/agents/openai.yaml",
+          ".codex/skills/codex-issue-digest/scripts/collect_issue_digest.py",
+          ".codex/skills/codex-issue-digest/scripts/test_collect_issue_digest.py",
+          ".codex/skills/codex-pr-body/SKILL.md",
+          ".codex/skills/remote-tests/SKILL.md",
+          ".codex/skills/test-tui/SKILL.md",
+          ".codex/skills/update-v8-version/SKILL.md",
+          ".codex/skills/update-v8-version/agents/openai.yaml",
+          ".devcontainer/Dockerfile",
+          ".devcontainer/Dockerfile.secure",
+          ".devcontainer/README.md",
+          ".devcontainer/codex-install/package.json",
+          ".devcontainer/codex-install/pnpm-lock.yaml"
+        ],
+        "token": "AGENTFS_TOKEN"
+      },
+      "total_seconds": 0.8408271949738264
+    }
+  },
+  "parameters": {
+    "edit_files": 4,
+    "fixture_dirs": 8,
+    "fixture_file_size_bytes": 1024,
+    "fixture_files": 96,
+    "read_bytes": 4096,
+    "read_files": 32,
+    "search_token": "AGENTFS_TOKEN",
+    "skip_fsck": true,
+    "timeout_seconds": 900.0
+  },
+  "schema_version": 1,
+  "source": {
+    "kind": "source",
+    "mirror_head": "7d47056ea42636271ac020b86347fbbef49490aa",
+    "path": "/home/ain3sh/factory/vfs/.agents/benchmarks/fixtures/codex"
+  },
+  "summary": {
+    "agentfs_base_unchanged": true,
+    "agentfs_seconds": 2.443190918012988,
+    "all_equivalent": true,
+    "correctness_passed": false,
+    "native_seconds": 0.8408271949738264,
+    "passed": false,
+    "performance_passed": false,
+    "phase_ratios": {
+      "checkout": {
+        "agentfs_seconds": 0.14689449104480445,
+        "native_seconds": 0.14135848497971892,
+        "ratio": 1.0391628848164283
+      },
+      "clone": {
+        "agentfs_seconds": 1.6519066839828156,
+        "native_seconds": 0.26900622696848586,
+        "ratio": 6.140774890598859
+      },
+      "diff": {
+        "agentfs_seconds": 0.29552334401523694,
+        "native_seconds": 0.24908075400162488,
+        "ratio": 1.1864559556187513
+      },
+      "edit": {
+        "agentfs_seconds": 0.0010691990028135478,
+        "native_seconds": 0.00024023698642849922,
+        "ratio": 4.4506011281146725
+      },
+      "fsck": {
+        "agentfs_seconds": 0.0,
+        "native_seconds": 0.0,
+        "ratio": null
+      },
+      "read_search": {
+        "agentfs_seconds": 0.0059385119820944965,
+        "native_seconds": 0.0035219070268794894,
+        "ratio": 1.6861637563885916
+      },
+      "status": {
+        "agentfs_seconds": 0.3417817280278541,
+        "native_seconds": 0.17754377197707072,
+        "ratio": 1.925056138111081
+      }
+    },
+    "ratio": 2.9056992121776464,
+    "threshold_failures": [
+      {
+        "agentfs_seconds": 1.6519066839828156,
+        "native_seconds": 0.26900622696848586,
+        "phase": "clone",
+        "ratio": 6.140774890598859
+      },
+      {
+        "agentfs_seconds": 0.0010691990028135478,
+        "native_seconds": 0.00024023698642849922,
+        "phase": "edit",
+        "ratio": 4.4506011281146725
+      }
+    ]
+  },
+  "temp_dir": "/tmp/agentfs-git-workload-0wpgk6vq"
+}

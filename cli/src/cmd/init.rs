@@ -106,7 +106,7 @@ pub async fn init_database(
     }
 
     // Check if agent already exists
-    let db_path = agentfs_dir().join(format!("{}.db", &id));
+    let db_path = agentfs_dir().join(format!("{}.db", id));
     if db_path.exists() {
         if force {
             for entry in std::fs::read_dir(agentfs_dir())? {
@@ -210,17 +210,16 @@ async fn run_init_cmd(
     use agentfs_sdk::{FileSystem, HostFS};
     use std::process::Command;
     use std::sync::Arc;
-    use tokio::sync::Mutex;
 
-    let fs: Arc<Mutex<dyn FileSystem + Send>> = if let Some(ref base_path) = base {
+    let fs: Arc<dyn FileSystem> = if let Some(ref base_path) = base {
         let canonical = base_path
             .canonicalize()
             .context("Failed to canonicalize base path")?;
         let hostfs = HostFS::new(&canonical)?;
         let overlay = OverlayFS::new(Arc::new(hostfs), agent.fs);
-        Arc::new(Mutex::new(overlay)) as Arc<Mutex<dyn FileSystem + Send>>
+        Arc::new(overlay) as Arc<dyn FileSystem>
     } else {
-        Arc::new(Mutex::new(agent.fs)) as Arc<Mutex<dyn FileSystem + Send>>
+        Arc::new(agent.fs) as Arc<dyn FileSystem>
     };
 
     let exec_id = uuid::Uuid::new_v4().to_string();
@@ -250,6 +249,8 @@ async fn run_init_cmd(
         .with_context(|| format!("Failed to execute: {}", cmd_str))?;
 
     drop(mount_handle);
+
+    agentfs_sdk::profiling::report_summary("init_command_parent");
 
     let _ = std::fs::remove_dir_all(&mountpoint);
 

@@ -216,7 +216,7 @@ pub fn list_ps<W: Write>(out: &mut W) -> Result<()> {
             writeln!(
                 out,
                 "{:<COL_SESSION$} {:>COL_PID$} {:^COL_OWNER$} {:<COL_COMMAND$} {:>COL_STARTED$}",
-                &session.session_id,
+                session.session_id,
                 proc.pid,
                 owner_marker,
                 truncate(&proc.command, COL_COMMAND),

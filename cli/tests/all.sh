@@ -19,6 +19,13 @@ DIR="$(dirname "$0")"
 
 "$DIR/test-run-bash.sh" || true  # Requires user namespaces (may fail in CI)
 "$DIR/test-run-git.sh" || true  # Requires user namespaces (may fail in CI)
+# Short corruption/concurrency smoke; the test prints SKIP and exits 0 if
+# Linux user namespace/FUSE prerequisites are unavailable.
+CORRUPTION_TORTURE_WORKERS="${CORRUPTION_TORTURE_WORKERS:-2}" \
+CORRUPTION_TORTURE_ITERATIONS="${CORRUPTION_TORTURE_ITERATIONS:-2}" \
+CORRUPTION_TORTURE_TIMEOUT="${CORRUPTION_TORTURE_TIMEOUT:-60}" \
+CORRUPTION_TORTURE_INTEGRITY_INTERVAL="${CORRUPTION_TORTURE_INTEGRITY_INTERVAL:-1}" \
+"$DIR/test-corruption-torture.sh"
 "$DIR/test-mount.sh"
 "$DIR/test-overlay-whiteout.sh"
 "$DIR/test-overlay-delta-in-base-dir.sh"

@@ -24,6 +24,26 @@ fn parse_encryption(key: Option<String>, cipher: Option<String>) -> Option<(Stri
     }
 }
 
+fn partial_origin_policy(
+    mode: Option<agentfs::opts::PartialOriginMode>,
+    threshold_bytes: Option<u64>,
+) -> Option<agentfs_sdk::PartialOriginPolicy> {
+    match (mode, threshold_bytes) {
+        (None, None) => None,
+        (Some(mode), threshold_bytes) => {
+            let mut policy = agentfs_sdk::PartialOriginPolicy::new(mode.into());
+            if let Some(threshold_bytes) = threshold_bytes {
+                policy = policy.with_threshold_bytes(threshold_bytes);
+            }
+            Some(policy)
+        }
+        (None, Some(threshold_bytes)) => Some(
+            agentfs_sdk::PartialOriginPolicy::new(agentfs_sdk::PartialOriginMode::Auto)
+                .with_threshold_bytes(threshold_bytes),
+        ),
+    }
+}
+
 fn main() {
     let _ = tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer())
@@ -108,12 +128,16 @@ fn main() {
             strace,
             session,
             system,
+            partial_origin,
+            partial_origin_threshold_bytes,
             key,
             cipher,
             command,
             args,
         } => {
             let encryption = parse_encryption(key, cipher);
+            let partial_origin_policy =
+                partial_origin_policy(partial_origin, partial_origin_threshold_bytes);
             let command = command.unwrap_or_else(default_shell);
             let rt = get_runtime();
             if let Err(e) = rt.block_on(cmd::handle_run_command(
@@ -124,6 +148,7 @@ fn main() {
                 session,
                 system,
                 encryption,
+                partial_origin_policy,
                 command,
                 args,
             )) {
@@ -149,6 +174,22 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        #[cfg(unix)]
+        Command::Clone {
+            id_or_path,
+            source,
+            name,
+            backend,
+            verify,
+        } => {
+            let rt = get_runtime();
+            if let Err(e) = rt.block_on(cmd::clone::handle_clone_command(
+                id_or_path, source, name, backend, verify,
+            )) {
+                eprintln!("Error: {e:?}");
+                std::process::exit(1);
+            }
+        }
         Command::Mount {
             id_or_path,
             mountpoint,
@@ -159,6 +200,8 @@ fn main() {
             uid,
             gid,
             backend,
+            partial_origin,
+            partial_origin_threshold_bytes,
         } => match (id_or_path, mountpoint) {
             (Some(id_or_path), Some(mountpoint)) => {
                 if let Err(e) = cmd::mount(cmd::MountArgs {
@@ -171,6 +214,10 @@ fn main() {
                     uid,
                     gid,
                     backend,
+                    partial_origin_policy: partial_origin_policy(
+                        partial_origin,
+                        partial_origin_threshold_bytes,
+                    ),
                 }) {
                     eprintln!("Error: {}", e);
                     std::process::exit(1);
@@ -321,6 +368,70 @@ fn main() {
                 }
             }
         },
+        Command::Integrity {
+            id_or_path,
+            json,
+            require_portable,
+            check_base,
+            key,
+            cipher,
+        } => {
+            let encryption = parse_encryption(key, cipher);
+            let rt = get_runtime();
+            if let Err(e) = rt.block_on(cmd::safety::handle_integrity_command(
+                &mut std::io::stdout(),
+                id_or_path,
+                json,
+                require_portable,
+                check_base,
+                encryption.as_ref(),
+            )) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Command::Backup {
+            id_or_path,
+            target,
+            verify,
+            materialize,
+            key,
+            cipher,
+        } => {
+            let encryption = parse_encryption(key, cipher);
+            let rt = get_runtime();
+            if let Err(e) = rt.block_on(cmd::safety::handle_backup_command(
+                &mut std::io::stdout(),
+                id_or_path,
+                target,
+                verify,
+                materialize,
+                encryption.as_ref(),
+            )) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Command::Materialize {
+            id_or_path,
+            output,
+            verify,
+            key,
+            cipher,
+        } => {
+            let encryption = parse_encryption(key, cipher);
+            let rt = get_runtime();
+            if let Err(e) = rt.block_on(cmd::safety::handle_materialize_command(
+                &mut std::io::stdout(),
+                id_or_path,
+                output,
+                verify,
+                encryption.as_ref(),
+            )) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
         Command::Migrate {
             id_or_path,
             dry_run,
@@ -330,6 +441,24 @@ fn main() {
                 &mut std::io::stdout(),
                 id_or_path,
                 dry_run,
+            )) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Command::MigrateV0_5 {
+            source,
+            target,
+            verify,
+            overwrite_target,
+        } => {
+            let rt = get_runtime();
+            if let Err(e) = rt.block_on(cmd::migrate::handle_migrate_v0_5_command(
+                &mut std::io::stdout(),
+                source,
+                target,
+                verify,
+                overwrite_target,
             )) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);

@@ -14,11 +14,13 @@ use super::reply::ReplySender;
 
 /// A raw communication channel to the FUSE kernel driver
 #[derive(Debug)]
-pub struct Channel(Arc<File>);
+pub struct Channel {
+    device: Arc<File>,
+}
 
 impl AsFd for Channel {
     fn as_fd(&self) -> BorrowedFd<'_> {
-        self.0.as_fd()
+        self.device.as_fd()
     }
 }
 
@@ -27,14 +29,14 @@ impl Channel {
     /// given path. The kernel driver will delegate filesystem operations of
     /// the given path to the channel.
     pub(crate) fn new(device: Arc<File>) -> Self {
-        Self(device)
+        Self { device }
     }
 
     /// Receives data up to the capacity of the given buffer (can block).
     pub fn receive(&self, buffer: &mut [u8]) -> io::Result<usize> {
         let rc = unsafe {
             libc::read(
-                self.0.as_raw_fd(),
+                self.device.as_raw_fd(),
                 buffer.as_ptr() as *mut c_void,
                 buffer.len() as size_t,
             )
@@ -46,33 +48,68 @@ impl Channel {
         }
     }
 
+    /// Returns the shared /dev/fuse device handle.
+    pub(crate) fn device(&self) -> Arc<File> {
+        self.device.clone()
+    }
+
     /// Returns a sender object for this channel. The sender object can be
     /// used to send to the channel. Multiple sender objects can be used
     /// and they can safely be sent to other threads.
     pub fn sender(&self) -> ChannelSender {
-        // Since write/writev syscalls are threadsafe, we can simply create
-        // a sender by using the same file and use it in other threads.
-        ChannelSender(self.0.clone())
+        ChannelSender::Fd {
+            device: self.device.clone(),
+        }
     }
 }
 
+/// Reply target for a FUSE request: either the classic /dev/fuse writev path
+/// or a fuse-over-io_uring ring entry commit.
 #[derive(Clone, Debug)]
-pub struct ChannelSender(Arc<File>);
+pub enum ChannelSender {
+    Fd {
+        device: Arc<File>,
+    },
+    #[cfg(target_os = "linux")]
+    Uring(super::uring::UringSender),
+}
+
+impl ChannelSender {
+    /// Notifications (and poll wakeups) are not supported over
+    /// fuse-io-uring; they must always travel via the /dev/fuse fd.
+    pub(crate) fn for_notify(&self) -> ChannelSender {
+        match self {
+            ChannelSender::Fd { device } => ChannelSender::Fd {
+                device: device.clone(),
+            },
+            #[cfg(target_os = "linux")]
+            ChannelSender::Uring(sender) => ChannelSender::Fd {
+                device: sender.device(),
+            },
+        }
+    }
+}
 
 impl ReplySender for ChannelSender {
     fn send(&self, bufs: &[io::IoSlice<'_>]) -> io::Result<()> {
-        let rc = unsafe {
-            libc::writev(
-                self.0.as_raw_fd(),
-                bufs.as_ptr() as *const libc::iovec,
-                bufs.len() as c_int,
-            )
-        };
-        if rc < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            debug_assert_eq!(bufs.iter().map(|b| b.len()).sum::<usize>(), rc as usize);
-            Ok(())
+        match self {
+            ChannelSender::Fd { device } => {
+                let rc = unsafe {
+                    libc::writev(
+                        device.as_raw_fd(),
+                        bufs.as_ptr() as *const libc::iovec,
+                        bufs.len() as c_int,
+                    )
+                };
+                if rc < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    debug_assert_eq!(bufs.iter().map(|b| b.len()).sum::<usize>(), rc as usize);
+                    Ok(())
+                }
+            }
+            #[cfg(target_os = "linux")]
+            ChannelSender::Uring(sender) => sender.send_reply(bufs),
         }
     }
 }

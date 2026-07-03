@@ -88,6 +88,12 @@ if ! echo "$LS_OUTPUT" | grep -q "file2.txt"; then
     wait $MOUNT_PID 2>/dev/null || true
     exit 1
 fi
+if stat "$MOUNTPOINT/file1.txt" > /dev/null 2>&1; then
+    echo "FAILED: stat still resolves file1.txt after unlink"
+    kill $MOUNT_PID 2>/dev/null || true
+    wait $MOUNT_PID 2>/dev/null || true
+    exit 1
+fi
 
 # Test 2: rmdir should not leave stale entries in readdir
 mkdir "$MOUNTPOINT/subdir"
@@ -101,6 +107,12 @@ LS_OUTPUT=$(ls "$MOUNTPOINT")
 if echo "$LS_OUTPUT" | grep -q "subdir"; then
     echo "FAILED: readdir still shows subdir after rmdir"
     echo "ls output was: $LS_OUTPUT"
+    kill $MOUNT_PID 2>/dev/null || true
+    wait $MOUNT_PID 2>/dev/null || true
+    exit 1
+fi
+if stat "$MOUNTPOINT/subdir" > /dev/null 2>&1; then
+    echo "FAILED: stat still resolves subdir after rmdir"
     kill $MOUNT_PID 2>/dev/null || true
     wait $MOUNT_PID 2>/dev/null || true
     exit 1
@@ -126,6 +138,18 @@ fi
 if ! echo "$LS_OUTPUT" | grep -q "after.txt"; then
     echo "FAILED: after.txt not visible after rename"
     echo "ls output was: $LS_OUTPUT"
+    kill $MOUNT_PID 2>/dev/null || true
+    wait $MOUNT_PID 2>/dev/null || true
+    exit 1
+fi
+if stat "$MOUNTPOINT/before.txt" > /dev/null 2>&1; then
+    echo "FAILED: stat still resolves before.txt after rename"
+    kill $MOUNT_PID 2>/dev/null || true
+    wait $MOUNT_PID 2>/dev/null || true
+    exit 1
+fi
+if [ "$(cat "$MOUNTPOINT/after.txt")" != "rename me" ]; then
+    echo "FAILED: after.txt content is stale after rename"
     kill $MOUNT_PID 2>/dev/null || true
     wait $MOUNT_PID 2>/dev/null || true
     exit 1
@@ -175,6 +199,48 @@ LS_OUTPUT=$(ls "$MOUNTPOINT")
 if ! echo "$LS_OUTPUT" | grep -q "negdir"; then
     echo "FAILED: readdir does not show negdir after mkdir"
     echo "ls output was: $LS_OUTPUT"
+    kill $MOUNT_PID 2>/dev/null || true
+    wait $MOUNT_PID 2>/dev/null || true
+    exit 1
+fi
+
+# Test 6: truncate must invalidate stale attrs and cached file data
+printf "abcdefghij" > "$MOUNTPOINT/truncate.txt"
+cat "$MOUNTPOINT/truncate.txt" > /dev/null
+stat "$MOUNTPOINT/truncate.txt" > /dev/null 2>&1
+truncate -s 4 "$MOUNTPOINT/truncate.txt"
+
+TRUNC_SIZE=$(wc -c < "$MOUNTPOINT/truncate.txt" | tr -d ' ')
+if [ "$TRUNC_SIZE" != "4" ]; then
+    echo "FAILED: truncate.txt size is stale after truncate: $TRUNC_SIZE"
+    kill $MOUNT_PID 2>/dev/null || true
+    wait $MOUNT_PID 2>/dev/null || true
+    exit 1
+fi
+TRUNC_CONTENT=$(cat "$MOUNTPOINT/truncate.txt")
+if [ "$TRUNC_CONTENT" != "abcd" ]; then
+    echo "FAILED: truncate.txt content is stale after truncate: $TRUNC_CONTENT"
+    kill $MOUNT_PID 2>/dev/null || true
+    wait $MOUNT_PID 2>/dev/null || true
+    exit 1
+fi
+
+# Test 7: repeated read/open cache must not serve stale data after write
+printf "cache-before" > "$MOUNTPOINT/keep-cache.txt"
+cat "$MOUNTPOINT/keep-cache.txt" > /dev/null
+cat "$MOUNTPOINT/keep-cache.txt" > /dev/null
+printf "cache-after" > "$MOUNTPOINT/keep-cache.txt"
+KEEP_CACHE_CONTENT=$(cat "$MOUNTPOINT/keep-cache.txt")
+if [ "$KEEP_CACHE_CONTENT" != "cache-after" ]; then
+    echo "FAILED: keep-cache.txt content is stale after overwrite: $KEEP_CACHE_CONTENT"
+    kill $MOUNT_PID 2>/dev/null || true
+    wait $MOUNT_PID 2>/dev/null || true
+    exit 1
+fi
+truncate -s 5 "$MOUNTPOINT/keep-cache.txt"
+KEEP_CACHE_CONTENT=$(cat "$MOUNTPOINT/keep-cache.txt")
+if [ "$KEEP_CACHE_CONTENT" != "cache" ]; then
+    echo "FAILED: keep-cache.txt content is stale after truncate: $KEEP_CACHE_CONTENT"
     kill $MOUNT_PID 2>/dev/null || true
     wait $MOUNT_PID 2>/dev/null || true
     exit 1

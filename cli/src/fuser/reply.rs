@@ -173,13 +173,29 @@ impl Reply for ReplyEntry {
 impl ReplyEntry {
     /// Reply to a request with the given entry
     pub fn entry(self, ttl: &Duration, attr: &FileAttr, generation: u64) {
+        self.entry_with_ttls(ttl, ttl, attr, generation);
+    }
+
+    /// Reply to a request with the given entry and separate entry/attribute TTLs.
+    pub fn entry_with_ttls(
+        self,
+        entry_ttl: &Duration,
+        attr_ttl: &Duration,
+        attr: &FileAttr,
+        generation: u64,
+    ) {
         self.reply.send_ll(&ll::Response::new_entry(
             ll::INodeNo(attr.ino),
             ll::Generation(generation),
             &attr.into(),
-            *ttl,
-            *ttl,
+            *attr_ttl,
+            *entry_ttl,
         ));
+    }
+
+    /// Reply to a lookup with a cacheable negative entry.
+    pub fn negative(self, ttl: &Duration) {
+        self.reply.send_ll(&ll::Response::new_negative_entry(*ttl));
     }
 
     /// Reply to a request with the given error code
@@ -392,10 +408,26 @@ impl ReplyCreate {
     /// # Panics
     /// When attempting to use kernel passthrough. Use `opened_passthrough()` instead.
     pub fn created(self, ttl: &Duration, attr: &FileAttr, generation: u64, fh: u64, flags: u32) {
+        self.created_with_ttls(ttl, ttl, attr, generation, fh, flags);
+    }
+
+    /// Reply to a request with a newly created file entry and separate entry/attribute TTLs.
+    /// # Panics
+    /// When attempting to use kernel passthrough. Use `opened_passthrough()` instead.
+    pub fn created_with_ttls(
+        self,
+        entry_ttl: &Duration,
+        attr_ttl: &Duration,
+        attr: &FileAttr,
+        generation: u64,
+        fh: u64,
+        flags: u32,
+    ) {
         #[cfg(feature = "abi-7-40")]
         assert_eq!(flags & FOPEN_PASSTHROUGH, 0);
         self.reply.send_ll(&ll::Response::new_create(
-            ttl,
+            attr_ttl,
+            entry_ttl,
             &attr.into(),
             ll::Generation(generation),
             ll::FileHandle(fh),
@@ -600,15 +632,30 @@ impl ReplyDirectoryPlus {
         attr: &FileAttr,
         generation: u64,
     ) -> bool {
+        self.add_with_ttls(ino, offset, name, ttl, ttl, attr, generation)
+    }
+
+    /// Add an entry to the directory-plus reply buffer with separate entry/attribute TTLs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_with_ttls<T: AsRef<OsStr>>(
+        &mut self,
+        ino: u64,
+        offset: i64,
+        name: T,
+        entry_ttl: &Duration,
+        attr_ttl: &Duration,
+        attr: &FileAttr,
+        generation: u64,
+    ) -> bool {
         let name = name.as_ref();
         self.buf.push(&DirEntryPlus::new(
             INodeNo(ino),
             Generation(generation),
             DirEntOffset(offset),
             name,
-            *ttl,
+            *entry_ttl,
             attr.into(),
-            *ttl,
+            *attr_ttl,
         ))
     }
 

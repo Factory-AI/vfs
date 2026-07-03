@@ -9,7 +9,7 @@
 //! use agentfs_cli::mount::{mount_fs, MountOpts, MountBackend};
 //!
 //! let opts = MountOpts::new(PathBuf::from("/mnt/agent"), MountBackend::Fuse);
-//! let handle = mount_fs(Arc::new(Mutex::new(my_fs)), opts).await?;
+//! let handle = mount_fs(Arc::new(my_fs), opts).await?;
 //! // ... use the mounted filesystem ...
 //! drop(handle); // auto-unmounts
 //! ```
@@ -22,7 +22,6 @@ use anyhow::Result;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 pub use crate::opts::MountBackend;
@@ -96,7 +95,7 @@ pub struct MountHandle {
 pub(crate) enum MountHandleInner {
     #[cfg(target_os = "linux")]
     Fuse {
-        _thread: std::thread::JoinHandle<anyhow::Result<()>>,
+        thread: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
     },
     Nfs {
         shutdown: CancellationToken,
@@ -116,15 +115,22 @@ impl Drop for MountHandle {
         // Move away from mountpoint before unmounting to avoid EBUSY
         let _ = std::env::set_current_dir("/");
 
-        match &self.inner {
+        match &mut self.inner {
             #[cfg(target_os = "linux")]
-            MountHandleInner::Fuse { .. } => {
+            MountHandleInner::Fuse { thread } => {
                 if let Err(e) = unmount(&self.mountpoint, self.backend, self.lazy_unmount) {
                     eprintln!(
                         "Warning: Failed to unmount FUSE filesystem at {}: {}",
                         self.mountpoint.display(),
                         e
                     );
+                }
+                if let Some(thread) = thread.take() {
+                    match thread.join() {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => eprintln!("Warning: FUSE session exited with error: {e}"),
+                        Err(e) => eprintln!("Warning: FUSE session thread panicked: {e:?}"),
+                    }
                 }
             }
             MountHandleInner::Nfs { shutdown, .. } => {
@@ -161,10 +167,10 @@ pub fn unmount(mountpoint: &Path, backend: MountBackend, lazy: bool) -> Result<(
 /// Mount a filesystem with the given options.
 ///
 /// Returns a handle that automatically unmounts when dropped.
-/// The filesystem must be wrapped in `Arc<Mutex<dyn FileSystem + Send>>`.
+/// The filesystem must be wrapped in `Arc<dyn FileSystem>`.
 #[cfg(target_os = "linux")]
 pub async fn mount_fs(
-    fs: Arc<Mutex<dyn agentfs_sdk::FileSystem + Send>>,
+    fs: Arc<dyn agentfs_sdk::FileSystem>,
     opts: MountOpts,
 ) -> Result<MountHandle> {
     match opts.backend {
@@ -176,7 +182,7 @@ pub async fn mount_fs(
 /// Mount a filesystem with the given options (macOS version).
 #[cfg(target_os = "macos")]
 pub async fn mount_fs(
-    fs: Arc<Mutex<dyn agentfs_sdk::FileSystem + Send>>,
+    fs: Arc<dyn agentfs_sdk::FileSystem>,
     opts: MountOpts,
 ) -> Result<MountHandle> {
     match opts.backend {
@@ -188,6 +194,25 @@ pub async fn mount_fs(
         }
         MountBackend::Nfs => nfs::mount_nfs(fs, opts).await,
     }
+}
+
+/// Resolve when SIGTERM, SIGINT, or SIGHUP is delivered.
+///
+/// Mount-owning commands must tear down through this rather than the default
+/// signal disposition: dying without unmounting leaves a dead mount table
+/// entry (ENOTCONN for every later visitor) and skips `MountHandle`'s Drop.
+#[cfg(unix)]
+pub async fn shutdown_signal() -> std::io::Result<()> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = signal(SignalKind::terminate())?;
+    let mut int = signal(SignalKind::interrupt())?;
+    let mut hup = signal(SignalKind::hangup())?;
+    tokio::select! {
+        _ = term.recv() => (),
+        _ = int.recv() => (),
+        _ = hup.recv() => (),
+    }
+    Ok(())
 }
 
 /// Wait for a path to become a mountpoint.

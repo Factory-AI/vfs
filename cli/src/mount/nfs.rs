@@ -4,7 +4,6 @@ use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
 use crate::nfs::AgentNFS;
 use crate::nfsserve::tcp::NFSTcp;
@@ -78,7 +77,7 @@ pub(super) fn unmount_nfs(mountpoint: &Path, lazy: bool) -> Result<()> {
 
 /// Internal NFS mount implementation.
 pub(super) async fn mount_nfs(
-    fs: Arc<Mutex<dyn agentfs_sdk::FileSystem + Send>>,
+    fs: Arc<dyn agentfs_sdk::FileSystem>,
     opts: MountOpts,
 ) -> Result<MountHandle> {
     use tokio_util::sync::CancellationToken;
@@ -166,7 +165,7 @@ fn nfs_mount(port: u32, mountpoint: &Path) -> Result<()> {
         .args([
             "-o",
             &format!(
-                "locallocks,vers=3,tcp,port={},mountport={},soft,timeo=10,retrans=2",
+                "locallocks,vers=3,tcp,port={},mountport={},wsize=1048576,rsize=1048576,soft,timeo=10,retrans=2",
                 port, port
             ),
             "127.0.0.1:/",

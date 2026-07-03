@@ -4,6 +4,7 @@ pub mod init;
 pub mod mcp_server;
 pub mod migrate;
 pub mod ps;
+pub mod safety;
 pub mod sync;
 pub mod timeline;
 
@@ -22,6 +23,10 @@ pub mod nfs;
 // Exec command (Unix only)
 #[cfg(unix)]
 pub mod exec;
+
+// Clone command (Unix only)
+#[cfg(unix)]
+pub mod clone;
 
 pub use mount::{mount, MountArgs, MountBackend};
 pub use run::handle_run_command;

@@ -1,0 +1,54 @@
+# Conservative unprivileged AgentFS POSIX gate for Phase 4.5.
+#
+# This profile intentionally excludes tests requiring root-only capabilities
+# such as block/char device mknod, successful chown/lchown, and alternate
+# uid/gid execution. Run `--profile full` for exploratory full-suite triage.
+
+chmod/02.t
+chmod/03.t
+chmod/04.t
+
+chown/04.t
+chown/06.t
+chown/08.t
+chown/09.t
+chown/10.t
+
+ftruncate/01.t
+ftruncate/02.t
+ftruncate/03.t
+ftruncate/04.t
+ftruncate/07.t
+ftruncate/08.t
+ftruncate/09.t
+ftruncate/10.t
+ftruncate/11.t
+ftruncate/14.t
+
+link/02.t
+
+mkdir/02.t
+mkdir/04.t
+
+open/04.t
+
+rename/01.t
+rename/15.t
+
+rmdir/00.t
+rmdir/02.t
+rmdir/03.t
+
+symlink/04.t
+symlink/09.t
+symlink/10.t
+
+truncate/04.t
+truncate/08.t
+truncate/09.t
+
+unlink/08.t
+unlink/09.t
+unlink/10.t
+
+utimensat/03.t
