@@ -30,6 +30,7 @@ use anyhow::{bail, Context, Result};
 use sha1::{Digest, Sha1};
 
 use crate::cmd::init::open_agentfs;
+use crate::cmd::supervise::{set_parent_death_signal_std, supervise_command, ChildOutcome};
 use crate::mount::{mount_fs, MountBackend, MountOpts};
 
 const S_IFDIR: u32 = 0o040000;
@@ -86,18 +87,45 @@ pub async fn handle_clone_command(
     };
     let mount_handle = mount_fs(fs, mount_opts).await?;
 
-    let result = clone_into_mount(&agent, &mountpoint, &source, &repo_name, verify).await;
+    let result = tokio::select! {
+        result = clone_into_mount(&agent, &mountpoint, &source, &repo_name, verify) => result,
+        signal = crate::mount::termination_signal() => {
+            match signal {
+                Ok(signo) => Err(InterruptedSignal(signo).into()),
+                Err(error) => Err(error.into()),
+            }
+        }
+    };
 
     drop(mount_handle);
     let _ = std::fs::remove_dir_all(&mountpoint);
 
-    let summary = result?;
+    let summary = match result {
+        Ok(summary) => summary,
+        Err(error) => {
+            if let Some(interrupted) = error.downcast_ref::<InterruptedSignal>() {
+                std::process::exit(128 + interrupted.0);
+            }
+            return Err(error);
+        }
+    };
     eprintln!(
         "Cloned {} into {} ({} files, {} bytes imported)",
         source, id_or_path, summary.files, summary.bytes
     );
     Ok(())
 }
+
+#[derive(Debug)]
+struct InterruptedSignal(i32);
+
+impl std::fmt::Display for InterruptedSignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "interrupted by signal {}", self.0)
+    }
+}
+
+impl std::error::Error for InterruptedSignal {}
 
 struct CloneSummary {
     files: usize,
@@ -128,7 +156,8 @@ async fn clone_into_mount(
     run_git(
         Path::new("."),
         &["clone", "--no-checkout", "--quiet", source, repo_dir_str],
-    )?;
+    )
+    .await?;
     stage("git-clone-no-checkout");
 
     let head = run_git_capture(&repo_dir, &["rev-parse", "--verify", "--quiet", "HEAD"]).ok();
@@ -220,25 +249,28 @@ fn derive_repo_name(source: &str) -> Result<String> {
     Ok(last.trim_end_matches(".git").to_string())
 }
 
-fn run_git(cwd: &Path, args: &[&str]) -> Result<()> {
-    let status = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .status()
-        .context("failed to run git")?;
-    if !status.success() {
-        bail!("git {} failed with {status}", args.join(" "));
+async fn run_git(cwd: &Path, args: &[&str]) -> Result<()> {
+    let mut command = tokio::process::Command::new("git");
+    command.args(args).current_dir(cwd);
+    match supervise_command(command)
+        .await
+        .context("failed to run git")?
+    {
+        ChildOutcome::Exited(status) => {
+            if !status.success() {
+                bail!("git {} failed with {status}", args.join(" "));
+            }
+        }
+        ChildOutcome::Interrupted(signo) => return Err(InterruptedSignal(signo).into()),
     }
     Ok(())
 }
 
 fn run_git_capture(repo: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .context("failed to run git")?;
+    let mut command = Command::new("git");
+    command.arg("-C").arg(repo).args(args);
+    set_parent_death_signal_std(&mut command);
+    let output = command.output().context("failed to run git")?;
     if !output.status.success() {
         bail!(
             "git {} failed with {}: {}",
@@ -251,12 +283,13 @@ fn run_git_capture(repo: &Path, args: &[&str]) -> Result<String> {
 }
 
 fn ls_tree(repo: &Path) -> Result<Vec<TreeRow>> {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(repo)
-        .args(["ls-tree", "-r", "-z", "HEAD"])
-        .output()
-        .context("failed to run git ls-tree")?;
+        .args(["ls-tree", "-r", "-z", "HEAD"]);
+    set_parent_death_signal_std(&mut command);
+    let output = command.output().context("failed to run git ls-tree")?;
     if !output.status.success() {
         bail!(
             "git ls-tree failed: {}",
@@ -343,13 +376,16 @@ fn spawn_blob_producer(
         refs.push((row.path.clone(), row.mode));
     }
 
-    let mut child = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(&repo)
         .args(["cat-file", "--batch"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    set_parent_death_signal_std(&mut command);
+    let mut child = command
         .spawn()
         .context("failed to spawn git cat-file --batch")?;
     let mut stdin = child.stdin.take().context("missing cat-file stdin")?;

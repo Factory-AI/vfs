@@ -14,6 +14,9 @@ pub mod mount;
 #[path = "mount_stub.rs"]
 pub mod mount;
 
+#[cfg(unix)]
+pub(crate) mod supervise;
+
 mod run;
 
 // Standalone NFS server command (Unix only)

@@ -11,6 +11,7 @@ use std::sync::Arc;
 use turso::value::Value;
 
 use crate::cmd::init::open_agentfs;
+use crate::cmd::supervise::{supervise_command, ChildOutcome};
 use crate::mount::{mount_fs, MountBackend, MountOpts};
 
 /// Handle the exec command.
@@ -99,7 +100,11 @@ pub async fn handle_exec_command(
     // Mount the filesystem
     let mount_handle = mount_fs(fs, mount_opts).await?;
 
-    let outcome = supervise_child(&command, &args, &mountpoint).await;
+    let mut child = tokio::process::Command::new(&command);
+    child.args(&args).current_dir(&mountpoint);
+    let outcome = supervise_command(child)
+        .await
+        .with_context(|| format!("Failed to execute: {}", command.display()));
 
     // Unmount and remove the mountpoint even when the workload was
     // interrupted, so no dead mount table entry or temp directory survives.
@@ -115,64 +120,4 @@ pub async fn handle_exec_command(
         }
         ChildOutcome::Interrupted(signo) => std::process::exit(128 + signo),
     }
-}
-
-enum ChildOutcome {
-    Exited(std::process::ExitStatus),
-    Interrupted(i32),
-}
-
-/// Run the workload while listening for termination signals.
-///
-/// The default signal disposition would kill this process without running
-/// `MountHandle`'s unmount, leaving a dead mount table entry and the child
-/// orphaned but alive inside it. PR_SET_PDEATHSIG additionally guarantees the
-/// child cannot outlive us even under SIGKILL, which no userspace handler can
-/// intercept.
-async fn supervise_child(
-    command: &std::path::Path,
-    args: &[String],
-    mountpoint: &std::path::Path,
-) -> Result<ChildOutcome> {
-    use tokio::signal::unix::{signal, SignalKind};
-
-    let mut cmd = tokio::process::Command::new(command);
-    cmd.args(args).current_dir(mountpoint);
-    #[cfg(target_os = "linux")]
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            // The parent may have died between fork and prctl.
-            if libc::getppid() == 1 {
-                libc::raise(libc::SIGKILL);
-            }
-            Ok(())
-        });
-    }
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("Failed to execute: {}", command.display()))?;
-
-    let mut sigterm = signal(SignalKind::terminate())?;
-    let mut sigint = signal(SignalKind::interrupt())?;
-    let mut sighup = signal(SignalKind::hangup())?;
-    let signo = tokio::select! {
-        status = child.wait() => return Ok(ChildOutcome::Exited(status?)),
-        _ = sigterm.recv() => libc::SIGTERM,
-        _ = sigint.recv() => libc::SIGINT,
-        _ = sighup.recv() => libc::SIGHUP,
-    };
-
-    if let Some(pid) = child.id() {
-        unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-    }
-    if tokio::time::timeout(std::time::Duration::from_secs(5), child.wait())
-        .await
-        .is_err()
-    {
-        let _ = child.kill().await;
-    }
-    Ok(ChildOutcome::Interrupted(signo))
 }

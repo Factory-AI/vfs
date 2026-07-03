@@ -20,6 +20,7 @@ DIR="$(dirname "$0")"
 "$DIR/test-run-bash.sh" || true  # Requires user namespaces (may fail in CI)
 "$DIR/test-run-git.sh" || true  # Requires user namespaces (may fail in CI)
 "$DIR/test-teardown-bounded.sh"
+"$DIR/test-signal-teardown.sh"
 # Short corruption/concurrency smoke; the test prints SKIP and exits 0 if
 # Linux user namespace/FUSE prerequisites are unavailable.
 CORRUPTION_TORTURE_WORKERS="${CORRUPTION_TORTURE_WORKERS:-2}" \

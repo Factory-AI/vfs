@@ -243,17 +243,23 @@ pub async fn mount_fs(
 /// signal disposition: dying without unmounting leaves a dead mount table
 /// entry (ENOTCONN for every later visitor) and skips `MountHandle`'s Drop.
 #[cfg(unix)]
-pub async fn shutdown_signal() -> std::io::Result<()> {
+pub async fn termination_signal() -> std::io::Result<i32> {
     use tokio::signal::unix::{signal, SignalKind};
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
     let mut hup = signal(SignalKind::hangup())?;
-    tokio::select! {
-        _ = term.recv() => (),
-        _ = int.recv() => (),
-        _ = hup.recv() => (),
-    }
-    Ok(())
+    let signo = tokio::select! {
+        _ = term.recv() => libc::SIGTERM,
+        _ = int.recv() => libc::SIGINT,
+        _ = hup.recv() => libc::SIGHUP,
+    };
+    Ok(signo)
+}
+
+/// Resolve when SIGTERM, SIGINT, or SIGHUP is delivered.
+#[cfg(unix)]
+pub async fn shutdown_signal() -> std::io::Result<()> {
+    termination_signal().await.map(|_| ())
 }
 
 /// Wait for a path to become a mountpoint.

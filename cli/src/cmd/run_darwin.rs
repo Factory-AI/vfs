@@ -21,6 +21,8 @@ use tokio_util::sync::CancellationToken;
 use crate::nfs::AgentNFS;
 use crate::nfsserve::tcp::NFSTcp;
 
+use crate::cmd::supervise::{supervise_command, ChildOutcome};
+
 #[cfg(target_os = "macos")]
 use crate::sandbox::darwin::{generate_sandbox_profile, SandboxConfig};
 
@@ -51,8 +53,8 @@ pub async fn run(
         if is_mount_healthy(&session.mountpoint) {
             eprintln!("Joining existing session: {}", session.session_id);
             eprintln!();
-            let exit_code = run_command_in_mount(&session, command, args)?;
-            std::process::exit(exit_code);
+            let outcome = run_command_in_mount(&session, command, args).await?;
+            std::process::exit(exit_code_for_outcome(outcome));
         } else {
             eprintln!("Cleaning up stale NFS mount...");
             if let Err(e) = unmount(&session.mountpoint) {
@@ -123,7 +125,7 @@ pub async fn run(
     print_welcome_banner(&session, encrypted);
 
     // Run the command
-    let exit_code = run_command_in_mount(&session, command, args)?;
+    let outcome = run_command_in_mount(&session, command, args).await;
 
     // Unmount
     unmount(&session.mountpoint)?;
@@ -153,7 +155,14 @@ pub async fn run(
     eprintln!("To see what changed:");
     eprintln!("  agentfs diff {}", session.session_id);
 
-    std::process::exit(exit_code);
+    std::process::exit(exit_code_for_outcome(outcome?));
+}
+
+fn exit_code_for_outcome(outcome: ChildOutcome) -> i32 {
+    match outcome {
+        ChildOutcome::Exited(status) => status.code().unwrap_or(1),
+        ChildOutcome::Interrupted(signo) => 128 + signo,
+    }
 }
 
 /// Print the welcome banner showing sandbox configuration (macOS).
@@ -372,7 +381,11 @@ fn mount_nfs(port: u32, mountpoint: &Path) -> Result<()> {
 /// The mountpoint overlays CWD, and additional paths in HOME are made writable
 /// through the allow_paths configuration.
 #[cfg(target_os = "macos")]
-fn run_command_in_mount(session: &RunSession, command: PathBuf, args: Vec<String>) -> Result<i32> {
+async fn run_command_in_mount(
+    session: &RunSession,
+    command: PathBuf,
+    args: Vec<String>,
+) -> Result<ChildOutcome> {
     // Generate the Sandbox profile
     let config = SandboxConfig {
         mountpoint: session.mountpoint.clone(),
@@ -384,7 +397,7 @@ fn run_command_in_mount(session: &RunSession, command: PathBuf, args: Vec<String
     let profile = generate_sandbox_profile(&config);
 
     // Wrap the command with sandbox-exec
-    let mut cmd = Command::new("sandbox-exec");
+    let mut cmd = tokio::process::Command::new("sandbox-exec");
     cmd.arg("-p")
         .arg(&profile)
         .arg(&command)
@@ -397,11 +410,9 @@ fn run_command_in_mount(session: &RunSession, command: PathBuf, args: Vec<String
         // Zsh: use custom ZDOTDIR to override prompt
         .env("ZDOTDIR", session.run_dir.join("zsh"));
 
-    let status = cmd
-        .status()
-        .with_context(|| format!("Failed to execute command: {}", command.display()))?;
-
-    Ok(status.code().unwrap_or(1))
+    supervise_command(cmd)
+        .await
+        .with_context(|| format!("Failed to execute command: {}", command.display()))
 }
 
 /// Run a command with the working directory set to the mounted filesystem (Linux).
@@ -409,8 +420,12 @@ fn run_command_in_mount(session: &RunSession, command: PathBuf, args: Vec<String
 /// On Linux, the command runs without additional sandboxing (NFS provides
 /// copy-on-write for the working directory).
 #[cfg(target_os = "linux")]
-fn run_command_in_mount(session: &RunSession, command: PathBuf, args: Vec<String>) -> Result<i32> {
-    let mut cmd = Command::new(&command);
+async fn run_command_in_mount(
+    session: &RunSession,
+    command: PathBuf,
+    args: Vec<String>,
+) -> Result<ChildOutcome> {
+    let mut cmd = tokio::process::Command::new(&command);
     cmd.args(&args)
         .current_dir(&session.mountpoint)
         .env("AGENTFS", "1")
@@ -419,11 +434,9 @@ fn run_command_in_mount(session: &RunSession, command: PathBuf, args: Vec<String
         // Zsh: use custom ZDOTDIR to override prompt
         .env("ZDOTDIR", session.run_dir.join("zsh"));
 
-    let status = cmd
-        .status()
-        .with_context(|| format!("Failed to execute command: {}", command.display()))?;
-
-    Ok(status.code().unwrap_or(1))
+    supervise_command(cmd)
+        .await
+        .with_context(|| format!("Failed to execute command: {}", command.display()))
 }
 
 /// Unmount the NFS filesystem (macOS version).

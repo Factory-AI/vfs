@@ -206,9 +206,9 @@ async fn run_init_cmd(
     base: Option<PathBuf>,
     agent: AgentFS,
 ) -> AnyhowResult<()> {
+    use crate::cmd::supervise::{supervise_command, ChildOutcome};
     use crate::mount::{mount_fs, MountOpts};
     use agentfs_sdk::{FileSystem, HostFS};
-    use std::process::Command;
     use std::sync::Arc;
 
     let fs: Arc<dyn FileSystem> = if let Some(ref base_path) = base {
@@ -241,12 +241,11 @@ async fn run_init_cmd(
 
     let mount_handle = mount_fs(fs, mount_opts).await?;
 
-    let status = Command::new("sh")
-        .arg("-c")
-        .arg(&cmd_str)
-        .current_dir(&mountpoint)
-        .status()
-        .with_context(|| format!("Failed to execute: {}", cmd_str))?;
+    let mut command = tokio::process::Command::new("sh");
+    command.arg("-c").arg(&cmd_str).current_dir(&mountpoint);
+    let outcome = supervise_command(command)
+        .await
+        .with_context(|| format!("Failed to execute: {}", cmd_str));
 
     drop(mount_handle);
 
@@ -254,8 +253,13 @@ async fn run_init_cmd(
 
     let _ = std::fs::remove_dir_all(&mountpoint);
 
-    if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
+    match outcome? {
+        ChildOutcome::Exited(status) => {
+            if !status.success() {
+                std::process::exit(status.code().unwrap_or(1));
+            }
+        }
+        ChildOutcome::Interrupted(signo) => std::process::exit(128 + signo),
     }
 
     Ok(())
