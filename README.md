@@ -9,8 +9,6 @@
 <p align="center">
   <a title="Build Status" target="_blank" href="https://github.com/tursodatabase/agentfs/actions/workflows/rust.yml"><img src="https://img.shields.io/github/actions/workflow/status/tursodatabase/agentfs/rust.yml?style=flat-square"></a>
   <a title="Rust" target="_blank" href="https://crates.io/crates/agentfs-sdk"><img alt="Crate" src="https://img.shields.io/crates/v/agentfs-sdk"></a>
-  <a title="JavaScript" target="_blank" href="https://www.npmjs.com/package/agentfs-sdk"><img alt="NPM" src="https://img.shields.io/npm/v/agentfs-sdk"></a>
-  <a title="Python" target="_blank" href="https://pypi.org/project/agentfs-sdk/"><img alt="PyPI" src="https://img.shields.io/pypi/v/agentfs-sdk"></a>
   <a title="MIT" target="_blank" href="https://github.com/tursodatabase/agentfs/blob/main/LICENSE.md"><img src="http://img.shields.io/badge/license-MIT-orange.svg?style=flat-square"></a>
 </p>
 <p align="center">
@@ -27,7 +25,7 @@ AgentFS is a filesystem explicitly designed for AI agents. Just as traditional f
 
 The AgentFS repository consists of the following:
 
-* **SDK** - [TypeScript](sdk/typescript), [Python](sdk/python), and [Rust](sdk/rust) libraries for programmatic filesystem access.
+* **SDK** - [Rust](sdk/rust) library for programmatic filesystem access.
 * **[CLI](MANUAL.md)** - Command-line interface for managing agent filesystems:
   - Mount AgentFS on host filesystem with FUSE on Linux and NFS on macOS.
   - Access AgentFS files with a command line tool.
@@ -115,54 +113,7 @@ Read the **[User Manual](MANUAL.md)** for complete documentation.
 
 ### Using the SDK
 
-Install the SDK in your project:
-
-```bash
-npm install agentfs-sdk
-```
-
-Use it in your agent code:
-
-```typescript
-import { AgentFS } from 'agentfs-sdk';
-
-// Persistent storage with identifier
-const agent = await AgentFS.open({ id: 'my-agent' });
-// Creates: .agentfs/my-agent.db
-
-// Or use ephemeral in-memory database
-const ephemeralAgent = await AgentFS.open();
-
-// Key-value operations
-await agent.kv.set('user:preferences', { theme: 'dark' });
-const prefs = await agent.kv.get('user:preferences');
-
-// Filesystem operations
-await agent.fs.writeFile('/output/report.pdf', pdfBuffer);
-const files = await agent.fs.readdir('/output');
-
-// Tool call tracking
-await agent.tools.record(
-  'web_search',
-  Date.now() / 1000,
-  Date.now() / 1000 + 1.5,
-  { query: 'AI' },
-  { results: [...] }
-);
-```
-
-### Examples
-
-This source repository also contains examples that demonstrate how to integrate AgentFS with some popular AI frameworks:
-
-- **[Mastra](examples/mastra/research-assistant)** - Research assistant using the Mastra AI framework
-- **[Claude Agent SDK](examples/claude-agent/research-assistant)** - Research assistant using Anthropic's Claude Agent SDK
-- **[OpenAI Agents](examples/openai-agents/research-assistant)** - Research assistant using OpenAI Agents SDK
-- **[Firecracker](examples/firecracker)** - Minimal Firecracker VM with AgentFS mounted via NFSv3
-- **[AI SDK + just-bash](examples/ai-sdk-just-bash)** - Interactive AI agent using Vercel AI SDK with just-bash for command execution
-- **[Cloudflare Workers](examples/cloudflare)** - AI agent using AI SDK + just-bash on Cloudflare Workers with Durable Objects storage
-
-See the **[examples](examples)** directory for more details.
+The Rust SDK lives in **[sdk/rust](sdk/rust)** for programmatic filesystem access.
 
 ## 🔧 How AgentFS Works?
 
@@ -205,7 +156,6 @@ The filesystem layer gives us capabilities that block devices can't. First, beca
 
 - **[User Manual](MANUAL.md)** - Complete guide to using the AgentFS CLI and SDK
 - **[Agent Filesystem Specification](SPEC.md)** - Technical specification of the agent filesystem SQLite schema
-- **[SDK Examples](examples/)** - Working code examples using AgentFS
 - **[Turso database](https://github.com/tursodatabase/turso)** - an in-process SQL database, compatible with SQLite.
 
 ### Blog Posts

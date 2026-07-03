@@ -1,8 +1,0 @@
-node_modules/
-dist/
-.env
-*.db
-*.log
-
-# AgentFS local databases
-.agentfs/

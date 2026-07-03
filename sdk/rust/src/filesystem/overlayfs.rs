@@ -4039,17 +4039,23 @@ mod tests {
     /// returns correct types for sibling entries in the base.
     ///
     /// Scenario:
-    ///   1. Base has /sdk/rust/ and /sdk/python/ (two sibling dirs)
-    ///   2. Modify a file under /sdk/rust/ → triggers copy-up, creates
-    ///      "sdk" and "rust" dirs in delta
-    ///   3. Lookup /sdk/python/ must still work (base directory)
+    ///   1. Base has /workspace/core/ and /workspace/tools/ (two sibling dirs)
+    ///   2. Modify a file under /workspace/core/ → triggers copy-up, creates
+    ///      "workspace" and "core" dirs in delta
+    ///   3. Lookup /workspace/tools/ must still work (base directory)
     #[tokio::test]
     async fn test_overlay_lookup_sibling_base_dirs_after_copy_up() -> Result<()> {
         let base_dir = tempdir()?;
-        std::fs::create_dir_all(base_dir.path().join("sdk/rust"))?;
-        std::fs::create_dir_all(base_dir.path().join("sdk/python"))?;
-        std::fs::write(base_dir.path().join("sdk/rust/lib.rs"), b"fn main() {}")?;
-        std::fs::write(base_dir.path().join("sdk/python/main.py"), b"print('hi')")?;
+        std::fs::create_dir_all(base_dir.path().join("workspace/core"))?;
+        std::fs::create_dir_all(base_dir.path().join("workspace/tools"))?;
+        std::fs::write(
+            base_dir.path().join("workspace/core/lib.rs"),
+            b"fn main() {}",
+        )?;
+        std::fs::write(
+            base_dir.path().join("workspace/tools/main.py"),
+            b"print('hi')",
+        )?;
 
         let base = Arc::new(HostFS::new(base_dir.path())?);
 
@@ -4060,24 +4066,24 @@ mod tests {
         let overlay = OverlayFS::new(base, delta);
         overlay.init(base_dir.path().to_str().unwrap()).await?;
 
-        // Navigate to sdk/rust/lib.rs and modify it (triggers copy-up)
-        let sdk_stats = overlay.lookup(ROOT_INO, "sdk").await?.unwrap();
-        let rust_stats = overlay.lookup(sdk_stats.ino, "rust").await?.unwrap();
-        let lib_stats = overlay.lookup(rust_stats.ino, "lib.rs").await?.unwrap();
+        // Navigate to workspace/core/lib.rs and modify it (triggers copy-up)
+        let workspace_stats = overlay.lookup(ROOT_INO, "workspace").await?.unwrap();
+        let core_stats = overlay.lookup(workspace_stats.ino, "core").await?.unwrap();
+        let lib_stats = overlay.lookup(core_stats.ino, "lib.rs").await?.unwrap();
         let lib_file = overlay.open(lib_stats.ino, libc::O_RDWR).await?;
         lib_file
             .pwrite(0, b"fn main() { println!(\"hello\"); }")
             .await?;
 
-        // Now lookup the sibling: sdk/python must still be a directory
-        let python_stats = overlay.lookup(sdk_stats.ino, "python").await?.unwrap();
+        // Now lookup the sibling: workspace/tools must still be a directory
+        let tools_stats = overlay.lookup(workspace_stats.ino, "tools").await?.unwrap();
         assert!(
-            python_stats.is_directory(),
-            "sdk/python should still be a directory after copy-up of sdk/rust/lib.rs"
+            tools_stats.is_directory(),
+            "workspace/tools should still be a directory after copy-up of workspace/core/lib.rs"
         );
 
-        // And sdk/python/main.py must be accessible
-        let main_py = overlay.lookup(python_stats.ino, "main.py").await?.unwrap();
+        // And workspace/tools/main.py must be accessible
+        let main_py = overlay.lookup(tools_stats.ino, "main.py").await?.unwrap();
         assert!(main_py.is_file());
         let file = overlay.open(main_py.ino, libc::O_RDONLY).await?;
         let content = file.pread(0, 100).await?;

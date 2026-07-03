@@ -1,2 +1,0 @@
-- name: Install system dependencies
-  run: ./scripts/install-deps.sh
