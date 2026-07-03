@@ -3,7 +3,7 @@ use super::nfs::*;
 pub use super::rpc::auth_unix;
 use async_trait::async_trait;
 use std::cmp::Ordering;
-use std::sync::Once;
+use std::sync::OnceLock;
 use std::time::SystemTime;
 #[derive(Default, Debug)]
 pub struct DirEntrySimple {
@@ -45,25 +45,15 @@ impl ReadDirSimpleResult {
     }
 }
 
-static mut GENERATION_NUMBER: u64 = 0;
-static GENERATION_NUMBER_INIT: Once = Once::new();
+static GENERATION_NUMBER: OnceLock<u64> = OnceLock::new();
 
 fn get_generation_number() -> u64 {
-    unsafe {
-        GENERATION_NUMBER_INIT.call_once(|| {
-            GENERATION_NUMBER = SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64;
-        });
-        GENERATION_NUMBER
-    }
-}
-
-/// What capabilities are supported
-pub enum VFSCapabilities {
-    ReadOnly,
-    ReadWrite,
+    *GENERATION_NUMBER.get_or_init(|| {
+        SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    })
 }
 
 /// The basic API to implement to provide an NFS file system
@@ -96,8 +86,6 @@ pub enum VFSCapabilities {
 ///
 #[async_trait]
 pub trait NFSFileSystem: Sync {
-    /// Returns the set of capabilities supported
-    fn capabilities(&self) -> VFSCapabilities;
     /// Returns the ID the of the root directory "/"
     fn root_dir(&self) -> fileid3;
     /// Look up the id of a path in a directory
@@ -113,8 +101,7 @@ pub trait NFSFileSystem: Sync {
     /// This method should be fast as it is used very frequently.
     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3>;
 
-    /// Sets the attributes of an id
-    /// this should return Err(nfsstat3::NFS3ERR_ROFS) if readonly
+    /// Sets the attributes of an id.
     async fn setattr(&self, id: fileid3, setattr: sattr3) -> Result<fattr3, nfsstat3>;
 
     /// Reads the contents of a file returning (bytes, EOF)
@@ -124,16 +111,12 @@ pub trait NFSFileSystem: Sync {
     async fn read(&self, id: fileid3, offset: u64, count: u32)
         -> Result<(Vec<u8>, bool), nfsstat3>;
 
-    /// Writes the contents of a file returning (bytes, EOF)
+    /// Writes the contents of a file.
     /// Note that offset/count may go past the end of the file and that
     /// in that case, the file is extended.
-    /// If not supported due to readonly file system
-    /// this should return Err(nfsstat3::NFS3ERR_ROFS)
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3>;
 
     /// Creates a file with the following attributes.
-    /// If not supported due to readonly file system
-    /// this should return Err(nfsstat3::NFS3ERR_ROFS)
     /// The auth parameter contains the caller's credentials for ownership.
     async fn create(
         &self,
@@ -144,7 +127,6 @@ pub trait NFSFileSystem: Sync {
     ) -> Result<(fileid3, fattr3), nfsstat3>;
 
     /// Creates a file if it does not already exist
-    /// this should return Err(nfsstat3::NFS3ERR_ROFS)
     /// The auth parameter contains the caller's credentials for ownership.
     async fn create_exclusive(
         &self,
@@ -154,8 +136,6 @@ pub trait NFSFileSystem: Sync {
     ) -> Result<fileid3, nfsstat3>;
 
     /// Makes a directory with the following attributes.
-    /// If not supported dur to readonly file system
-    /// this should return Err(nfsstat3::NFS3ERR_ROFS)
     /// The auth parameter contains the caller's credentials for ownership.
     async fn mkdir(
         &self,
@@ -166,8 +146,6 @@ pub trait NFSFileSystem: Sync {
     ) -> Result<(fileid3, fattr3), nfsstat3>;
 
     /// Creates a special file (device, fifo, socket) with the given attributes.
-    /// If not supported due to readonly file system
-    /// this should return Err(nfsstat3::NFS3ERR_ROFS)
     /// The auth parameter contains the caller's credentials for ownership.
     async fn mknod(
         &self,
@@ -180,13 +158,9 @@ pub trait NFSFileSystem: Sync {
     ) -> Result<(fileid3, fattr3), nfsstat3>;
 
     /// Removes a file.
-    /// If not supported due to readonly file system
-    /// this should return Err(nfsstat3::NFS3ERR_ROFS)
     async fn remove(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3>;
 
     /// Removes a file.
-    /// If not supported due to readonly file system
-    /// this should return Err(nfsstat3::NFS3ERR_ROFS)
     async fn rename(
         &self,
         from_dirid: fileid3,
@@ -196,8 +170,6 @@ pub trait NFSFileSystem: Sync {
     ) -> Result<(), nfsstat3>;
 
     /// Creates a hard link to an existing file.
-    /// If not supported due to readonly file system
-    /// this should return Err(nfsstat3::NFS3ERR_ROFS)
     async fn link(
         &self,
         id: fileid3,
@@ -233,8 +205,6 @@ pub trait NFSFileSystem: Sync {
     }
 
     /// Makes a symlink with the following attributes.
-    /// If not supported due to readonly file system
-    /// this should return Err(nfsstat3::NFS3ERR_ROFS)
     /// The auth parameter contains the caller's credentials for ownership.
     async fn symlink(
         &self,

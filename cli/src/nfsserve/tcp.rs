@@ -10,7 +10,6 @@ use std::time::Duration;
 use std::{io, net::IpAddr};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
@@ -20,7 +19,6 @@ pub struct NFSTcpListener<T: NFSFileSystem + Send + Sync + 'static> {
     listener: TcpListener,
     port: u16,
     arcfs: Arc<T>,
-    mount_signal: Option<mpsc::Sender<bool>>,
     export_name: Arc<String>,
     transaction_tracker: Arc<TransactionTracker>,
 }
@@ -119,10 +117,6 @@ pub trait NFSTcp: Send + Sync {
     /// Gets the true listening IP. Useful on windows when the IP may be random
     fn get_listen_ip(&self) -> IpAddr;
 
-    /// Sets a mount listener. A "true" signal will be sent on a mount
-    /// and a "false" will be sent on an unmount
-    fn set_mount_listener(&mut self, signal: mpsc::Sender<bool>);
-
     /// Loops forever and never returns handling all incoming connections.
     async fn handle_forever(&self) -> io::Result<()> {
         self.handle_until_cancelled(CancellationToken::new()).await
@@ -194,7 +188,6 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
             listener,
             port,
             arcfs,
-            mount_signal: None,
             export_name: Arc::from("/".to_string()),
             transaction_tracker: Arc::new(TransactionTracker::new(Duration::from_secs(60))),
         })
@@ -230,12 +223,6 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
         addr.ip()
     }
 
-    /// Sets a mount listener. A "true" signal will be sent on a mount
-    /// and a "false" will be sent on an unmount
-    fn set_mount_listener(&mut self, signal: mpsc::Sender<bool>) {
-        self.mount_signal = Some(signal);
-    }
-
     /// Handles incoming connections until the cancellation token is triggered.
     async fn handle_until_cancelled(&self, shutdown: CancellationToken) -> io::Result<()> {
         let mut connections = JoinSet::new();
@@ -253,7 +240,6 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
                         client_addr: socket.peer_addr().unwrap().to_string(),
                         auth: super::rpc::auth_unix::default(),
                         vfs: self.arcfs.clone(),
-                        mount_signal: self.mount_signal.clone(),
                         export_name: self.export_name.clone(),
                         transaction_tracker: self.transaction_tracker.clone(),
                     };

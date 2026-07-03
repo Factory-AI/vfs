@@ -14,7 +14,7 @@ use crate::nfsserve::nfs::{
     fattr3, fileid3, filename3, ftype3, nfs_fh3, nfspath3, nfsstat3, nfstime3, sattr3, set_atime,
     set_gid3, set_mode3, set_mtime, set_size3, set_uid3, specdata3,
 };
-use crate::nfsserve::vfs::{auth_unix, DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
+use crate::nfsserve::vfs::{auth_unix, DirEntry, NFSFileSystem, ReadDirResult};
 use agentfs_sdk::error::Error as SdkError;
 use agentfs_sdk::filesystem::FsError;
 use agentfs_sdk::{
@@ -178,10 +178,6 @@ impl AgentNFS {
 impl NFSFileSystem for AgentNFS {
     fn root_dir(&self) -> fileid3 {
         ROOT_INO
-    }
-
-    fn capabilities(&self) -> VFSCapabilities {
-        VFSCapabilities::ReadWrite
     }
 
     fn id_to_fh(&self, id: fileid3) -> nfs_fh3 {

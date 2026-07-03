@@ -115,9 +115,6 @@ pub async fn mountproc3_mnt(
             ],
         };
         debug!("{:?} --> {:?}", xid, response);
-        if let Some(ref chan) = context.mount_signal {
-            let _ = chan.send(true).await;
-        }
         make_success_reply(xid).serialize(output)?;
         mountstat3::MNT3_OK.serialize(output)?;
         response.serialize(output)?;
@@ -185,15 +182,12 @@ pub async fn mountproc3_umnt(
     xid: u32,
     input: &mut impl Read,
     output: &mut impl Write,
-    context: &RPCContext,
+    _context: &RPCContext,
 ) -> Result<(), anyhow::Error> {
     let mut path = dirpath::new();
     path.deserialize(input)?;
     let utf8path = std::str::from_utf8(&path).unwrap_or_default();
     debug!("mountproc3_umnt({:?},{:?}) ", xid, utf8path);
-    if let Some(ref chan) = context.mount_signal {
-        let _ = chan.send(false).await;
-    }
     make_success_reply(xid).serialize(output)?;
     mountstat3::MNT3_OK.serialize(output)?;
     Ok(())
@@ -203,12 +197,9 @@ pub async fn mountproc3_umnt_all(
     xid: u32,
     _input: &mut impl Read,
     output: &mut impl Write,
-    context: &RPCContext,
+    _context: &RPCContext,
 ) -> Result<(), anyhow::Error> {
     debug!("mountproc3_umnt_all({:?}) ", xid);
-    if let Some(ref chan) = context.mount_signal {
-        let _ = chan.send(false).await;
-    }
     make_success_reply(xid).serialize(output)?;
     mountstat3::MNT3_OK.serialize(output)?;
     Ok(())

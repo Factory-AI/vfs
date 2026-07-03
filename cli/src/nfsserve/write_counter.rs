@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use std::io::Write;
 
 // from https://stackoverflow.com/questions/42187591/how-to-keep-track-of-how-many-bytes-written-when-using-stdiowrite
@@ -14,10 +13,6 @@ where
 {
     pub fn new(inner: W) -> Self {
         WriteCounter { inner, count: 0 }
-    }
-
-    pub fn into_inner(self) -> W {
-        self.inner
     }
 
     pub fn bytes_written(&self) -> usize {

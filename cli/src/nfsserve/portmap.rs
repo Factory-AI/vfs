@@ -18,7 +18,5 @@ pub struct mapping {
     pub port: u32,
 }
 XDRStruct!(mapping, prog, vers, prot, port);
-pub const IPPROTO_TCP: u32 = 6; /* protocol number for TCP/IP */
-pub const IPPROTO_UDP: u32 = 17; /* protocol number for UDP/IP */
 pub const PROGRAM: u32 = 100000;
 pub const VERSION: u32 = 2;

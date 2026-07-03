@@ -4,7 +4,6 @@ use super::context::RPCContext;
 use super::nfs;
 use super::permissions;
 use super::rpc::*;
-use super::vfs::VFSCapabilities;
 use super::xdr::*;
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use num_derive::{FromPrimitive, ToPrimitive};
@@ -564,13 +563,7 @@ pub async fn nfsproc3_access(
     };
 
     // Compute access based on auth credentials and file attributes
-    let mut granted_access = permissions::compute_access(&context.auth, &attr, requested_access);
-
-    // If filesystem is read-only, remove write permissions
-    if !matches!(context.vfs.capabilities(), VFSCapabilities::ReadWrite) {
-        granted_access &=
-            permissions::ACCESS3_READ | permissions::ACCESS3_LOOKUP | permissions::ACCESS3_EXECUTE;
-    }
+    let granted_access = permissions::compute_access(&context.auth, &attr, requested_access);
 
     debug!(
         " {:?} ---> requested={:?}, granted={:?}",
@@ -1275,15 +1268,6 @@ pub async fn nfsproc3_write(
     output: &mut impl Write,
     context: &RPCContext,
 ) -> Result<(), anyhow::Error> {
-    // if we do not have write capabilities
-    if !matches!(context.vfs.capabilities(), VFSCapabilities::ReadWrite) {
-        warn!("No write capabilities.");
-        make_success_reply(xid).serialize(output)?;
-        nfs::nfsstat3::NFS3ERR_ROFS.serialize(output)?;
-        nfs::wcc_data::default().serialize(output)?;
-        return Ok(());
-    }
-
     let mut args = WRITE3args::default();
     args.deserialize(input)?;
     debug!("nfsproc3_write({:?},...) ", xid);
@@ -1436,15 +1420,6 @@ pub async fn nfsproc3_create(
     output: &mut impl Write,
     context: &RPCContext,
 ) -> Result<(), anyhow::Error> {
-    // if we do not have write capabilities
-    if !matches!(context.vfs.capabilities(), VFSCapabilities::ReadWrite) {
-        warn!("No write capabilities.");
-        make_success_reply(xid).serialize(output)?;
-        nfs::nfsstat3::NFS3ERR_ROFS.serialize(output)?;
-        nfs::wcc_data::default().serialize(output)?;
-        return Ok(());
-    }
-
     let mut dirops = nfs::diropargs3::default();
     dirops.deserialize(input)?;
     let mut createhow = createmode3::default();
@@ -1652,13 +1627,6 @@ pub async fn nfsproc3_setattr(
     output: &mut impl Write,
     context: &RPCContext,
 ) -> Result<(), anyhow::Error> {
-    if !matches!(context.vfs.capabilities(), VFSCapabilities::ReadWrite) {
-        warn!("No write capabilities.");
-        make_success_reply(xid).serialize(output)?;
-        nfs::nfsstat3::NFS3ERR_ROFS.serialize(output)?;
-        nfs::wcc_data::default().serialize(output)?;
-        return Ok(());
-    }
     let mut args = SETATTR3args::default();
     args.deserialize(input)?;
     debug!("nfsproc3_setattr({:?},{:?}) ", xid, args);
@@ -1912,15 +1880,6 @@ pub async fn nfsproc3_remove(
     output: &mut impl Write,
     context: &RPCContext,
 ) -> Result<(), anyhow::Error> {
-    // if we do not have write capabilities
-    if !matches!(context.vfs.capabilities(), VFSCapabilities::ReadWrite) {
-        warn!("No write capabilities.");
-        make_success_reply(xid).serialize(output)?;
-        nfs::nfsstat3::NFS3ERR_ROFS.serialize(output)?;
-        nfs::wcc_data::default().serialize(output)?;
-        return Ok(());
-    }
-
     let mut dirops = nfs::diropargs3::default();
     dirops.deserialize(input)?;
 
@@ -2055,15 +2014,6 @@ pub async fn nfsproc3_rename(
     output: &mut impl Write,
     context: &RPCContext,
 ) -> Result<(), anyhow::Error> {
-    // if we do not have write capabilities
-    if !matches!(context.vfs.capabilities(), VFSCapabilities::ReadWrite) {
-        warn!("No write capabilities.");
-        make_success_reply(xid).serialize(output)?;
-        nfs::nfsstat3::NFS3ERR_ROFS.serialize(output)?;
-        nfs::wcc_data::default().serialize(output)?;
-        return Ok(());
-    }
-
     let mut fromdirops = nfs::diropargs3::default();
     let mut todirops = nfs::diropargs3::default();
     fromdirops.deserialize(input)?;
@@ -2325,14 +2275,6 @@ pub async fn nfsproc3_mkdir(
     output: &mut impl Write,
     context: &RPCContext,
 ) -> Result<(), anyhow::Error> {
-    // if we do not have write capabilities
-    if !matches!(context.vfs.capabilities(), VFSCapabilities::ReadWrite) {
-        warn!("No write capabilities.");
-        make_success_reply(xid).serialize(output)?;
-        nfs::nfsstat3::NFS3ERR_ROFS.serialize(output)?;
-        nfs::wcc_data::default().serialize(output)?;
-        return Ok(());
-    }
     let mut args = MKDIR3args::default();
     args.deserialize(input)?;
 
@@ -2473,14 +2415,6 @@ pub async fn nfsproc3_symlink(
     output: &mut impl Write,
     context: &RPCContext,
 ) -> Result<(), anyhow::Error> {
-    // if we do not have write capabilities
-    if !matches!(context.vfs.capabilities(), VFSCapabilities::ReadWrite) {
-        warn!("No write capabilities.");
-        make_success_reply(xid).serialize(output)?;
-        nfs::nfsstat3::NFS3ERR_ROFS.serialize(output)?;
-        nfs::wcc_data::default().serialize(output)?;
-        return Ok(());
-    }
     let mut args = SYMLINK3args::default();
     args.deserialize(input)?;
 
@@ -2622,16 +2556,6 @@ pub async fn nfsproc3_link(
     output: &mut impl Write,
     context: &RPCContext,
 ) -> Result<(), anyhow::Error> {
-    // if we do not have write capabilities
-    if !matches!(context.vfs.capabilities(), VFSCapabilities::ReadWrite) {
-        warn!("No write capabilities.");
-        make_success_reply(xid).serialize(output)?;
-        nfs::nfsstat3::NFS3ERR_ROFS.serialize(output)?;
-        nfs::post_op_attr::Void.serialize(output)?;
-        nfs::wcc_data::default().serialize(output)?;
-        return Ok(());
-    }
-
     let mut args = LINK3args::default();
     args.deserialize(input)?;
 
@@ -2875,15 +2799,6 @@ pub async fn nfsproc3_mknod(
     output: &mut impl Write,
     context: &RPCContext,
 ) -> Result<(), anyhow::Error> {
-    // if we do not have write capabilities
-    if !matches!(context.vfs.capabilities(), VFSCapabilities::ReadWrite) {
-        warn!("No write capabilities.");
-        make_success_reply(xid).serialize(output)?;
-        nfs::nfsstat3::NFS3ERR_ROFS.serialize(output)?;
-        nfs::wcc_data::default().serialize(output)?;
-        return Ok(());
-    }
-
     // Read diropargs3 (where to create)
     let mut dirops = nfs::diropargs3::default();
     dirops.deserialize(input)?;
@@ -3061,7 +2976,6 @@ mod tests {
                 gids: vec![TEST_GID],
             },
             vfs,
-            mount_signal: None,
             export_name: Arc::new("/".to_string()),
             transaction_tracker: Arc::new(TransactionTracker::new(Duration::from_secs(60))),
         };

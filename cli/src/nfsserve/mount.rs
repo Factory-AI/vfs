@@ -13,10 +13,6 @@ use std::io::{Read, Write};
 pub const PROGRAM: u32 = 100005;
 pub const VERSION: u32 = 3;
 
-pub const MNTPATHLEN: u32 = 1024; /* Maximum bytes in a path name */
-pub const MNTNAMLEN: u32 = 255; /* Maximum bytes in a name */
-pub const FHSIZE3: u32 = 64; /* Maximum bytes in a V3 file handle */
-
 pub type fhandle3 = Vec<u8>;
 pub type dirpath = Vec<u8>;
 pub type name = Vec<u8>;

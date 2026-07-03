@@ -143,9 +143,6 @@ pub enum nfsstat3 {
     /// No space left on device. The operation would have caused
     /// the server's file system to exceed its limit.
     NFS3ERR_NOSPC = 28,
-    /// Read-only file system. A modifying operation was
-    /// attempted on a read-only file system.
-    NFS3ERR_ROFS = 30,
     /// Too many hard links.
     NFS3ERR_MLINK = 31,
     /// The filename in an operation was too long.
@@ -559,8 +556,3 @@ pub struct symlinkdata3 {
     pub symlink_data: nfspath3,
 }
 XDRStruct!(symlinkdata3, symlink_attributes, symlink_data);
-
-/// We define the root handle here
-pub fn get_root_mount_handle() -> Vec<u8> {
-    vec![0]
-}
