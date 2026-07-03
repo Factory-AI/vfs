@@ -235,7 +235,8 @@ pub async fn run_cmd(
         .db_path
         .to_str()
         .context("Database path contains non-UTF8 characters")?;
-    let mut options = AgentFSOptions::with_path(db_path_str);
+    let mut options = AgentFSOptions::with_path(db_path_str)
+        .with_core_config(crate::config::core_config_from_env());
     if let Some((key, cipher)) = encryption {
         options = options.with_encryption(EncryptionConfig {
             hex_key: key,

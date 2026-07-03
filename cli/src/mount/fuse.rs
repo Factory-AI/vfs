@@ -251,6 +251,10 @@ impl agentfs_sdk::FileSystem for ReadWriteLaneFsAdapter {
         }
     }
 
+    fn delta_keep_cache_fast_path(&self) -> bool {
+        self.inner.delta_keep_cache_fast_path()
+    }
+
     async fn mkdir(
         &self,
         parent_ino: i64,

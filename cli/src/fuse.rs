@@ -2904,6 +2904,7 @@ impl AgentFSFuse {
     /// The provided Tokio runtime is used to execute async FileSystem operations
     /// from within synchronous FUSE callbacks via `block_on`.
     fn new(fs: Arc<dyn FileSystem>, runtime: Runtime) -> Self {
+        let keepcache_delta_enabled = fs.delta_keep_cache_fast_path();
         let sync_inval = fuse_sync_inval_enabled_from_env();
         let self_inval = env_flag_default("AGENTFS_FUSE_SELF_INVAL", false);
         let drain_on_release = fuse_drain_on_release_from_env();
@@ -2952,7 +2953,7 @@ impl AgentFSFuse {
             drain_on_forget,
             flush_inval_always,
             noflush,
-            keepcache_delta_enabled: agentfs_sdk::filesystem::keepcache_delta_enabled(),
+            keepcache_delta_enabled,
             noopen,
             noopen_active: AtomicBool::new(false),
             ino_files: Mutex::new(HashMap::new()),

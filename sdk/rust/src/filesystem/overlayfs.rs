@@ -20,7 +20,6 @@ use super::{
 /// Root inode number (matches FUSE convention)
 const ROOT_INO: i64 = 1;
 const STORAGE_CHUNKED: i64 = 0;
-const PARTIAL_ORIGIN_ENV: &str = "AGENTFS_OVERLAY_PARTIAL_ORIGIN";
 pub const DEFAULT_PARTIAL_ORIGIN_THRESHOLD_BYTES: u64 = 1024 * 1024;
 
 /// Explicit policy for partial-origin copy-up of regular base files.
@@ -63,15 +62,6 @@ impl PartialOriginPolicy {
         self
     }
 
-    /// Preserve legacy env-var opt-in while keeping ordinary defaults strict/off.
-    pub fn from_env_compat() -> Self {
-        if env_flag_enabled(PARTIAL_ORIGIN_ENV) {
-            Self::new(PartialOriginMode::On)
-        } else {
-            Self::default()
-        }
-    }
-
     fn permits(&self, stats: &Stats) -> bool {
         if !stats.is_file() {
             return false;
@@ -90,17 +80,6 @@ impl PartialOriginPolicy {
 fn current_timestamp() -> Result<(i64, i64)> {
     let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
     Ok((dur.as_secs() as i64, dur.subsec_nanos() as i64))
-}
-
-fn env_flag_enabled(name: &str) -> bool {
-    std::env::var(name)
-        .map(|value| {
-            matches!(
-                value.to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
 }
 
 fn is_write_open(flags: i32) -> bool {
@@ -188,7 +167,8 @@ pub struct OverlayFS {
 impl OverlayFS {
     /// Create a new overlay filesystem
     pub fn new(base: Arc<dyn FileSystem>, delta: AgentFS) -> Self {
-        Self::new_with_partial_origin_policy(base, delta, PartialOriginPolicy::from_env_compat())
+        let partial_origin_policy = delta.partial_origin_policy();
+        Self::new_with_partial_origin_policy(base, delta, partial_origin_policy)
     }
 
     pub fn new_with_partial_origin_policy(
@@ -2079,6 +2059,10 @@ impl FileSystem for OverlayFS {
                 FileSystem::keep_cache_for_read_open(&self.delta, info.underlying_ino, flags).await
             }
         }
+    }
+
+    fn delta_keep_cache_fast_path(&self) -> bool {
+        self.delta.delta_keep_cache_fast_path()
     }
 
     async fn open(&self, ino: i64, flags: i32) -> Result<BoxedFile> {

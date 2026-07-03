@@ -17,21 +17,13 @@ use super::{
     BoxedFile, DirEntry, File, FileSystem, FilesystemStats, FsError, Stats, TimeChange, WriteRange,
     DEFAULT_DIR_MODE, MAX_NAME_LEN, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG,
 };
+use crate::config::{
+    BatcherConfig, CoreConfig, Geometry, DEFAULT_CHUNK_SIZE, DEFAULT_INLINE_THRESHOLD,
+};
 use crate::connection_pool::{ConnectionPool, ConnectionPoolOptions};
 use crate::schema::{self, AGENTFS_SCHEMA_VERSION};
 
 const ROOT_INO: i64 = 1;
-const DEFAULT_CHUNK_SIZE: usize = 65536;
-/// Tier Three Axis I: raised from 4 KiB to 16 KiB so the (4, 16] KiB tail of
-/// codex working-tree files (which dominate at ~14 KiB median) avoids the
-/// chunked-storage path entirely. The fs_inode metadata SELECTs in
-/// `getattr`/`lookup` explicitly project named columns and do NOT pull
-/// `data_inline`, so the only cost of a larger inline blob is paid on actual
-/// reads of those specific files — which is more than offset by skipping the
-/// extra `fs_data` row and its SELECT+UPDATE-on-write cycle. The persisted
-/// `fs_config.inline_threshold` is per-DB so existing databases keep their
-/// 4 KiB threshold; only newly-initialised databases pick up the new default.
-const DEFAULT_INLINE_THRESHOLD: usize = 16384;
 const STORAGE_CHUNKED: i64 = 0;
 const STORAGE_INLINE: i64 = 1;
 const DENTRY_CACHE_MAX_SIZE: usize = 10000;
@@ -50,33 +42,6 @@ const FILE_BACKED_SETUP_SQL: &[&str] = &[
     BASELINE_SYNCHRONOUS_SQL,
 ];
 const ATTR_CACHE_MAX_SIZE: usize = 10000;
-const WRITE_BATCHER_ENABLE_ENV: &str = "AGENTFS_FUSE_WRITEBACK";
-const WRITE_BATCHER_MS_ENV: &str = "AGENTFS_BATCH_MS";
-const WRITE_BATCHER_BYTES_ENV: &str = "AGENTFS_BATCH_BYTES";
-/// Global (cross-inode) ceiling on in-memory pending write bytes. When the sum
-/// of all pending inode batches reaches this, the enqueue path triggers a full
-/// batched drain. This bounds memory so the group-commit window
-/// (`AGENTFS_BATCH_MS`) can coalesce many file closes into far fewer commits
-/// without risking unbounded RSS during a write burst (e.g. git clone).
-const WRITE_BATCHER_GLOBAL_BYTES_ENV: &str = "AGENTFS_BATCH_GLOBAL_BYTES";
-/// Per-transaction bounds for the coalescing drain scheduler: one batched
-/// drain transaction commits at most this many inodes / pending bytes. When a
-/// pass over the pending map exceeds the bound, the remainder is committed in
-/// immediately-following back-to-back transactions instead of one unbounded
-/// `BEGIN IMMEDIATE`.
-const WRITE_BATCHER_TXN_INODES_ENV: &str = "AGENTFS_BATCH_TXN_INODES";
-const WRITE_BATCHER_TXN_BYTES_ENV: &str = "AGENTFS_BATCH_TXN_BYTES";
-const DEFAULT_WRITE_BATCH_MS: u64 = 5;
-const DEFAULT_WRITE_BATCH_BYTES: usize = 4 * 1024 * 1024;
-const DEFAULT_WRITE_BATCH_GLOBAL_BYTES: usize = 64 * 1024 * 1024;
-const DEFAULT_WRITE_BATCH_TXN_INODES: usize = 1024;
-const DEFAULT_WRITE_BATCH_TXN_BYTES: usize = 32 * 1024 * 1024;
-/// Tier 4 escape hatch. When `AGENTFS_OVERLAY_READS=0`, the SDK reverts to
-/// Tier 3 semantics: `pwrite` drains before commit, `pread` drains before
-/// read, `merge_pending_view` is a no-op. Defaults to ON so a clean install
-/// gets Tier 4 benefits, but operators can flip it OFF without rebuilding if
-/// a previously-unknown read-merge bug surfaces in production.
-const OVERLAY_READS_ENV: &str = "AGENTFS_OVERLAY_READS";
 
 /// Production connection-pool options for local file-backed AgentFS databases.
 pub(crate) fn file_backed_connection_pool_options() -> ConnectionPoolOptions {
@@ -191,65 +156,6 @@ async fn ensure_column_matches(conn: &Connection, spec: ColumnSpec) -> Result<()
         "schema ALTER reported duplicate column {}.{}, but PRAGMA table_info did not find it",
         spec.table_name, spec.column_name
     )))
-}
-
-/// Returns the value of an env-var boolean flag, falling back to `default`
-/// when the variable is unset. Mirrors `env_flag_default` in `cli/src/fuse.rs`
-/// so the SDK can agree with the cli on shared env vars (notably
-/// `AGENTFS_FUSE_WRITEBACK`, which the cli defaults to TRUE).
-fn env_flag_default(name: &str, default: bool) -> bool {
-    match std::env::var(name) {
-        Ok(value) => matches!(
-            value.to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        ),
-        Err(_) => default,
-    }
-}
-
-/// Whether chmod / chown / utimens should force a synchronous batcher drain
-/// (one SQLite commit per call) before applying the attribute change.
-///
-/// Default TRUE (legacy drain-before-setattr). The deferred path
-/// (`AGENTFS_DRAIN_ON_SETATTR=0`) stashes the kernel times via
-/// `mark_times_explicit` + `preserve_times` and lets the group commit apply
-/// them, which cut clone-phase transactions from ~4,700 to ~250 (clone median
-/// -7.4%). It is opt-in because the 2026-05-30 A/B measured a +9.6% workload
-/// total regression: deferred commits land after git writes its index, the
-/// FUSE adapter's buffered WRITE is enqueued after the SETATTR and clears the
-/// stashed mtime/ctime, and the resulting stat drift makes checkout/status
-/// re-read ~4,700 files. Flip the default only after deferred commits are
-/// attribute-transparent and that A/B goes green.
-fn drain_on_setattr() -> bool {
-    static DRAIN_ON_SETATTR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *DRAIN_ON_SETATTR.get_or_init(|| env_flag_default("AGENTFS_DRAIN_ON_SETATTR", true))
-}
-
-/// Whether DB-backed regular files may keep the kernel page cache across
-/// read-only opens (`FOPEN_KEEP_CACHE`). Default true; the FUSE adapter's
-/// fingerprint guard revalidates stats at each open.
-/// Whether DB-backed (delta) files may grant `FOPEN_KEEP_CACHE` on read-only
-/// opens. Public so FUSE adapters can gate their own cached-stats fast path
-/// on the same kill switch (`AGENTFS_KEEPCACHE_DELTA=0`).
-pub fn keepcache_delta_enabled() -> bool {
-    static KEEPCACHE_DELTA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *KEEPCACHE_DELTA.get_or_init(|| env_flag_default("AGENTFS_KEEPCACHE_DELTA", true))
-}
-
-fn env_duration_millis(name: &str, default_ms: u64) -> Duration {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or_else(|| Duration::from_millis(default_ms))
-}
-
-fn env_usize(name: &str, default_value: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(default_value)
 }
 
 /// LRU cache for directory entry lookups.
@@ -662,27 +568,23 @@ struct AgentFSWriteBatcher {
 }
 
 impl AgentFSWriteBatcher {
-    fn from_env(
+    fn from_config(
         pool: ConnectionPool,
         chunk_size: usize,
         inline_threshold: usize,
         attr_cache: Arc<AttrCache>,
+        config: &BatcherConfig,
     ) -> Self {
         Self {
             pool,
             chunk_size,
             inline_threshold,
             attr_cache,
-            batch_ms: env_duration_millis(WRITE_BATCHER_MS_ENV, DEFAULT_WRITE_BATCH_MS),
-            batch_bytes: env_usize(WRITE_BATCHER_BYTES_ENV, DEFAULT_WRITE_BATCH_BYTES),
-            batch_global_bytes: env_usize(
-                WRITE_BATCHER_GLOBAL_BYTES_ENV,
-                DEFAULT_WRITE_BATCH_GLOBAL_BYTES,
-            ),
-            txn_max_inodes: env_usize(WRITE_BATCHER_TXN_INODES_ENV, DEFAULT_WRITE_BATCH_TXN_INODES)
-                .max(1),
-            txn_max_bytes: env_usize(WRITE_BATCHER_TXN_BYTES_ENV, DEFAULT_WRITE_BATCH_TXN_BYTES)
-                .max(1),
+            batch_ms: config.window,
+            batch_bytes: config.inode_bytes,
+            batch_global_bytes: config.global_bytes,
+            txn_max_inodes: config.txn_max_inodes.max(1),
+            txn_max_bytes: config.txn_max_bytes.max(1),
             state: RwLock::new(AgentFSWriteBatcherState::default()),
             commit_lock: AsyncMutex::new(()),
         }
@@ -1487,6 +1389,8 @@ pub struct AgentFS {
     /// behaves like Tier 3 — every pwrite drains, every pread drains,
     /// `merge_pending_view` is a no-op. ON by default.
     overlay_reads: bool,
+    /// Typed runtime configuration captured once when the filesystem opens.
+    core_config: Arc<CoreConfig>,
     /// Live open-handle registry for deferred orphan reaping (see
     /// [`OpenInodes`]).
     open_inodes: Arc<OpenInodes>,
@@ -2586,17 +2490,23 @@ impl AgentFS {
         } else {
             Some(PathBuf::from(db_path))
         };
-        Self::from_pool_with_path(pool, db_path).await
+        Self::from_pool_with_path_and_config(pool, db_path, CoreConfig::from_env()).await
     }
 
     /// Create a filesystem from a connection pool
     pub async fn from_pool(pool: ConnectionPool) -> Result<Self> {
-        Self::from_pool_with_path(pool, None).await
+        Self::from_pool_with_config(pool, CoreConfig::from_env()).await
     }
 
-    pub(crate) async fn from_pool_with_path(
+    /// Create a filesystem from a connection pool and explicit core config.
+    pub async fn from_pool_with_config(pool: ConnectionPool, config: CoreConfig) -> Result<Self> {
+        Self::from_pool_with_path_and_config(pool, None, config).await
+    }
+
+    pub(crate) async fn from_pool_with_path_and_config(
         pool: ConnectionPool,
         db_path: Option<PathBuf>,
+        mut config: CoreConfig,
     ) -> Result<Self> {
         let conn = pool.get_connection().await?;
 
@@ -2610,20 +2520,23 @@ impl AgentFS {
         // Get chunk_size from config (or use default)
         let chunk_size = Self::read_chunk_size(&conn).await?;
         let inline_threshold = Self::read_inline_threshold(&conn).await?;
+        config.geometry = Geometry {
+            chunk_size,
+            inline_threshold,
+        };
+        let core_config = Arc::new(config);
 
         let attr_cache = Arc::new(AttrCache::new(ATTR_CACHE_MAX_SIZE));
-        // Tier Three Axis D: default the SDK write batcher to ON, matching
-        // the cli's `FuseKernelCacheConfig::from_env` which defaults
-        // `AGENTFS_FUSE_WRITEBACK` to TRUE when unset. Tier Two shipped the
-        // cross-inode batched commit path but the env var defaulted to FALSE
-        // on this side, making A1 dead code under the canonical workload
-        // (see tier-two-post/COMPARISON.md retroactive correction).
-        let write_batcher = if env_flag_default(WRITE_BATCHER_ENABLE_ENV, true) {
-            Some(Arc::new(AgentFSWriteBatcher::from_env(
+        // Tier Three Axis D: default the write batcher to ON. CLI callers pass
+        // the FUSE writeback decision through AgentFSOptions, while SDK callers
+        // can supply CoreConfig directly.
+        let write_batcher = if core_config.batcher.enabled {
+            Some(Arc::new(AgentFSWriteBatcher::from_config(
                 pool.clone(),
                 chunk_size,
                 inline_threshold,
                 attr_cache.clone(),
+                &core_config.batcher,
             )))
         } else {
             None
@@ -2645,7 +2558,7 @@ impl AgentFS {
         conn.execute("DELETE FROM fs_inode WHERE nlink = 0", ())
             .await?;
 
-        let overlay_reads = env_flag_default(OVERLAY_READS_ENV, true);
+        let overlay_reads = core_config.overlay_reads;
         let fs = Self {
             pool,
             db_path: db_path.map(Arc::new),
@@ -2658,6 +2571,7 @@ impl AgentFS {
             attr_cache,
             write_batcher,
             overlay_reads,
+            core_config,
             open_inodes: Arc::new(OpenInodes::default()),
             _profile_report: Arc::new(crate::profiling::ProfileReportGuard::new("agentfs")),
         };
@@ -2672,6 +2586,14 @@ impl AgentFS {
     /// Get the configured inline threshold.
     pub fn inline_threshold(&self) -> usize {
         self.inline_threshold
+    }
+
+    pub fn core_config(&self) -> &CoreConfig {
+        self.core_config.as_ref()
+    }
+
+    pub fn partial_origin_policy(&self) -> crate::filesystem::PartialOriginPolicy {
+        self.core_config.partial_origin
     }
 
     /// Get a database connection from the pool
@@ -3055,11 +2977,11 @@ impl AgentFS {
 
     /// Prelude shared by chmod / chown / utimens.
     ///
-    /// Legacy behaviour (`AGENTFS_DRAIN_ON_SETATTR=1`): synchronously commit
-    /// the inode's pending batched writes so the deferred data commit can
-    /// never re-stamp mtime/ctime after the explicit attribute change. With
-    /// FUSE writeback caching the kernel issues one SETATTR per written file,
-    /// so that drain serialised a SQLite commit per file on the clone path.
+    /// Legacy drain-on-setattr behaviour synchronously commits the inode's
+    /// pending batched writes so the deferred data commit can never re-stamp
+    /// mtime/ctime after the explicit attribute change. With FUSE writeback
+    /// caching the kernel issues one SETATTR per written file, so that drain
+    /// serialised a SQLite commit per file on the clone path.
     ///
     /// Default: skip the drain and instead mark the pending entry so the
     /// eventual batched commit preserves mtime/ctime (`mark_times_explicit` /
@@ -3069,12 +2991,12 @@ impl AgentFS {
     /// interleaving.
     ///
     /// The deferral requires Tier-4 overlay reads: with
-    /// `AGENTFS_OVERLAY_READS=0`, getattr/size are served straight from
+    /// overlay reads disabled, getattr/size are served straight from
     /// SQLite with no pending-size merge, so the legacy drain is kept to make
     /// the just-written size visible at close time (git reads files by
     /// `st_size`).
     async fn prepare_attr_change(&self, ino: i64) -> Result<()> {
-        if drain_on_setattr() || !self.overlay_reads {
+        if self.core_config.drain_on_setattr || !self.overlay_reads {
             return self.drain_inode_writes(ino).await;
         }
         if let Some(batcher) = &self.write_batcher {
@@ -3503,8 +3425,8 @@ impl AgentFS {
         results: &mut Vec<ImportedEntry>,
         entries: &[ImportEntry],
     ) -> Result<()> {
-        let max_inodes = env_usize(WRITE_BATCHER_TXN_INODES_ENV, 1024).max(1);
-        let max_bytes = env_usize(WRITE_BATCHER_TXN_BYTES_ENV, 32 * 1024 * 1024).max(1);
+        let max_inodes = self.core_config.batcher.txn_max_inodes.max(1);
+        let max_bytes = self.core_config.batcher.txn_max_bytes.max(1);
         let (ts_secs, ts_nsec) = opts.timestamp;
 
         let mut inode_stmt = conn
@@ -4075,19 +3997,23 @@ impl FileSystem for AgentFS {
     /// coherent for its own writes) and the adapter's fingerprint guard
     /// revalidates mtime/ctime/size at each open, so out-of-band SDK writers
     /// are caught exactly like external edits to host-backed base files.
-    /// Kill switch: `AGENTFS_KEEPCACHE_DELTA=0` restores the old policy
-    /// where only host-backed base-layer files were eligible.
+    /// The keepcache-delta kill switch restores the old policy where only
+    /// host-backed base-layer files were eligible.
     async fn keep_cache_for_read_open(&self, ino: i64, flags: i32) -> Result<Option<Stats>> {
         if (flags & libc::O_ACCMODE) != libc::O_RDONLY || (flags & libc::O_TRUNC) != 0 {
             return Ok(None);
         }
-        if !keepcache_delta_enabled() {
+        if !self.core_config.keepcache_delta {
             return Ok(None);
         }
         let Some(stats) = FileSystem::getattr(self, ino).await? else {
             return Ok(None);
         };
         Ok(stats.is_file().then_some(stats))
+    }
+
+    fn delta_keep_cache_fast_path(&self) -> bool {
+        self.core_config.keepcache_delta
     }
 
     async fn readlink(&self, ino: i64) -> Result<Option<String>> {
@@ -4444,7 +4370,7 @@ impl FileSystem for AgentFS {
         // the change is visible immediately. Falls through to the direct
         // (transaction-wrapped) UPDATE when overlay reads are disabled or the
         // legacy drain is requested.
-        if !drain_on_setattr() && self.overlay_reads {
+        if !self.core_config.drain_on_setattr && self.overlay_reads {
             if let Some(batcher) = &self.write_batcher {
                 let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
                 let now = (dur.as_secs() as i64, dur.subsec_nanos() as i64);
@@ -5583,10 +5509,58 @@ mod tests {
     const TURSO_OBSERVED_SYNCHRONOUS_NORMAL: i64 = 1;
 
     async fn create_test_fs() -> Result<(AgentFS, tempfile::TempDir)> {
+        create_test_fs_with_config(CoreConfig::from_env()).await
+    }
+
+    async fn create_test_fs_with_config(
+        config: CoreConfig,
+    ) -> Result<(AgentFS, tempfile::TempDir)> {
         let dir = tempdir()?;
         let db_path = dir.path().join("test.db");
-        let fs = AgentFS::new(db_path.to_str().unwrap()).await?;
+        let db = Builder::new_local(db_path.to_str().unwrap())
+            .build()
+            .await?;
+        let pool = ConnectionPool::with_options(db, file_backed_connection_pool_options());
+        let fs = AgentFS::from_pool_with_path_and_config(pool, Some(db_path), config).await?;
         Ok((fs, dir))
+    }
+
+    fn test_config_with_long_batch_window() -> CoreConfig {
+        let mut config = CoreConfig::default();
+        config.batcher.enabled = true;
+        config.batcher.window = Duration::from_secs(60);
+        config.batcher.inode_bytes = 1_048_576;
+        config.batcher.global_bytes = 64 * 1024 * 1024;
+        config
+    }
+
+    #[tokio::test]
+    async fn core_config_batcher_enabled_flows_through_options() -> Result<()> {
+        let dir = tempdir()?;
+
+        let mut disabled = CoreConfig::default();
+        disabled.batcher.enabled = false;
+        let disabled_agent = crate::AgentFS::open(
+            crate::AgentFSOptions::with_path(dir.path().join("disabled.db").to_string_lossy())
+                .with_core_config(disabled),
+        )
+        .await?;
+        assert!(
+            disabled_agent.fs.write_batcher.is_none(),
+            "AgentFSOptions CoreConfig should be able to disable the write batcher"
+        );
+
+        let enabled_agent = crate::AgentFS::open(
+            crate::AgentFSOptions::with_path(dir.path().join("enabled.db").to_string_lossy())
+                .with_core_config(test_config_with_long_batch_window()),
+        )
+        .await?;
+        assert!(
+            enabled_agent.fs.write_batcher.is_some(),
+            "AgentFSOptions CoreConfig should be able to enable the write batcher"
+        );
+
+        Ok(())
     }
 
     async fn fs_inode_column_count(conn: &Connection, column_name: &str) -> Result<usize> {
@@ -7302,11 +7276,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_pwrite_ranges_batched_drains_explicitly() -> Result<()> {
-        std::env::set_var(WRITE_BATCHER_ENABLE_ENV, "1");
-        std::env::set_var(WRITE_BATCHER_MS_ENV, "60000");
-        std::env::set_var(WRITE_BATCHER_BYTES_ENV, "1048576");
-
-        let (fs, _dir) = create_test_fs().await?;
+        let (fs, _dir) = create_test_fs_with_config(test_config_with_long_batch_window()).await?;
         let (stats, file) = fs
             .create_file("/batched.txt", DEFAULT_FILE_MODE, 0, 0)
             .await?;
@@ -7337,11 +7307,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_setattr_after_batched_write_preserves_explicit_times() -> Result<()> {
-        std::env::set_var(WRITE_BATCHER_ENABLE_ENV, "1");
-        std::env::set_var(WRITE_BATCHER_MS_ENV, "60000");
-        std::env::set_var(WRITE_BATCHER_BYTES_ENV, "1048576");
-
-        let (fs, _dir) = create_test_fs().await?;
+        let (fs, _dir) = create_test_fs_with_config(test_config_with_long_batch_window()).await?;
         let (stats, file) = fs
             .create_file("/setattr-after-write.txt", DEFAULT_FILE_MODE, 0, 0)
             .await?;
@@ -7386,11 +7352,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_after_setattr_restamps_times_on_commit() -> Result<()> {
-        std::env::set_var(WRITE_BATCHER_ENABLE_ENV, "1");
-        std::env::set_var(WRITE_BATCHER_MS_ENV, "60000");
-        std::env::set_var(WRITE_BATCHER_BYTES_ENV, "1048576");
-
-        let (fs, _dir) = create_test_fs().await?;
+        let (fs, _dir) = create_test_fs_with_config(test_config_with_long_batch_window()).await?;
         let (stats, file) = fs
             .create_file("/write-after-setattr.txt", DEFAULT_FILE_MODE, 0, 0)
             .await?;
@@ -7434,11 +7396,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_utimens_with_pending_writes_is_visible_and_committed_with_data() -> Result<()> {
-        std::env::set_var(WRITE_BATCHER_ENABLE_ENV, "1");
-        std::env::set_var(WRITE_BATCHER_MS_ENV, "60000");
-        std::env::set_var(WRITE_BATCHER_BYTES_ENV, "1048576");
-
-        let (fs, _dir) = create_test_fs().await?;
+        let (fs, _dir) = create_test_fs_with_config(test_config_with_long_batch_window()).await?;
         let (stats, file) = fs
             .create_file("/stash-times.txt", DEFAULT_FILE_MODE, 0, 0)
             .await?;
@@ -7492,11 +7450,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_after_stashed_utimens_restamps_mtime_keeps_atime() -> Result<()> {
-        std::env::set_var(WRITE_BATCHER_ENABLE_ENV, "1");
-        std::env::set_var(WRITE_BATCHER_MS_ENV, "60000");
-        std::env::set_var(WRITE_BATCHER_BYTES_ENV, "1048576");
-
-        let (fs, _dir) = create_test_fs().await?;
+        let (fs, _dir) = create_test_fs_with_config(test_config_with_long_batch_window()).await?;
         let (stats, file) = fs
             .create_file("/stash-then-write.txt", DEFAULT_FILE_MODE, 0, 0)
             .await?;
@@ -7558,8 +7512,8 @@ mod tests {
             batch_ms: Duration::from_secs(batch_ms_secs),
             batch_bytes,
             batch_global_bytes,
-            txn_max_inodes: DEFAULT_WRITE_BATCH_TXN_INODES,
-            txn_max_bytes: DEFAULT_WRITE_BATCH_TXN_BYTES,
+            txn_max_inodes: crate::config::DEFAULT_WRITE_BATCH_TXN_INODES,
+            txn_max_bytes: crate::config::DEFAULT_WRITE_BATCH_TXN_BYTES,
             state: RwLock::new(AgentFSWriteBatcherState::default()),
             commit_lock: AsyncMutex::new(()),
         })

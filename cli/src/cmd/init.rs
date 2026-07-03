@@ -18,6 +18,9 @@ pub struct EncryptionOptions {
 
 pub async fn open_agentfs(options: AgentFSOptions) -> Result<AgentFS, agentfs_sdk::error::Error> {
     let mut options = options;
+    if options.core_config.is_none() {
+        options = options.with_core_config(crate::config::core_config_from_env());
+    }
     // CLI handles env var fallback for auth token
     if options.sync.auth_token.is_none() {
         if let Ok(auth_token) = std::env::var("TURSO_DB_AUTH_TOKEN") {
@@ -131,6 +134,7 @@ pub async fn init_database(
     if let Some(base_path) = base.as_ref() {
         open_options = open_options.with_base(base_path);
     }
+    open_options = open_options.with_core_config(crate::config::core_config_from_env());
 
     let encrypted = if let Some(enc_opts) = encryption {
         if sync_options.sync_remote_url.is_some() {

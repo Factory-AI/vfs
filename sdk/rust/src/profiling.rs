@@ -1069,11 +1069,7 @@ pub fn is_enabled() -> bool {
     }
     #[cfg(not(test))]
     {
-        *ENABLED.get_or_init(|| {
-            std::env::var("AGENTFS_PROFILE")
-                .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
-                .unwrap_or(false)
-        })
+        *ENABLED.get_or_init(|| crate::config::EnvReader::new().bool("AGENTFS_PROFILE", false))
     }
 }
 

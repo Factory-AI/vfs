@@ -1,3 +1,4 @@
+pub mod config;
 pub mod connection_pool;
 pub mod error;
 pub mod filesystem;
@@ -17,6 +18,7 @@ use turso::{Builder, EncryptionOpts, Value};
 pub use turso::sync::{DatabaseSyncStats, PartialBootstrapStrategy, PartialSyncOpts};
 
 // Re-export filesystem types
+pub use config::{BatcherConfig, CoreConfig, EnvReader, Geometry};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use filesystem::HostFS;
 pub use filesystem::{
@@ -119,6 +121,9 @@ pub struct AgentFSOptions {
     pub sync: SyncOptions,
     /// Encryption configuration for database at rest
     pub encryption: Option<EncryptionConfig>,
+    /// Typed core runtime configuration. When omitted, [`CoreConfig::from_env`]
+    /// is evaluated once by [`AgentFS::open`].
+    pub core_config: Option<CoreConfig>,
 }
 
 impl AgentFSOptions {
@@ -160,6 +165,7 @@ impl AgentFSOptions {
             base: None,
             sync: SyncOptions::default(),
             encryption: None,
+            core_config: None,
         }
     }
 
@@ -171,6 +177,7 @@ impl AgentFSOptions {
             base: None,
             sync: SyncOptions::default(),
             encryption: None,
+            core_config: None,
         }
     }
 
@@ -182,12 +189,19 @@ impl AgentFSOptions {
             base: None,
             sync: SyncOptions::default(),
             encryption: None,
+            core_config: None,
         }
     }
 
     /// Set sync options
     pub fn with_sync(mut self, sync: SyncOptions) -> Self {
         self.sync = sync;
+        self
+    }
+
+    /// Set typed core runtime configuration.
+    pub fn with_core_config(mut self, core_config: CoreConfig) -> Self {
+        self.core_config = Some(core_config);
         self
     }
 
@@ -292,6 +306,11 @@ impl AgentFS {
     /// # }
     /// ```
     pub async fn open(options: AgentFSOptions) -> Result<Self> {
+        let core_config = options
+            .core_config
+            .clone()
+            .unwrap_or_else(CoreConfig::from_env);
+
         // Validate base directory if provided
         if let Some(ref path) = options.base {
             if !path.exists() {
@@ -380,7 +399,7 @@ impl AgentFS {
             None
         };
 
-        Self::open_with_pool_and_path(pool, sync_db, db_path_for_fs).await
+        Self::open_with_pool_and_path(pool, sync_db, db_path_for_fs, core_config).await
     }
 
     /// Open an AgentFS instance from a connection pool
@@ -388,8 +407,17 @@ impl AgentFS {
         pool: connection_pool::ConnectionPool,
         sync_db: Option<turso::sync::Database>,
     ) -> Result<Self> {
+        Self::open_with_pool_and_config(pool, sync_db, CoreConfig::from_env()).await
+    }
+
+    /// Open an AgentFS instance from a connection pool and explicit core config.
+    pub async fn open_with_pool_and_config(
+        pool: connection_pool::ConnectionPool,
+        sync_db: Option<turso::sync::Database>,
+        core_config: CoreConfig,
+    ) -> Result<Self> {
         let kv = KvStore::from_pool(pool.clone()).await?;
-        let fs = filesystem::AgentFS::from_pool(pool.clone()).await?;
+        let fs = filesystem::AgentFS::from_pool_with_config(pool.clone(), core_config).await?;
         let tools = ToolCalls::from_pool(pool.clone()).await?;
 
         Ok(Self {
@@ -405,9 +433,12 @@ impl AgentFS {
         pool: connection_pool::ConnectionPool,
         sync_db: Option<turso::sync::Database>,
         db_path: Option<PathBuf>,
+        core_config: CoreConfig,
     ) -> Result<Self> {
         let kv = KvStore::from_pool(pool.clone()).await?;
-        let fs = filesystem::AgentFS::from_pool_with_path(pool.clone(), db_path).await?;
+        let fs =
+            filesystem::AgentFS::from_pool_with_path_and_config(pool.clone(), db_path, core_config)
+                .await?;
         let tools = ToolCalls::from_pool(pool.clone()).await?;
 
         Ok(Self {

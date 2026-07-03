@@ -11,9 +11,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 // Re-export implementations
-pub use agentfs::{
-    keepcache_delta_enabled, AgentFS, ImportEntry, ImportOptions, ImportSession, ImportedEntry,
-};
+pub use agentfs::{AgentFS, ImportEntry, ImportOptions, ImportSession, ImportedEntry};
 #[cfg(target_os = "macos")]
 pub use hostfs_darwin::HostFS;
 #[cfg(target_os = "linux")]
@@ -287,6 +285,13 @@ pub trait FileSystem: Send + Sync {
     /// is conservative and disables `FOPEN_KEEP_CACHE`.
     async fn keep_cache_for_read_open(&self, _ino: i64, _flags: i32) -> Result<Option<Stats>> {
         Ok(None)
+    }
+
+    /// Whether a FUSE adapter may use an adapter-local attr-cache fast path for
+    /// DB-backed keep-cache decisions before falling back to
+    /// [`FileSystem::keep_cache_for_read_open`].
+    fn delta_keep_cache_fast_path(&self) -> bool {
+        false
     }
 
     /// Create a directory with the specified ownership.
