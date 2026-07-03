@@ -988,3 +988,93 @@ impl From<Stats> for StatsResponse {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agentfs_sdk::{error::Error as SdkError, FsError};
+    use tempfile::tempdir;
+
+    async fn create_test_server() -> Result<(McpServer, tempfile::TempDir)> {
+        let dir = tempdir()?;
+        let db_path = dir.path().join("test.db");
+        let agentfs = AgentFS::open(AgentFSOptions::with_path(
+            db_path.to_string_lossy().to_string(),
+        ))
+        .await?;
+        Ok((McpServer::new(agentfs, None), dir))
+    }
+
+    #[tokio::test]
+    async fn mcp_rename_directory_into_own_subtree_returns_error_and_preserves_namespace(
+    ) -> Result<()> {
+        let (server, _dir) = create_test_server().await?;
+        server.agentfs.fs.mkdir("/parent", 0, 0).await?;
+        server.agentfs.fs.mkdir("/parent/child", 0, 0).await?;
+
+        let parent_ino = server.agentfs.fs.stat("/parent").await?.unwrap().ino;
+        let child_ino = server.agentfs.fs.stat("/parent/child").await?.unwrap().ino;
+        let root_before = server.agentfs.fs.readdir(ROOT_INO).await?.unwrap();
+        let parent_before = server.agentfs.fs.readdir(parent_ino).await?.unwrap();
+        let child_before = server.agentfs.fs.readdir(child_ino).await?.unwrap();
+
+        let direct_error = server
+            .handle_rename(RenameParams {
+                from: "/parent".to_string(),
+                to: "/parent/child/parent".to_string(),
+            })
+            .await
+            .expect_err("cycle rename should fail");
+        assert!(
+            direct_error.chain().any(|cause| {
+                matches!(
+                    cause.downcast_ref::<SdkError>(),
+                    Some(SdkError::Fs(FsError::InvalidRename))
+                )
+            }),
+            "expected InvalidRename in error chain, got {direct_error:#}"
+        );
+
+        let response = server
+            .handle_request(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "rename",
+                    "arguments": {
+                        "from": "/parent",
+                        "to": "/parent/child/parent"
+                    }
+                }
+            }))
+            .await
+            .expect("tools/call requests must produce a response");
+        assert!(
+            response.get("error").is_some(),
+            "cycle rename should return a JSON-RPC error response: {response}"
+        );
+
+        assert_eq!(
+            server.agentfs.fs.readdir(ROOT_INO).await?.unwrap(),
+            root_before
+        );
+        assert_eq!(
+            server.agentfs.fs.readdir(parent_ino).await?.unwrap(),
+            parent_before
+        );
+        assert_eq!(
+            server.agentfs.fs.readdir(child_ino).await?.unwrap(),
+            child_before
+        );
+        assert!(server.agentfs.fs.stat("/parent").await?.is_some());
+        assert!(server.agentfs.fs.stat("/parent/child").await?.is_some());
+        assert!(server
+            .agentfs
+            .fs
+            .stat("/parent/child/parent")
+            .await?
+            .is_none());
+        Ok(())
+    }
+}

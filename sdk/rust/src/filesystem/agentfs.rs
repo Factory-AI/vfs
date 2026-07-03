@@ -5363,6 +5363,33 @@ impl FileSystem for AgentFS {
 
         let result: Result<Option<i64>> = async {
             let mut replaced_dst_ino = None;
+
+            if src_stats.is_directory() {
+                let mut ancestor_ino = newparent_ino;
+                while ancestor_ino != ROOT_INO {
+                    if ancestor_ino == src_ino {
+                        return Err(FsError::InvalidRename.into());
+                    }
+
+                    let mut stmt = conn
+                        .prepare_cached("SELECT parent_ino FROM fs_dentry WHERE ino = ?")
+                        .await?;
+                    let mut rows = stmt.query((ancestor_ino,)).await?;
+                    let parent_ino = rows
+                        .next()
+                        .await?
+                        .ok_or(FsError::NotFound)?
+                        .get_value(0)
+                        .ok()
+                        .and_then(|value| value.as_integer().copied())
+                        .ok_or(FsError::InvalidPath)?;
+                    if rows.next().await?.is_some() {
+                        return Err(FsError::InvalidPath.into());
+                    }
+                    ancestor_ino = parent_ino;
+                }
+            }
+
             // Check if destination exists
             if let Some(dst_ino) = self.lookup_child(&conn, newparent_ino, newname).await? {
                 replaced_dst_ino = Some(dst_ino);
@@ -7830,6 +7857,30 @@ mod tests {
         assert!(fs.stat("/olddir").await?.is_none());
         assert!(fs.stat("/newdir").await?.is_some());
         assert_eq!(fs.read_file("/newdir/file.txt").await?.unwrap(), b"content");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn trait_rename_directory_into_own_subtree_fails() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        fs.mkdir("/parent", 0, 0).await?;
+        fs.mkdir("/parent/child", 0, 0).await?;
+
+        let parent_ino = fs.stat("/parent").await?.unwrap().ino;
+        let child_ino = fs.stat("/parent/child").await?.unwrap().ino;
+        let root_before = fs.readdir(ROOT_INO).await?.unwrap();
+        let parent_before = fs.readdir(parent_ino).await?.unwrap();
+        let child_before = fs.readdir(child_ino).await?.unwrap();
+
+        let result = rename_path_via_trait(&fs, "/parent", "/parent/child/parent").await;
+
+        assert!(matches!(result, Err(Error::Fs(FsError::InvalidRename))));
+        assert_eq!(fs.readdir(ROOT_INO).await?.unwrap(), root_before);
+        assert_eq!(fs.readdir(parent_ino).await?.unwrap(), parent_before);
+        assert_eq!(fs.readdir(child_ino).await?.unwrap(), child_before);
+        assert!(fs.stat("/parent").await?.is_some());
+        assert!(fs.stat("/parent/child").await?.is_some());
+        assert!(fs.stat("/parent/child/parent").await?.is_none());
         Ok(())
     }
 
