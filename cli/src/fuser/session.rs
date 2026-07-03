@@ -11,7 +11,7 @@ use nix::unistd::geteuid;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
@@ -64,6 +64,9 @@ pub struct Session<FS: Filesystem> {
     notify_tx: Option<mpsc::Sender<NotifyOp>>,
     /// Receiver half — moved to the notify thread in run()
     notify_rx: Option<mpsc::Receiver<NotifyOp>>,
+    /// Shutdown/join control for optional FUSE-over-io_uring queue threads.
+    #[cfg(target_os = "linux")]
+    uring_control: Arc<super::uring::UringQueueControl>,
 }
 
 #[derive(Debug)]
@@ -397,6 +400,8 @@ impl<FS: Filesystem> Session<FS> {
             mount: Arc::new(Mutex::new(Some((mountpoint.to_owned(), mount)))),
             notify_tx: Some(notify_tx),
             notify_rx: Some(notify_rx),
+            #[cfg(target_os = "linux")]
+            uring_control: super::uring::UringQueueControl::new(),
         })
     }
 
@@ -411,6 +416,8 @@ impl<FS: Filesystem> Session<FS> {
             mount: Arc::new(Mutex::new(None)),
             notify_tx: Some(notify_tx),
             notify_rx: Some(notify_rx),
+            #[cfg(target_os = "linux")]
+            uring_control: super::uring::UringQueueControl::new(),
         }
     }
 
@@ -454,6 +461,7 @@ impl<FS: Filesystem> Session<FS> {
                 self.shared.clone(),
                 deferred.clone(),
                 self.ch.device(),
+                self.uring_control.clone(),
             );
         }
 
@@ -477,6 +485,9 @@ impl<FS: Filesystem> Session<FS> {
                 self.run_parallel(deferred.clone(), workers, queue_capacity)
             }
         };
+
+        #[cfg(target_os = "linux")]
+        self.uring_control.shutdown_and_join();
 
         // Drop all senders to close the channel, then join the notify thread
         // to ensure in-flight invalidations are flushed before returning.
@@ -635,6 +646,9 @@ impl<FS: Filesystem> Session<FS> {
     pub fn unmount_callable(&mut self) -> SessionUnmounter {
         SessionUnmounter {
             mount: self.mount.clone(),
+            device: self.ch.device(),
+            #[cfg(target_os = "linux")]
+            uring_control: self.uring_control.clone(),
         }
     }
 
@@ -648,13 +662,40 @@ impl<FS: Filesystem> Session<FS> {
 /// A thread-safe object that can be used to unmount a Filesystem
 pub struct SessionUnmounter {
     mount: Arc<Mutex<Option<(PathBuf, Mount)>>>,
+    device: Arc<std::fs::File>,
+    #[cfg(target_os = "linux")]
+    uring_control: Arc<super::uring::UringQueueControl>,
 }
 
 impl SessionUnmounter {
     /// Unmount the filesystem
     pub fn unmount(&mut self) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        self.uring_control.shutdown_and_join();
+        #[cfg(target_os = "linux")]
+        if let Err(err) = abort_fuse_connection(&self.device) {
+            debug!("failed to abort FUSE connection during unmount: {err}");
+        }
         drop(std::mem::take(&mut *self.mount.lock().unwrap()));
         Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn abort_fuse_connection(device: &std::fs::File) -> io::Result<()> {
+    let fdinfo_path = format!("/proc/self/fdinfo/{}", device.as_raw_fd());
+    let fdinfo = std::fs::read_to_string(fdinfo_path)?;
+    let Some(connection_id) = fdinfo.lines().find_map(|line| {
+        line.strip_prefix("fuse_connection:")
+            .and_then(|value| value.split_whitespace().next())
+    }) else {
+        return Ok(());
+    };
+    let abort_path = format!("/sys/fs/fuse/connections/{connection_id}/abort");
+    match std::fs::write(&abort_path, b"1\n") {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
     }
 }
 
@@ -696,6 +737,12 @@ pub struct BackgroundSession {
     sender: ChannelSender,
     /// Ensures the filesystem is unmounted when the session ends
     _mount: Option<Mount>,
+    /// Device fd used to abort the FUSE connection during cooperative teardown.
+    #[cfg(target_os = "linux")]
+    device: Arc<std::fs::File>,
+    /// Shutdown/join control for optional FUSE-over-io_uring queue threads.
+    #[cfg(target_os = "linux")]
+    uring_control: Arc<super::uring::UringQueueControl>,
 }
 
 impl BackgroundSession {
@@ -704,8 +751,12 @@ impl BackgroundSession {
     /// the filesystem is unmounted and the given session ends.
     pub fn new<FS: Filesystem + Send + 'static>(se: Session<FS>) -> io::Result<BackgroundSession> {
         let sender = se.ch.sender();
+        #[cfg(target_os = "linux")]
+        let device = se.ch.device();
         // Take the fuse_session, so that we can unmount it
         let mount = std::mem::take(&mut *se.mount.lock().unwrap()).map(|(_, mount)| mount);
+        #[cfg(target_os = "linux")]
+        let uring_control = se.uring_control.clone();
         let guard = thread::spawn(move || {
             let mut se = se;
             se.run()
@@ -714,6 +765,10 @@ impl BackgroundSession {
             guard,
             sender,
             _mount: mount,
+            #[cfg(target_os = "linux")]
+            device,
+            #[cfg(target_os = "linux")]
+            uring_control,
         })
     }
     /// Unmount the filesystem and join the background thread.
@@ -724,7 +779,17 @@ impl BackgroundSession {
             guard,
             sender: _,
             _mount,
+            #[cfg(target_os = "linux")]
+            device,
+            #[cfg(target_os = "linux")]
+            uring_control,
         } = self;
+        #[cfg(target_os = "linux")]
+        uring_control.shutdown_and_join();
+        #[cfg(target_os = "linux")]
+        if let Err(err) = abort_fuse_connection(&device) {
+            debug!("failed to abort FUSE connection during background join: {err}");
+        }
         drop(_mount);
         guard.join().unwrap().unwrap();
     }

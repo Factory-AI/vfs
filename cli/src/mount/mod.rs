@@ -95,7 +95,7 @@ pub struct MountHandle {
 pub(crate) enum MountHandleInner {
     #[cfg(target_os = "linux")]
     Fuse {
-        thread: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
+        session: Option<crate::fuse::FuseSessionHandle>,
     },
     Nfs {
         shutdown: CancellationToken,
@@ -117,20 +117,44 @@ impl Drop for MountHandle {
 
         match &mut self.inner {
             #[cfg(target_os = "linux")]
-            MountHandleInner::Fuse { thread } => {
-                if let Err(e) = unmount(&self.mountpoint, self.backend, self.lazy_unmount) {
-                    eprintln!(
-                        "Warning: Failed to unmount FUSE filesystem at {}: {}",
-                        self.mountpoint.display(),
-                        e
-                    );
-                }
-                if let Some(thread) = thread.take() {
-                    match thread.join() {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => eprintln!("Warning: FUSE session exited with error: {e}"),
-                        Err(e) => eprintln!("Warning: FUSE session thread panicked: {e:?}"),
+            MountHandleInner::Fuse { session } => {
+                if let Some(session) = session.as_mut() {
+                    if let Err(e) = session.unmount() {
+                        eprintln!(
+                            "Warning: Failed to request FUSE session unmount at {}: {}",
+                            self.mountpoint.display(),
+                            e
+                        );
                     }
+                }
+                if is_mountpoint(&self.mountpoint) {
+                    if let Err(e) = unmount(&self.mountpoint, self.backend, self.lazy_unmount) {
+                        eprintln!(
+                            "Warning: Failed to unmount FUSE filesystem at {}: {}",
+                            self.mountpoint.display(),
+                            e
+                        );
+                    }
+                }
+                if let Some(session) = session.take() {
+                    if let Err(e) = session.join() {
+                        eprintln!("Warning: FUSE session exited with error: {e}");
+                    }
+                }
+                if is_mountpoint(&self.mountpoint) {
+                    if let Err(e) = unmount(&self.mountpoint, self.backend, self.lazy_unmount) {
+                        eprintln!(
+                            "Warning: Failed final FUSE unmount at {}: {}",
+                            self.mountpoint.display(),
+                            e
+                        );
+                    }
+                }
+                if is_mountpoint(&self.mountpoint) {
+                    eprintln!(
+                        "Warning: FUSE mountpoint {} is still mounted after teardown",
+                        self.mountpoint.display()
+                    );
                 }
             }
             MountHandleInner::Nfs { shutdown, .. } => {

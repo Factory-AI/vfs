@@ -32,6 +32,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use log::{debug, error, warn};
@@ -58,6 +59,7 @@ const IORING_OFF_SQES: i64 = 0x1000_0000;
 
 const IORING_ENTER_GETEVENTS: u32 = 1;
 
+const IORING_OP_NOP: u8 = 0;
 const IORING_OP_URING_CMD: u8 = 46;
 
 #[repr(C)]
@@ -397,6 +399,13 @@ fn build_cmd_sqe(
     sqe
 }
 
+fn build_nop_sqe(user_data: u64) -> [u8; 128] {
+    let mut sqe = [0u8; 128];
+    sqe[0] = IORING_OP_NOP;
+    sqe[32..40].copy_from_slice(&user_data.to_le_bytes());
+    sqe
+}
+
 // ─── queue state ─────────────────────────────────────────────────────────────
 
 struct EntryBufs {
@@ -426,6 +435,82 @@ impl std::fmt::Debug for QueueShared {
         f.debug_struct("QueueShared")
             .field("qid", &self.qid)
             .finish()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct UringQueueControl {
+    shutdown: AtomicBool,
+    starter: Mutex<Option<JoinHandle<()>>>,
+    handles: Mutex<Vec<JoinHandle<()>>>,
+    queues: Mutex<Vec<Arc<QueueShared>>>,
+}
+
+impl UringQueueControl {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            shutdown: AtomicBool::new(false),
+            starter: Mutex::new(None),
+            handles: Mutex::new(Vec::new()),
+            queues: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn is_shutdown(&self) -> bool {
+        self.shutdown.load(Ordering::Acquire)
+    }
+
+    fn set_starter(&self, handle: JoinHandle<()>) {
+        *self.starter.lock().unwrap() = Some(handle);
+    }
+
+    fn push_handle(&self, handle: JoinHandle<()>) {
+        self.handles.lock().unwrap().push(handle);
+    }
+
+    fn register_queue(&self, queue: Arc<QueueShared>) {
+        if self.is_shutdown() {
+            wake_queue(&queue);
+        }
+        self.queues.lock().unwrap().push(queue);
+    }
+
+    pub(crate) fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
+        let queues = self.queues.lock().unwrap().clone();
+        for queue in queues {
+            wake_queue(&queue);
+        }
+    }
+
+    pub(crate) fn shutdown_and_join(&self) {
+        self.shutdown();
+
+        if let Some(starter) = self.starter.lock().unwrap().take() {
+            if let Err(e) = starter.join() {
+                warn!("fuse-uring: starter thread panicked: {e:?}");
+            }
+        }
+
+        let handles = std::mem::take(&mut *self.handles.lock().unwrap());
+        for handle in handles {
+            if let Err(e) = handle.join() {
+                warn!("fuse-uring: queue thread panicked: {e:?}");
+            }
+        }
+
+        self.queues.lock().unwrap().clear();
+    }
+}
+
+fn wake_queue(queue: &Arc<QueueShared>) {
+    let ring_fd = {
+        let mut ring = queue.ring.lock().unwrap();
+        ring.push_sqe(&build_nop_sqe(u64::MAX));
+        ring.fd.as_raw_fd()
+    };
+    if let Err(e) = enter(ring_fd, 1, 0) {
+        debug!("fuse-uring: shutdown wake failed on qid={}: {e}", queue.qid);
     }
 }
 
@@ -512,16 +597,21 @@ pub(crate) fn start_uring_queues<FS: Filesystem + Send + Sync + 'static>(
     shared: Arc<SessionShared<FS>>,
     deferred: Arc<DeferredNotifier>,
     device: Arc<File>,
+    control: Arc<UringQueueControl>,
 ) {
     let depth = uring_queue_depth();
     let nr_queues = possible_cpus();
     let active_dispatches = Arc::new(AtomicU64::new(0));
+    let starter_control = control.clone();
     let starter = move || {
         // REGISTER needs the kernel-side fc->initialized; our INIT reply also
         // races the kernel's processing of it, so the per-queue registration
         // loop additionally retries on EAGAIN.
         let wait_start = std::time::Instant::now();
         while !shared.is_initialized() {
+            if starter_control.is_shutdown() {
+                return;
+            }
             if wait_start.elapsed() > Duration::from_secs(30) {
                 warn!("fuse-uring: session not initialized after 30s; not starting rings");
                 return;
@@ -534,7 +624,11 @@ pub(crate) fn start_uring_queues<FS: Filesystem + Send + Sync + 'static>(
             let deferred = deferred.clone();
             let device = device.clone();
             let active_dispatches = active_dispatches.clone();
-            if let Err(e) = std::thread::Builder::new()
+            let control = starter_control.clone();
+            if control.is_shutdown() {
+                return;
+            }
+            match std::thread::Builder::new()
                 .name(format!("agentfs-fuse-uring-{qid}"))
                 .spawn(move || {
                     queue_thread(
@@ -544,19 +638,23 @@ pub(crate) fn start_uring_queues<FS: Filesystem + Send + Sync + 'static>(
                         deferred,
                         device,
                         active_dispatches,
+                        control,
                     )
-                })
-            {
-                error!("fuse-uring: failed to spawn queue thread {qid}: {e}");
-                return;
+                }) {
+                Ok(handle) => starter_control.push_handle(handle),
+                Err(e) => {
+                    error!("fuse-uring: failed to spawn queue thread {qid}: {e}");
+                    return;
+                }
             }
         }
     };
-    if let Err(e) = std::thread::Builder::new()
+    match std::thread::Builder::new()
         .name("agentfs-fuse-uring-start".into())
         .spawn(starter)
     {
-        error!("fuse-uring: failed to spawn starter thread: {e}");
+        Ok(handle) => control.set_starter(handle),
+        Err(e) => error!("fuse-uring: failed to spawn starter thread: {e}"),
     }
 }
 
@@ -567,6 +665,7 @@ fn queue_thread<FS: Filesystem>(
     deferred: Arc<DeferredNotifier>,
     device: Arc<File>,
     active_dispatches: Arc<AtomicU64>,
+    control: Arc<UringQueueControl>,
 ) {
     let ring = match RawRing::new((depth + 1) as u32) {
         Ok(ring) => ring,
@@ -602,6 +701,7 @@ fn queue_thread<FS: Filesystem>(
         pending_submit: AtomicU32::new(0),
         device,
     });
+    control.register_queue(queue.clone());
 
     let register_sqe = |slot: usize| {
         let ent = queue.entries[slot].lock().unwrap();
@@ -630,6 +730,10 @@ fn queue_thread<FS: Filesystem>(
     let spin = Duration::from_micros(uring_spin_us());
 
     loop {
+        if control.is_shutdown() {
+            debug!("fuse-uring: queue {qid} shutting down");
+            return;
+        }
         // Submit pending SQEs immediately, then optionally busy-poll the CQ
         // before blocking: the wakeup from a blocking enter costs more than
         // a typical request inter-arrival gap on hot paths.
@@ -655,6 +759,10 @@ fn queue_thread<FS: Filesystem>(
             }
         } else if let Err(e) = enter(ring_fd, to_submit, 1) {
             error!("fuse-uring: io_uring_enter failed on qid={qid}: {e}");
+            return;
+        }
+        if control.is_shutdown() {
+            debug!("fuse-uring: queue {qid} shutting down");
             return;
         }
         loop {

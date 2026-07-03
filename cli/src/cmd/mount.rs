@@ -9,8 +9,6 @@ use std::{
 };
 use turso::value::Value;
 
-#[cfg(target_os = "linux")]
-use crate::mount::unmount;
 use crate::mount::{mount_fs, MountOpts};
 use crate::nfs::AgentNFS;
 use crate::nfsserve::tcp::NFSTcp;
@@ -140,7 +138,6 @@ fn mount_fuse(args: MountArgs) -> Result<()> {
     let id_or_path = args.id_or_path.clone();
     let foreground = args.foreground;
     let partial_origin_policy = args.partial_origin_policy;
-    let mountpoint_for_shutdown = mountpoint.clone();
     let mount = move || {
         let rt = crate::get_runtime();
         let agentfs = match rt.block_on(open_agentfs(opts)) {
@@ -196,7 +193,7 @@ fn mount_fuse(args: MountArgs) -> Result<()> {
         // Run the session on its own thread so termination signals can tear
         // the mount down; the default disposition would kill the process
         // without unmounting, stranding a dead mount table entry.
-        let session = std::thread::spawn(move || crate::fuse::mount(fs, fuse_opts, rt));
+        let mut session = crate::fuse::spawn_mount(fs, fuse_opts, rt)?;
         let interrupted = crate::get_runtime().block_on(async {
             tokio::select! {
                 result = crate::mount::shutdown_signal() => result.map(|_| true),
@@ -211,12 +208,9 @@ fn mount_fuse(args: MountArgs) -> Result<()> {
             }
         })?;
         if interrupted {
-            let _ = unmount(&mountpoint_for_shutdown, MountBackend::Fuse, true);
+            let _ = session.unmount();
         }
-        match session.join() {
-            Ok(result) => result,
-            Err(panic) => Err(anyhow::anyhow!("FUSE session thread panicked: {panic:?}")),
-        }
+        session.join()
     };
 
     if foreground {

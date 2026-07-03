@@ -60,10 +60,8 @@ pub(super) fn mount_fuse(
 
     let fs_arc: Arc<dyn agentfs_sdk::FileSystem> = Arc::new(ReadWriteLaneFsAdapter::new(fs));
 
-    let fuse_handle = std::thread::spawn(move || {
-        let rt = crate::get_runtime();
-        crate::fuse::mount(fs_arc, fuse_opts, rt)
-    });
+    let rt = crate::get_runtime();
+    let fuse_session = crate::fuse::spawn_mount(fs_arc, fuse_opts, rt)?;
 
     if !wait_for_mount(&mountpoint, timeout) {
         anyhow::bail!("FUSE mount did not become ready within {:?}", timeout);
@@ -74,7 +72,7 @@ pub(super) fn mount_fuse(
         backend: MountBackend::Fuse,
         lazy_unmount,
         inner: MountHandleInner::Fuse {
-            thread: Some(fuse_handle),
+            session: Some(fuse_session),
         },
     })
 }

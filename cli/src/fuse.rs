@@ -3356,11 +3356,47 @@ fn allow_other_supported() -> bool {
     false
 }
 
+pub struct FuseSessionHandle {
+    thread: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
+    unmounter: crate::fuser::SessionUnmounter,
+}
+
+impl FuseSessionHandle {
+    pub fn unmount(&mut self) -> std::io::Result<()> {
+        self.unmounter.unmount()
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.thread
+            .as_ref()
+            .map(std::thread::JoinHandle::is_finished)
+            .unwrap_or(true)
+    }
+
+    pub fn join(mut self) -> anyhow::Result<()> {
+        let Some(thread) = self.thread.take() else {
+            return Ok(());
+        };
+        match thread.join() {
+            Ok(result) => result,
+            Err(panic) => Err(anyhow::anyhow!("FUSE session thread panicked: {panic:?}")),
+        }
+    }
+}
+
 pub fn mount(
     fs: Arc<dyn FileSystem>,
     opts: FuseMountOptions,
     runtime: Runtime,
 ) -> anyhow::Result<()> {
+    spawn_mount(fs, opts, runtime)?.join()
+}
+
+pub fn spawn_mount(
+    fs: Arc<dyn FileSystem>,
+    opts: FuseMountOptions,
+    runtime: Runtime,
+) -> anyhow::Result<FuseSessionHandle> {
     // Raise fd limit to hard limit to prevent "too many open files" errors
     // when passthrough filesystems cache O_PATH file descriptors
     maximize_fd_limit();
@@ -3393,9 +3429,14 @@ pub fn mount(
         mount_opts.push(MountOption::AllowRoot);
     }
 
-    crate::fuser::mount2(fs, &opts.mountpoint, &mount_opts)?;
+    let mut session = crate::fuser::Session::new(fs, &opts.mountpoint, &mount_opts)?;
+    let unmounter = session.unmount_callable();
+    let thread = std::thread::spawn(move || session.run().map_err(anyhow::Error::from));
 
-    Ok(())
+    Ok(FuseSessionHandle {
+        thread: Some(thread),
+        unmounter,
+    })
 }
 
 #[cfg(test)]
