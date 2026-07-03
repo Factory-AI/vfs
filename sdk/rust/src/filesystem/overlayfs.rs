@@ -781,6 +781,17 @@ impl OverlayFS {
         Ok(stats)
     }
 
+    async fn resolves_to_visible_base_directory(&self, path: &str) -> Result<bool> {
+        if self.is_whiteout(path) {
+            return Ok(false);
+        }
+
+        Ok(self
+            .resolve_base_path(path)
+            .await?
+            .is_some_and(|stats| stats.is_directory()))
+    }
+
     fn validate_partial_origin(&self, origin: &PartialOrigin, stats: &Stats) -> Result<()> {
         if stats.size != origin.base_fingerprint_size {
             return Err(Error::Internal(format!(
@@ -2395,11 +2406,13 @@ impl FileSystem for OverlayFS {
             .get_inode_info(src_stats.ino)
             .ok_or(FsError::NotFound)?;
 
-        // A base-layer directory copy-up only creates the directory itself,
-        // not its subtree. Renaming that partial copy-up would hide the source
-        // base path with a whiteout and expose an empty destination. Return
-        // EXDEV so user-space callers such as `mv` perform copy+delete.
-        if src_info.layer == Layer::Base && src_stats.is_directory() {
+        // A base-origin directory copy-up only creates the directory itself,
+        // not its subtree. ensure_parent_dirs can promote such a directory to
+        // Layer::Delta after a single child write, so the layer tag alone is not
+        // a safe origin test. If the old path still resolves to a visible base
+        // directory, return EXDEV so user-space callers such as `mv` perform
+        // copy+delete.
+        if src_stats.is_directory() && self.resolves_to_visible_base_directory(&old_path).await? {
             return Err(FsError::CrossDevice.into());
         }
 
@@ -3644,6 +3657,143 @@ mod tests {
             b"nested",
             "base backing file must remain unchanged"
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overlay_rename_merged_base_dir_returns_exdev() -> Result<()> {
+        let base_dir = tempdir()?;
+        std::fs::create_dir_all(base_dir.path().join("base_dir/sub"))?;
+        std::fs::write(base_dir.path().join("base_dir/base.txt"), b"base root")?;
+        std::fs::write(
+            base_dir.path().join("base_dir/sub/nested.txt"),
+            b"base nested",
+        )?;
+
+        let base = Arc::new(HostFS::new(base_dir.path())?);
+
+        let delta_dir = tempdir()?;
+        let db_path = delta_dir.path().join("delta.db");
+        let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+
+        let overlay = OverlayFS::new(base, delta);
+        overlay.init(base_dir.path().to_str().unwrap()).await?;
+
+        let dir_stats = overlay.lookup(ROOT_INO, "base_dir").await?.unwrap();
+        assert!(
+            dir_stats.is_directory(),
+            "test fixture base_dir should be a base-origin directory"
+        );
+
+        let (_new_stats, new_file) = overlay
+            .create_file(dir_stats.ino, "new.txt", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        new_file.pwrite(0, b"delta child").await?;
+
+        let entries = overlay.readdir(dir_stats.ino).await?.unwrap();
+        assert!(
+            entries.contains(&"base.txt".to_string()),
+            "merged directory should still show base child before rename"
+        );
+        assert!(
+            entries.contains(&"new.txt".to_string()),
+            "merged directory should show delta child before rename"
+        );
+        assert!(
+            entries.contains(&"sub".to_string()),
+            "merged directory should still show base subdirectory before rename"
+        );
+
+        let err = overlay
+            .rename(ROOT_INO, "base_dir", ROOT_INO, "moved")
+            .await
+            .expect_err("renaming a merged base-origin directory must return EXDEV");
+        match err {
+            Error::Fs(FsError::CrossDevice) => {}
+            other => panic!("expected CrossDevice/EXDEV, got {other:?}"),
+        }
+
+        let original_stats = overlay
+            .lookup(ROOT_INO, "base_dir")
+            .await?
+            .expect("source directory must remain visible after EXDEV");
+        assert!(original_stats.is_directory());
+        assert!(
+            overlay.lookup(ROOT_INO, "moved").await?.is_none(),
+            "failed merged-dir rename must not create the destination"
+        );
+
+        let base_child = overlay
+            .lookup(original_stats.ino, "base.txt")
+            .await?
+            .expect("base child must remain visible at original path");
+        let base_file = overlay.open(base_child.ino, libc::O_RDONLY).await?;
+        assert_eq!(base_file.pread(0, 100).await?, b"base root");
+
+        let new_child = overlay
+            .lookup(original_stats.ino, "new.txt")
+            .await?
+            .expect("delta child must remain visible at original path");
+        let new_file = overlay.open(new_child.ino, libc::O_RDONLY).await?;
+        assert_eq!(new_file.pread(0, 100).await?, b"delta child");
+
+        let subdir = overlay
+            .lookup(original_stats.ino, "sub")
+            .await?
+            .expect("base subdirectory must remain visible at original path");
+        let nested = overlay
+            .lookup(subdir.ino, "nested.txt")
+            .await?
+            .expect("nested base child must remain visible at original path");
+        let nested_file = overlay.open(nested.ino, libc::O_RDONLY).await?;
+        assert_eq!(nested_file.pread(0, 100).await?, b"base nested");
+
+        assert_eq!(
+            std::fs::read(base_dir.path().join("base_dir/base.txt"))?,
+            b"base root",
+            "base backing file must remain unchanged"
+        );
+        assert_eq!(
+            std::fs::read(base_dir.path().join("base_dir/sub/nested.txt"))?,
+            b"base nested",
+            "nested base backing file must remain unchanged"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overlay_rename_delta_origin_directory_succeeds() -> Result<()> {
+        let (overlay, _base_dir, _delta_dir) = create_test_overlay().await?;
+
+        let dir_stats = overlay.mkdir(ROOT_INO, "delta_dir", 0o755, 0, 0).await?;
+        let (_child_stats, child_file) = overlay
+            .create_file(dir_stats.ino, "child.txt", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        child_file.pwrite(0, b"delta child").await?;
+
+        overlay
+            .rename(ROOT_INO, "delta_dir", ROOT_INO, "moved_delta")
+            .await?;
+
+        assert!(
+            overlay.lookup(ROOT_INO, "delta_dir").await?.is_none(),
+            "delta-origin source directory should be gone after rename"
+        );
+
+        let moved = overlay
+            .lookup(ROOT_INO, "moved_delta")
+            .await?
+            .expect("delta-origin destination directory should exist after rename");
+        assert!(moved.is_directory());
+
+        let child = overlay
+            .lookup(moved.ino, "child.txt")
+            .await?
+            .expect("delta-origin child should move with the directory");
+        let file = overlay.open(child.ino, libc::O_RDONLY).await?;
+        assert_eq!(file.pread(0, 100).await?, b"delta child");
 
         Ok(())
     }
