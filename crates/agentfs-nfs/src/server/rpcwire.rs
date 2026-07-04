@@ -12,6 +12,7 @@ use super::mount_handlers;
 
 use super::nfs;
 use super::nfs_handlers;
+use super::transaction_tracker::TransactionLookup;
 
 use super::portmap;
 use super::portmap_handlers;
@@ -41,38 +42,52 @@ async fn handle_rpc(
             auth.deserialize(&mut Cursor::new(&call.cred.body))?;
             context.auth = auth;
         }
+
+        let mut client_verifier = Vec::new();
+        call.verf.serialize(&mut client_verifier)?;
+        let transaction = context.transaction_tracker.begin(xid, client_verifier);
+        let transaction_guard = match transaction {
+            TransactionLookup::New(guard) => guard,
+            TransactionLookup::InProgress => {
+                debug!(
+                    "In-progress retransmission detected, xid: {}, client_addr: {}, call: {:?}",
+                    xid, context.client_addr, call
+                );
+                return Ok(false);
+            }
+            TransactionLookup::Replay(reply) => {
+                debug!(
+                    "Replaying cached RPC reply, xid: {}, client_addr: {}, call: {:?}",
+                    xid, context.client_addr, call
+                );
+                output.write_all(reply.as_ref())?;
+                return Ok(true);
+            }
+        };
+
         if call.rpcvers != 2 {
             warn!("Invalid RPC version {} != 2", call.rpcvers);
-            rpc_vers_mismatch(xid).serialize(output)?;
+            let mut reply = Vec::new();
+            rpc_vers_mismatch(xid).serialize(&mut reply)?;
+            transaction_guard.complete(reply.clone());
+            output.write_all(&reply)?;
             return Ok(true);
         }
 
-        if context
-            .transaction_tracker
-            .is_retransmission(xid, &context.client_addr)
-        {
-            // This is a retransmission
-            // Drop the message and return
-            debug!(
-                "Retransmission detected, xid: {}, client_addr: {}, call: {:?}",
-                xid, context.client_addr, call
-            );
-            return Ok(false);
-        }
-
+        let mut handler_output = Vec::new();
         let res = {
             if call.prog == nfs::PROGRAM {
-                nfs_handlers::handle_nfs(xid, call, input, output, &context).await
+                nfs_handlers::handle_nfs(xid, call, input, &mut handler_output, &context).await
             } else if call.prog == portmap::PROGRAM {
-                portmap_handlers::handle_portmap(xid, call, input, output, &context)
+                portmap_handlers::handle_portmap(xid, call, input, &mut handler_output, &context)
             } else if call.prog == mount::PROGRAM {
-                mount_handlers::handle_mount(xid, call, input, output, &context).await
+                mount_handlers::handle_mount(xid, call, input, &mut handler_output, &context).await
             } else if call.prog == NFS_ACL_PROGRAM
                 || call.prog == NFS_ID_MAP_PROGRAM
                 || call.prog == NFS_METADATA_PROGRAM
             {
                 trace!("ignoring NFS_ACL packet");
-                prog_unavail_reply_message(xid).serialize(output)?;
+                prog_unavail_reply_message(xid).serialize(&mut handler_output)?;
                 Ok(())
             } else {
                 warn!(
@@ -80,14 +95,15 @@ async fn handle_rpc(
                     call.prog,
                     nfs::PROGRAM
                 );
-                prog_unavail_reply_message(xid).serialize(output)?;
+                prog_unavail_reply_message(xid).serialize(&mut handler_output)?;
                 Ok(())
             }
         }
         .map(|_| true);
-        context
-            .transaction_tracker
-            .mark_processed(xid, &context.client_addr);
+        if res.is_ok() {
+            transaction_guard.complete(handler_output.clone());
+            output.write_all(&handler_output)?;
+        }
         res
     } else {
         error!("Unexpectedly received a Reply instead of a Call");
@@ -214,5 +230,197 @@ impl SocketMessageHandler {
             });
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapter::AgentNFS;
+    use crate::server::nfs;
+    use crate::server::nfs_handlers::createmode3;
+    use crate::server::rpc::{auth_flavor, call_body, opaque_auth, rpc_body, rpc_msg};
+    use crate::server::transaction_tracker::{TransactionTracker, DEFAULT_REPLY_CACHE_CAPACITY};
+    use crate::server::vfs::NFSFileSystem;
+    use agentfs_core::{AgentFS as AgentSdk, AgentFSOptions, FileSystem};
+    use std::sync::Arc;
+
+    async fn test_context() -> (RPCContext, agentfs_core::fs::AgentFS) {
+        let agent = AgentSdk::open(AgentFSOptions::ephemeral())
+            .await
+            .expect("open ephemeral AgentFS");
+        agent
+            .fs
+            .chmod(1, 0o777)
+            .await
+            .expect("make root writable to unprivileged test user");
+        let fs = agent.fs.clone();
+        let nfs = AgentNFS::new(Arc::new(agent.fs));
+        let vfs: Arc<dyn NFSFileSystem + Send + Sync> = Arc::new(nfs);
+        let context = RPCContext {
+            local_port: 11111,
+            client_addr: "127.0.0.1:40001".to_string(),
+            auth: crate::server::rpc::auth_unix {
+                stamp: 0,
+                machinename: b"test".to_vec(),
+                uid: 1000,
+                gid: 1000,
+                gids: vec![1000],
+            },
+            vfs,
+            export_name: Arc::new("/".to_string()),
+            transaction_tracker: Arc::new(TransactionTracker::new(DEFAULT_REPLY_CACHE_CAPACITY)),
+        };
+        (context, fs)
+    }
+
+    fn verifier(body: &[u8]) -> opaque_auth {
+        opaque_auth {
+            flavor: auth_flavor::AUTH_NULL,
+            body: body.to_vec(),
+        }
+    }
+
+    fn serialize_guarded_create_call(
+        xid: u32,
+        root_fh: nfs::nfs_fh3,
+        name: &[u8],
+        verf: opaque_auth,
+    ) -> Vec<u8> {
+        let mut msg = Vec::new();
+        rpc_msg {
+            xid,
+            body: rpc_body::CALL(call_body {
+                rpcvers: 2,
+                prog: nfs::PROGRAM,
+                vers: nfs::VERSION,
+                proc: 8,
+                cred: opaque_auth::default(),
+                verf,
+            }),
+        }
+        .serialize(&mut msg)
+        .expect("serialize RPC header");
+        nfs::diropargs3 {
+            dir: root_fh,
+            name: name.into(),
+        }
+        .serialize(&mut msg)
+        .expect("serialize CREATE dirops");
+        createmode3::GUARDED
+            .serialize(&mut msg)
+            .expect("serialize CREATE mode");
+        nfs::sattr3 {
+            mode: nfs::set_mode3::mode(0o644),
+            ..Default::default()
+        }
+        .serialize(&mut msg)
+        .expect("serialize CREATE attrs");
+        msg
+    }
+
+    async fn run_rpc(payload: &[u8], context: RPCContext) -> Vec<u8> {
+        let mut input = Cursor::new(payload.to_vec());
+        let mut output = Vec::new();
+        let replied = handle_rpc(&mut input, &mut output, context)
+            .await
+            .expect("handle RPC");
+        assert!(replied, "completed retransmissions must replay a reply");
+        output
+    }
+
+    fn parse_nfs_status(reply: &[u8], xid: u32) -> nfs::nfsstat3 {
+        let mut cursor = Cursor::new(reply.to_vec());
+        let mut msg = rpc_msg::default();
+        msg.deserialize(&mut cursor).expect("deserialize RPC reply");
+        assert_eq!(msg.xid, xid);
+        match msg.body {
+            rpc_body::REPLY(crate::server::rpc::reply_body::MSG_ACCEPTED(
+                crate::server::rpc::accepted_reply {
+                    reply_data: crate::server::rpc::accept_body::SUCCESS,
+                    ..
+                },
+            )) => {}
+            other => panic!("unexpected RPC reply: {other:?}"),
+        }
+        let mut status = nfs::nfsstat3::NFS3_OK;
+        status
+            .deserialize(&mut cursor)
+            .expect("deserialize NFS status");
+        status
+    }
+
+    #[tokio::test]
+    async fn completed_retransmission_replays_cached_reply_without_reexecuting_create() {
+        let (context, fs) = test_context().await;
+        let xid = 4100;
+        let name = b"drc-replay-create";
+        let call = serialize_guarded_create_call(
+            xid,
+            context.vfs.id_to_fh(1),
+            name,
+            verifier(b"client-verifier"),
+        );
+
+        let first_reply = run_rpc(&call, context.clone()).await;
+        assert!(matches!(
+            parse_nfs_status(&first_reply, xid),
+            nfs::nfsstat3::NFS3_OK
+        ));
+
+        let retransmitted_reply = run_rpc(&call, context.clone()).await;
+        assert_eq!(
+            first_reply, retransmitted_reply,
+            "completed retransmission should replay exact cached reply bytes"
+        );
+        assert!(matches!(
+            parse_nfs_status(&retransmitted_reply, xid),
+            nfs::nfsstat3::NFS3_OK
+        ));
+        assert!(
+            FileSystem::lookup(&fs, 1, std::str::from_utf8(name).unwrap())
+                .await
+                .expect("lookup created file")
+                .is_some()
+        );
+        println!(
+            "replayed=true reconnect=false xid={xid} verifier=client-verifier side_effect_count=1"
+        );
+    }
+
+    #[tokio::test]
+    async fn drc_key_ignores_reconnect_source_port_churn() {
+        let (context, _fs) = test_context().await;
+        let xid = 4200;
+        let name = b"drc-reconnect-create";
+        let call = serialize_guarded_create_call(
+            xid,
+            context.vfs.id_to_fh(1),
+            name,
+            verifier(b"stable-client-verifier"),
+        );
+        let mut first_context = context.clone();
+        first_context.client_addr = "127.0.0.1:40001".to_string();
+        let mut reconnected_context = context.clone();
+        reconnected_context.client_addr = "127.0.0.1:50002".to_string();
+
+        let first_reply = run_rpc(&call, first_context).await;
+        assert!(matches!(
+            parse_nfs_status(&first_reply, xid),
+            nfs::nfsstat3::NFS3_OK
+        ));
+
+        let retransmitted_reply = run_rpc(&call, reconnected_context).await;
+        assert_eq!(
+            first_reply, retransmitted_reply,
+            "source-port churn must not change the DRC key"
+        );
+        assert!(matches!(
+            parse_nfs_status(&retransmitted_reply, xid),
+            nfs::nfsstat3::NFS3_OK
+        ));
+        println!(
+            "replayed=true reconnect=true first_port=40001 second_port=50002 xid={xid} verifier=stable-client-verifier side_effect_count=1"
+        );
     }
 }

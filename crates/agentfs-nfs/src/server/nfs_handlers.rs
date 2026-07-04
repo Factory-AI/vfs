@@ -2831,13 +2831,12 @@ mod tests {
     use super::*;
     use crate::adapter::AgentNFS;
     use crate::server::rpc::{accept_body, accepted_reply, reply_body, rpc_body, rpc_msg};
-    use crate::server::transaction_tracker::TransactionTracker;
+    use crate::server::transaction_tracker::{TransactionTracker, DEFAULT_REPLY_CACHE_CAPACITY};
     use crate::server::vfs::NFSFileSystem;
     use agentfs_core::{AgentFS as AgentSdk, AgentFSOptions, FileSystem};
     use std::io::Cursor;
     use std::path::Path;
     use std::sync::Arc;
-    use std::time::Duration;
 
     const TEST_UID: u32 = 1000;
     const TEST_GID: u32 = 1000;
@@ -2907,7 +2906,7 @@ mod tests {
             },
             vfs,
             export_name: Arc::new("/".to_string()),
-            transaction_tracker: Arc::new(TransactionTracker::new(Duration::from_secs(60))),
+            transaction_tracker: Arc::new(TransactionTracker::new(DEFAULT_REPLY_CACHE_CAPACITY)),
         };
         (context, fs)
     }

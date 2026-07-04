@@ -1,11 +1,10 @@
 use super::context::RPCContext;
 use super::rpcwire::*;
-use super::transaction_tracker::TransactionTracker;
+use super::transaction_tracker::{TransactionTracker, DEFAULT_REPLY_CACHE_CAPACITY};
 use super::vfs::NFSFileSystem;
 use async_trait::async_trait;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 use std::{io, net::IpAddr};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
@@ -183,7 +182,7 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
             port,
             arcfs,
             export_name: Arc::from("/".to_string()),
-            transaction_tracker: Arc::new(TransactionTracker::new(Duration::from_secs(60))),
+            transaction_tracker: Arc::new(TransactionTracker::new(DEFAULT_REPLY_CACHE_CAPACITY)),
         })
     }
 
@@ -281,6 +280,7 @@ mod tests {
     use crate::server::xdr::XDR;
     use agentfs_core::{AgentFS as AgentSdk, AgentFSOptions, FileSystem, DEFAULT_FILE_MODE};
     use std::io::Cursor;
+    use std::time::Duration;
     use tokio::io::AsyncReadExt;
 
     fn serialize_rpc_call(xid: u32, proc: u32) -> Vec<u8> {
