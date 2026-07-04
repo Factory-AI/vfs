@@ -6,9 +6,8 @@ use crate::config::Geometry;
 use crate::error::{Error, Result};
 use crate::filesystem::{FsError, Stats};
 
-use super::{
-    current_timestamp, write_commit_time_sets, PendingTimeChange, STORAGE_CHUNKED, STORAGE_INLINE,
-};
+use super::batcher::{write_commit_time_sets, PendingTimeChange};
+use super::{current_timestamp, STORAGE_CHUNKED, STORAGE_INLINE};
 
 pub(super) struct FileStorage {
     pub(super) size: u64,
