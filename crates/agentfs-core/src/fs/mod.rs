@@ -44,6 +44,12 @@ pub enum FsError {
     #[error("Cannot modify root directory")]
     RootOperation,
 
+    #[error("Permission denied")]
+    PermissionDenied,
+
+    #[error("Operation not permitted")]
+    OperationNotPermitted,
+
     #[error("Too many levels of symbolic links")]
     SymlinkLoop,
 
@@ -72,6 +78,8 @@ impl FsError {
             FsError::NotASymlink => libc::EINVAL,
             FsError::InvalidPath => libc::EINVAL,
             FsError::RootOperation => libc::EPERM,
+            FsError::PermissionDenied => libc::EACCES,
+            FsError::OperationNotPermitted => libc::EPERM,
             FsError::SymlinkLoop => libc::ELOOP,
             FsError::InvalidRename => libc::EINVAL,
             FsError::CrossDevice => libc::EXDEV,

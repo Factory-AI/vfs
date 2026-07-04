@@ -4,6 +4,7 @@ use super::nfs;
 use super::permissions;
 use super::rpc::*;
 use super::xdr::*;
+use agentfs_core::semantics::access;
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use num_derive::{FromPrimitive, ToPrimitive};
 use num_traits::cast::FromPrimitive;
@@ -281,8 +282,10 @@ pub async fn nfsproc3_lookup(
         }
     };
 
+    let creds = permissions::credentials(&context.auth);
+    let dir_stats = permissions::stats(&dir_attr_full);
     // Check execute (search) permission on directory
-    if !permissions::can_execute(&context.auth, &dir_attr_full) {
+    if !access::may_search(&dir_stats, &creds) {
         debug!(
             "lookup permission denied for uid={} on directory",
             context.auth.uid
@@ -392,8 +395,10 @@ pub async fn nfsproc3_read(
         }
     };
 
+    let creds = permissions::credentials(&context.auth);
+    let stats = permissions::stats(&attr);
     // Check read permission
-    if !permissions::can_read(&context.auth, &attr) {
+    if !access::may_read(&stats, &creds) {
         debug!("read permission denied for uid={}", context.auth.uid);
         make_success_reply(xid).serialize(output)?;
         nfs::nfsstat3::NFS3ERR_ACCES.serialize(output)?;
@@ -872,8 +877,10 @@ pub async fn nfsproc3_readdirplus(
         }
     };
 
+    let creds = permissions::credentials(&context.auth);
+    let dir_stats = permissions::stats(&dir_attr_full);
     // Check read permission on directory
-    if !permissions::can_read(&context.auth, &dir_attr_full) {
+    if !access::may_read(&dir_stats, &creds) {
         debug!(
             "readdirplus permission denied for uid={} on directory",
             context.auth.uid
@@ -1084,8 +1091,10 @@ pub async fn nfsproc3_readdir(
         }
     };
 
+    let creds = permissions::credentials(&context.auth);
+    let dir_stats = permissions::stats(&dir_attr_full);
     // Check read permission on directory
-    if !permissions::can_read(&context.auth, &dir_attr_full) {
+    if !access::may_read(&dir_stats, &creds) {
         debug!(
             "readdir permission denied for uid={} on directory",
             context.auth.uid
@@ -1296,14 +1305,15 @@ pub async fn nfsproc3_write(
         }
     };
 
+    let creds = permissions::credentials(&context.auth);
+    let stats = permissions::stats(&attr);
+
     // Check write permission. NFSv3 is stateless and has no OPEN RPC, but the
     // file handle returned by CREATE represents the client's open write path.
     // Honor write authority captured in that handle so git loose objects can
     // be created with a read-only final mode and still receive writes through
     // the same handle; fresh LOOKUP handles still fall back to mode checks.
-    if !context.vfs.fh_has_write_authority(&args.file, id)
-        && !permissions::can_write(&context.auth, &attr)
-    {
+    if !context.vfs.fh_has_write_authority(&args.file, id) && !access::may_write(&stats, &creds) {
         debug!("write permission denied for uid={}", context.auth.uid);
         let pre_obj_attr = nfs::pre_op_attr::attributes(nfs::wcc_attr {
             size: attr.size,
@@ -1328,9 +1338,10 @@ pub async fn nfsproc3_write(
 
     match context.vfs.write(id, args.offset, &args.data).await {
         Ok(mut fattr) => {
-            // POSIX: Clear SUID/SGID bits when a non-root user writes to a file
-            if context.auth.uid != 0 && fattr.mode & 0o6000 != 0 {
-                let cleared_mode = fattr.mode & !0o6000;
+            // POSIX: Clear SUID/SGID bits when a non-root user writes to a file.
+            let written_stats = permissions::stats(&fattr);
+            let cleared_mode = permissions::without_killpriv(&written_stats, &creds, fattr.mode);
+            if cleared_mode != fattr.mode {
                 let clear_sattr = nfs::sattr3 {
                     mode: nfs::set_mode3::mode(cleared_mode),
                     ..Default::default()
@@ -1458,8 +1469,10 @@ pub async fn nfsproc3_create(
         ctime: dir_attr.ctime,
     });
 
+    let creds = permissions::credentials(&context.auth);
+    let dir_stats = permissions::stats(&dir_attr);
     // Check write and execute permission on parent directory
-    if !permissions::can_modify_directory(&context.auth, &dir_attr) {
+    if !access::may_modify_directory(&dir_stats, &creds) {
         debug!(
             "create permission denied for uid={} on directory",
             context.auth.uid
@@ -1656,160 +1669,40 @@ pub async fn nfsproc3_setattr(
         ctime: attr.ctime,
     });
 
-    // Check permissions based on what's being changed
-    // For size change (truncate), need write permission
-    if matches!(args.new_attribute.size, nfs::set_size3::size(_))
-        && !context.vfs.fh_has_write_authority(&args.object, id)
-        && !permissions::can_write(&context.auth, &attr)
+    let creds = permissions::credentials(&context.auth);
+    let stats = permissions::stats(&attr);
+    let original_change = permissions::attr_change(&args.new_attribute);
+    let mut authorized_change = original_change;
+    if original_change.size && context.vfs.fh_has_write_authority(&args.object, id) {
+        authorized_change.size = false;
+    }
+
+    if let Err(error) = access::setattr_allowed(&stats, &creds, &authorized_change) {
+        debug!(
+            "setattr permission denied for uid={} on ino={}: {}",
+            context.auth.uid, id, error
+        );
+        make_success_reply(xid).serialize(output)?;
+        permissions::denial_status(&error).serialize(output)?;
+        nfs::wcc_data {
+            before: pre_op_attr,
+            after: nfs::post_op_attr::attributes(attr),
+        }
+        .serialize(output)?;
+        return Ok(());
+    }
+
+    if let Some(mode) = permissions::normalize_setattr_mode(&stats, &creds, &original_change) {
+        args.new_attribute.mode = nfs::set_mode3::mode(mode);
+    }
+
+    // POSIX: writes/truncates and non-root owner/group changes clear SUID/SGID
+    // unless this SETATTR also supplies an explicit mode.
+    if (original_change.size || original_change.uid.is_some() || original_change.gid.is_some())
+        && original_change.mode.is_none()
     {
-        debug!(
-            "setattr (truncate) permission denied for uid={}",
-            context.auth.uid
-        );
-        make_success_reply(xid).serialize(output)?;
-        nfs::nfsstat3::NFS3ERR_ACCES.serialize(output)?;
-        nfs::wcc_data {
-            before: pre_op_attr,
-            after: nfs::post_op_attr::attributes(attr),
-        }
-        .serialize(output)?;
-        return Ok(());
-    }
-
-    // For mode/uid/gid changes, check permissions per POSIX semantics
-    let changing_mode = matches!(args.new_attribute.mode, nfs::set_mode3::mode(_));
-    let new_uid = match args.new_attribute.uid {
-        nfs::set_uid3::uid(u) => Some(u),
-        nfs::set_uid3::Void => None,
-    };
-    let new_gid = match args.new_attribute.gid {
-        nfs::set_gid3::gid(g) => Some(g),
-        nfs::set_gid3::Void => None,
-    };
-
-    // For chmod: must be owner (or root)
-    if changing_mode && !permissions::is_owner(&context.auth, &attr) {
-        debug!(
-            "setattr (chmod) permission denied for uid={}, file owner={}",
-            context.auth.uid, attr.uid
-        );
-        make_success_reply(xid).serialize(output)?;
-        nfs::nfsstat3::NFS3ERR_PERM.serialize(output)?;
-        nfs::wcc_data {
-            before: pre_op_attr,
-            after: nfs::post_op_attr::attributes(attr),
-        }
-        .serialize(output)?;
-        return Ok(());
-    }
-
-    // For chown (changing uid): only root can change to a different user.
-    // An owner can "chown" to themselves (no-op on uid).
-    if let Some(target_uid) = new_uid {
-        if context.auth.uid != 0 && target_uid != attr.uid {
-            debug!(
-                "setattr (chown uid) permission denied: only root can change file owner, caller uid={}",
-                context.auth.uid
-            );
-            make_success_reply(xid).serialize(output)?;
-            nfs::nfsstat3::NFS3ERR_PERM.serialize(output)?;
-            nfs::wcc_data {
-                before: pre_op_attr,
-                after: nfs::post_op_attr::attributes(attr),
-            }
-            .serialize(output)?;
-            return Ok(());
-        }
-    }
-
-    // For chgrp (changing gid): root can change to any group,
-    // owner can change to a group they belong to
-    if let Some(target_gid) = new_gid {
-        if context.auth.uid != 0 {
-            // Must be owner
-            if !permissions::is_owner(&context.auth, &attr) {
-                debug!(
-                    "setattr (chgrp) permission denied: not owner, uid={}, file owner={}",
-                    context.auth.uid, attr.uid
-                );
-                make_success_reply(xid).serialize(output)?;
-                nfs::nfsstat3::NFS3ERR_PERM.serialize(output)?;
-                nfs::wcc_data {
-                    before: pre_op_attr,
-                    after: nfs::post_op_attr::attributes(attr),
-                }
-                .serialize(output)?;
-                return Ok(());
-            }
-            // Owner can only change to a group they belong to
-            let in_target_group =
-                context.auth.gid == target_gid || context.auth.gids.contains(&target_gid);
-            if !in_target_group {
-                debug!(
-                    "setattr (chgrp) permission denied: uid={} not member of target group {}",
-                    context.auth.uid, target_gid
-                );
-                make_success_reply(xid).serialize(output)?;
-                nfs::nfsstat3::NFS3ERR_PERM.serialize(output)?;
-                nfs::wcc_data {
-                    before: pre_op_attr,
-                    after: nfs::post_op_attr::attributes(attr),
-                }
-                .serialize(output)?;
-                return Ok(());
-            }
-        }
-    }
-
-    // For setting explicit timestamps (SET_TO_CLIENT_TIME): must be owner or root.
-    // SET_TO_SERVER_TIME only requires write access (not checked here).
-    let setting_explicit_atime = matches!(
-        args.new_attribute.atime,
-        nfs::set_atime::SET_TO_CLIENT_TIME(_)
-    );
-    let setting_explicit_mtime = matches!(
-        args.new_attribute.mtime,
-        nfs::set_mtime::SET_TO_CLIENT_TIME(_)
-    );
-    if (setting_explicit_atime || setting_explicit_mtime)
-        && !permissions::is_owner(&context.auth, &attr)
-    {
-        debug!(
-            "setattr (utimes) permission denied: uid={} is not owner={}",
-            context.auth.uid, attr.uid
-        );
-        make_success_reply(xid).serialize(output)?;
-        nfs::nfsstat3::NFS3ERR_PERM.serialize(output)?;
-        nfs::wcc_data {
-            before: pre_op_attr,
-            after: nfs::post_op_attr::attributes(attr),
-        }
-        .serialize(output)?;
-        return Ok(());
-    }
-
-    // POSIX: If a non-root user sets S_ISGID via chmod on a regular file and
-    // the user is not a member of the file's group, silently clear S_ISGID.
-    if changing_mode && context.auth.uid != 0 {
-        if let nfs::set_mode3::mode(ref mut mode) = args.new_attribute.mode {
-            if *mode & 0o2000 != 0 {
-                let file_gid = new_gid.unwrap_or(attr.gid);
-                let in_group =
-                    context.auth.gid == file_gid || context.auth.gids.contains(&file_gid);
-                if !in_group {
-                    *mode &= !0o2000;
-                }
-            }
-        }
-    }
-
-    // POSIX: When a non-root user changes uid or gid, clear SUID/SGID bits.
-    // If the caller is not root and is performing a chown/chgrp, and is not
-    // explicitly setting mode, we must strip the SUID and SGID bits.
-    if context.auth.uid != 0 && (new_uid.is_some() || new_gid.is_some()) && !changing_mode {
-        let current_mode = attr.mode;
-        if current_mode & 0o6000 != 0 {
-            let cleared_mode = current_mode & !0o6000;
+        let cleared_mode = permissions::without_killpriv(&stats, &creds, attr.mode);
+        if cleared_mode != attr.mode {
             args.new_attribute.mode = nfs::set_mode3::mode(cleared_mode);
         }
     }
@@ -1914,20 +1807,18 @@ pub async fn nfsproc3_remove(
         ctime: dir_attr.ctime,
     });
 
+    let creds = permissions::credentials(&context.auth);
+    let dir_stats = permissions::stats(&dir_attr);
     // Check permission to delete entry (includes sticky bit check)
-    let remove_allowed = if (dir_attr.mode & permissions::S_ISVTX) != 0 {
-        // Sticky bit set: need to look up entry attributes
-        match context.vfs.lookup(dirid, &dirops.name).await {
-            Ok(entry_id) => match context.vfs.getattr(entry_id).await {
-                Ok(entry_attr) => {
-                    permissions::can_delete_entry(&context.auth, &dir_attr, &entry_attr)
-                }
-                Err(_) => permissions::can_modify_directory(&context.auth, &dir_attr),
-            },
-            Err(_) => permissions::can_modify_directory(&context.auth, &dir_attr),
-        }
-    } else {
-        permissions::can_modify_directory(&context.auth, &dir_attr)
+    let remove_allowed = match context.vfs.lookup(dirid, &dirops.name).await {
+        Ok(entry_id) => match context.vfs.getattr(entry_id).await {
+            Ok(entry_attr) => {
+                let entry_stats = permissions::stats(&entry_attr);
+                access::sticky_delete_ok(&dir_stats, &entry_stats, &creds)
+            }
+            Err(_) => access::may_modify_directory(&dir_stats, &creds),
+        },
+        Err(_) => access::may_modify_directory(&dir_stats, &creds),
     };
 
     if !remove_allowed {
@@ -2085,33 +1976,24 @@ pub async fn nfsproc3_rename(
         ctime: to_dir_attr.ctime,
     });
 
+    let creds = permissions::credentials(&context.auth);
+    let from_dir_stats = permissions::stats(&from_dir_attr);
+    let to_dir_stats = permissions::stats(&to_dir_attr);
     // Check permission on source directory (includes sticky bit check)
-    let from_allowed = if (from_dir_attr.mode & permissions::S_ISVTX) != 0 {
-        match context.vfs.lookup(from_dirid, &fromdirops.name).await {
-            Ok(entry_id) => match context.vfs.getattr(entry_id).await {
-                Ok(entry_attr) => {
-                    let basic =
-                        permissions::can_delete_entry(&context.auth, &from_dir_attr, &entry_attr);
-                    // For directory entries being renamed across parents, the caller
-                    // must own the entry (not just the sticky directory), because the
-                    // operation modifies the directory's ".." link.
-                    if basic
-                        && matches!(entry_attr.ftype, nfs::ftype3::NF3DIR)
-                        && from_dirid != to_dirid
-                        && context.auth.uid != 0
-                        && context.auth.uid != entry_attr.uid
-                    {
-                        false
-                    } else {
-                        basic
-                    }
-                }
-                Err(_) => permissions::can_modify_directory(&context.auth, &from_dir_attr),
-            },
-            Err(_) => permissions::can_modify_directory(&context.auth, &from_dir_attr),
-        }
-    } else {
-        permissions::can_modify_directory(&context.auth, &from_dir_attr)
+    let from_allowed = match context.vfs.lookup(from_dirid, &fromdirops.name).await {
+        Ok(entry_id) => match context.vfs.getattr(entry_id).await {
+            Ok(entry_attr) => {
+                let entry_stats = permissions::stats(&entry_attr);
+                access::sticky_rename_from_ok(
+                    &from_dir_stats,
+                    &entry_stats,
+                    &creds,
+                    from_dirid != to_dirid,
+                )
+            }
+            Err(_) => access::may_modify_directory(&from_dir_stats, &creds),
+        },
+        Err(_) => access::may_modify_directory(&from_dir_stats, &creds),
     };
 
     if !from_allowed {
@@ -2143,20 +2025,16 @@ pub async fn nfsproc3_rename(
     }
 
     // Check permission on target directory (includes sticky bit check if dest exists)
-    let to_allowed = if (to_dir_attr.mode & permissions::S_ISVTX) != 0 {
-        // Sticky bit on target dir: check if destination entry exists
-        match context.vfs.lookup(to_dirid, &todirops.name).await {
-            Ok(entry_id) => match context.vfs.getattr(entry_id).await {
-                Ok(entry_attr) => {
-                    permissions::can_delete_entry(&context.auth, &to_dir_attr, &entry_attr)
-                }
-                Err(_) => permissions::can_modify_directory(&context.auth, &to_dir_attr),
-            },
-            // Dest doesn't exist, just need write+execute on target dir
-            Err(_) => permissions::can_modify_directory(&context.auth, &to_dir_attr),
-        }
-    } else {
-        permissions::can_modify_directory(&context.auth, &to_dir_attr)
+    let to_allowed = match context.vfs.lookup(to_dirid, &todirops.name).await {
+        Ok(entry_id) => match context.vfs.getattr(entry_id).await {
+            Ok(entry_attr) => {
+                let entry_stats = permissions::stats(&entry_attr);
+                access::sticky_delete_ok(&to_dir_stats, &entry_stats, &creds)
+            }
+            Err(_) => access::may_modify_directory(&to_dir_stats, &creds),
+        },
+        // Dest doesn't exist, just need write+execute on target dir
+        Err(_) => access::may_modify_directory(&to_dir_stats, &creds),
     };
 
     if !to_allowed {
@@ -2311,8 +2189,10 @@ pub async fn nfsproc3_mkdir(
         ctime: dir_attr.ctime,
     });
 
+    let creds = permissions::credentials(&context.auth);
+    let dir_stats = permissions::stats(&dir_attr);
     // Check write and execute permission on parent directory
-    if !permissions::can_modify_directory(&context.auth, &dir_attr) {
+    if !access::may_modify_directory(&dir_stats, &creds) {
         debug!(
             "mkdir permission denied for uid={} on directory",
             context.auth.uid
@@ -2451,8 +2331,10 @@ pub async fn nfsproc3_symlink(
         ctime: dir_attr.ctime,
     });
 
+    let creds = permissions::credentials(&context.auth);
+    let dir_stats = permissions::stats(&dir_attr);
     // Check write and execute permission on parent directory
-    if !permissions::can_modify_directory(&context.auth, &dir_attr) {
+    if !access::may_modify_directory(&dir_stats, &creds) {
         debug!(
             "symlink permission denied for uid={} on directory",
             context.auth.uid
@@ -2621,8 +2503,10 @@ pub async fn nfsproc3_link(
         ctime: dir_attr.ctime,
     });
 
+    let creds = permissions::credentials(&context.auth);
+    let dir_stats = permissions::stats(&dir_attr);
     // Check write and execute permission on directory
-    if !permissions::can_modify_directory(&context.auth, &dir_attr) {
+    if !access::may_modify_directory(&dir_stats, &creds) {
         debug!(
             "link permission denied for uid={} on directory",
             context.auth.uid
@@ -2863,8 +2747,10 @@ pub async fn nfsproc3_mknod(
         ctime: dir_attr.ctime,
     });
 
+    let creds = permissions::credentials(&context.auth);
+    let dir_stats = permissions::stats(&dir_attr);
     // Check write and execute permission on parent directory
-    if !permissions::can_modify_directory(&context.auth, &dir_attr) {
+    if !access::may_modify_directory(&dir_stats, &creds) {
         debug!(
             "mknod permission denied for uid={} on directory",
             context.auth.uid
@@ -2934,6 +2820,34 @@ mod tests {
 
     const TEST_UID: u32 = 1000;
     const TEST_GID: u32 = 1000;
+
+    fn make_auth(uid: u32, gid: u32, gids: Vec<u32>) -> auth_unix {
+        auth_unix {
+            stamp: 0,
+            machinename: Vec::new(),
+            uid,
+            gid,
+            gids,
+        }
+    }
+
+    fn make_attr(mode: u32, uid: u32, gid: u32, ftype: nfs::ftype3) -> nfs::fattr3 {
+        nfs::fattr3 {
+            ftype,
+            mode,
+            nlink: 1,
+            uid,
+            gid,
+            size: 0,
+            used: 0,
+            rdev: nfs::specdata3::default(),
+            fsid: 0,
+            fileid: 2,
+            atime: nfs::nfstime3::default(),
+            mtime: nfs::nfstime3::default(),
+            ctime: nfs::nfstime3::default(),
+        }
+    }
 
     async fn test_context() -> (RPCContext, agentfs_core::fs::AgentFS) {
         let agent = AgentSdk::open(AgentFSOptions::ephemeral())
@@ -3063,6 +2977,69 @@ mod tests {
         .serialize(&mut cursor)
         .expect("serialize SETATTR size args");
         input
+    }
+
+    #[test]
+    fn nfs_access_cases_match_shared_access() {
+        let requested = permissions::ACCESS3_READ
+            | permissions::ACCESS3_LOOKUP
+            | permissions::ACCESS3_MODIFY
+            | permissions::ACCESS3_EXTEND
+            | permissions::ACCESS3_DELETE
+            | permissions::ACCESS3_EXECUTE;
+        let cases = [
+            (
+                "nfs owner regular rwx",
+                make_auth(1000, 1000, vec![]),
+                make_attr(0o700, 1000, 2000, nfs::ftype3::NF3REG),
+            ),
+            (
+                "nfs auxiliary group read",
+                make_auth(1000, 1000, vec![2000]),
+                make_attr(0o040, 3000, 2000, nfs::ftype3::NF3REG),
+            ),
+            (
+                "nfs owner directory rwx",
+                make_auth(1000, 1000, vec![]),
+                make_attr(0o700, 1000, 2000, nfs::ftype3::NF3DIR),
+            ),
+            (
+                "nfs root regular mode zero",
+                make_auth(0, 0, vec![]),
+                make_attr(0o000, 1000, 1000, nfs::ftype3::NF3REG),
+            ),
+        ];
+
+        println!("adapter=nfs authority=semantics::access");
+        let mut mismatches = 0usize;
+        for (name, auth, attr) in cases {
+            let stats = permissions::stats(&attr);
+            let creds = permissions::credentials(&auth);
+            let mut shared = 0;
+            if access::may_read(&stats, &creds) {
+                shared |= permissions::ACCESS3_READ;
+            }
+            if stats.is_directory() && access::may_search(&stats, &creds) {
+                shared |= permissions::ACCESS3_LOOKUP;
+            }
+            if access::may_write(&stats, &creds) {
+                shared |= permissions::ACCESS3_MODIFY | permissions::ACCESS3_EXTEND;
+                if stats.is_directory() {
+                    shared |= permissions::ACCESS3_DELETE;
+                }
+            }
+            if !stats.is_directory() && access::may_search(&stats, &creds) {
+                shared |= permissions::ACCESS3_EXECUTE;
+            }
+
+            let nfs = permissions::compute_access(&auth, &attr, requested);
+            println!("{name}: nfs={nfs:#04x} access={shared:#04x}");
+            if nfs != shared {
+                mismatches += 1;
+            }
+        }
+        println!("adapter=nfs access_conformance mismatches={mismatches}");
+        assert_eq!(mismatches, 0);
     }
 
     async fn create_readonly_file(context: &RPCContext) -> nfs::nfs_fh3 {

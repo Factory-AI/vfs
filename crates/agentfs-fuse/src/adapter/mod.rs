@@ -2787,9 +2787,27 @@ pub fn mount(
     let dispatch_mode = fuse_config.dispatch_mode;
     let uring_config = fuse_config.uring;
     let fs = AgentFSFuse::new(fs, runtime, fuse_config);
+    let mount_opts = build_mount_options(&opts)?;
 
+    let mut session = crate::transport::Session::new(
+        fs,
+        &opts.mountpoint,
+        &mount_opts,
+        dispatch_mode,
+        uring_config,
+    )?;
+    let unmounter = session.unmount_callable();
+    let thread = std::thread::spawn(move || session.run().map_err(anyhow::Error::from));
+
+    Ok(SessionHandle {
+        thread: Some(thread),
+        unmounter,
+    })
+}
+
+fn build_mount_options(opts: &FuseMountOptions) -> anyhow::Result<Vec<MountOption>> {
     let mut mount_opts = vec![
-        MountOption::FSName(opts.fsname),
+        MountOption::FSName(opts.fsname.clone()),
         // Enable kernel-level permission checking based on file mode/uid/gid
         MountOption::DefaultPermissions,
     ];
@@ -2815,26 +2833,19 @@ pub fn mount(
     }
 
     crate::transport::check_option_conflicts(&mount_opts)?;
-    let mut session = crate::transport::Session::new(
-        fs,
-        &opts.mountpoint,
-        &mount_opts,
-        dispatch_mode,
-        uring_config,
-    )?;
-    let unmounter = session.unmount_callable();
-    let thread = std::thread::spawn(move || session.run().map_err(anyhow::Error::from));
-
-    Ok(SessionHandle {
-        thread: Some(thread),
-        unmounter,
-    })
+    Ok(mount_opts)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{build_cached_readdir_entries, fuse_write_open, readdir_start};
+    use super::{
+        build_cached_readdir_entries, build_mount_options, fuse_write_open, readdir_start,
+        FuseMountOptions,
+    };
     use agentfs_core::fs::{DirEntry, Stats, S_IFDIR, S_IFLNK, S_IFREG};
+    use agentfs_core::semantics::access;
+    use smallvec::smallvec;
+    use std::path::PathBuf;
 
     fn stats(ino: i64, mode: u32) -> Stats {
         Stats {
@@ -2852,6 +2863,98 @@ mod tests {
             ctime_nsec: 6,
             rdev: 0,
         }
+    }
+
+    fn stats_with_owner(ino: i64, mode: u32, uid: u32, gid: u32) -> Stats {
+        Stats {
+            uid,
+            gid,
+            ..stats(ino, mode)
+        }
+    }
+
+    #[test]
+    fn fuse_mount_keeps_kernel_default_permissions_enabled() {
+        let opts = FuseMountOptions {
+            mountpoint: PathBuf::from("/tmp/agentfs-test"),
+            auto_unmount: false,
+            allow_root: false,
+            allow_other: false,
+            fsname: "agentfs-test".to_string(),
+            uid: None,
+            gid: None,
+        };
+
+        let options = build_mount_options(&opts).expect("mount options build");
+
+        assert!(
+            options.contains(&crate::transport::MountOption::DefaultPermissions),
+            "FUSE adapter must keep kernel default_permissions as the access authority"
+        );
+    }
+
+    #[test]
+    fn fuse_default_permissions_cases_match_shared_access() {
+        let owner = access::Credentials {
+            uid: 1000,
+            gid: 1000,
+            groups: smallvec![],
+        };
+        let other = access::Credentials {
+            uid: 3000,
+            gid: 3000,
+            groups: smallvec![],
+        };
+        let root = access::Credentials {
+            uid: 0,
+            gid: 0,
+            groups: smallvec![],
+        };
+        let cases = [
+            (
+                "fuse owner file rw",
+                stats_with_owner(20, S_IFREG | 0o600, 1000, 1000),
+                owner.clone(),
+                true,
+                true,
+                false,
+            ),
+            (
+                "fuse other denied",
+                stats_with_owner(21, S_IFREG | 0o600, 1000, 1000),
+                other,
+                false,
+                false,
+                false,
+            ),
+            (
+                "fuse root directory search",
+                stats_with_owner(22, S_IFDIR, 1000, 1000),
+                root,
+                true,
+                true,
+                true,
+            ),
+        ];
+
+        println!("adapter=fuse authority=kernel_default_permissions surface=semantics::access");
+        let mut mismatches = 0usize;
+        for (name, stats, creds, read, write, search) in cases {
+            let got = (
+                access::may_read(&stats, &creds),
+                access::may_write(&stats, &creds),
+                access::may_search(&stats, &creds),
+            );
+            println!(
+                "{name}: fuse=({read},{write},{search}) access=({},{},{})",
+                got.0, got.1, got.2
+            );
+            if got != (read, write, search) {
+                mismatches += 1;
+            }
+        }
+        println!("adapter=fuse access_conformance mismatches={mismatches}");
+        assert_eq!(mismatches, 0);
     }
 
     #[test]

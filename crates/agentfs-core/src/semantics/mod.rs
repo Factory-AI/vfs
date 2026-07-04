@@ -1,6 +1,7 @@
-//! Placeholder for the shared semantics facade.
+//! Shared semantics facade under the transport adapters.
 //!
 //! M6 fills this module with the permission, durability, and handle-table
-//! contracts that sit under the FUSE and NFS adapters. The M5 core split
-//! reserves the module path so downstream crate moves can depend on the final
-//! tree shape without introducing behavior yet.
+//! contracts that sit under the FUSE and NFS adapters. Access control lives
+//! here so transport handlers cannot drift on POSIX mode-bit behavior.
+
+pub mod access;
