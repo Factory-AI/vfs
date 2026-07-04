@@ -1,20 +1,26 @@
-use crate::error::{Error, Result};
-use async_trait::async_trait;
-use lru::LruCache;
-use std::collections::{HashMap, HashSet};
-use std::num::NonZeroUsize;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
-use turso::transaction::{Transaction, TransactionBehavior};
-use turso::{Builder, Connection, Value};
+//! AgentFS core facade and module spine.
+//!
+//! This module owns the shared `AgentFS` state, connection setup, path
+//! resolution helpers, cache invalidation hooks, and lifecycle spine. Focused
+//! child modules implement caches, file handles, bulk import, path delegates,
+//! and the canonical `FileSystem` trait implementation.
 
 #[cfg(test)]
-use super::DEFAULT_FILE_MODE;
+use crate::error::Error;
+use crate::error::Result;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
+use turso::{Builder, Connection, Value};
+
 use super::{
-    BoxedFile, DirEntry, File, FileSystem, FilesystemStats, FsError, Stats, TimeChange, WriteRange,
-    DEFAULT_DIR_MODE, MAX_NAME_LEN, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG,
+    BoxedFile, FilesystemStats, FsError, Stats, DEFAULT_DIR_MODE, MAX_NAME_LEN, S_IFDIR, S_IFLNK,
+    S_IFMT, S_IFREG,
 };
+#[cfg(test)]
+use super::{FileSystem, TimeChange, WriteRange, DEFAULT_FILE_MODE};
 #[cfg(test)]
 use crate::config::BatcherConfig;
 use crate::config::{CoreConfig, Geometry, DEFAULT_CHUNK_SIZE, DEFAULT_INLINE_THRESHOLD};
@@ -22,18 +28,27 @@ use crate::connection_pool::{ConnectionPool, ConnectionPoolOptions};
 use crate::schema;
 
 mod batcher;
+mod caches;
+mod file;
+mod fs;
+mod import;
 mod lifecycle;
+mod path_api;
 pub(in crate::filesystem) mod store;
+
 use batcher::{
-    AgentFSWriteBatcher, BatcherDrain, BatcherPendingView, Drain, EnqueueOutcome,
-    PendingGeneration, PendingTimeChange, PendingView,
+    AgentFSWriteBatcher, BatcherDrain, BatcherPendingView, Drain, PendingGeneration, PendingView,
 };
+use caches::{AttrCache, DentryCache, NegativeDentryCache};
+pub use file::AgentFSFile;
+pub use import::{ImportEntry, ImportOptions, ImportSession, ImportedEntry};
 pub use lifecycle::ReapHook;
 use lifecycle::{Lifecycle, OpenInodeGuard};
-use store::WriteRangeRef;
 
 #[cfg(test)]
-use store::{dense_after_inline_write_batch, normalize_write_ranges, NormalizedWriteRange};
+use store::{
+    dense_after_inline_write_batch, normalize_write_ranges, NormalizedWriteRange, WriteRangeRef,
+};
 
 const ROOT_INO: i64 = 1;
 const STORAGE_CHUNKED: i64 = 0;
@@ -96,224 +111,6 @@ fn remove_checkpointed_sidecars(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// LRU cache for directory entry lookups.
-///
-/// Maps (parent_ino, name) -> child_ino to avoid repeated database queries
-/// during path resolution. For a path like `/a/b/c/d`, this reduces queries
-/// from 4 to potentially 0 on cache hits.
-struct DentryCache {
-    // Mutex required because LruCache::get() mutates internal order
-    entries: Mutex<LruCache<(i64, String), i64>>,
-}
-
-impl DentryCache {
-    fn new(max_size: usize) -> Self {
-        Self {
-            entries: Mutex::new(LruCache::new(
-                NonZeroUsize::new(max_size).expect("cache size must be > 0"),
-            )),
-        }
-    }
-
-    /// Look up a cached entry (updates LRU order)
-    fn get(&self, parent_ino: i64, name: &str) -> Option<i64> {
-        let entry = self
-            .entries
-            .lock()
-            .unwrap()
-            .get(&(parent_ino, name.to_string()))
-            .copied();
-        if entry.is_some() {
-            crate::profiling::record_dentry_cache_hit();
-            crate::profiling::record_path_cache_hit();
-        } else {
-            crate::profiling::record_dentry_cache_miss();
-            crate::profiling::record_path_cache_miss();
-        }
-        entry
-    }
-
-    /// Insert an entry into the cache (evicts LRU entry if full)
-    fn insert(&self, parent_ino: i64, name: &str, child_ino: i64) {
-        self.entries
-            .lock()
-            .unwrap()
-            .put((parent_ino, name.to_string()), child_ino);
-    }
-
-    /// Remove an entry from the cache
-    fn remove(&self, parent_ino: i64, name: &str) {
-        self.entries
-            .lock()
-            .unwrap()
-            .pop(&(parent_ino, name.to_string()));
-    }
-}
-
-/// LRU cache for safe negative directory entry lookups.
-///
-/// A negative entry means "this (parent, name) did not exist in the last
-/// serialized AgentFS view". Every namespace mutation invalidates exactly the
-/// affected key before the mutation reports success, so cached ENOENT results
-/// cannot hide later creates or renames made through this filesystem.
-struct NegativeDentryCache {
-    entries: Mutex<LruCache<(i64, String), ()>>,
-}
-
-impl NegativeDentryCache {
-    fn new(max_size: usize) -> Self {
-        Self {
-            entries: Mutex::new(LruCache::new(
-                NonZeroUsize::new(max_size).expect("cache size must be > 0"),
-            )),
-        }
-    }
-
-    fn contains(&self, parent_ino: i64, name: &str) -> bool {
-        let cached = self
-            .entries
-            .lock()
-            .unwrap()
-            .get(&(parent_ino, name.to_string()))
-            .is_some();
-        if cached {
-            crate::profiling::record_negative_cache_hit();
-        } else {
-            crate::profiling::record_negative_cache_miss();
-        }
-        cached
-    }
-
-    fn insert(&self, parent_ino: i64, name: &str) {
-        self.entries
-            .lock()
-            .unwrap()
-            .put((parent_ino, name.to_string()), ());
-    }
-
-    fn remove(&self, parent_ino: i64, name: &str) {
-        if self
-            .entries
-            .lock()
-            .unwrap()
-            .pop(&(parent_ino, name.to_string()))
-            .is_some()
-        {
-            crate::profiling::record_negative_cache_invalidation();
-        }
-    }
-}
-
-/// LRU cache for inode attributes.
-///
-/// FUSE and SDK stat-heavy read paths often ask for the same inode metadata
-/// repeatedly after lookup/readdir_plus. This cache is conservative: every
-/// namespace, metadata, or size/content mutation invalidates the affected inode
-/// and parent directory entries before the mutation is considered complete.
-struct AttrCache {
-    entries: Mutex<LruCache<i64, Stats>>,
-}
-
-impl AttrCache {
-    fn new(max_size: usize) -> Self {
-        Self {
-            entries: Mutex::new(LruCache::new(
-                NonZeroUsize::new(max_size).expect("cache size must be > 0"),
-            )),
-        }
-    }
-
-    fn get(&self, ino: i64) -> Option<Stats> {
-        let stats = self.entries.lock().unwrap().get(&ino).cloned();
-        if stats.is_some() {
-            crate::profiling::record_attr_cache_hit();
-        } else {
-            crate::profiling::record_attr_cache_miss();
-        }
-        stats
-    }
-
-    fn insert(&self, stats: Stats) {
-        self.entries.lock().unwrap().put(stats.ino, stats);
-    }
-
-    fn remove(&self, ino: i64) {
-        self.entries.lock().unwrap().pop(&ino);
-    }
-}
-
-/// One node for [`AgentFS::import_entries`]. `path` is relative to the import
-/// root and '/'-separated; parent directories must precede their children.
-#[derive(Debug, Clone)]
-pub struct ImportEntry {
-    pub path: String,
-    /// Full `st_mode` bits (S_IFDIR / S_IFREG / S_IFLNK plus permissions).
-    pub mode: u32,
-    /// File content, or the symlink target bytes; empty for directories.
-    pub data: Vec<u8>,
-}
-
-/// Result row for one imported node: echoes the exact `ino`/`mode`/`size`
-/// the filesystem will serve so callers can fabricate externally-consistent
-/// stat metadata (e.g. a git index) without re-reading content.
-#[derive(Debug, Clone)]
-pub struct ImportedEntry {
-    pub path: String,
-    pub ino: i64,
-    pub mode: u32,
-    pub size: u64,
-}
-
-/// Ownership and timestamps applied to every node of one bulk import.
-#[derive(Debug, Clone)]
-pub struct ImportOptions {
-    pub uid: u32,
-    pub gid: u32,
-    /// (secs, nanos) stamped as atime/mtime/ctime on every imported inode.
-    pub timestamp: (i64, i64),
-}
-
-/// A streaming bulk import started by [`AgentFS::begin_import`]. Holds one
-/// pooled connection plus the directory-path -> ino map across
-/// [`ImportSession::import_chunk`] calls, so a producer can feed entries as
-/// they become available (e.g. as `git cat-file --batch` emits blobs)
-/// instead of buffering the whole tree in memory. The ordering contract
-/// matches [`AgentFS::import_entries`]: every parent directory must appear
-/// in some chunk before (or in the same chunk as) its children.
-pub struct ImportSession {
-    fs: AgentFS,
-    conn: crate::connection_pool::PooledConnection,
-    dest_parent: i64,
-    opts: ImportOptions,
-    dir_inos: HashMap<String, i64>,
-    results: Vec<ImportedEntry>,
-}
-
-impl ImportSession {
-    /// Import one batch of entries. Parent directories imported by earlier
-    /// chunks (or earlier in this chunk) resolve normally; a parent that has
-    /// never been imported yields `FsError::NotFound`.
-    pub async fn import_chunk(&mut self, entries: &[ImportEntry]) -> Result<()> {
-        self.fs
-            .import_chunk_with_conn(
-                &self.conn,
-                self.dest_parent,
-                &self.opts,
-                &mut self.dir_inos,
-                &mut self.results,
-                entries,
-            )
-            .await
-    }
-
-    /// Finish the import and return one [`ImportedEntry`] per imported node,
-    /// in the order the entries were fed.
-    pub fn finish(self) -> Vec<ImportedEntry> {
-        self.fs.invalidate_attr(self.dest_parent);
-        self.results
-    }
-}
-
 /// A filesystem backed by SQLite
 #[derive(Clone)]
 pub struct AgentFS {
@@ -335,6 +132,9 @@ pub struct AgentFS {
     /// Concrete batcher retained only for white-box unit tests.
     #[cfg(test)]
     write_batcher: Option<Arc<AgentFSWriteBatcher>>,
+    /// Bulk-import transaction sizes observed by white-box tests.
+    #[cfg(test)]
+    import_commit_sizes: Arc<Mutex<Vec<usize>>>,
     /// Tier 4 escape hatch: when false (`AGENTFS_OVERLAY_READS=0`), the SDK
     /// behaves like Tier 3 — every pwrite drains, every pread drains,
     /// `merge_pending_view` is a no-op. ON by default.
@@ -345,303 +145,9 @@ pub struct AgentFS {
     lifecycle: Arc<Lifecycle>,
 }
 
-/// An open file handle for AgentFS.
-///
-/// This struct holds the inode number resolved at open time, allowing
-/// efficient read/write/fsync operations without path lookups.
-pub struct AgentFSFile {
-    pool: ConnectionPool,
-    ino: i64,
-    chunk_size: usize,
-    inline_threshold: usize,
-    attr_cache: Arc<AttrCache>,
-    pending_view: Option<BatcherPendingView>,
-    write_drain: Option<BatcherDrain>,
-    /// Same semantics as the field on `AgentFS`; cloned at open time so the
-    /// hot read/write path doesn't have to chase an extra indirection.
-    overlay_reads: bool,
-    /// Present for user-visible handles so unlink defers inode reaping while
-    /// they live. This remains optional until lifecycle extraction flattens
-    /// the handle construction API.
-    _open_guard: Option<OpenInodeGuard>,
-}
-
 fn current_timestamp() -> Result<(i64, i64)> {
     let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
     Ok((dur.as_secs() as i64, dur.subsec_nanos() as i64))
-}
-
-#[async_trait]
-impl File for AgentFSFile {
-    async fn pread(&self, offset: u64, size: u64) -> Result<Vec<u8>> {
-        // Tier Four: NO `drain_writes()` prelude. Read SQLite-resident bytes
-        // (committed state) and overlay pending writes from the in-memory
-        // batcher snapshot. Together they form a read-after-write consistent
-        // view without forcing a SQLite commit on the read path.
-        //
-        // Ordering matters: peek the batcher state BEFORE acquiring a pool
-        // connection, and release the connection BEFORE the splice loop. Long
-        // pread workloads (parallel git-grep) saturate the 8-slot pool, and
-        // holding a connection across `state.lock().await` starves the timer
-        // drain task that also needs a connection to commit.
-        if size == 0 {
-            return Ok(Vec::new());
-        }
-        // Escape hatch: when overlay reads are disabled, behave like Tier 3
-        // — drain the inode's pending writes before reading SQLite. Same
-        // wire result, slower but battle-tested.
-        if !self.overlay_reads {
-            self.drain_writes().await?;
-        }
-        let pending_max_end = match &self.pending_view {
-            Some(view) if self.overlay_reads && view.has_pending(self.ino) => {
-                view.pending_max_end(self.ino)
-            }
-            _ => None,
-        };
-
-        let conn = self.pool.get_connection().await?;
-        let metadata = store::file_storage(&conn, self.ino).await?;
-        let effective_size = match pending_max_end {
-            Some(end) => metadata.size.max(end),
-            None => metadata.size,
-        };
-
-        if offset >= effective_size {
-            return Ok(Vec::new());
-        }
-        let read_size = size.min(effective_size - offset);
-
-        let base_window = if offset < metadata.size {
-            (metadata.size - offset).min(read_size)
-        } else {
-            0
-        };
-        let mut result = if base_window > 0 {
-            let mut buf = store::read_from_storage(
-                &conn,
-                self.ino,
-                self.geometry(),
-                &metadata,
-                offset,
-                base_window,
-            )
-            .await?;
-            buf.resize(read_size as usize, 0);
-            buf
-        } else {
-            vec![0u8; read_size as usize]
-        };
-        drop(conn);
-
-        if let Some(view) = &self.pending_view {
-            if pending_max_end.is_some() {
-                let _ = view.overlay_read(self.ino, offset, &mut result);
-            }
-        }
-
-        Ok(result)
-    }
-
-    async fn pwrite(&self, offset: u64, data: &[u8]) -> Result<()> {
-        if data.is_empty() {
-            return Ok(());
-        }
-        // Tier Four: with the batcher wired AND overlay reads enabled,
-        // route through enqueue so the overlay holds the write and readers
-        // see it via `pread`'s peek_pending merge. Drain only on
-        // fsync/destroy/timer. When `AGENTFS_OVERLAY_READS=0` the
-        // overlay-reads escape hatch is engaged: skip the batcher and commit
-        // directly so the legacy Tier 3 read path (which drains before
-        // reading) sees the write.
-        if let Some(drain) = &self.write_drain {
-            if self.overlay_reads {
-                let outcome = drain.enqueue(
-                    self.ino,
-                    vec![WriteRange {
-                        offset,
-                        data: data.to_vec(),
-                    }],
-                )?;
-                return Self::finish_enqueue(drain, self.ino, outcome).await;
-            }
-        }
-        // Fallback (no batcher): direct commit. drain_writes is a no-op
-        // when there's no batcher, but keeping the call here makes the
-        // contract explicit.
-        self.drain_writes().await?;
-        let conn = self.pool.get_connection().await?;
-        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
-        let ranges = [WriteRangeRef { offset, data }];
-        let result =
-            store::write_ranges(&conn, self.ino, self.geometry(), &ranges, false, None).await;
-        match result {
-            Ok(()) => {
-                txn.commit().await?;
-                self.attr_cache.remove(self.ino);
-                Ok(())
-            }
-            Err(e) => {
-                let _ = txn.rollback().await;
-                Err(e)
-            }
-        }
-    }
-
-    async fn pwrite_ranges(&self, ranges: Vec<WriteRange>) -> Result<()> {
-        if ranges.iter().all(|range| range.data.is_empty()) {
-            return Ok(());
-        }
-        // Tier Four: route through the batcher when overlay reads are
-        // enabled; otherwise commit immediately (escape hatch — see pwrite).
-        if let Some(drain) = &self.write_drain {
-            if self.overlay_reads {
-                let outcome = drain.enqueue(self.ino, ranges)?;
-                return Self::finish_enqueue(drain, self.ino, outcome).await;
-            }
-        }
-        self.drain_writes().await?;
-
-        let conn = self.pool.get_connection().await?;
-        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
-        let range_refs: Vec<_> = ranges
-            .iter()
-            .map(|range| WriteRangeRef {
-                offset: range.offset,
-                data: range.data.as_slice(),
-            })
-            .collect();
-        let result =
-            store::write_ranges(&conn, self.ino, self.geometry(), &range_refs, false, None).await;
-        match result {
-            Ok(()) => {
-                txn.commit().await?;
-                self.attr_cache.remove(self.ino);
-                Ok(())
-            }
-            Err(e) => {
-                let _ = txn.rollback().await;
-                Err(e)
-            }
-        }
-    }
-
-    async fn pwrite_ranges_batched(&self, ranges: Vec<WriteRange>) -> Result<()> {
-        if ranges.iter().all(|range| range.data.is_empty()) {
-            return Ok(());
-        }
-
-        if let Some(drain) = &self.write_drain {
-            let outcome = drain.enqueue(self.ino, ranges)?;
-            Self::finish_enqueue(drain, self.ino, outcome).await
-        } else {
-            self.pwrite_ranges(ranges).await
-        }
-    }
-
-    async fn truncate(&self, new_size: u64) -> Result<()> {
-        // Tier Four: shrink the in-memory overlay BEFORE touching SQLite, so
-        // a concurrent reader doesn't observe pending bytes past the new EOF
-        // between the SQLite truncate and the batcher catching up.
-        if let Some(drain) = &self.write_drain {
-            drain.truncate_pending(self.ino, new_size);
-        }
-        // Drain remaining pending so the SQLite truncate sees a consistent
-        // size. With truncate_pending called above, the only pending left is
-        // for offsets < new_size, which will be applied by the timer / next
-        // drain trigger. We still drain here so the SQLite size after this
-        // call exactly matches `new_size`.
-        self.drain_writes().await?;
-        let conn = self.pool.get_connection().await?;
-        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
-        let result = store::truncate(&conn, self.ino, self.geometry(), new_size).await;
-        match result {
-            Ok(()) => {
-                txn.commit().await?;
-                self.attr_cache.remove(self.ino);
-                Ok(())
-            }
-            Err(e) => {
-                let _ = txn.rollback().await;
-                Err(e)
-            }
-        }
-    }
-
-    async fn fsync(&self) -> Result<()> {
-        // Tier Four: fsync remains the explicit durability barrier — drain the
-        // batcher so the WAL checkpoint that follows captures every pending
-        // write.
-        self.drain_writes().await?;
-        let conn = self.pool.get_connection().await?;
-        conn.prepare_cached(DURABLE_SYNCHRONOUS_SQL)
-            .await?
-            .execute(())
-            .await?;
-        checkpoint_wal(&conn).await?;
-        conn.prepare_cached(BASELINE_SYNCHRONOUS_SQL)
-            .await?
-            .execute(())
-            .await?;
-        Ok(())
-    }
-
-    async fn fstat(&self) -> Result<Stats> {
-        self.drain_writes().await?;
-        if let Some(stats) = self.attr_cache.get(self.ino) {
-            return Ok(stats);
-        }
-
-        let conn = self.pool.get_connection().await?;
-        let generation = self
-            .pending_view
-            .as_ref()
-            .map(|view| view.pending_generation(self.ino));
-        let mut stmt = conn
-            .prepare_cached("SELECT ino, mode, nlink, uid, gid, size, atime, mtime, ctime, rdev, atime_nsec, mtime_nsec, ctime_nsec FROM fs_inode WHERE ino = ?")
-            .await?;
-        let mut rows = stmt.query((self.ino,)).await?;
-
-        if let Some(row) = rows.next().await? {
-            let stats = store::stats_from_row(&row)?;
-            if let (Some(view), Some(generation)) = (&self.pending_view, generation) {
-                if view.pending_generation(stats.ino) == generation {
-                    self.attr_cache.insert(stats.clone());
-                }
-            } else {
-                self.attr_cache.insert(stats.clone());
-            }
-            Ok(stats)
-        } else {
-            Err(FsError::NotFound.into())
-        }
-    }
-
-    async fn drain_writes(&self) -> Result<()> {
-        if let Some(drain) = &self.write_drain {
-            drain.drain_inode(self.ino).await?;
-        }
-        Ok(())
-    }
-}
-
-impl AgentFSFile {
-    async fn finish_enqueue(drain: &BatcherDrain, ino: i64, outcome: EnqueueOutcome) -> Result<()> {
-        if outcome.drain_all {
-            drain.drain_all_bytes().await
-        } else if outcome.drain_inode {
-            drain.drain_inode_bytes(ino).await
-        } else {
-            Ok(())
-        }
-    }
-
-    fn geometry(&self) -> Geometry {
-        Geometry {
-            chunk_size: self.chunk_size,
-            inline_threshold: self.inline_threshold,
-        }
-    }
 }
 
 impl AgentFS {
@@ -743,6 +249,8 @@ impl AgentFS {
             write_drain,
             #[cfg(test)]
             write_batcher: _write_batcher,
+            #[cfg(test)]
+            import_commit_sizes: Arc::new(Mutex::new(Vec::new())),
             overlay_reads,
             core_config,
             lifecycle,
@@ -1195,7 +703,7 @@ impl AgentFS {
                     .get_value(0)
                     .ok()
                     .and_then(|v| v.as_integer().copied())
-                    .unwrap_or(0);
+                    .ok_or_else(|| FsError::Corrupt("invalid ino: expected integer".to_string()))?;
 
                 // Populate cache
                 self.cache_dentry(current_ino, &component, child_ino);
@@ -1227,320 +735,6 @@ impl AgentFS {
             .ok_or(FsError::NotFound)?;
         let name = components.last().cloned().ok_or(FsError::InvalidPath)?;
         Ok((parent_ino, name))
-    }
-
-    /// Get file statistics, following symlinks.
-    pub async fn stat(&self, path: &str) -> Result<Option<Stats>> {
-        let path = self.normalize_path(path);
-        let mut current_path = path;
-        for _ in 0..40 {
-            let ino = match self.resolve_path(&current_path).await? {
-                Some(ino) => ino,
-                None => return Ok(None),
-            };
-            let Some(stats) = FileSystem::getattr(self, ino).await? else {
-                return Ok(None);
-            };
-            if !stats.is_symlink() {
-                return Ok(Some(stats));
-            }
-
-            let target = FileSystem::readlink(self, ino)
-                .await?
-                .ok_or(FsError::NotFound)?;
-            current_path = if target.starts_with('/') {
-                target
-            } else {
-                let base_path = Path::new(&current_path);
-                let parent = base_path.parent().unwrap_or(Path::new("/"));
-                parent.join(&target).to_string_lossy().into_owned()
-            };
-            current_path = self.normalize_path(&current_path);
-        }
-
-        Err(FsError::SymlinkLoop.into())
-    }
-
-    /// Bulk-import a tree of nodes under `dest_parent` using large
-    /// multi-inode transactions instead of one transaction per node, sized by
-    /// the write batcher's txn limits (`AGENTFS_BATCH_TXN_INODES` /
-    /// `AGENTFS_BATCH_TXN_BYTES`). This is the fast path for populating the
-    /// database without per-file FUSE round trips (`agentfs clone` / `fs
-    /// import`): a 4.7k-file worktree pays a handful of commits instead of
-    /// ~9.4k per-file create+write transaction boundaries.
-    ///
-    /// Entries must be ordered parents-before-children; every parent
-    /// directory of a nested path must itself appear as an entry (or be the
-    /// import root). All inodes are stamped with `opts.timestamp`, and the
-    /// returned rows echo the exact `ino`/`mode`/`size` the filesystem will
-    /// serve, so callers can fabricate externally-consistent stat metadata
-    /// (e.g. a git index) without re-reading anything.
-    pub async fn import_entries(
-        &self,
-        dest_parent: i64,
-        entries: &[ImportEntry],
-        opts: &ImportOptions,
-    ) -> Result<Vec<ImportedEntry>> {
-        let mut session = self.begin_import(dest_parent, opts.clone()).await?;
-        session.import_chunk(entries).await?;
-        Ok(session.finish())
-    }
-
-    /// Begin a streaming bulk import under `dest_parent`; see
-    /// [`ImportSession`]. [`AgentFS::import_entries`] is the buffered
-    /// one-shot form.
-    pub async fn begin_import(
-        &self,
-        dest_parent: i64,
-        opts: ImportOptions,
-    ) -> Result<ImportSession> {
-        Ok(ImportSession {
-            fs: self.clone(),
-            conn: self.pool.get_connection().await?,
-            dest_parent,
-            opts,
-            dir_inos: HashMap::new(),
-            results: Vec::new(),
-        })
-    }
-
-    /// One chunk of a streaming import. `conn`, `dir_inos`, and `results`
-    /// persist across calls so later chunks may reference directories
-    /// imported by earlier ones; each call still splits its entries into
-    /// bounded transactions.
-    async fn import_chunk_with_conn(
-        &self,
-        conn: &crate::connection_pool::PooledConnection,
-        dest_parent: i64,
-        opts: &ImportOptions,
-        dir_inos: &mut HashMap<String, i64>,
-        results: &mut Vec<ImportedEntry>,
-        entries: &[ImportEntry],
-    ) -> Result<()> {
-        let max_inodes = self.core_config.batcher.txn_max_inodes.max(1);
-        let max_bytes = self.core_config.batcher.txn_max_bytes.max(1);
-        let (ts_secs, ts_nsec) = opts.timestamp;
-
-        let mut inode_stmt = conn
-            .prepare_cached(
-                "INSERT INTO fs_inode (mode, nlink, uid, gid, size, atime, mtime, ctime, atime_nsec, mtime_nsec, ctime_nsec, data_inline, storage_kind)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING ino",
-            )
-            .await?;
-        let mut dentry_stmt = conn
-            .prepare_cached("INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, ?, ?)")
-            .await?;
-        let mut chunk_stmt = conn
-            .prepare_cached("INSERT INTO fs_data (ino, chunk_index, data) VALUES (?, ?, ?)")
-            .await?;
-        let mut symlink_stmt = conn
-            .prepare_cached("INSERT INTO fs_symlink (ino, target) VALUES (?, ?)")
-            .await?;
-        let mut parent_stmt = conn
-            .prepare_cached(
-                "UPDATE fs_inode SET nlink = nlink + ?, ctime = ?, mtime = ?, ctime_nsec = ?, mtime_nsec = ? WHERE ino = ?",
-            )
-            .await?;
-
-        results.reserve(entries.len());
-
-        let mut idx = 0usize;
-        while idx < entries.len() {
-            let mut batch_end = idx;
-            let mut batch_bytes = 0usize;
-            while batch_end < entries.len()
-                && batch_end - idx < max_inodes
-                && (batch_end == idx || batch_bytes + entries[batch_end].data.len() <= max_bytes)
-            {
-                batch_bytes += entries[batch_end].data.len();
-                batch_end += 1;
-            }
-
-            // Cache fills staged until after a successful commit so a rolled
-            // back batch never leaves phantom dentries/attrs behind.
-            let mut staged: Vec<(i64, String, Stats)> = Vec::with_capacity(batch_end - idx);
-            // parent ino -> nlink bump from new subdirectories ("..").
-            let mut parent_bumps: HashMap<i64, i64> = HashMap::new();
-
-            let txn = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).await?;
-            for entry in &entries[idx..batch_end] {
-                let (parent_path, name) = match entry.path.rsplit_once('/') {
-                    Some((parent, name)) => (parent, name),
-                    None => ("", entry.path.as_str()),
-                };
-                if name.is_empty() || name == "." || name == ".." {
-                    return Err(FsError::InvalidPath.into());
-                }
-                if name.len() > MAX_NAME_LEN {
-                    return Err(FsError::NameTooLong.into());
-                }
-                let parent_ino = if parent_path.is_empty() {
-                    dest_parent
-                } else {
-                    *dir_inos
-                        .get(parent_path)
-                        .ok_or_else(|| Error::Fs(FsError::NotFound))?
-                };
-
-                let kind = entry.mode & S_IFMT;
-                let (nlink, size, data_inline, storage_kind) = match kind {
-                    S_IFDIR => (2i64, 0u64, Value::Null, STORAGE_CHUNKED),
-                    S_IFLNK => (1, entry.data.len() as u64, Value::Null, STORAGE_CHUNKED),
-                    S_IFREG => {
-                        if entry.data.len() <= self.inline_threshold {
-                            (
-                                1,
-                                entry.data.len() as u64,
-                                Value::Blob(entry.data.clone()),
-                                STORAGE_INLINE,
-                            )
-                        } else {
-                            (1, entry.data.len() as u64, Value::Null, STORAGE_CHUNKED)
-                        }
-                    }
-                    _ => return Err(FsError::InvalidPath.into()),
-                };
-
-                let row = inode_stmt
-                    .query_row((
-                        entry.mode as i64,
-                        nlink,
-                        opts.uid,
-                        opts.gid,
-                        size as i64,
-                        ts_secs,
-                        ts_secs,
-                        ts_secs,
-                        ts_nsec,
-                        ts_nsec,
-                        ts_nsec,
-                        data_inline,
-                        storage_kind,
-                    ))
-                    .await?;
-                let ino = row
-                    .get_value(0)
-                    .ok()
-                    .and_then(|v| v.as_integer().copied())
-                    .ok_or_else(|| Error::Internal("failed to get inode".to_string()))?;
-
-                match dentry_stmt.execute((name, parent_ino, ino)).await {
-                    Ok(_) => {}
-                    Err(turso::Error::Constraint(_)) => return Err(FsError::AlreadyExists.into()),
-                    Err(error) => return Err(error.into()),
-                }
-
-                match kind {
-                    S_IFDIR => {
-                        dir_inos.insert(entry.path.clone(), ino);
-                        *parent_bumps.entry(parent_ino).or_insert(0) += 1;
-                    }
-                    S_IFLNK => {
-                        let target = std::str::from_utf8(&entry.data)
-                            .map_err(|_| Error::Fs(FsError::InvalidPath))?;
-                        symlink_stmt.execute((ino, target)).await?;
-                        parent_bumps.entry(parent_ino).or_insert(0);
-                    }
-                    _ => {
-                        if storage_kind == STORAGE_CHUNKED {
-                            for (chunk_index, chunk) in
-                                entry.data.chunks(self.chunk_size).enumerate()
-                            {
-                                chunk_stmt
-                                    .execute((ino, chunk_index as i64, Value::Blob(chunk.to_vec())))
-                                    .await?;
-                            }
-                        }
-                        parent_bumps.entry(parent_ino).or_insert(0);
-                    }
-                }
-
-                staged.push((
-                    parent_ino,
-                    name.to_string(),
-                    Stats {
-                        ino,
-                        mode: entry.mode,
-                        nlink: nlink as u32,
-                        uid: opts.uid,
-                        gid: opts.gid,
-                        size: size as i64,
-                        atime: ts_secs,
-                        mtime: ts_secs,
-                        ctime: ts_secs,
-                        atime_nsec: ts_nsec as u32,
-                        mtime_nsec: ts_nsec as u32,
-                        ctime_nsec: ts_nsec as u32,
-                        rdev: 0,
-                    },
-                ));
-                results.push(ImportedEntry {
-                    path: entry.path.clone(),
-                    ino,
-                    mode: entry.mode,
-                    size,
-                });
-            }
-
-            for (parent_ino, bump) in &parent_bumps {
-                parent_stmt
-                    .execute((*bump, ts_secs, ts_secs, ts_nsec, ts_nsec, *parent_ino))
-                    .await?;
-            }
-
-            txn.commit().await?;
-            crate::profiling::record_agentfs_batcher_commit_txn(staged.len() as u64);
-
-            for (parent_ino, name, stats) in staged {
-                self.cache_dentry(parent_ino, &name, stats.ino);
-                // Directories keep changing (nlink/time bumps as later batches
-                // add children), so only leaf attrs are safe to prime.
-                if stats.mode & S_IFMT != S_IFDIR {
-                    self.cache_attr(stats);
-                }
-            }
-            for parent_ino in parent_bumps.keys() {
-                self.invalidate_attr(*parent_ino);
-            }
-
-            idx = batch_end;
-        }
-
-        Ok(())
-    }
-
-    /// Create a directory
-    pub async fn mkdir(&self, path: &str, uid: u32, gid: u32) -> Result<()> {
-        let (parent_ino, name) = self.resolve_parent_and_name(path).await?;
-        FileSystem::mkdir(self, parent_ino, &name, DEFAULT_DIR_MODE, uid, gid).await?;
-        Ok(())
-    }
-
-    /// Create a new empty file with the specified mode and ownership.
-    ///
-    /// This is an optimized path for FUSE create() that combines inode creation,
-    /// dentry creation, and file handle opening in a single operation.
-    /// Returns both Stats and an open file handle.
-    pub async fn create_file(
-        &self,
-        path: &str,
-        mode: u32,
-        uid: u32,
-        gid: u32,
-    ) -> Result<(Stats, BoxedFile)> {
-        let (parent_ino, name) = self.resolve_parent_and_name(path).await?;
-        FileSystem::create_file(self, parent_ino, &name, mode, uid, gid).await
-    }
-
-    /// Read data from a file
-    pub async fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>> {
-        let stats = match self.stat(path).await? {
-            Some(stats) => stats,
-            None => return Ok(None),
-        };
-        let file = FileSystem::open(self, stats.ino, libc::O_RDONLY).await?;
-        let size = u64::try_from(stats.size).unwrap_or(0);
-        Ok(Some(file.pread(0, size).await?))
     }
 
     /// List directory contents
@@ -1618,19 +812,6 @@ impl AgentFS {
         }
     }
 
-    /// Remove a file or empty directory
-    pub async fn remove(&self, path: &str) -> Result<()> {
-        let (parent_ino, name) = self.resolve_parent_and_name(path).await?;
-        let stats = FileSystem::lookup(self, parent_ino, &name)
-            .await?
-            .ok_or(FsError::NotFound)?;
-        if stats.is_directory() {
-            FileSystem::rmdir(self, parent_ino, &name).await
-        } else {
-            FileSystem::unlink(self, parent_ino, &name).await
-        }
-    }
-
     /// Get filesystem statistics
     ///
     /// Returns the total number of inodes and bytes used by file contents.
@@ -1666,27 +847,6 @@ impl AgentFS {
         };
 
         Ok(FilesystemStats { inodes, bytes_used })
-    }
-
-    /// Synchronize file data to persistent storage
-    ///
-    /// Temporarily enables FULL synchronous mode, runs a transaction to force
-    /// a checkpoint, then restores NORMAL mode. This ensures durability while
-    /// maintaining high performance for normal operations.
-    ///
-    pub async fn fsync(&self) -> Result<()> {
-        FileSystem::drain_all(self).await?;
-        let conn = self.pool.get_connection().await?;
-        conn.prepare_cached(DURABLE_SYNCHRONOUS_SQL)
-            .await?
-            .execute(())
-            .await?;
-        checkpoint_wal(&conn).await?;
-        conn.prepare_cached(BASELINE_SYNCHRONOUS_SQL)
-            .await?
-            .execute(())
-            .await?;
-        Ok(())
     }
 
     /// Open a file and return a file handle.
@@ -1759,1500 +919,6 @@ impl AgentFS {
             Err(FsError::NotFound.into())
         }
     }
-}
-
-#[async_trait]
-impl FileSystem for AgentFS {
-    async fn lookup(&self, parent_ino: i64, name: &str) -> Result<Option<Stats>> {
-        crate::profiling::record_lookup();
-        if name.len() > MAX_NAME_LEN {
-            return Err(FsError::NameTooLong.into());
-        }
-
-        // Connection-free fast paths via the in-memory caches. These are the
-        // same caches (and invalidation semantics) that `lookup_child` already
-        // trusts; consulting them BEFORE acquiring a pool connection avoids a
-        // wasted acquire/release on every cache hit. This is the clone hot
-        // path: `OverlayFS::resolve_delta_parent` does O(depth) negative
-        // delta-parent probes per base-layer lookup, all of which are negative
-        // cache hits that previously each took a connection.
-        if name != ".." {
-            if self.negative_dentry_cache.contains(parent_ino, name) {
-                crate::profiling::record_negative_lookup();
-                return Ok(None);
-            }
-            if let Some(child_ino) = self.dentry_cache.get(parent_ino, name) {
-                if let Some(mut stats) = self.attr_cache.get(child_ino) {
-                    self.merge_pending_view(child_ino, Some(&mut stats));
-                    return Ok(Some(stats));
-                }
-            }
-        }
-
-        let conn = self.pool.get_connection().await?;
-
-        // Handle ".." by finding the parent of parent_ino
-        if name == ".." {
-            if parent_ino == ROOT_INO {
-                // Root's parent is itself
-                return self.getattr_with_conn(&conn, ROOT_INO).await;
-            }
-            let mut stmt = conn
-                .prepare_cached("SELECT parent_ino FROM fs_dentry WHERE ino = ? LIMIT 1")
-                .await?;
-            let mut rows = stmt.query((parent_ino,)).await?;
-            let parent = if let Some(row) = rows.next().await? {
-                row.get_value(0)
-                    .ok()
-                    .and_then(|v| v.as_integer().copied())
-                    .unwrap_or(ROOT_INO)
-            } else {
-                ROOT_INO
-            };
-            return self.getattr_with_conn(&conn, parent).await;
-        }
-
-        // Look up the child inode
-        let child_ino = match self.lookup_child(&conn, parent_ino, name).await? {
-            Some(ino) => ino,
-            None => {
-                crate::profiling::record_negative_lookup();
-                return Ok(None);
-            }
-        };
-        let generation = self.pending_generation(child_ino);
-        // Tier Four: do NOT call `drain_inode_writes` here. The single-
-        // connection ephemeral pool (and even the file-backed pool under
-        // contention) would deadlock — we already hold the only connection
-        // permit, and `drain_inode_writes` -> `drain_pending_batched` tries
-        // to acquire one. Read SQLite, then merge the batcher's pending
-        // max-end into the size field the same way `getattr` does.
-
-        // Get stats for the child inode
-        let mut stmt = conn
-            .prepare_cached("SELECT ino, mode, nlink, uid, gid, size, atime, mtime, ctime, rdev, atime_nsec, mtime_nsec, ctime_nsec FROM fs_inode WHERE ino = ?")
-            .await?;
-        let mut rows = stmt.query((child_ino,)).await?;
-
-        if let Some(row) = rows.next().await? {
-            let mut stats = store::stats_from_row(&row)?;
-            self.merge_pending_view(child_ino, Some(&mut stats));
-            // Cache the lookup result
-            self.cache_dentry(parent_ino, name, child_ino);
-            self.cache_attr_if_pending_generation(stats.clone(), generation);
-            Ok(Some(stats))
-        } else {
-            Ok(None)
-        }
-    }
-
-    async fn getattr(&self, ino: i64) -> Result<Option<Stats>> {
-        crate::profiling::record_getattr();
-        // Connection-free fast path: an attr-cache hit needs no pool connection.
-        // The cache is invalidated on every write (enqueue removes the entry),
-        // so a hit means there is no uncommitted pending write to merge; the
-        // merge below is therefore an idempotent no-op but is kept for safety.
-        // Same cache `getattr_with_conn` already trusts, consulted before the
-        // acquire.
-        if let Some(mut stats) = self.attr_cache.get(ino) {
-            self.merge_pending_view(ino, Some(&mut stats));
-            return Ok(Some(stats));
-        }
-        // Tier Four: don't drain — read SQLite metadata and OR in the
-        // batcher's peek_pending_max_end so the size view reflects pending
-        // writes that haven't been committed yet. Refresh the attr cache
-        // with the merged size so subsequent direct cache reads agree with
-        // what we just returned.
-        let conn = self.pool.get_connection().await?;
-        self.getattr_with_conn(&conn, ino).await
-    }
-
-    /// DB-backed regular files qualify for `FOPEN_KEEP_CACHE`: every mutation
-    /// path through a mount is kernel-originated (the kernel's pages stay
-    /// coherent for its own writes) and the adapter's fingerprint guard
-    /// revalidates mtime/ctime/size at each open, so out-of-band SDK writers
-    /// are caught exactly like external edits to host-backed base files.
-    /// The keepcache-delta kill switch restores the old policy where only
-    /// host-backed base-layer files were eligible.
-    async fn keep_cache_for_read_open(&self, ino: i64, flags: i32) -> Result<Option<Stats>> {
-        if (flags & libc::O_ACCMODE) != libc::O_RDONLY || (flags & libc::O_TRUNC) != 0 {
-            return Ok(None);
-        }
-        if !self.core_config.keepcache_delta {
-            return Ok(None);
-        }
-        let Some(stats) = FileSystem::getattr(self, ino).await? else {
-            return Ok(None);
-        };
-        Ok(stats.is_file().then_some(stats))
-    }
-
-    fn delta_keep_cache_fast_path(&self) -> bool {
-        self.core_config.keepcache_delta
-    }
-
-    async fn readlink(&self, ino: i64) -> Result<Option<String>> {
-        let conn = self.pool.get_connection().await?;
-
-        // Check if the inode exists and is a symlink
-        if let Some(mode) = store::mode(&conn, ino).await? {
-            if (mode & S_IFMT) != S_IFLNK {
-                return Err(FsError::NotASymlink.into());
-            }
-        } else {
-            return Ok(None);
-        }
-
-        // Read target from fs_symlink table
-        let mut stmt = conn
-            .prepare_cached("SELECT target FROM fs_symlink WHERE ino = ?")
-            .await?;
-        let mut rows = stmt.query((ino,)).await?;
-
-        if let Some(row) = rows.next().await? {
-            let target = row
-                .get_value(0)
-                .ok()
-                .and_then(|v| match v {
-                    Value::Text(s) => Some(s.to_string()),
-                    _ => None,
-                })
-                .ok_or(FsError::InvalidPath)?;
-            Ok(Some(target))
-        } else {
-            Ok(None)
-        }
-    }
-
-    async fn readdir(&self, ino: i64) -> Result<Option<Vec<String>>> {
-        crate::profiling::record_readdir();
-        let conn = self.pool.get_connection().await?;
-
-        // Check if inode exists and is a directory
-        if let Some(mode) = store::mode(&conn, ino).await? {
-            if (mode & S_IFMT) != super::S_IFDIR {
-                return Err(FsError::NotADirectory.into());
-            }
-        } else {
-            return Ok(None);
-        }
-
-        let mut stmt = conn
-            .prepare_cached("SELECT name FROM fs_dentry WHERE parent_ino = ? ORDER BY name")
-            .await?;
-        let mut rows = stmt.query((ino,)).await?;
-
-        let mut entries = Vec::new();
-        while let Some(row) = rows.next().await? {
-            let name = row
-                .get_value(0)
-                .ok()
-                .and_then(|v| {
-                    if let Value::Text(s) = v {
-                        Some(s.clone())
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or_default();
-            if !name.is_empty() {
-                entries.push(name);
-            }
-        }
-
-        Ok(Some(entries))
-    }
-
-    async fn readdir_plus(&self, ino: i64) -> Result<Option<Vec<DirEntry>>> {
-        crate::profiling::record_readdir_plus();
-        self.drain_all().await?;
-        let conn = self.pool.get_connection().await?;
-
-        // Check if inode exists and is a directory
-        if let Some(mode) = store::mode(&conn, ino).await? {
-            if (mode & S_IFMT) != super::S_IFDIR {
-                return Err(FsError::NotADirectory.into());
-            }
-        } else {
-            return Ok(None);
-        }
-
-        let mut stmt = conn.prepare_cached("SELECT d.name, i.ino, i.mode, i.nlink, i.uid, i.gid, i.size, i.atime, i.mtime, i.ctime, i.rdev, i.atime_nsec, i.mtime_nsec, i.ctime_nsec
-            FROM fs_dentry d
-            JOIN fs_inode i ON d.ino = i.ino
-            WHERE d.parent_ino = ?
-            ORDER BY d.name"
-        ).await?;
-        let mut rows = stmt.query((ino,)).await?;
-
-        let mut entries = Vec::new();
-        while let Some(row) = rows.next().await? {
-            let name = row
-                .get_value(0)
-                .ok()
-                .and_then(|v| {
-                    if let Value::Text(s) = v {
-                        Some(s.clone())
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or_default();
-
-            if name.is_empty() {
-                continue;
-            }
-
-            let stats = store::stats_from_row_at(&row, 1)?;
-
-            self.cache_attr(stats.clone());
-            entries.push(DirEntry { name, stats });
-        }
-
-        Ok(Some(entries))
-    }
-
-    async fn chmod(&self, ino: i64, mode: u32) -> Result<()> {
-        self.prepare_attr_change(ino).await?;
-        let conn = self.pool.get_connection().await?;
-        // BEGIN IMMEDIATE so this serialises with concurrent batcher drain
-        // transactions instead of racing them as an autocommit statement
-        // (turso reports such write/write races as "database snapshot is
-        // stale" instead of waiting on the write lock).
-        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
-        let result: Result<()> = async {
-            // Get current mode to preserve file type bits
-            let mut stmt = conn
-                .prepare_cached("SELECT mode FROM fs_inode WHERE ino = ?")
-                .await?;
-            let mut rows = stmt.query((ino,)).await?;
-
-            let current_mode = if let Some(row) = rows.next().await? {
-                row.get_value(0)
-                    .ok()
-                    .and_then(|v| v.as_integer().copied())
-                    .unwrap_or(0) as u32
-            } else {
-                return Err(FsError::NotFound.into());
-            };
-
-            // Preserve file type bits (upper bits), replace permission bits (lower 12 bits)
-            let new_mode = (current_mode & S_IFMT) | (mode & 0o7777);
-
-            let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
-            let now_secs = dur.as_secs() as i64;
-            let now_nsec = dur.subsec_nanos() as i64;
-            let mut stmt = conn
-                .prepare_cached(
-                    "UPDATE fs_inode SET mode = ?, ctime = ?, ctime_nsec = ? WHERE ino = ?",
-                )
-                .await?;
-            stmt.execute((new_mode as i64, now_secs, now_nsec, ino))
-                .await?;
-            Ok(())
-        }
-        .await;
-
-        match result {
-            Ok(()) => {
-                txn.commit().await?;
-                self.invalidate_attr(ino);
-                Ok(())
-            }
-            Err(error) => {
-                let _ = txn.rollback().await;
-                Err(error)
-            }
-        }
-    }
-
-    async fn chown(&self, ino: i64, uid: Option<u32>, gid: Option<u32>) -> Result<()> {
-        if uid.is_none() && gid.is_none() {
-            return Ok(());
-        }
-        self.prepare_attr_change(ino).await?;
-
-        let conn = self.pool.get_connection().await?;
-        // BEGIN IMMEDIATE: see `chmod` — avoid autocommit write/write races
-        // with concurrent batcher drain transactions.
-        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
-        let result: Result<()> = async {
-            // Verify inode exists
-            let mut stmt = conn
-                .prepare_cached("SELECT ino FROM fs_inode WHERE ino = ?")
-                .await?;
-            let mut rows = stmt.query((ino,)).await?;
-
-            if rows.next().await?.is_none() {
-                return Err(FsError::NotFound.into());
-            }
-
-            // Build the update query dynamically based on which values are provided
-            let mut updates = Vec::new();
-            let mut values: Vec<Value> = Vec::new();
-
-            if let Some(uid) = uid {
-                updates.push("uid = ?");
-                values.push(Value::Integer(uid as i64));
-            }
-            if let Some(gid) = gid {
-                updates.push("gid = ?");
-                values.push(Value::Integer(gid as i64));
-            }
-
-            let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
-            let now_secs = dur.as_secs() as i64;
-            let now_nsec = dur.subsec_nanos() as i64;
-            updates.push("ctime = ?");
-            values.push(Value::Integer(now_secs));
-            updates.push("ctime_nsec = ?");
-            values.push(Value::Integer(now_nsec));
-
-            values.push(Value::Integer(ino));
-            let sql = format!("UPDATE fs_inode SET {} WHERE ino = ?", updates.join(", "));
-            conn.execute(&sql, values).await?;
-            Ok(())
-        }
-        .await;
-
-        match result {
-            Ok(()) => {
-                txn.commit().await?;
-                self.invalidate_attr(ino);
-                Ok(())
-            }
-            Err(error) => {
-                let _ = txn.rollback().await;
-                Err(error)
-            }
-        }
-    }
-
-    async fn utimens(&self, ino: i64, atime: TimeChange, mtime: TimeChange) -> Result<()> {
-        if matches!(atime, TimeChange::Omit) && matches!(mtime, TimeChange::Omit) {
-            return Ok(());
-        }
-
-        // Group-commit fast path: with FUSE writeback caching the kernel sends
-        // one SETATTR (mtime) per freshly written file, usually while that
-        // file's data is pending in the write batcher (and sometimes after it
-        // already drained). Instead of paying a dedicated SQLite transaction
-        // per file for the time UPDATE, stash the resolved values in the
-        // inode's pending entry (created on demand) — the batcher commits them
-        // inside its next drain transaction (`apply_pending_times_with_conn`),
-        // and `merge_pending_view` overlays them onto getattr/lookup results so
-        // the change is visible immediately. Falls through to the direct
-        // (transaction-wrapped) UPDATE when overlay reads are disabled or the
-        // legacy drain is requested.
-        if !self.core_config.drain_on_setattr && self.overlay_reads {
-            if let Some(drain) = &self.write_drain {
-                let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
-                let now = (dur.as_secs() as i64, dur.subsec_nanos() as i64);
-                let resolve = |tc: TimeChange| -> Option<(i64, i64)> {
-                    match tc {
-                        TimeChange::Set(secs, nsec) => Some((secs, nsec as i64)),
-                        TimeChange::Now => Some(now),
-                        TimeChange::Omit => None,
-                    }
-                };
-                let change = PendingTimeChange {
-                    atime: resolve(atime),
-                    mtime: resolve(mtime),
-                    // utimens always bumps ctime.
-                    ctime: Some(now),
-                };
-                drain.stash_times(ino, change);
-                self.invalidate_attr(ino);
-                return Ok(());
-            }
-        }
-
-        self.prepare_attr_change(ino).await?;
-        let conn = self.pool.get_connection().await?;
-        // BEGIN IMMEDIATE: see `chmod` — avoid autocommit write/write races
-        // with concurrent batcher drain transactions.
-        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
-        let result: Result<()> = async {
-            // Verify inode exists
-            let mut stmt = conn
-                .prepare_cached("SELECT ino FROM fs_inode WHERE ino = ?")
-                .await?;
-            let mut rows = stmt.query((ino,)).await?;
-            if rows.next().await?.is_none() {
-                return Err(FsError::NotFound.into());
-            }
-
-            let mut updates = Vec::new();
-            let mut values: Vec<Value> = Vec::new();
-
-            let resolve = |tc: TimeChange| -> (i64, i64) {
-                match tc {
-                    TimeChange::Set(secs, nsec) => (secs, nsec as i64),
-                    TimeChange::Now => {
-                        let dur = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-                        (dur.as_secs() as i64, dur.subsec_nanos() as i64)
-                    }
-                    TimeChange::Omit => unreachable!(),
-                }
-            };
-
-            if !matches!(atime, TimeChange::Omit) {
-                let (secs, nsec) = resolve(atime);
-                updates.push("atime = ?");
-                values.push(Value::Integer(secs));
-                updates.push("atime_nsec = ?");
-                values.push(Value::Integer(nsec));
-            }
-
-            if !matches!(mtime, TimeChange::Omit) {
-                let (secs, nsec) = resolve(mtime);
-                updates.push("mtime = ?");
-                values.push(Value::Integer(secs));
-                updates.push("mtime_nsec = ?");
-                values.push(Value::Integer(nsec));
-            }
-
-            // Also update ctime
-            let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
-            updates.push("ctime = ?");
-            values.push(Value::Integer(dur.as_secs() as i64));
-            updates.push("ctime_nsec = ?");
-            values.push(Value::Integer(dur.subsec_nanos() as i64));
-
-            values.push(Value::Integer(ino));
-            let sql = format!("UPDATE fs_inode SET {} WHERE ino = ?", updates.join(", "));
-            conn.execute(&sql, values).await?;
-            Ok(())
-        }
-        .await;
-
-        match result {
-            Ok(()) => {
-                txn.commit().await?;
-                self.invalidate_attr(ino);
-                Ok(())
-            }
-            Err(error) => {
-                let _ = txn.rollback().await;
-                Err(error)
-            }
-        }
-    }
-
-    async fn open(&self, ino: i64, _flags: i32) -> Result<BoxedFile> {
-        let conn = self.pool.get_connection().await?;
-
-        // Verify inode exists
-        let mut stmt = conn
-            .prepare_cached("SELECT ino FROM fs_inode WHERE ino = ?")
-            .await?;
-        let mut rows = stmt.query((ino,)).await?;
-
-        if rows.next().await?.is_none() {
-            return Err(FsError::NotFound.into());
-        }
-
-        Ok(Arc::new(AgentFSFile {
-            pool: self.pool.clone(),
-            ino,
-            chunk_size: self.chunk_size,
-            inline_threshold: self.inline_threshold,
-            attr_cache: self.attr_cache.clone(),
-            pending_view: self.pending_view.clone(),
-            write_drain: self.write_drain.clone(),
-            overlay_reads: self.overlay_reads,
-            _open_guard: Some(self.lifecycle.guard(ino)),
-        }))
-    }
-
-    async fn mkdir(
-        &self,
-        parent_ino: i64,
-        name: &str,
-        mode: u32,
-        uid: u32,
-        gid: u32,
-    ) -> Result<Stats> {
-        if name.len() > MAX_NAME_LEN {
-            return Err(FsError::NameTooLong.into());
-        }
-        let conn = self.pool.get_connection().await?;
-        // BEGIN IMMEDIATE: see `chmod` — multi-statement metadata mutations
-        // must not run as autocommit statements that race the write batcher's
-        // drain transactions (turso reports such write/write races as
-        // "database snapshot is stale" instead of waiting on the write lock).
-        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
-        let result: Result<Stats> = async {
-            // Check if already exists
-            if self.lookup_child(&conn, parent_ino, name).await?.is_some() {
-                return Err(FsError::AlreadyExists.into());
-            }
-
-            // Create inode
-            let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
-            let now_secs = dur.as_secs() as i64;
-            let now_nsec = dur.subsec_nanos() as i64;
-            let mut stmt = conn
-                .prepare_cached(
-                    "INSERT INTO fs_inode (mode, uid, gid, size, atime, mtime, ctime, atime_nsec, mtime_nsec, ctime_nsec)
-                    VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?) RETURNING ino",
-                )
-                .await?;
-            let dir_mode = super::S_IFDIR | (mode & 0o7777);
-            let row = stmt
-                .query_row((
-                    dir_mode as i64,
-                    uid,
-                    gid,
-                    now_secs,
-                    now_secs,
-                    now_secs,
-                    now_nsec,
-                    now_nsec,
-                    now_nsec,
-                ))
-                .await?;
-
-            let ino = row
-                .get_value(0)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .ok_or_else(|| Error::Internal("failed to get inode".to_string()))?;
-
-            // Create directory entry
-            let mut stmt = conn
-                .prepare_cached("INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, ?, ?)")
-                .await?;
-            stmt.execute((name, parent_ino, ino)).await?;
-
-            // Set nlink to 2 for new directory (self "." + parent's dentry)
-            let mut stmt = conn
-                .prepare_cached("UPDATE fs_inode SET nlink = 2 WHERE ino = ?")
-                .await?;
-            stmt.execute((ino,)).await?;
-
-            // Increment parent nlink (new directory's ".." link) and update timestamps
-            let mut stmt = conn
-                .prepare_cached(
-                    "UPDATE fs_inode SET nlink = nlink + 1, ctime = ?, mtime = ?, ctime_nsec = ?, mtime_nsec = ? WHERE ino = ?",
-                )
-                .await?;
-            stmt.execute((now_secs, now_secs, now_nsec, now_nsec, parent_ino))
-                .await?;
-
-            Ok(Stats {
-                ino,
-                mode: dir_mode,
-                nlink: 2,
-                uid,
-                gid,
-                size: 0,
-                atime: now_secs,
-                mtime: now_secs,
-                ctime: now_secs,
-                atime_nsec: now_nsec as u32,
-                mtime_nsec: now_nsec as u32,
-                ctime_nsec: now_nsec as u32,
-                rdev: 0,
-            })
-        }
-        .await;
-
-        match result {
-            Ok(stats) => {
-                txn.commit().await?;
-                // Populate dentry cache only after the transaction is durable.
-                self.cache_dentry(parent_ino, name, stats.ino);
-                self.invalidate_parent_attr(parent_ino);
-                self.cache_attr(stats.clone());
-                Ok(stats)
-            }
-            Err(error) => {
-                let _ = txn.rollback().await;
-                Err(error)
-            }
-        }
-    }
-
-    async fn create_file(
-        &self,
-        parent_ino: i64,
-        name: &str,
-        mode: u32,
-        uid: u32,
-        gid: u32,
-    ) -> Result<(Stats, BoxedFile)> {
-        if name.len() > MAX_NAME_LEN {
-            return Err(FsError::NameTooLong.into());
-        }
-        let conn = self.pool.get_connection().await?;
-
-        // No existence pre-check: fs_dentry's UNIQUE(parent_ino, name) makes
-        // the dentry INSERT below the authoritative collision detector (its
-        // Constraint error maps to AlreadyExists and the transaction drop
-        // rolls back the inode row). Saves one SELECT on the synchronous
-        // create path that every git-clone file pays.
-
-        // Prepare statements before starting the transaction
-        let mut inode_stmt = conn
-            .prepare_cached(
-                "INSERT INTO fs_inode (mode, nlink, uid, gid, size, atime, mtime, ctime, atime_nsec, mtime_nsec, ctime_nsec, data_inline, storage_kind)
-                 VALUES (?, 1, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING ino",
-            )
-            .await?;
-        let mut dentry_stmt = conn
-            .prepare_cached("INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, ?, ?)")
-            .await?;
-
-        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
-
-        let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
-        let now_secs = dur.as_secs() as i64;
-        let now_nsec = dur.subsec_nanos() as i64;
-        let file_mode = S_IFREG | (mode & 0o7777);
-
-        let row = inode_stmt
-            .query_row((
-                file_mode as i64,
-                uid,
-                gid,
-                now_secs,
-                now_secs,
-                now_secs,
-                now_nsec,
-                now_nsec,
-                now_nsec,
-                Value::Blob(Vec::new()),
-                STORAGE_INLINE,
-            ))
-            .await?;
-
-        let ino = row
-            .get_value(0)
-            .ok()
-            .and_then(|v| v.as_integer().copied())
-            .ok_or_else(|| Error::Internal("failed to get inode".to_string()))?;
-
-        match dentry_stmt.execute((name, parent_ino, ino)).await {
-            Ok(_) => {}
-            Err(turso::Error::Constraint(_)) => return Err(FsError::AlreadyExists.into()),
-            Err(error) => return Err(error.into()),
-        }
-
-        // Parent mtime/ctime: stash into the batcher overlay (committed by the
-        // next group drain, served immediately via merge_pending_view) instead
-        // of paying an UPDATE on the synchronous create path. Falls back to
-        // the in-transaction UPDATE when the overlay cannot serve reads.
-        let stash_parent_times = self.overlay_reads && self.write_drain.is_some();
-        if !stash_parent_times {
-            conn.execute(
-                "UPDATE fs_inode SET ctime = ?, mtime = ?, ctime_nsec = ?, mtime_nsec = ? WHERE ino = ?",
-                (now_secs, now_secs, now_nsec, now_nsec, parent_ino),
-            )
-            .await?;
-        }
-
-        txn.commit().await?;
-
-        if stash_parent_times {
-            if let Some(drain) = &self.write_drain {
-                drain.stash_times(
-                    parent_ino,
-                    PendingTimeChange {
-                        atime: None,
-                        mtime: Some((now_secs, now_nsec)),
-                        ctime: Some((now_secs, now_nsec)),
-                    },
-                );
-            }
-        }
-
-        self.cache_dentry(parent_ino, name, ino);
-        self.invalidate_parent_attr(parent_ino);
-
-        let stats = Stats {
-            ino,
-            mode: file_mode,
-            nlink: 1,
-            uid,
-            gid,
-            size: 0,
-            atime: now_secs,
-            mtime: now_secs,
-            ctime: now_secs,
-            atime_nsec: now_nsec as u32,
-            mtime_nsec: now_nsec as u32,
-            ctime_nsec: now_nsec as u32,
-            rdev: 0,
-        };
-        self.cache_attr(stats.clone());
-
-        let file: BoxedFile = Arc::new(AgentFSFile {
-            pool: self.pool.clone(),
-            ino,
-            chunk_size: self.chunk_size,
-            inline_threshold: self.inline_threshold,
-            attr_cache: self.attr_cache.clone(),
-            pending_view: self.pending_view.clone(),
-            write_drain: self.write_drain.clone(),
-            overlay_reads: self.overlay_reads,
-            _open_guard: Some(self.lifecycle.guard(ino)),
-        });
-
-        Ok((stats, file))
-    }
-
-    async fn mknod(
-        &self,
-        parent_ino: i64,
-        name: &str,
-        mode: u32,
-        rdev: u64,
-        uid: u32,
-        gid: u32,
-    ) -> Result<Stats> {
-        if name.len() > MAX_NAME_LEN {
-            return Err(FsError::NameTooLong.into());
-        }
-        let conn = self.pool.get_connection().await?;
-        // BEGIN IMMEDIATE: see `mkdir` — never race the batcher's drain
-        // transactions with autocommit metadata writes.
-        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
-        let result: Result<Stats> = async {
-            // Check if already exists
-            if self.lookup_child(&conn, parent_ino, name).await?.is_some() {
-                return Err(FsError::AlreadyExists.into());
-            }
-
-            // Create inode with mode and rdev
-            let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
-            let now_secs = dur.as_secs() as i64;
-            let now_nsec = dur.subsec_nanos() as i64;
-            let mut stmt = conn
-                .prepare_cached(
-                    "INSERT INTO fs_inode (mode, uid, gid, size, atime, mtime, ctime, rdev, atime_nsec, mtime_nsec, ctime_nsec)
-                    VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?) RETURNING ino",
-                )
-                .await?;
-            let row = stmt
-                .query_row((
-                    mode as i64,
-                    uid,
-                    gid,
-                    now_secs,
-                    now_secs,
-                    now_secs,
-                    rdev as i64,
-                    now_nsec,
-                    now_nsec,
-                    now_nsec,
-                ))
-                .await?;
-
-            let ino = row
-                .get_value(0)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .ok_or_else(|| Error::Internal("failed to get inode".to_string()))?;
-
-            // Create directory entry
-            let mut stmt = conn
-                .prepare_cached("INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, ?, ?)")
-                .await?;
-            stmt.execute((name, parent_ino, ino)).await?;
-
-            // Increment link count
-            let mut stmt = conn
-                .prepare_cached("UPDATE fs_inode SET nlink = nlink + 1 WHERE ino = ?")
-                .await?;
-            stmt.execute((ino,)).await?;
-
-            // Update parent directory ctime and mtime
-            let mut stmt = conn
-                .prepare_cached("UPDATE fs_inode SET ctime = ?, mtime = ?, ctime_nsec = ?, mtime_nsec = ? WHERE ino = ?")
-                .await?;
-            stmt.execute((now_secs, now_secs, now_nsec, now_nsec, parent_ino))
-                .await?;
-
-            Ok(Stats {
-                ino,
-                mode,
-                nlink: 1,
-                uid,
-                gid,
-                size: 0,
-                atime: now_secs,
-                mtime: now_secs,
-                ctime: now_secs,
-                atime_nsec: now_nsec as u32,
-                mtime_nsec: now_nsec as u32,
-                ctime_nsec: now_nsec as u32,
-                rdev,
-            })
-        }
-        .await;
-
-        match result {
-            Ok(stats) => {
-                txn.commit().await?;
-                // Populate dentry cache only after the transaction is durable.
-                self.cache_dentry(parent_ino, name, stats.ino);
-                self.invalidate_parent_attr(parent_ino);
-                self.cache_attr(stats.clone());
-                Ok(stats)
-            }
-            Err(error) => {
-                let _ = txn.rollback().await;
-                Err(error)
-            }
-        }
-    }
-
-    async fn symlink(
-        &self,
-        parent_ino: i64,
-        name: &str,
-        target: &str,
-        uid: u32,
-        gid: u32,
-    ) -> Result<Stats> {
-        if name.len() > MAX_NAME_LEN {
-            return Err(FsError::NameTooLong.into());
-        }
-        let conn = self.pool.get_connection().await?;
-        // BEGIN IMMEDIATE: see `mkdir` — never race the batcher's drain
-        // transactions with autocommit metadata writes.
-        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
-        let result: Result<Stats> = async {
-            // Check if entry already exists
-            if self.lookup_child(&conn, parent_ino, name).await?.is_some() {
-                return Err(FsError::AlreadyExists.into());
-            }
-
-            // Create inode for symlink
-            let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
-            let now_secs = dur.as_secs() as i64;
-            let now_nsec = dur.subsec_nanos() as i64;
-            let mode = S_IFLNK | 0o777; // Symlinks typically have 777 permissions
-            let size = target.len() as i64;
-
-            let mut stmt = conn
-                .prepare_cached(
-                    "INSERT INTO fs_inode (mode, uid, gid, size, atime, mtime, ctime, atime_nsec, mtime_nsec, ctime_nsec)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING ino",
-                )
-                .await?;
-            let row = stmt
-                .query_row((
-                    mode, uid, gid, size, now_secs, now_secs, now_secs, now_nsec, now_nsec,
-                    now_nsec,
-                ))
-                .await?;
-
-            let ino = row
-                .get_value(0)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .ok_or_else(|| Error::Internal("failed to get inode".to_string()))?;
-
-            // Store symlink target
-            conn.execute(
-                "INSERT INTO fs_symlink (ino, target) VALUES (?, ?)",
-                (ino, target),
-            )
-            .await?;
-
-            // Create directory entry
-            conn.execute(
-                "INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, ?, ?)",
-                (name, parent_ino, ino),
-            )
-            .await?;
-
-            // Increment link count
-            conn.execute(
-                "UPDATE fs_inode SET nlink = nlink + 1 WHERE ino = ?",
-                (ino,),
-            )
-            .await?;
-
-            // Update parent directory ctime and mtime
-            conn.execute(
-                "UPDATE fs_inode SET ctime = ?, mtime = ?, ctime_nsec = ?, mtime_nsec = ? WHERE ino = ?",
-                (now_secs, now_secs, now_nsec, now_nsec, parent_ino),
-            )
-            .await?;
-
-            Ok(Stats {
-                ino,
-                mode,
-                nlink: 1,
-                uid,
-                gid,
-                size,
-                atime: now_secs,
-                mtime: now_secs,
-                ctime: now_secs,
-                atime_nsec: now_nsec as u32,
-                mtime_nsec: now_nsec as u32,
-                ctime_nsec: now_nsec as u32,
-                rdev: 0,
-            })
-        }
-        .await;
-
-        match result {
-            Ok(stats) => {
-                txn.commit().await?;
-                // Populate dentry cache only after the transaction is durable.
-                self.cache_dentry(parent_ino, name, stats.ino);
-                self.invalidate_parent_attr(parent_ino);
-                self.cache_attr(stats.clone());
-                Ok(stats)
-            }
-            Err(error) => {
-                let _ = txn.rollback().await;
-                Err(error)
-            }
-        }
-    }
-
-    async fn unlink(&self, parent_ino: i64, name: &str) -> Result<()> {
-        if name.len() > MAX_NAME_LEN {
-            return Err(FsError::NameTooLong.into());
-        }
-        self.process_deferred_reaps().await?;
-        let conn = self.pool.get_connection().await?;
-        // BEGIN IMMEDIATE: this is the path that intermittently failed with
-        // "database snapshot is stale" -> EIO when its autocommit statements
-        // raced the write batcher's drain transactions (git unlinking
-        // `.git/config.lock` during a clone). The transaction also makes the
-        // dentry/nlink/inode removal atomic.
-        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
-        let result: Result<(i64, bool)> = async {
-            // Look up the child inode
-            let ino = self
-                .lookup_child(&conn, parent_ino, name)
-                .await?
-                .ok_or(FsError::NotFound)?;
-
-            // Check if it's a directory (use rmdir for directories)
-            let mut stmt = conn
-                .prepare_cached("SELECT mode FROM fs_inode WHERE ino = ?")
-                .await?;
-            let mut rows = stmt.query((ino,)).await?;
-
-            if let Some(row) = rows.next().await? {
-                let mode = row
-                    .get_value(0)
-                    .ok()
-                    .and_then(|v| v.as_integer().copied())
-                    .unwrap_or(0) as u32;
-
-                if (mode & S_IFMT) == super::S_IFDIR {
-                    return Err(FsError::IsADirectory.into());
-                }
-            }
-
-            // Delete the directory entry
-            let mut stmt = conn
-                .prepare_cached("DELETE FROM fs_dentry WHERE parent_ino = ? AND name = ?")
-                .await?;
-            stmt.execute((parent_ino, name)).await?;
-
-            // Update parent directory mtime and ctime
-            let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
-            let now_secs = dur.as_secs() as i64;
-            let now_nsec = dur.subsec_nanos() as i64;
-            let mut stmt = conn
-                .prepare_cached("UPDATE fs_inode SET mtime = ?, ctime = ?, mtime_nsec = ?, ctime_nsec = ? WHERE ino = ?")
-                .await?;
-            stmt.execute((now_secs, now_secs, now_nsec, now_nsec, parent_ino))
-                .await?;
-
-            // Decrement link count and update ctime
-            let mut stmt = conn
-                .prepare_cached(
-                    "UPDATE fs_inode SET nlink = nlink - 1, ctime = ?, ctime_nsec = ? WHERE ino = ?",
-                )
-                .await?;
-            stmt.execute((now_secs, now_nsec, ino)).await?;
-
-            // Check if this was the last link to the inode. POSIX: while
-            // open handles exist the nlink=0 rows stay alive; the last
-            // handle drop queues the orphan for process_deferred_reaps.
-            let link_count = self.get_link_count(&conn, ino).await?;
-            let removed = link_count == 0 && !self.lifecycle.defer_reap_if_open(ino);
-            if removed {
-                self.reap_inode_with_conn(&conn, ino).await?;
-            }
-
-            Ok((ino, removed))
-        }
-        .await;
-
-        match result {
-            Ok((ino, removed)) => {
-                txn.commit().await?;
-                if removed {
-                    // Tier Four: discard any pending writes the batcher might
-                    // still hold for this inode. The drains tolerate a deleted
-                    // inode (NotFound is skipped, never inserted as orphan
-                    // `fs_data` rows), so dropping the moot ranges after the
-                    // commit keeps the overlay clean without risking data loss
-                    // on a rolled-back unlink.
-                    self.discard_pending_after_reap(ino);
-                }
-                self.invalidate_dentry(parent_ino, name);
-                self.invalidate_parent_attr(parent_ino);
-                self.invalidate_attr(ino);
-                self.cache_negative_dentry(parent_ino, name);
-                Ok(())
-            }
-            Err(error) => {
-                let _ = txn.rollback().await;
-                Err(error)
-            }
-        }
-    }
-
-    async fn rmdir(&self, parent_ino: i64, name: &str) -> Result<()> {
-        if name.len() > MAX_NAME_LEN {
-            return Err(FsError::NameTooLong.into());
-        }
-        self.process_deferred_reaps().await?;
-        let conn = self.pool.get_connection().await?;
-        // BEGIN IMMEDIATE: see `unlink` — never race the batcher's drain
-        // transactions with autocommit metadata writes.
-        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
-        let result: Result<i64> = async {
-            // Look up the child inode
-            let ino = self
-                .lookup_child(&conn, parent_ino, name)
-                .await?
-                .ok_or(FsError::NotFound)?;
-
-            if ino == ROOT_INO {
-                return Err(FsError::RootOperation.into());
-            }
-
-            // Check if it's a directory
-            let mut stmt = conn
-                .prepare_cached("SELECT mode FROM fs_inode WHERE ino = ?")
-                .await?;
-            let mut rows = stmt.query((ino,)).await?;
-
-            if let Some(row) = rows.next().await? {
-                let mode = row
-                    .get_value(0)
-                    .ok()
-                    .and_then(|v| v.as_integer().copied())
-                    .unwrap_or(0) as u32;
-
-                if (mode & S_IFMT) != super::S_IFDIR {
-                    return Err(FsError::NotADirectory.into());
-                }
-            } else {
-                return Err(FsError::NotFound.into());
-            }
-
-            // Check if directory is empty
-            let mut stmt = conn
-                .prepare_cached("SELECT COUNT(*) FROM fs_dentry WHERE parent_ino = ?")
-                .await?;
-            let mut rows = stmt.query((ino,)).await?;
-
-            if let Some(row) = rows.next().await? {
-                let count = row
-                    .get_value(0)
-                    .ok()
-                    .and_then(|v| v.as_integer().copied())
-                    .unwrap_or(0);
-                if count > 0 {
-                    return Err(FsError::NotEmpty.into());
-                }
-            }
-
-            // Delete the directory entry
-            let mut stmt = conn
-                .prepare_cached("DELETE FROM fs_dentry WHERE parent_ino = ? AND name = ?")
-                .await?;
-            stmt.execute((parent_ino, name)).await?;
-
-            // Decrement link count on removed directory
-            let mut stmt = conn
-                .prepare_cached("UPDATE fs_inode SET nlink = nlink - 1 WHERE ino = ?")
-                .await?;
-            stmt.execute((ino,)).await?;
-
-            // Decrement parent nlink (removed directory's ".." link) and update timestamps
-            let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
-            let now_secs = dur.as_secs() as i64;
-            let now_nsec = dur.subsec_nanos() as i64;
-            let mut stmt = conn
-                .prepare_cached(
-                    "UPDATE fs_inode SET nlink = nlink - 1, ctime = ?, mtime = ?, ctime_nsec = ?, mtime_nsec = ? WHERE ino = ?",
-                )
-                .await?;
-            stmt.execute((now_secs, now_secs, now_nsec, now_nsec, parent_ino))
-                .await?;
-
-            // Delete inode if no more links
-            let link_count = self.get_link_count(&conn, ino).await?;
-            if link_count == 0 {
-                let mut stmt = conn
-                    .prepare_cached("DELETE FROM fs_inode WHERE ino = ?")
-                    .await?;
-                stmt.execute((ino,)).await?;
-            }
-
-            Ok(ino)
-        }
-        .await;
-
-        match result {
-            Ok(ino) => {
-                txn.commit().await?;
-                self.invalidate_dentry(parent_ino, name);
-                self.invalidate_parent_attr(parent_ino);
-                self.invalidate_attr(ino);
-                self.cache_negative_dentry(parent_ino, name);
-                Ok(())
-            }
-            Err(error) => {
-                let _ = txn.rollback().await;
-                Err(error)
-            }
-        }
-    }
-
-    async fn link(&self, ino: i64, newparent_ino: i64, newname: &str) -> Result<Stats> {
-        if newname.len() > MAX_NAME_LEN {
-            return Err(FsError::NameTooLong.into());
-        }
-        let conn = self.pool.get_connection().await?;
-        // BEGIN IMMEDIATE: see `unlink` — never race the batcher's drain
-        // transactions with autocommit metadata writes.
-        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
-        let result: Result<Stats> = async {
-            // Check if source inode exists and is not a directory
-            let mut stmt = conn
-                .prepare_cached("SELECT mode FROM fs_inode WHERE ino = ?")
-                .await?;
-            let mut rows = stmt.query((ino,)).await?;
-
-            if let Some(row) = rows.next().await? {
-                let mode = row
-                    .get_value(0)
-                    .ok()
-                    .and_then(|v| v.as_integer().copied())
-                    .unwrap_or(0) as u32;
-
-                if (mode & S_IFMT) == super::S_IFDIR {
-                    return Err(FsError::IsADirectory.into());
-                }
-            } else {
-                return Err(FsError::NotFound.into());
-            }
-
-            // Check if destination already exists
-            if self
-                .lookup_child(&conn, newparent_ino, newname)
-                .await?
-                .is_some()
-            {
-                return Err(FsError::AlreadyExists.into());
-            }
-
-            // Create directory entry pointing to the same inode
-            conn.execute(
-                "INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, ?, ?)",
-                (newname, newparent_ino, ino),
-            )
-            .await?;
-
-            // Increment link count and update ctime
-            let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
-            let now_secs = dur.as_secs() as i64;
-            let now_nsec = dur.subsec_nanos() as i64;
-            conn.execute(
-                "UPDATE fs_inode SET nlink = nlink + 1, ctime = ?, ctime_nsec = ? WHERE ino = ?",
-                (now_secs, now_nsec, ino),
-            )
-            .await?;
-
-            // Update parent directory ctime and mtime
-            conn.execute(
-                "UPDATE fs_inode SET ctime = ?, mtime = ?, ctime_nsec = ?, mtime_nsec = ? WHERE ino = ?",
-                (now_secs, now_secs, now_nsec, now_nsec, newparent_ino),
-            )
-            .await?;
-
-            // Return updated stats (drop the cached pre-link attr so the read
-            // below reflects the nlink/ctime updates made in this transaction).
-            self.invalidate_attr(ino);
-            self.getattr_with_conn(&conn, ino)
-                .await?
-                .ok_or(FsError::NotFound.into())
-        }
-        .await;
-
-        match result {
-            Ok(stats) => {
-                txn.commit().await?;
-                // Populate dentry cache only after the transaction is durable.
-                self.cache_dentry(newparent_ino, newname, ino);
-                self.invalidate_parent_attr(newparent_ino);
-                self.invalidate_attr(ino);
-                Ok(stats)
-            }
-            Err(error) => {
-                let _ = txn.rollback().await;
-                self.invalidate_attr(ino);
-                Err(error)
-            }
-        }
-    }
-
-    async fn rename(
-        &self,
-        oldparent_ino: i64,
-        oldname: &str,
-        newparent_ino: i64,
-        newname: &str,
-    ) -> Result<()> {
-        if newname.len() > MAX_NAME_LEN {
-            return Err(FsError::NameTooLong.into());
-        }
-        self.process_deferred_reaps().await?;
-        let conn = self.pool.get_connection().await?;
-
-        // Get source inode
-        let src_ino = self
-            .lookup_child(&conn, oldparent_ino, oldname)
-            .await?
-            .ok_or(FsError::NotFound)?;
-
-        if src_ino == ROOT_INO {
-            return Err(FsError::RootOperation.into());
-        }
-
-        // Get source stats to check if it's a directory
-        let src_stats = self
-            .getattr_with_conn(&conn, src_ino)
-            .await?
-            .ok_or(FsError::NotFound)?;
-
-        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
-
-        let result: Result<(Option<i64>, Option<i64>)> = async {
-            let mut replaced_dst_ino = None;
-            let mut reaped_dst_ino = None;
-
-            if src_stats.is_directory() {
-                let mut ancestor_ino = newparent_ino;
-                let mut visited = HashSet::new();
-                while ancestor_ino != ROOT_INO {
-                    if ancestor_ino == src_ino {
-                        return Err(FsError::InvalidRename.into());
-                    }
-                    if !visited.insert(ancestor_ino) {
-                        return Err(FsError::InvalidPath.into());
-                    }
-
-                    let mut stmt = conn
-                        .prepare_cached("SELECT parent_ino FROM fs_dentry WHERE ino = ?")
-                        .await?;
-                    let mut rows = stmt.query((ancestor_ino,)).await?;
-                    let parent_ino = rows
-                        .next()
-                        .await?
-                        .ok_or(FsError::NotFound)?
-                        .get_value(0)
-                        .ok()
-                        .and_then(|value| value.as_integer().copied())
-                        .ok_or(FsError::InvalidPath)?;
-                    if rows.next().await?.is_some() {
-                        return Err(FsError::InvalidPath.into());
-                    }
-                    ancestor_ino = parent_ino;
-                }
-            }
-
-            // Check if destination exists
-            if let Some(dst_ino) = self.lookup_child(&conn, newparent_ino, newname).await? {
-                replaced_dst_ino = Some(dst_ino);
-                let dst_stats = self.getattr_with_conn(&conn, dst_ino).await?.ok_or(FsError::NotFound)?;
-
-                // Can't replace directory with non-directory
-                if dst_stats.is_directory() && !src_stats.is_directory() {
-                    return Err(FsError::IsADirectory.into());
-                }
-
-                // Can't replace non-directory with directory
-                if !dst_stats.is_directory() && src_stats.is_directory() {
-                    return Err(FsError::NotADirectory.into());
-                }
-
-                // If destination is directory, it must be empty
-                if dst_stats.is_directory() {
-                    let mut stmt = conn
-                        .prepare_cached("SELECT COUNT(*) FROM fs_dentry WHERE parent_ino = ?")
-                        .await?;
-                    let mut rows = stmt.query((dst_ino,)).await?;
-
-                    if let Some(row) = rows.next().await? {
-                        let count = row
-                            .get_value(0)
-                            .ok()
-                            .and_then(|v| v.as_integer().copied())
-                            .unwrap_or(0);
-                        if count > 0 {
-                            return Err(FsError::NotEmpty.into());
-                        }
-                    }
-                }
-
-                // Remove destination entry
-                let mut stmt = conn
-                    .prepare_cached("DELETE FROM fs_dentry WHERE parent_ino = ? AND name = ?")
-                    .await?;
-                stmt.execute((newparent_ino, newname)).await?;
-
-                // Decrement link count and update ctime on destination inode
-                let dur_dec = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default();
-                let now_dec = dur_dec.as_secs() as i64;
-                let now_dec_nsec = dur_dec.subsec_nanos() as i64;
-                let mut stmt = conn
-                    .prepare_cached("UPDATE fs_inode SET nlink = nlink - 1, ctime = ?, ctime_nsec = ? WHERE ino = ?")
-                    .await?;
-                stmt.execute((now_dec, now_dec_nsec, dst_ino)).await?;
-
-                // Clean up destination inode if no more links (deferred while
-                // open handles exist — see lifecycle).
-                let link_count = self.get_link_count(&conn, dst_ino).await?;
-                if link_count == 0
-                    && !self.lifecycle.defer_reap_if_open(dst_ino)
-                    && self.reap_inode_with_conn(&conn, dst_ino).await?
-                {
-                    reaped_dst_ino = Some(dst_ino);
-                }
-            }
-
-            // Update the dentry: change parent and/or name
-            let mut stmt = conn
-                .prepare_cached(
-                    "UPDATE fs_dentry SET parent_ino = ?, name = ? WHERE parent_ino = ? AND name = ?",
-                )
-                .await?;
-            stmt.execute((newparent_ino, newname, oldparent_ino, oldname))
-                .await?;
-
-            // If renaming a directory across parents, adjust parent nlink counts
-            // (the ".." link moves from old parent to new parent)
-            if src_stats.is_directory() && oldparent_ino != newparent_ino {
-                let mut stmt = conn
-                    .prepare_cached("UPDATE fs_inode SET nlink = nlink - 1 WHERE ino = ?")
-                    .await?;
-                stmt.execute((oldparent_ino,)).await?;
-
-                let mut stmt = conn
-                    .prepare_cached("UPDATE fs_inode SET nlink = nlink + 1 WHERE ino = ?")
-                    .await?;
-                stmt.execute((newparent_ino,)).await?;
-            }
-
-            // Update ctime of the inode
-            let dur = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default();
-            let now_secs = dur.as_secs() as i64;
-            let now_nsec = dur.subsec_nanos() as i64;
-
-            let mut stmt = conn
-                .prepare_cached("UPDATE fs_inode SET ctime = ?, ctime_nsec = ? WHERE ino = ?")
-                .await?;
-            stmt.execute((now_secs, now_nsec, src_ino)).await?;
-
-            // Update source parent directory timestamps
-            let mut stmt = conn
-                .prepare_cached("UPDATE fs_inode SET mtime = ?, ctime = ?, mtime_nsec = ?, ctime_nsec = ? WHERE ino = ?")
-                .await?;
-            stmt.execute((now_secs, now_secs, now_nsec, now_nsec, oldparent_ino)).await?;
-
-            // Update destination parent directory timestamps
-            if newparent_ino != oldparent_ino {
-                let mut stmt = conn
-                    .prepare_cached("UPDATE fs_inode SET mtime = ?, ctime = ?, mtime_nsec = ?, ctime_nsec = ? WHERE ino = ?")
-                    .await?;
-                stmt.execute((now_secs, now_secs, now_nsec, now_nsec, newparent_ino)).await?;
-            }
-
-            Ok((replaced_dst_ino, reaped_dst_ino))
-        }
-        .await;
-
-        match result {
-            Ok((replaced_dst_ino, reaped_dst_ino)) => {
-                txn.commit().await?;
-                if let Some(dst_ino) = reaped_dst_ino {
-                    // Tier Four: see public `rename` for rationale — drop
-                    // pending batched writes for the deleted inode so a
-                    // subsequent batched drain doesn't INSERT into a
-                    // missing fs_inode row.
-                    self.discard_pending_after_reap(dst_ino);
-                }
-
-                // Invalidate cache for source and destination
-                self.invalidate_dentry(oldparent_ino, oldname);
-                self.invalidate_dentry(newparent_ino, newname);
-                self.invalidate_attr(src_ino);
-                self.invalidate_parent_attr(oldparent_ino);
-                self.invalidate_parent_attr(newparent_ino);
-                if let Some(dst_ino) = replaced_dst_ino {
-                    self.invalidate_attr(dst_ino);
-                }
-
-                // Add exact post-rename namespace state to the caches.
-                if oldparent_ino != newparent_ino || oldname != newname {
-                    self.cache_negative_dentry(oldparent_ino, oldname);
-                }
-                self.cache_dentry(newparent_ino, newname, src_ino);
-
-                Ok(())
-            }
-            Err(e) => {
-                let _ = txn.rollback().await;
-                Err(e)
-            }
-        }
-    }
-
-    async fn statfs(&self) -> Result<FilesystemStats> {
-        AgentFS::statfs(self).await
-    }
-
-    async fn drain_inode_writes(&self, ino: i64) -> Result<()> {
-        AgentFS::drain_inode_writes(self, ino).await
-    }
-
-    async fn drain_all(&self) -> Result<()> {
-        AgentFS::drain_all(self).await
-    }
-
-    async fn finalize(&self) -> Result<()> {
-        AgentFS::finalize(self).await
-    }
-
-    // `forget` deliberately uses the default no-op trait impl: a FORGET only
-    // drops the kernel's reference to the inode. Pending batched writes stay
-    // readable through the Tier-4 overlay and are committed by the batcher
-    // timer/bytes triggers, fsync, or finalize — committing them here issued
-    // one serial SQLite transaction per written file during clone workloads
-    // (the kernel FORGETs each file shortly after our post-write entry
-    // invalidation).
 }
 
 #[cfg(test)]
@@ -3521,6 +1187,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn corrupt_mode_mutations_return_corrupt_without_namespace_changes() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        FileSystem::mkdir(&fs, ROOT_INO, "dir", 0o755, 0, 0).await?;
+        let dir = FileSystem::lookup(&fs, ROOT_INO, "dir").await?.unwrap();
+
+        let conn = fs.pool.get_connection().await?;
+        conn.execute(
+            "UPDATE fs_inode SET mode = ? WHERE ino = ?",
+            (Value::Text("not-an-integer".to_string()), dir.ino),
+        )
+        .await?;
+        fs.invalidate_attr(dir.ino);
+
+        assert_corrupt_error(
+            FileSystem::unlink(&fs, ROOT_INO, "dir").await.unwrap_err(),
+            "mode",
+        );
+        assert!(
+            FileSystem::lookup(&fs, ROOT_INO, "dir").await.is_err(),
+            "the corrupt dentry must still be present after the failed unlink"
+        );
+
+        conn.execute(
+            "UPDATE fs_inode SET mode = ? WHERE ino = ?",
+            ((S_IFDIR | 0o755) as i64, dir.ino),
+        )
+        .await?;
+        fs.invalidate_attr(dir.ino);
+        assert!(FileSystem::lookup(&fs, ROOT_INO, "dir").await?.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn corrupt_path_child_inode_returns_corrupt_and_is_not_cached() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        fs.mkdir("/parent", 0, 0).await?;
+        let parent = fs.stat("/parent").await?.unwrap();
+        fs.mkdir("/parent/child", 0, 0).await?;
+
+        let conn = fs.pool.get_connection().await?;
+        conn.execute(
+            "UPDATE fs_dentry SET ino = ? WHERE parent_ino = ? AND name = ?",
+            (
+                Value::Text("not-an-integer".to_string()),
+                parent.ino,
+                "child",
+            ),
+        )
+        .await?;
+        fs.invalidate_dentry(parent.ino, "child");
+
+        assert_corrupt_error(fs.stat("/parent/child").await.unwrap_err(), "ino");
+        assert!(
+            fs.dentry_cache.get(parent.ino, "child").is_none(),
+            "corrupt child ino must not populate the dentry cache"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn path_api_delegates_to_trait_semantics() -> Result<()> {
         let (fs, _dir) = create_test_fs().await?;
 
@@ -3601,7 +1327,7 @@ mod tests {
         let (fs, _dir) = create_test_fs().await?;
 
         let big = vec![0xabu8; DEFAULT_INLINE_THRESHOLD + DEFAULT_CHUNK_SIZE + 17];
-        let entries = vec![
+        let entries = [
             ImportEntry {
                 path: "sub".to_string(),
                 mode: S_IFDIR | 0o755,
@@ -3664,6 +1390,102 @@ mod tests {
         let dup = fs.import_entries(ROOT_INO, &entries[..1], &opts).await;
         assert!(matches!(dup, Err(Error::Fs(FsError::AlreadyExists))));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn import_session_preserves_tree_and_chunk_limits() -> Result<()> {
+        let mut config = CoreConfig::default();
+        config.batcher.txn_max_inodes = 2;
+        config.batcher.txn_max_bytes = usize::MAX;
+        let (fs, _dir) = create_test_fs_with_config(config).await?;
+
+        let big = vec![0xcdu8; DEFAULT_INLINE_THRESHOLD + DEFAULT_CHUNK_SIZE + 11];
+        let entries = [
+            ImportEntry {
+                path: "tree".to_string(),
+                mode: S_IFDIR | 0o755,
+                data: Vec::new(),
+            },
+            ImportEntry {
+                path: "tree/nested".to_string(),
+                mode: S_IFDIR | 0o700,
+                data: Vec::new(),
+            },
+            ImportEntry {
+                path: "tree/small.txt".to_string(),
+                mode: S_IFREG | 0o640,
+                data: b"small import".to_vec(),
+            },
+            ImportEntry {
+                path: "tree/nested/big.bin".to_string(),
+                mode: S_IFREG | 0o600,
+                data: big.clone(),
+            },
+            ImportEntry {
+                path: "tree/link".to_string(),
+                mode: S_IFLNK | 0o777,
+                data: b"nested/big.bin".to_vec(),
+            },
+        ];
+        let opts = ImportOptions {
+            uid: 111,
+            gid: 222,
+            timestamp: (1_800_000_000, 987_654_321),
+        };
+
+        let commit_start = fs.import_commit_sizes.lock().unwrap().len();
+        let mut session = fs.begin_import(ROOT_INO, opts.clone()).await?;
+        session.import_chunk(&entries[..2]).await?;
+        session.import_chunk(&entries[2..]).await?;
+        let imported = session.finish();
+        let commit_sizes = {
+            let sizes = fs.import_commit_sizes.lock().unwrap();
+            sizes[commit_start..].to_vec()
+        };
+
+        assert_eq!(imported.len(), entries.len());
+        assert_eq!(
+            commit_sizes,
+            vec![2, 2, 1],
+            "two explicit import chunks should commit as 2 + 2 + 1 inode transactions"
+        );
+        println!(
+            "imported {} entries in transaction chunks {:?}",
+            imported.len(),
+            commit_sizes
+        );
+
+        let tree = fs.stat("/tree").await?.unwrap();
+        assert_eq!(tree.mode, S_IFDIR | 0o755);
+        assert_eq!(tree.nlink, 3);
+        assert_eq!((tree.uid, tree.gid), (111, 222));
+        assert_eq!(tree.mtime, opts.timestamp.0);
+        assert_eq!(tree.mtime_nsec, opts.timestamp.1 as u32);
+
+        let small = fs.stat("/tree/small.txt").await?.unwrap();
+        let small_reported = imported
+            .iter()
+            .find(|entry| entry.path == "tree/small.txt")
+            .unwrap();
+        assert_eq!(small.ino, small_reported.ino);
+        assert_eq!(small.mode, S_IFREG | 0o640);
+        assert_eq!(small.size as u64, small_reported.size);
+        assert_eq!(
+            fs.read_file("/tree/small.txt").await?.unwrap(),
+            b"small import"
+        );
+
+        let big_stat = fs.stat("/tree/nested/big.bin").await?.unwrap();
+        let big_reported = imported
+            .iter()
+            .find(|entry| entry.path == "tree/nested/big.bin")
+            .unwrap();
+        assert_eq!(big_stat.ino, big_reported.ino);
+        assert_eq!(big_stat.mode, S_IFREG | 0o600);
+        assert_eq!(big_stat.size as usize, big.len());
+        assert_eq!(fs.read_file("/tree/nested/big.bin").await?.unwrap(), big);
+        assert_eq!(fs.readlink("/tree/link").await?.unwrap(), "nested/big.bin");
         Ok(())
     }
 
