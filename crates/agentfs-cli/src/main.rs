@@ -157,8 +157,8 @@ fn main() {
                 command: command.unwrap_or_else(default_shell),
                 args,
             };
-            let rt = get_runtime();
-            if let Err(e) = rt.block_on(cmd::handle_run_command(options)) {
+            // No runtime here: the Linux backend must fork before tokio starts.
+            if let Err(e) = cmd::handle_run_command(options) {
                 exit_with_error(format_args!("{e:?}"));
             }
         }

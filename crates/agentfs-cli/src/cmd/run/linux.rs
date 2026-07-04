@@ -17,7 +17,9 @@
 
 use super::{default_allowed_paths, group_paths_by_parent};
 use crate::opts::RunOptions;
-use agentfs_core::{AgentFS, AgentFSOptions, HostFS, OverlayFS};
+use agentfs_core::{
+    AgentFS, AgentFSOptions, EncryptionConfig, HostFS, OverlayFS, PartialOriginPolicy,
+};
 use anyhow::{bail, Context, Result};
 use std::{
     cmp::Reverse,
@@ -43,12 +45,22 @@ const FUSE_MOUNT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1
 /// These are skipped when remounting the filesystem hierarchy as read-only.
 const SKIP_MOUNT_PREFIXES: &[&str] = &["/proc", "/sys", "/dev", "/tmp"];
 
+/// World-writable temp directories hidden from the sandbox alongside the home
+/// directory (sacred invariant 2: reads are scopeable). Each is replaced by an
+/// empty namespace-private tmpfs, so host files there are invisible and
+/// sandbox writes to them never reach the host.
+const READ_SCOPED_TMPDIRS: &[&str] = &["/tmp", "/var/tmp"];
+
 /// Field index for mount point in /proc/self/mountinfo.
 /// Format: ID PARENT_ID MAJOR:MINOR ROOT MOUNT_POINT OPTIONS ...
 const MOUNTINFO_MOUNT_POINT_FIELD: usize = 4;
 
 /// Run a command in an overlay sandbox.
-pub async fn run(options: RunOptions) -> Result<()> {
+///
+/// Forks the sandbox child BEFORE any tokio runtime exists: forking a live
+/// multi-threaded runtime can deadlock the child on the allocator lock held
+/// by another worker thread at fork time (cli-cmd-sandbox-deep Q4).
+pub fn run(options: RunOptions) -> Result<()> {
     let RunOptions {
         allow,
         no_default_allows,
@@ -83,16 +95,115 @@ pub async fn run(options: RunOptions) -> Result<()> {
             command,
             args,
             &session.run_id,
-        )
-        .await;
+        );
     }
 
     print_welcome_banner(&cwd, &allowed_paths, &session.run_id, encryption.is_some());
 
+    // SAFETY: getuid/getgid are always safe
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+
+    // Create pipes for parent-child coordination.
+    // The parent needs to write uid_map/gid_map for the child after unshare.
+    let (pipe_to_child, pipe_to_parent) = create_sync_pipes()?;
+
+    // SAFETY: the process is still single-threaded here (no tokio runtime
+    // yet), so the child cannot inherit a lock held by another thread.
+    let child_pid = unsafe { libc::fork() };
+
+    if child_pid < 0 {
+        bail!("Failed to fork: {}", std::io::Error::last_os_error());
+    }
+
+    if child_pid == 0 {
+        // SAFETY: Closing unused pipe ends in child; these fds are valid from pipe()
+        unsafe {
+            libc::close(pipe_to_child[1]); // Close write end
+            libc::close(pipe_to_parent[0]); // Close read end
+        }
+
+        run_child(
+            &cwd,
+            &session.fuse_mountpoint,
+            &allowed_paths,
+            command,
+            args,
+            &session.run_id,
+            pipe_to_child[0],
+            pipe_to_parent[1],
+        );
+    }
+
+    // SAFETY: Closing unused pipe ends in parent; these fds are valid from pipe()
+    unsafe {
+        libc::close(pipe_to_child[0]); // Close read end
+        libc::close(pipe_to_parent[1]); // Close write end
+    }
+
+    // The child blocks on the pipe protocol until the parent signals, so the
+    // FUSE mount is guaranteed live before the child bind-mounts it.
+    let rt = crate::get_runtime();
+    let mount_handle = match rt.block_on(mount_session_fs(
+        &cwd,
+        &session,
+        encryption,
+        partial_origin_policy,
+        uid,
+        gid,
+        system,
+    )) {
+        Ok(handle) => handle,
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            abort_child(pipe_to_child[1], child_pid);
+        }
+    };
+
+    // Wait for child to signal it has called unshare
+    if !wait_for_pipe_signal(pipe_to_parent[0]) {
+        eprintln!("Error: Failed to read sync signal from child process");
+        abort_child(pipe_to_child[1], child_pid);
+    }
+
+    // Configure user namespace mappings for the child
+    write_namespace_mappings(child_pid, uid, gid, pipe_to_child[1]);
+
+    // Signal child that mappings are done
+    // SAFETY: Writing to and closing valid pipe fds
+    unsafe {
+        libc::write(pipe_to_child[1], b"x".as_ptr() as *const libc::c_void, 1);
+        libc::close(pipe_to_child[1]);
+        libc::close(pipe_to_parent[0]);
+    }
+
+    // Write proc file for this session (owner = true)
+    if let Err(e) =
+        crate::cmd::ps::write_proc_file(&session.run_id, true, &command.to_string_lossy(), &cwd)
+    {
+        eprintln!("Warning: Failed to write proc file: {}", e);
+    }
+
+    let exit_code = rt.block_on(run_parent(child_pid, mount_handle, &session.run_id))?;
+    std::process::exit(exit_code);
+}
+
+/// Open the delta database, build the overlay, and mount it on the session's
+/// FUSE mountpoint.
+async fn mount_session_fs(
+    cwd: &Path,
+    session: &RunSession,
+    encryption: Option<EncryptionConfig>,
+    partial_origin_policy: Option<PartialOriginPolicy>,
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    system: bool,
+) -> Result<MountHandle> {
     // Open the directory BEFORE mounting FUSE on top of it.
     // This fd lets us access the underlying directory through /proc/self/fd/N,
-    // bypassing the FUSE mount that will be placed on top.
-    let cwd_fd = std::fs::File::open(&cwd).context("Failed to open current directory")?;
+    // bypassing the FUSE mount that will be placed on top. HostFS dups the fd
+    // at construction, so ours only needs to outlive HostFS::new.
+    let cwd_fd = std::fs::File::open(cwd).context("Failed to open current directory")?;
     let fd_num = cwd_fd.as_raw_fd();
     let fd_path = format!("/proc/self/fd/{}", fd_num);
 
@@ -137,10 +248,6 @@ pub async fn run(options: RunOptions) -> Result<()> {
     std::fs::write(&session.base_path_file, cwd_str)
         .context("Failed to write session base path")?;
 
-    // SAFETY: getuid/getgid are always safe
-    let uid = unsafe { libc::getuid() };
-    let gid = unsafe { libc::getgid() };
-
     let mount_opts = MountOpts {
         mountpoint: session.fuse_mountpoint.clone(),
         backend: Backend::Fuse,
@@ -154,83 +261,14 @@ pub async fn run(options: RunOptions) -> Result<()> {
         timeout: FUSE_MOUNT_TIMEOUT,
     };
 
-    // Mount the overlay filesystem
-    let mount_handle = mount_fs(Arc::new(overlay), mount_opts).await?;
-
-    // Create pipes for parent-child coordination.
-    // The parent needs to write uid_map/gid_map for the child after unshare.
-    let (pipe_to_child, pipe_to_parent) = create_sync_pipes()?;
-
-    // SAFETY: fork() is safe when called from a single-threaded context before
-    // the child performs any async-signal-unsafe operations. Our child immediately
-    // closes unused fds and calls exec after namespace setup.
-    let child_pid = unsafe { libc::fork() };
-
-    if child_pid < 0 {
-        bail!("Failed to fork: {}", std::io::Error::last_os_error());
-    }
-
-    if child_pid == 0 {
-        // SAFETY: Closing unused pipe ends in child; these fds are valid from pipe()
-        unsafe {
-            libc::close(pipe_to_child[1]); // Close write end
-            libc::close(pipe_to_parent[0]); // Close read end
-        }
-
-        // Close the fd in child - we don't need it (parent keeps it for FUSE)
-        drop(cwd_fd);
-        run_child(
-            &cwd,
-            &session.fuse_mountpoint,
-            &allowed_paths,
-            command,
-            args,
-            &session.run_id,
-            pipe_to_child[0],
-            pipe_to_parent[1],
-        );
-    } else {
-        // SAFETY: Closing unused pipe ends in parent; these fds are valid from pipe()
-        unsafe {
-            libc::close(pipe_to_child[0]); // Close read end
-            libc::close(pipe_to_parent[1]); // Close write end
-        }
-
-        // Wait for child to signal it has called unshare
-        if !wait_for_pipe_signal(pipe_to_parent[0]) {
-            eprintln!("Error: Failed to read sync signal from child process");
-            abort_child(pipe_to_child[1], child_pid);
-        }
-
-        // Configure user namespace mappings for the child
-        write_namespace_mappings(child_pid, uid, gid, pipe_to_child[1]);
-
-        // Signal child that mappings are done
-        // SAFETY: Writing to and closing valid pipe fds
-        unsafe {
-            libc::write(pipe_to_child[1], b"x".as_ptr() as *const libc::c_void, 1);
-            libc::close(pipe_to_child[1]);
-            libc::close(pipe_to_parent[0]);
-        }
-
-        // Write proc file for this session (owner = true)
-        if let Err(e) =
-            crate::cmd::ps::write_proc_file(&session.run_id, true, &command.to_string_lossy(), &cwd)
-        {
-            eprintln!("Warning: Failed to write proc file: {}", e);
-        }
-
-        // Keep cwd_fd alive - it's needed by HostFS in the FUSE thread.
-        let exit_code = run_parent(child_pid, cwd_fd, mount_handle, &session.run_id).await?;
-        std::process::exit(exit_code);
-    }
+    mount_fs(Arc::new(overlay), mount_opts).await
 }
 
 /// Run a command in an existing session's FUSE mount.
 ///
 /// This is used when joining an existing session that already has a FUSE mount active.
 /// We don't need to start a new FUSE server, just run the command in the existing mount.
-async fn run_in_existing_session(
+fn run_in_existing_session(
     cwd: &Path,
     fuse_mountpoint: &Path,
     allowed_paths: &[PathBuf],
@@ -245,7 +283,8 @@ async fn run_in_existing_session(
     // Create pipes for parent-child coordination.
     let (pipe_to_child, pipe_to_parent) = create_sync_pipes()?;
 
-    // SAFETY: fork() is safe here
+    // SAFETY: the process is still single-threaded here (no tokio runtime
+    // yet), so the child cannot inherit a lock held by another thread.
     let child_pid = unsafe { libc::fork() };
 
     if child_pid < 0 {
@@ -269,53 +308,53 @@ async fn run_in_existing_session(
             pipe_to_child[0],
             pipe_to_parent[1],
         );
-    } else {
-        // Parent process
-        unsafe {
-            libc::close(pipe_to_child[0]);
-            libc::close(pipe_to_parent[1]);
-        }
-
-        // Wait for child to signal it has called unshare
-        if !wait_for_pipe_signal(pipe_to_parent[0]) {
-            eprintln!("Error: Failed to read sync signal from child process");
-            abort_child(pipe_to_child[1], child_pid);
-        }
-
-        // Configure user namespace mappings for the child
-        write_namespace_mappings(child_pid, uid, gid, pipe_to_child[1]);
-
-        // Signal child that mappings are done
-        unsafe {
-            libc::write(pipe_to_child[1], b"x".as_ptr() as *const libc::c_void, 1);
-            libc::close(pipe_to_child[1]);
-            libc::close(pipe_to_parent[0]);
-        }
-
-        // Write proc file for this joined session (owner = false)
-        if let Err(e) =
-            crate::cmd::ps::write_proc_file(session_id, false, &command.to_string_lossy(), cwd)
-        {
-            eprintln!("Warning: Failed to write proc file: {}", e);
-        }
-
-        let status = agentfs_mount::supervise::supervise_pid_with_hooks(
-            child_pid,
-            agentfs_mount::supervise::SuperviseOpts::default(),
-            agentfs_mount::supervise::SuperviseHooks::with_profile_checkpoint(
-                crate::profiling::report_checkpoint,
-            ),
-        )
-        .await?;
-        let exit_code = agentfs_mount::supervise::exit_code_for_status(status);
-
-        // Clean up proc file
-        crate::cmd::ps::remove_proc_file(session_id);
-
-        crate::profiling::emit_cli_report();
-
-        std::process::exit(exit_code);
     }
+
+    // Parent process
+    unsafe {
+        libc::close(pipe_to_child[0]);
+        libc::close(pipe_to_parent[1]);
+    }
+
+    // Wait for child to signal it has called unshare
+    if !wait_for_pipe_signal(pipe_to_parent[0]) {
+        eprintln!("Error: Failed to read sync signal from child process");
+        abort_child(pipe_to_child[1], child_pid);
+    }
+
+    // Configure user namespace mappings for the child
+    write_namespace_mappings(child_pid, uid, gid, pipe_to_child[1]);
+
+    // Signal child that mappings are done
+    unsafe {
+        libc::write(pipe_to_child[1], b"x".as_ptr() as *const libc::c_void, 1);
+        libc::close(pipe_to_child[1]);
+        libc::close(pipe_to_parent[0]);
+    }
+
+    // Write proc file for this joined session (owner = false)
+    if let Err(e) =
+        crate::cmd::ps::write_proc_file(session_id, false, &command.to_string_lossy(), cwd)
+    {
+        eprintln!("Warning: Failed to write proc file: {}", e);
+    }
+
+    let rt = crate::get_runtime();
+    let status = rt.block_on(agentfs_mount::supervise::supervise_pid_with_hooks(
+        child_pid,
+        agentfs_mount::supervise::SuperviseOpts::default(),
+        agentfs_mount::supervise::SuperviseHooks::with_profile_checkpoint(
+            crate::profiling::report_checkpoint,
+        ),
+    ))?;
+    let exit_code = agentfs_mount::supervise::exit_code_for_status(status);
+
+    // Clean up proc file
+    crate::cmd::ps::remove_proc_file(session_id);
+
+    crate::profiling::emit_cli_report();
+
+    std::process::exit(exit_code);
 }
 
 /// Print the welcome banner showing sandbox configuration.
@@ -329,7 +368,8 @@ fn print_welcome_banner(cwd: &Path, allowed_paths: &[PathBuf], session_id: &str,
         eprintln!("  - {}", grouped_path);
     }
     eprintln!();
-    eprintln!("🔒 Everything else is read-only.");
+    eprintln!("🔒 System paths are read-only.");
+    eprintln!("🙈 Other files under your home directory and /tmp are hidden.");
     if encrypted {
         eprintln!("🔐 Delta layer is encrypted.");
     }
@@ -575,13 +615,185 @@ fn run_child(
         child_exit("Failed to change to working directory");
     }
 
-    // Step 7: Remount all other filesystems as read-only.
+    // Step 7: Hide scoped host data (home and temp dirs) behind fresh tmpfs,
+    // re-exposing only the overlay cwd and the allowed paths.
+    if let Err(e) = scope_reads(cwd, allowed_paths) {
+        child_exit(&format!("Failed to scope sandbox reads: {:#}", e));
+    }
+
+    // Step 8: Remount all other filesystems as read-only.
     if let Err(e) = remount_all_readonly_except(cwd, allowed_paths) {
         child_exit(&format!("Failed to remount filesystems read-only: {}", e));
     }
 
-    // Step 8: Execute the command (does not return).
+    // Step 9: Execute the command (does not return).
     exec_command(command, args, session_id);
+}
+
+/// A read-scoping zone to hide behind a tmpfs, plus the paths inside it that
+/// must stay visible.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct ZonePlan {
+    /// Zone root the tmpfs is mounted on.
+    pub(super) root: PathBuf,
+    /// Whether the tmpfs is world-writable (temp dirs) or user-private (home).
+    pub(super) world_writable: bool,
+    /// Paths re-bound into the tmpfs, parents before children.
+    pub(super) keep: Vec<PathBuf>,
+}
+
+/// Decide which zones to hide and which paths to re-expose inside each.
+///
+/// All inputs must already be canonicalized. A zone that is itself covered by
+/// the overlay cwd is skipped (the overlay already owns those reads), and
+/// allowed paths inside the cwd are skipped for the same reason.
+pub(super) fn plan_read_scoping(
+    zones: &[(PathBuf, bool)],
+    cwd: &Path,
+    allowed_paths: &[PathBuf],
+) -> Vec<ZonePlan> {
+    zones
+        .iter()
+        .filter_map(|(zone, world_writable)| {
+            if zone.starts_with(cwd) {
+                return None;
+            }
+            let mut keep: Vec<PathBuf> = allowed_paths
+                .iter()
+                .filter(|path| path.starts_with(zone) && !path.starts_with(cwd))
+                .cloned()
+                .collect();
+            if cwd.starts_with(zone) {
+                keep.push(cwd.to_path_buf());
+            }
+            keep.sort_by_key(|path| path.components().count());
+            Some(ZonePlan {
+                root: zone.clone(),
+                world_writable: *world_writable,
+                keep,
+            })
+        })
+        .collect()
+}
+
+/// Hide the home directory and temp dirs behind namespace-private tmpfs,
+/// keeping only the overlay cwd and allowed paths visible.
+///
+/// Runs in the child's mount namespace after uid/gid maps are written (tmpfs
+/// mounts need CAP_SYS_ADMIN in the user namespace) and before the read-only
+/// remount pass, so the fresh tmpfs zones are part of that pass's mount scan.
+fn scope_reads(cwd: &Path, allowed_paths: &[PathBuf]) -> Result<()> {
+    let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+
+    let mut zones: Vec<(PathBuf, bool)> = Vec::new();
+    if let Some(home) = dirs::home_dir().and_then(|home| home.canonicalize().ok()) {
+        if home != Path::new("/") {
+            zones.push((home, false));
+        }
+    }
+    for dir in READ_SCOPED_TMPDIRS {
+        if let Ok(zone) = Path::new(dir).canonicalize() {
+            zones.push((zone, true));
+        }
+    }
+
+    let allowed: Vec<PathBuf> = allowed_paths
+        .iter()
+        .filter_map(|path| path.canonicalize().ok())
+        .collect();
+
+    for plan in plan_read_scoping(&zones, &cwd, &allowed) {
+        apply_zone_plan(&plan)?;
+    }
+    Ok(())
+}
+
+/// Mount a tmpfs over the zone root, then re-bind each kept path into it via
+/// a pre-opened fd (the tmpfs shadows the original host paths).
+fn apply_zone_plan(plan: &ZonePlan) -> Result<()> {
+    let mut keeps: Vec<(PathBuf, libc::c_int, bool)> = Vec::new();
+    for path in &plan.keep {
+        let is_dir = std::fs::metadata(path)
+            .with_context(|| format!("Failed to stat kept path {}", path.display()))?
+            .is_dir();
+        let path_cstr = path_to_cstring(path, "kept path");
+        // SAFETY: opening a valid NUL-terminated path with O_PATH
+        let fd = unsafe { libc::open(path_cstr.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        if fd < 0 {
+            bail!(
+                "Failed to open kept path {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            );
+        }
+        keeps.push((path.clone(), fd, is_dir));
+    }
+
+    // getuid/getgid return the mapped ids here (uid_map is already written).
+    // SAFETY: getuid/getgid are always safe
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    let data = if plan.world_writable {
+        "mode=1777".to_string()
+    } else {
+        format!("mode=0700,uid={uid},gid={gid}")
+    };
+    let data_cstr = CString::new(data).expect("tmpfs options contain no NUL bytes");
+    let fstype = CString::new("tmpfs").expect("static string");
+    let root_cstr = path_to_cstring(&plan.root, "scoped zone root");
+    // SAFETY: mounting a fresh tmpfs over a valid path in our own namespace
+    if unsafe {
+        libc::mount(
+            fstype.as_ptr(),
+            root_cstr.as_ptr(),
+            fstype.as_ptr(),
+            libc::MS_NOSUID | libc::MS_NODEV,
+            data_cstr.as_ptr() as *const libc::c_void,
+        )
+    } != 0
+    {
+        bail!(
+            "Failed to mount scoping tmpfs on {}: {}",
+            plan.root.display(),
+            std::io::Error::last_os_error()
+        );
+    }
+
+    for (path, fd, is_dir) in keeps {
+        if is_dir {
+            std::fs::create_dir_all(&path)
+        } else {
+            match path.parent() {
+                Some(parent) => std::fs::create_dir_all(parent),
+                None => Ok(()),
+            }
+            .and_then(|()| std::fs::File::create(&path).map(drop))
+        }
+        .with_context(|| format!("Failed to recreate {} in tmpfs", path.display()))?;
+
+        let src = CString::new(format!("/proc/self/fd/{fd}")).expect("fd path has no NUL bytes");
+        let dst = path_to_cstring(&path, "kept path");
+        // SAFETY: bind-mounting the pre-opened host path onto its tmpfs shadow
+        if unsafe {
+            libc::mount(
+                src.as_ptr(),
+                dst.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND,
+                std::ptr::null(),
+            )
+        } != 0
+        {
+            bail!(
+                "Failed to re-bind {} into scoped zone: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            );
+        }
+        // SAFETY: closing an fd we opened above
+        unsafe { libc::close(fd) };
+    }
+
+    Ok(())
 }
 
 /// Remount all filesystems as read-only, except for the specified paths.
@@ -799,17 +1011,9 @@ fn unescape_mountinfo(s: &str) -> String {
 }
 
 /// Parent process: wait for child to exit, then clean up.
-async fn run_parent(
-    child_pid: i32,
-    cwd_fd: std::fs::File,
-    mount_handle: MountHandle,
-    session_id: &str,
-) -> Result<i32> {
+async fn run_parent(child_pid: i32, mount_handle: MountHandle, session_id: &str) -> Result<i32> {
     // Get mountpoint before dropping handle
     let fuse_mountpoint = mount_handle.mountpoint().to_path_buf();
-
-    // Release the underlying directory fd (was kept alive for HostFS)
-    drop(cwd_fd);
 
     let status = agentfs_mount::supervise::run_supervised_pid_with_hooks(
         mount_handle,

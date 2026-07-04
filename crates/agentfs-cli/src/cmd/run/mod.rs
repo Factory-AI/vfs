@@ -56,8 +56,19 @@ fn default_allowed_paths(home: &Path) -> Vec<PathBuf> {
 }
 
 /// Handle the `run` command, dispatching to the platform-specific implementation.
-pub async fn handle_run_command(options: RunOptions) -> Result<()> {
-    sys::run(options).await
+///
+/// Deliberately synchronous: the Linux backend must fork before any tokio
+/// runtime exists (forking a live multi-threaded runtime can deadlock the
+/// child on the allocator lock), so each backend owns its runtime.
+#[cfg(target_os = "linux")]
+pub fn handle_run_command(options: RunOptions) -> Result<()> {
+    sys::run(options)
+}
+
+/// Handle the `run` command, dispatching to the platform-specific implementation.
+#[cfg(not(target_os = "linux"))]
+pub fn handle_run_command(options: RunOptions) -> Result<()> {
+    crate::get_runtime().block_on(sys::run(options))
 }
 
 /// Group paths by parent directory and format using brace expansion.

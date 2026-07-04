@@ -86,6 +86,7 @@ run_test "run-syscalls" "$DIR/test-run-syscalls.sh"
 
 run_test "run-bash" "$DIR/test-run-bash.sh"
 run_test "run-git" "$DIR/test-run-git.sh"
+run_test "run-read-scoping" "$DIR/test-run-read-scoping.sh"
 run_test "profile-error-summary" "$DIR/test-profile-error-summary.sh"
 run_test "ephemeral-sidecar-cleanup" "$DIR/test-ephemeral-sidecar-cleanup.sh"
 run_test "teardown-bounded" "$DIR/test-teardown-bounded.sh"

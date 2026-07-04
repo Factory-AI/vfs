@@ -6,8 +6,13 @@ echo -n "TEST git init and commit in overlay... "
 # Clean up any previous test directory
 rm -rf test-git-repo
 
-# Run git operations in overlay: init, add, commit
+# Run git operations in overlay: init, add, commit.
+# Identity is set explicitly: read scoping hides ~/.gitconfig inside the
+# sandbox, and CI runners have no global identity anyway.
 output=$(cargo run -- run /bin/bash -c '
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+export GIT_AUTHOR_NAME="AgentFS Test" GIT_AUTHOR_EMAIL="agentfs-test@example.com"
+export GIT_COMMITTER_NAME="AgentFS Test" GIT_COMMITTER_EMAIL="agentfs-test@example.com"
 mkdir test-git-repo
 cd test-git-repo
 git init
