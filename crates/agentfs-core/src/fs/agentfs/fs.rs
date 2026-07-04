@@ -1077,7 +1077,7 @@ impl FileSystem for AgentFS {
         // `.git/config.lock` during a clone). The transaction also makes the
         // dentry/nlink/inode removal atomic.
         let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
-        let result: Result<i64> = async {
+        let result: Result<(i64, Option<i64>)> = async {
             // Look up the child inode
             let ino = self
                 .lookup_child(&conn, parent_ino, name)
@@ -1122,18 +1122,22 @@ impl FileSystem for AgentFS {
             // handle drop queues the orphan for process_deferred_reaps.
             let link_count = self.get_link_count(&conn, ino).await?;
             let removed = link_count == 0 && !self.lifecycle.defer_reap_if_open(ino);
-            if removed {
-                self.discard_pending_before_reap(ino);
-                self.reap_inode_with_conn(&conn, ino).await?;
-            }
+            let reaped_ino = if removed && self.reap_inode_with_conn(&conn, ino).await? {
+                Some(ino)
+            } else {
+                None
+            };
 
-            Ok(ino)
+            Ok((ino, reaped_ino))
         }
         .await;
 
         match result {
-            Ok(ino) => {
+            Ok((ino, reaped_ino)) => {
                 txn.commit().await?;
+                if let Some(reaped_ino) = reaped_ino {
+                    self.discard_pending_for_reaped_inode(reaped_ino);
+                }
                 self.invalidate_dentry(parent_ino, name);
                 self.invalidate_parent_attr(parent_ino);
                 self.invalidate_attr(ino);
@@ -1366,8 +1370,9 @@ impl FileSystem for AgentFS {
 
         let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
 
-        let result: Result<Option<i64>> = async {
+        let result: Result<(Option<i64>, Option<i64>)> = async {
             let mut replaced_dst_ino = None;
+            let mut reaped_dst_ino = None;
 
             if src_stats.is_directory() {
                 let mut ancestor_ino = newparent_ino;
@@ -1455,9 +1460,9 @@ impl FileSystem for AgentFS {
                 let link_count = self.get_link_count(&conn, dst_ino).await?;
                 if link_count == 0
                     && !self.lifecycle.defer_reap_if_open(dst_ino)
+                    && self.reap_inode_with_conn(&conn, dst_ino).await?
                 {
-                    self.discard_pending_before_reap(dst_ino);
-                    self.reap_inode_with_conn(&conn, dst_ino).await?;
+                    reaped_dst_ino = Some(dst_ino);
                 }
             }
 
@@ -1510,13 +1515,16 @@ impl FileSystem for AgentFS {
                 stmt.execute((now_secs, now_secs, now_nsec, now_nsec, newparent_ino)).await?;
             }
 
-            Ok(replaced_dst_ino)
+            Ok((replaced_dst_ino, reaped_dst_ino))
         }
         .await;
 
         match result {
-            Ok(replaced_dst_ino) => {
+            Ok((replaced_dst_ino, reaped_dst_ino)) => {
                 txn.commit().await?;
+                if let Some(reaped_dst_ino) = reaped_dst_ino {
+                    self.discard_pending_for_reaped_inode(reaped_dst_ino);
+                }
 
                 // Invalidate cache for source and destination
                 self.invalidate_dentry(oldparent_ino, oldname);

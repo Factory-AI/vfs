@@ -291,11 +291,14 @@ struct AgentFSWriteBatcherState {
     /// read SQLite before a concurrent drain must compare the generation they
     /// observed with the current one before inserting attrs.
     retired_generations: HashMap<i64, RetiredGeneration>,
-    /// Global monotonic generation watermark. When an old retired generation
-    /// is pruned, absent inodes report this watermark instead of resetting to
-    /// zero. That makes pruning ABA-safe: a cache fill that observed a
-    /// pending generation can never compare equal after the entry is drained
-    /// and swept from `retired_generations`.
+    /// Fallback generation for inodes whose retired entry was pruned. It is
+    /// advanced only by actual pruning, so never-batched inodes keep the
+    /// stable zero fallback across unrelated write traffic while pruned
+    /// retired entries remain ABA-safe.
+    pruned_generation_watermark: u64,
+    /// Global monotonic generation counter. This advances for every pending
+    /// overlay mutation, but absent never-batched inodes do not report it
+    /// directly (see `pruned_generation_watermark`).
     last_generation: u64,
     /// Logical retirement epoch used only to bound `retired_generations`.
     retired_generation_epoch: u64,
@@ -324,7 +327,7 @@ impl AgentFSWriteBatcherState {
                         .get(&ino)
                         .map(|retired| retired.generation)
                 })
-                .unwrap_or(self.last_generation),
+                .unwrap_or(self.pruned_generation_watermark),
         )
     }
 
@@ -361,21 +364,22 @@ impl AgentFSWriteBatcherState {
     }
 
     fn prune_retired_generations(&mut self) {
-        let len = self.retired_generations.len();
-        if len <= MAX_RETIRED_GENERATIONS {
-            return;
+        let mut pruned = false;
+        while self.retired_generations.len() > MAX_RETIRED_GENERATIONS {
+            let Some(oldest_ino) = self
+                .retired_generations
+                .iter()
+                .min_by_key(|(_, retired)| retired.retired_at)
+                .map(|(ino, _)| *ino)
+            else {
+                break;
+            };
+            self.retired_generations.remove(&oldest_ino);
+            pruned = true;
         }
-
-        let drop_count = len - MAX_RETIRED_GENERATIONS;
-        let mut epochs: Vec<u64> = self
-            .retired_generations
-            .values()
-            .map(|retired| retired.retired_at)
-            .collect();
-        epochs.sort_unstable();
-        let cutoff = epochs[drop_count - 1];
-        self.retired_generations
-            .retain(|_, retired| retired.retired_at > cutoff);
+        if pruned {
+            self.pruned_generation_watermark = self.last_generation;
+        }
     }
 
     #[cfg(debug_assertions)]
@@ -1161,7 +1165,7 @@ impl AgentFSWriteBatcher {
             return;
         }
         let generation = state.next_generation();
-        let (old_bytes, new_bytes, now_empty, generation) = {
+        let (old_bytes, new_bytes, now_empty) = {
             let Some(batch) = state.pending.get_mut(&ino) else {
                 return;
             };
@@ -1181,12 +1185,7 @@ impl AgentFSWriteBatcher {
             });
             batch.pending_bytes = new_bytes;
             batch.bump_generation(generation);
-            (
-                old_bytes,
-                new_bytes,
-                batch.ranges.is_empty(),
-                batch.generation,
-            )
+            (old_bytes, new_bytes, batch.ranges.is_empty())
         };
         state.total_pending_bytes = state
             .total_pending_bytes
@@ -1199,9 +1198,9 @@ impl AgentFSWriteBatcher {
         state.debug_assert_total();
     }
 
-    /// Discard every pending write for `ino`. Used by `AgentFS::unlink`
-    /// after the inode row is deleted, to avoid `fs_data` orphan rows when
-    /// the timer later tries to commit ranges for a no-longer-existent ino.
+    /// Discard every pending write for a reaped inode once the deletion is
+    /// committed (or before a deferred reap transaction opens). This prevents
+    /// stale pending data from surviving past the inode's logical lifetime.
     pub(super) fn discard_pending(&self, ino: i64) {
         let mut state = self.state.write();
         if let Some(batch) = state.pending.remove(&ino) {

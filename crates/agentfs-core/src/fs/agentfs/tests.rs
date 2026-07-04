@@ -2076,6 +2076,150 @@
     }
 
     #[tokio::test]
+    async fn inline_unlink_reap_rollback_keeps_pending_writes_until_commit() -> Result<()> {
+        let (fs, _dir) = create_test_fs_with_config(test_config_with_long_batch_window()).await?;
+        let conn = fs.pool.get_connection().await?;
+        conn.execute("CREATE TABLE reap_hook_probe (ino INTEGER PRIMARY KEY)", ())
+            .await?;
+        drop(conn);
+
+        fs.register_reap_hook(Arc::new(FailOnceReapHook::default()));
+
+        let (stats, file) = fs
+            .create_file("/rollback-unlink.bin", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        let ino = stats.ino;
+        file.pwrite(0, b"rollback-pending").await?;
+        drop(file);
+
+        let batcher = fs
+            .write_batcher
+            .as_ref()
+            .expect("long-window test config enables the batcher")
+            .clone();
+        assert!(
+            batcher.has_pending(ino),
+            "test setup requires a pending write before inline reap"
+        );
+
+        let err = FileSystem::unlink(&fs, ROOT_INO, "rollback-unlink.bin")
+            .await
+            .expect_err("first inline reap hook invocation should fail");
+        assert!(
+            err.to_string().contains("intentional reap hook failure"),
+            "unexpected reap hook error: {err}"
+        );
+        assert_eq!(
+            count_rows(&fs, "fs_inode", ino).await?,
+            1,
+            "failed inline reap must roll back the inode deletion"
+        );
+        assert_eq!(
+            count_probe_rows(&fs, ino).await?,
+            0,
+            "hook writes must roll back with the failed inline reap"
+        );
+        assert!(
+            batcher.has_pending(ino),
+            "pending writes must survive while the metadata transaction rolls back"
+        );
+        assert_eq!(
+            fs.read_file("/rollback-unlink.bin").await?.unwrap(),
+            b"rollback-pending"
+        );
+
+        FileSystem::unlink(&fs, ROOT_INO, "rollback-unlink.bin").await?;
+        assert!(
+            !batcher.has_pending(ino),
+            "pending writes are discarded only after the inline reap commits"
+        );
+        assert_eq!(count_probe_rows(&fs, ino).await?, 1);
+        assert_eq!(count_rows(&fs, "fs_inode", ino).await?, 0);
+        assert_eq!(count_rows(&fs, "fs_data", ino).await?, 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn inline_rename_replace_reap_rollback_keeps_pending_writes_until_commit() -> Result<()> {
+        let (fs, _dir) = create_test_fs_with_config(test_config_with_long_batch_window()).await?;
+        let conn = fs.pool.get_connection().await?;
+        conn.execute("CREATE TABLE reap_hook_probe (ino INTEGER PRIMARY KEY)", ())
+            .await?;
+        drop(conn);
+
+        fs.register_reap_hook(Arc::new(FailOnceReapHook::default()));
+
+        let (victim, victim_file) = fs
+            .create_file("/victim.bin", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        victim_file.pwrite(0, b"victim-pending").await?;
+        drop(victim_file);
+        let (replacement, replacement_file) = fs
+            .create_file("/replacement.bin", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        replacement_file.pwrite(0, b"replacement").await?;
+        drop(replacement_file);
+
+        let batcher = fs
+            .write_batcher
+            .as_ref()
+            .expect("long-window test config enables the batcher")
+            .clone();
+        assert!(
+            batcher.has_pending(victim.ino),
+            "test setup requires pending writes on the replaced inode"
+        );
+
+        let err = FileSystem::rename(&fs, ROOT_INO, "replacement.bin", ROOT_INO, "victim.bin")
+            .await
+            .expect_err("first rename-replace reap hook invocation should fail");
+        assert!(
+            err.to_string().contains("intentional reap hook failure"),
+            "unexpected reap hook error: {err}"
+        );
+        assert!(
+            batcher.has_pending(victim.ino),
+            "pending writes for the replaced inode must survive rollback"
+        );
+        assert_eq!(
+            fs.read_file("/victim.bin").await?.unwrap(),
+            b"victim-pending"
+        );
+        assert_eq!(
+            FileSystem::lookup(&fs, ROOT_INO, "replacement.bin")
+                .await?
+                .expect("source dentry should roll back")
+                .ino,
+            replacement.ino
+        );
+        assert_eq!(count_probe_rows(&fs, victim.ino).await?, 0);
+
+        FileSystem::rename(&fs, ROOT_INO, "replacement.bin", ROOT_INO, "victim.bin").await?;
+        assert!(
+            !batcher.has_pending(victim.ino),
+            "pending writes for the replaced inode are discarded after commit"
+        );
+        assert_eq!(
+            FileSystem::lookup(&fs, ROOT_INO, "victim.bin")
+                .await?
+                .expect("replacement should land at destination")
+                .ino,
+            replacement.ino
+        );
+        assert!(
+            FileSystem::lookup(&fs, ROOT_INO, "replacement.bin")
+                .await?
+                .is_none()
+        );
+        assert_eq!(count_probe_rows(&fs, victim.ino).await?, 1);
+        assert_eq!(count_rows(&fs, "fs_inode", victim.ino).await?, 0);
+        assert_eq!(count_rows(&fs, "fs_data", victim.ino).await?, 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn deferred_reap_discards_pending_before_reap_hooks() -> Result<()> {
         let (fs, _dir) = create_test_fs_with_config(test_config_with_long_batch_window()).await?;
         let (stats, file) = fs
@@ -3479,6 +3623,41 @@
             .expect("file should still exist");
         assert_eq!(current.size, 7);
         assert_eq!(file.pread(0, 16).await?, b"pending");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn never_batched_attr_cache_fill_survives_unrelated_generation_bumps() -> Result<()> {
+        let (fs, _dir) = create_test_fs_with_config(test_config_with_long_batch_window()).await?;
+        let (stable, _stable_file) = fs
+            .create_file("/stable.txt", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        fs.invalidate_attr(stable.ino);
+
+        let conn = fs.pool.get_connection().await?;
+        let generation = fs.pending_generation(stable.ino);
+        let stable_stats = store::getattr(&conn, stable.ino)
+            .await?
+            .expect("stable file should exist");
+        drop(conn);
+
+        let (unrelated, unrelated_file) = fs
+            .create_file("/unrelated.txt", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        unrelated_file.pwrite(0, b"unrelated").await?;
+        assert!(
+            fs.write_batcher
+                .as_ref()
+                .is_some_and(|batcher| batcher.has_pending(unrelated.ino)),
+            "unrelated write should bump the global generation without touching stable.txt"
+        );
+
+        fs.cache_attr_if_pending_generation(stable_stats, generation);
+        assert!(
+            cached_attr(&fs, stable.ino).is_some(),
+            "never-batched inode cache fill must not be suppressed by unrelated write traffic"
+        );
+
         Ok(())
     }
 

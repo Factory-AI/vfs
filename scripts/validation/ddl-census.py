@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -43,6 +44,13 @@ class Match:
         return f"{self.path}:{self.line_no}:{self.text.strip()}"
 
 
+@dataclass(frozen=True)
+class CensusResult:
+    inside: list[Match]
+    outside: list[Match]
+    path_included_tests: set[Path]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -50,6 +58,11 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path.cwd(),
         help="Repository root to scan (default: current working directory)",
+    )
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="Run ddl-census fixture checks and exit",
     )
     return parser.parse_args()
 
@@ -84,8 +97,61 @@ def rust_files(root: Path) -> list[Path]:
     )
 
 
+def cfg_expr(attr: str) -> str | None:
+    match = re.fullmatch(r"#\s*\[\s*cfg\s*\((.*)\)\s*\]\s*", attr)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
+def split_top_level_args(text: str) -> list[str]:
+    args: list[str] = []
+    depth = 0
+    start = 0
+    in_string: str | None = None
+    escaped = False
+    for idx, ch in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == in_string:
+                in_string = None
+            continue
+        if ch in ("'", '"'):
+            in_string = ch
+            continue
+        if ch == "(":
+            depth += 1
+            continue
+        if ch == ")":
+            depth -= 1
+            continue
+        if ch == "," and depth == 0:
+            args.append(text[start:idx].strip())
+            start = idx + 1
+    tail = text[start:].strip()
+    if tail:
+        args.append(tail)
+    return args
+
+
+def cfg_is_test_only(expr: str) -> bool:
+    if expr == "test":
+        return True
+    match = re.fullmatch(r"all\s*\((.*)\)", expr, flags=re.DOTALL)
+    if not match:
+        return False
+    return any(arg == "test" for arg in split_top_level_args(match.group(1)))
+
+
 def has_test_cfg(attrs: list[str]) -> bool:
-    return any("#[cfg" in attr and re.search(r"\btest\b", attr) for attr in attrs)
+    return any(
+        cfg_is_test_only(expr)
+        for attr in attrs
+        if (expr := cfg_expr(attr)) is not None
+    )
 
 
 def path_attr(attrs: list[str]) -> str | None:
@@ -246,9 +312,8 @@ def find_matches(root: Path, path: Path, text: str, skip_lines: set[int]) -> lis
     return matches
 
 
-def main() -> int:
-    args = parse_args()
-    root = args.root.resolve()
+def run_census(root: Path) -> CensusResult:
+    root = root.resolve()
     files = rust_files(root)
 
     texts: dict[Path, str] = {}
@@ -271,26 +336,93 @@ def main() -> int:
             continue
         outside.extend(find_matches(root, path, text, test_ranges[path]))
 
-    print(f"inside_schema_matches={len(inside)}")
-    print(f"outside_schema_matches={len(outside)}")
-    print(f"path_included_test_files={len(path_included_tests)}")
+    return CensusResult(inside, outside, path_included_tests)
 
-    if inside:
+
+def emit_result(result: CensusResult) -> int:
+    print(f"inside_schema_matches={len(result.inside)}")
+    print(f"outside_schema_matches={len(result.outside)}")
+    print(f"path_included_test_files={len(result.path_included_tests)}")
+
+    if result.inside:
         print("schema_authority_positive_sample:")
-        for match in inside[:10]:
+        for match in result.inside[:10]:
             print(f"  {match.render()}")
 
-    if outside:
+    if result.outside:
         print("outside_schema_match_details:")
-        for match in outside:
+        for match in result.outside:
             print(f"  {match.render()}")
         return 1
 
-    if not inside:
+    if not result.inside:
         print("error: no schema authority DDL matches found", file=sys.stderr)
         return 1
 
     return 0
+
+
+def run_self_test() -> int:
+    with tempfile.TemporaryDirectory(prefix="ddl-census-fixture-") as tmp:
+        root = Path(tmp)
+        schema_dir = root / "crates/agentfs-core/src/schema"
+        schema_dir.mkdir(parents=True)
+        (schema_dir / "mod.rs").write_text(
+            'pub const AUTHORITY_DDL: &str = "CREATE TABLE authority (id INTEGER)";\n',
+            encoding="utf-8",
+        )
+
+        src_dir = root / "crates/agentfs-core/src"
+        (src_dir / "lib.rs").write_text(
+            r'''
+#[cfg(test)]
+mod inline_tests {
+    const TEST_DDL: &str = "CREATE TABLE ignored_inline_test (id INTEGER)";
+}
+
+#[cfg(all(test, feature = "ddl-tests"))]
+mod all_test_feature_tests {
+    const TEST_DDL: &str = "ALTER TABLE ignored_all_test ADD COLUMN value INTEGER";
+}
+
+#[cfg(test)]
+#[path = "ddl_tests.rs"]
+mod ddl_tests;
+
+#[cfg(feature = "test-utils")]
+pub fn production_feature_named_test_utils() {
+    let _sql = "CREATE TABLE production_feature_named_test_utils (id INTEGER)";
+}
+'''.lstrip(),
+            encoding="utf-8",
+        )
+        (src_dir / "ddl_tests.rs").write_text(
+            'const PATH_TEST_DDL: &str = "CREATE TABLE ignored_path_test (id INTEGER)";\n',
+            encoding="utf-8",
+        )
+
+        result = run_census(root)
+        outside = "\n".join(match.render() for match in result.outside)
+        assert result.inside, "fixture should include schema-authority DDL"
+        assert any(
+            "production_feature_named_test_utils" in match.text for match in result.outside
+        ), f"cfg(feature = \"test-utils\") DDL must remain production-visible:\n{outside}"
+        assert "ignored_inline_test" not in outside
+        assert "ignored_all_test" not in outside
+        assert "ignored_path_test" not in outside
+        assert (
+            len(result.path_included_tests) == 1
+        ), f"expected one cfg(test) #[path] include, got {result.path_included_tests}"
+
+    print("ddl-census self-test passed")
+    return 0
+
+
+def main() -> int:
+    args = parse_args()
+    if args.self_test:
+        return run_self_test()
+    return emit_result(run_census(args.root))
 
 
 if __name__ == "__main__":

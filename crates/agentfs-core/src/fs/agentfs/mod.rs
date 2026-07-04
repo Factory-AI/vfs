@@ -607,7 +607,7 @@ impl AgentFS {
         let reaped = self
             .lifecycle
             .process_deferred_reaps(&self.pool, |ino| {
-                self.discard_pending_before_reap(ino);
+                self.discard_pending_for_reaped_inode(ino);
             })
             .await?;
         for ino in reaped {
@@ -620,7 +620,12 @@ impl AgentFS {
         self.lifecycle.reap_inode_with_conn(conn, ino).await
     }
 
-    fn discard_pending_before_reap(&self, ino: i64) {
+    /// Drop batcher state for an inode that is being reaped. Inline unlink /
+    /// rename-replace callers invoke this only after their metadata
+    /// transaction commits, so a reap-hook rollback leaves pending writes
+    /// intact with the still-live inode. Deferred reaps call it before the
+    /// transaction opens because the inode is already nlink=0 and invisible.
+    fn discard_pending_for_reaped_inode(&self, ino: i64) {
         if let Some(drain) = &self.write_drain {
             drain.discard_pending(ino);
         }
