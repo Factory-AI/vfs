@@ -14,6 +14,55 @@ use agentfs_sdk::EnvReader;
 /// worker plus queued request.
 pub(crate) const FUSE_REQUEST_BUFFER_SIZE: usize = (16 * 1024 * 1024) + 4096;
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum FuseWorkersDefault {
+    Auto,
+}
+
+impl FuseWorkersDefault {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+        }
+    }
+
+    fn matches(self, value: &str) -> bool {
+        value.trim().eq_ignore_ascii_case(self.as_str())
+    }
+
+    fn resolve(self) -> usize {
+        match self {
+            Self::Auto => workers_from_resource_percent(
+                env_percent("AGENTFS_FUSE_CPU_PERCENT", DEFAULT_AUTO_PERCENT),
+                env_percent("AGENTFS_FUSE_MEMORY_PERCENT", DEFAULT_AUTO_PERCENT),
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum FuseQueueDefault {
+    Derived,
+}
+
+impl FuseQueueDefault {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Derived => "derived",
+        }
+    }
+
+    fn matches(self, value: &str) -> bool {
+        value.trim().eq_ignore_ascii_case(self.as_str())
+    }
+
+    fn resolve(self, workers: usize) -> usize {
+        match self {
+            Self::Derived => derived_queue_capacity(workers),
+        }
+    }
+}
+
 /// Default kernel TTLs for positive dentries and attributes. 10s lets a whole
 /// git-style workload (clone ≈3s + status/diff/fsck) reuse the dentries and
 /// attrs established by mutation replies instead of re-LOOKUP/GETATTR storms
@@ -33,8 +82,8 @@ pub(crate) const DEFAULT_AUTO_PERCENT: u8 = 50;
 pub(crate) const DEFAULT_QUEUE_MEMORY_PERCENT: u8 = 25;
 pub(crate) const DEFAULT_INO_FILES_CAP: usize = 65_536;
 pub(crate) const DEFAULT_URING_DEPTH: usize = 4;
-pub(crate) const DEFAULT_FUSE_WORKERS: &str = "auto";
-pub(crate) const DEFAULT_FUSE_QUEUE: &str = "derived";
+pub(crate) const DEFAULT_FUSE_WORKERS: FuseWorkersDefault = FuseWorkersDefault::Auto;
+pub(crate) const DEFAULT_FUSE_QUEUE: FuseQueueDefault = FuseQueueDefault::Derived;
 pub(crate) const DEFAULT_FUSE_WRITEBACK: bool = true;
 pub(crate) const DEFAULT_FUSE_KEEPCACHE: bool = true;
 pub(crate) const DEFAULT_FUSE_SYNC_INVAL: bool = false;
@@ -67,10 +116,7 @@ impl DispatchMode {
     fn from_env() -> Self {
         let workers = match std::env::var("AGENTFS_FUSE_WORKERS") {
             Ok(value) if value.eq_ignore_ascii_case("serial") => return Self::Serial,
-            Ok(value) if value.eq_ignore_ascii_case("auto") => workers_from_resource_percent(
-                env_percent("AGENTFS_FUSE_CPU_PERCENT", DEFAULT_AUTO_PERCENT),
-                env_percent("AGENTFS_FUSE_MEMORY_PERCENT", DEFAULT_AUTO_PERCENT),
-            ),
+            Ok(value) if DEFAULT_FUSE_WORKERS.matches(&value) => DEFAULT_FUSE_WORKERS.resolve(),
             Ok(value) => parse_workers(&value).unwrap_or_else(|| {
                 tracing::warn!(
                     value,
@@ -78,10 +124,7 @@ impl DispatchMode {
                 );
                 0
             }),
-            Err(VarError::NotPresent) => workers_from_resource_percent(
-                env_percent("AGENTFS_FUSE_CPU_PERCENT", DEFAULT_AUTO_PERCENT),
-                env_percent("AGENTFS_FUSE_MEMORY_PERCENT", DEFAULT_AUTO_PERCENT),
-            ),
+            Err(VarError::NotPresent) => DEFAULT_FUSE_WORKERS.resolve(),
             Err(VarError::NotUnicode(value)) => {
                 tracing::warn!(
                     ?value,
@@ -97,6 +140,7 @@ impl DispatchMode {
 
         let default_queue_capacity = default_queue_capacity(workers);
         let queue_capacity = match std::env::var("AGENTFS_FUSE_QUEUE") {
+            Ok(value) if DEFAULT_FUSE_QUEUE.matches(&value) => default_queue_capacity,
             Ok(value) => parse_queue_capacity(&value, workers).unwrap_or_else(|| {
                 tracing::warn!(
                     value,
@@ -610,6 +654,10 @@ fn workers_from_resource_percent(cpu_percent: u8, memory_percent: u8) -> usize {
 }
 
 fn default_queue_capacity(workers: usize) -> usize {
+    DEFAULT_FUSE_QUEUE.resolve(workers)
+}
+
+fn derived_queue_capacity(workers: usize) -> usize {
     let memory_percent = env_percent(
         "AGENTFS_FUSE_QUEUE_MEMORY_PERCENT",
         DEFAULT_QUEUE_MEMORY_PERCENT,
@@ -736,6 +784,41 @@ mod tests {
             keepcache_sticky_drop: false,
             uring: UringConfig::default(),
         }
+    }
+
+    #[test]
+    fn documented_default_tokens_feed_runtime_parsers() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _snapshot = EnvSnapshot::capture(FUSE_ENV_KEYS);
+
+        let unset_config = FuseConfig::from_env();
+        let unset_workers = match unset_config.dispatch_mode {
+            DispatchMode::Parallel { workers, .. } => workers,
+            DispatchMode::Serial => 0,
+        };
+
+        std::env::set_var("AGENTFS_FUSE_WORKERS", DEFAULT_FUSE_WORKERS.as_str());
+        let explicit_config = FuseConfig::from_env();
+        let explicit_workers = match explicit_config.dispatch_mode {
+            DispatchMode::Parallel { workers, .. } => workers,
+            DispatchMode::Serial => 0,
+        };
+        assert_eq!(
+            explicit_workers, unset_workers,
+            "documented worker default must use the same parser path as an unset env var"
+        );
+
+        std::env::set_var("AGENTFS_FUSE_WORKERS", "2");
+        std::env::remove_var("AGENTFS_FUSE_QUEUE");
+        let unset_queue_config = FuseConfig::from_env();
+
+        std::env::set_var("AGENTFS_FUSE_QUEUE", DEFAULT_FUSE_QUEUE.as_str());
+        let explicit_queue_config = FuseConfig::from_env();
+
+        assert_eq!(
+            explicit_queue_config.dispatch_mode, unset_queue_config.dispatch_mode,
+            "documented queue default must use the same parser path as an unset env var"
+        );
     }
 
     #[test]

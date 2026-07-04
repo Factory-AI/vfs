@@ -2479,7 +2479,7 @@ impl AgentFS {
     pub async fn new(db_path: &str) -> Result<Self> {
         let db = Builder::new_local(db_path).build().await?;
         let pool = if db_path == ":memory:" {
-            ConnectionPool::new_single_connection(db)
+            ConnectionPool::with_options(db, memory_connection_pool_options())
         } else {
             ConnectionPool::with_options(db, file_backed_connection_pool_options())
         };
@@ -6753,6 +6753,11 @@ mod tests {
 
         let conn = agentfs.get_connection().await?;
         assert_eq!(read_pragma_i64(&conn, "PRAGMA temp_store").await, 2);
+        drop(conn);
+
+        let core_agentfs = AgentFS::new(":memory:").await?;
+        let core_conn = core_agentfs.pool.get_connection().await?;
+        assert_eq!(read_pragma_i64(&core_conn, "PRAGMA temp_store").await, 2);
 
         Ok(())
     }
