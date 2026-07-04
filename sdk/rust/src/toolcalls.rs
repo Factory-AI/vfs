@@ -1,5 +1,6 @@
 use crate::connection_pool::ConnectionPool;
 use crate::error::{Error, Result};
+use crate::schema;
 use serde::{Deserialize, Serialize};
 use std::{
     fmt,
@@ -91,37 +92,7 @@ impl ToolCalls {
     /// Initialize the database schema
     async fn initialize(&self) -> Result<()> {
         let conn = self.pool.get_connection().await?;
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS tool_calls (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                parameters TEXT,
-                result TEXT,
-                error TEXT,
-                status TEXT NOT NULL DEFAULT 'pending',
-                started_at INTEGER NOT NULL,
-                completed_at INTEGER,
-                duration_ms INTEGER
-            )",
-            (),
-        )
-        .await?;
-
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_tool_calls_name
-            ON tool_calls(name)",
-            (),
-        )
-        .await?;
-
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_tool_calls_started_at
-            ON tool_calls(started_at)",
-            (),
-        )
-        .await?;
-
-        Ok(())
+        schema::ensure_current(&conn).await
     }
 
     /// Start a new tool call and mark it as pending

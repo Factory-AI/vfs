@@ -1,5 +1,6 @@
 use crate::connection_pool::ConnectionPool;
 use crate::error::Result;
+use crate::schema;
 use serde::{Deserialize, Serialize};
 use turso::Builder;
 
@@ -29,25 +30,7 @@ impl KvStore {
     /// Initialize the database schema
     async fn initialize(&self) -> Result<()> {
         let conn = self.pool.get_connection().await?;
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS kv_store (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL,
-                created_at INTEGER DEFAULT (unixepoch()),
-                updated_at INTEGER DEFAULT (unixepoch())
-            )",
-            (),
-        )
-        .await?;
-
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_kv_store_created_at
-            ON kv_store(created_at)",
-            (),
-        )
-        .await?;
-
-        Ok(())
+        schema::ensure_current(&conn).await
     }
 
     /// Set a key-value pair

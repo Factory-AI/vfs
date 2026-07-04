@@ -98,7 +98,7 @@ fn mount_fuse(args: MountArgs) -> Result<()> {
         let result: Result<(), SdkError> = rt.block_on(async {
             let db = turso::Builder::new_local(&db_path).build().await?;
             let conn = db.connect()?;
-            agentfs_sdk::schema::check_schema_version(&conn).await?;
+            agentfs_sdk::schema::ensure_current(&conn).await?;
             Ok(())
         });
         if let Err(SdkError::SchemaVersionMismatch { found, expected }) = result {

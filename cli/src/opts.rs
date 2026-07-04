@@ -401,6 +401,10 @@ pub enum Command {
         #[arg(long)]
         check_base: bool,
 
+        /// Checkpoint the WAL and remove empty SQLite sidecars after checks pass
+        #[arg(long)]
+        checkpoint: bool,
+
         /// Hex-encoded encryption key for encrypted databases
         #[arg(long)]
         key: Option<String>,

@@ -2,7 +2,10 @@
 //!
 //! Migrates an agentfs SQLite database to the current schema version.
 
-use agentfs_sdk::{AgentFSOptions, SchemaVersion};
+use agentfs_sdk::{
+    config::{DEFAULT_CHUNK_SIZE, DEFAULT_INLINE_THRESHOLD},
+    schema, AgentFSOptions, SchemaVersion,
+};
 use anyhow::{Context, Result as AnyhowResult};
 use std::collections::{hash_map::DefaultHasher, HashSet};
 use std::fs;
@@ -12,9 +15,6 @@ use std::path::{Path, PathBuf};
 use turso::transaction::{Transaction, TransactionBehavior};
 use turso::{Builder, Connection, Value};
 
-const V0_5_SCHEMA_VERSION: &str = "0.5";
-const V0_5_CHUNK_SIZE: usize = 65_536;
-const V0_5_INLINE_THRESHOLD: usize = 4_096;
 const S_IFMT: i64 = 0o170000;
 const S_IFREG: i64 = 0o100000;
 
@@ -44,22 +44,14 @@ pub async fn handle_migrate_command(
     let conn = db.connect().context("Failed to connect to database")?;
 
     // Detect current schema version using SDK
-    let current_version = agentfs_sdk::schema::detect_schema_version(&conn)
+    let current_version = schema::detect_schema_version(&conn)
         .await?
         .unwrap_or(SchemaVersion::V0_0);
     writeln!(stdout, "Current schema version: {}", current_version)?;
-    writeln!(stdout, "Target schema version: 0.4 (legacy in-place)")?;
+    writeln!(stdout, "Target schema version: {}", schema::CURRENT)?;
 
-    if current_version == SchemaVersion::V0_5 {
-        writeln!(stdout, "Database is already at schema v0.5.")?;
-        return Ok(());
-    }
-
-    if current_version == SchemaVersion::V0_4 {
-        writeln!(
-            stdout,
-            "Database is at legacy schema v0.4. Use migrate-v0-5 for copy-based v0.5 migration."
-        )?;
+    if current_version == schema::CURRENT {
+        writeln!(stdout, "Database is already at schema {}.", schema::CURRENT)?;
         return Ok(());
     }
 
@@ -72,15 +64,9 @@ pub async fn handle_migrate_command(
         writeln!(stdout, "\nRun without --dry-run to apply migrations.")?;
     } else {
         writeln!(stdout, "\nApplying migrations...")?;
-        apply_migrations(&conn, current_version, stdout).await?;
-
-        // Store schema version in fs_config for future use
-        conn.execute(
-            "INSERT OR REPLACE INTO fs_config (key, value) VALUES ('schema_version', ?)",
-            ["0.4"],
-        )
-        .await
-        .context("Failed to store schema version")?;
+        schema::ensure_current(&conn)
+            .await
+            .context("Failed to migrate schema to current")?;
 
         writeln!(stdout, "\nMigration completed successfully.")?;
     }
@@ -105,154 +91,17 @@ fn print_pending_migrations(
     from_version: SchemaVersion,
 ) -> AnyhowResult<()> {
     match from_version {
-        SchemaVersion::V0_0 => {
-            writeln!(stdout, "  - v0.0 -> v0.2: Add nlink column to fs_inode")?;
-            writeln!(stdout, "  - v0.2 -> v0.4: Add atime_nsec, mtime_nsec, ctime_nsec, rdev columns to fs_inode")?;
-        }
-        SchemaVersion::V0_2 => {
-            writeln!(stdout, "  - v0.2 -> v0.4: Add atime_nsec, mtime_nsec, ctime_nsec, rdev columns to fs_inode")?;
-        }
-        SchemaVersion::V0_4 => {
-            // Already at latest
-        }
-        SchemaVersion::V0_5 => {
-            // v0.5 uses the copy-based migrate-v0-5 command.
-        }
-    }
-    Ok(())
-}
-
-/// Apply migrations from the current version to the target version.
-async fn apply_migrations(
-    conn: &turso::Connection,
-    from_version: SchemaVersion,
-    stdout: &mut impl Write,
-) -> AnyhowResult<()> {
-    match from_version {
-        SchemaVersion::V0_0 => {
-            // Migrate v0.0 -> v0.2
-            migrate_v0_0_to_v0_2(conn, stdout).await?;
-            // Then v0.2 -> v0.4
-            migrate_v0_2_to_v0_4(conn, stdout).await?;
-        }
-        SchemaVersion::V0_2 => {
-            // Migrate v0.2 -> v0.4
-            migrate_v0_2_to_v0_4(conn, stdout).await?;
-        }
-        SchemaVersion::V0_4 => {
-            // Already at latest version
-        }
-        SchemaVersion::V0_5 => {
-            // v0.5 uses the copy-based migrate-v0-5 command.
-        }
-    }
-    Ok(())
-}
-
-/// Migrate from v0.0 to v0.2: Add nlink column to fs_inode.
-async fn migrate_v0_0_to_v0_2(
-    conn: &turso::Connection,
-    stdout: &mut impl Write,
-) -> AnyhowResult<()> {
-    writeln!(stdout, "  Migrating v0.0 -> v0.2...")?;
-
-    // Add nlink column (idempotent - ignore if exists)
-    let result = conn
-        .execute(
-            "ALTER TABLE fs_inode ADD COLUMN nlink INTEGER NOT NULL DEFAULT 0",
-            (),
-        )
-        .await;
-
-    match result {
-        Ok(_) => writeln!(stdout, "    Added nlink column to fs_inode")?,
-        Err(e) => {
-            // Check if it's a "duplicate column" error (column already exists)
-            let err_msg = e.to_string();
-            if err_msg.contains("duplicate column") {
-                writeln!(stdout, "    nlink column already exists (skipping)")?;
-            } else {
-                return Err(e).context("Failed to add nlink column");
-            }
-        }
-    }
-
-    writeln!(stdout, "  v0.0 -> v0.2 migration complete.")?;
-    Ok(())
-}
-
-/// Migrate from v0.2 to v0.4: Add nanosecond timestamp columns and rdev.
-async fn migrate_v0_2_to_v0_4(
-    conn: &turso::Connection,
-    stdout: &mut impl Write,
-) -> AnyhowResult<()> {
-    writeln!(stdout, "  Migrating v0.2 -> v0.4...")?;
-
-    // Add atime_nsec column (idempotent)
-    add_column_idempotent(
-        conn,
-        stdout,
-        "atime_nsec",
-        "ALTER TABLE fs_inode ADD COLUMN atime_nsec INTEGER NOT NULL DEFAULT 0",
-    )
-    .await?;
-
-    // Add mtime_nsec column (idempotent)
-    add_column_idempotent(
-        conn,
-        stdout,
-        "mtime_nsec",
-        "ALTER TABLE fs_inode ADD COLUMN mtime_nsec INTEGER NOT NULL DEFAULT 0",
-    )
-    .await?;
-
-    // Add ctime_nsec column (idempotent)
-    add_column_idempotent(
-        conn,
-        stdout,
-        "ctime_nsec",
-        "ALTER TABLE fs_inode ADD COLUMN ctime_nsec INTEGER NOT NULL DEFAULT 0",
-    )
-    .await?;
-
-    // Add rdev column (idempotent)
-    add_column_idempotent(
-        conn,
-        stdout,
-        "rdev",
-        "ALTER TABLE fs_inode ADD COLUMN rdev INTEGER NOT NULL DEFAULT 0",
-    )
-    .await?;
-
-    writeln!(stdout, "  v0.2 -> v0.4 migration complete.")?;
-    Ok(())
-}
-
-/// Add a column idempotently (ignore duplicate column errors).
-async fn add_column_idempotent(
-    conn: &turso::Connection,
-    stdout: &mut impl Write,
-    column_name: &str,
-    sql: &str,
-) -> AnyhowResult<()> {
-    let result = conn.execute(sql, ()).await;
-
-    match result {
-        Ok(_) => writeln!(stdout, "    Added {} column to fs_inode", column_name)?,
-        Err(e) => {
-            let err_msg = e.to_string();
-            if err_msg.contains("duplicate column") {
+        version if version == schema::CURRENT => {}
+        version => {
+            for migration in schema::pending_migrations(version) {
                 writeln!(
                     stdout,
-                    "    {} column already exists (skipping)",
-                    column_name
+                    "  - {} -> {}: {}",
+                    migration.from, migration.to, migration.description
                 )?;
-            } else {
-                return Err(e).context(format!("Failed to add {} column", column_name));
             }
         }
     }
-
     Ok(())
 }
 
@@ -300,7 +149,7 @@ async fn migrate_v0_4_to_v0_5(
         .with_context(|| format!("Failed to hash source {}", source_path.display()))?;
 
     run_integrity_check(&source_conn, "source").await?;
-    let source_version = agentfs_sdk::schema::detect_schema_version(&source_conn)
+    let source_version = schema::detect_schema_version(&source_conn)
         .await?
         .unwrap_or(SchemaVersion::V0_0);
     if source_version != SchemaVersion::V0_4 {
@@ -325,7 +174,7 @@ async fn migrate_v0_4_to_v0_5(
     writeln!(stdout, "Source: {}", source_path.display())?;
     writeln!(stdout, "Target: {}", target_path.display())?;
     writeln!(stdout, "Source schema version: {source_version}")?;
-    writeln!(stdout, "Target schema version: {V0_5_SCHEMA_VERSION}")?;
+    writeln!(stdout, "Target schema version: {}", schema::CURRENT)?;
 
     create_v0_5_schema(&target_conn).await?;
 
@@ -375,163 +224,22 @@ async fn migrate_v0_4_to_v0_5(
 }
 
 async fn create_v0_5_schema(conn: &Connection) -> AnyhowResult<()> {
-    conn.execute(
-        "CREATE TABLE fs_config (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        )",
-        (),
-    )
-    .await?;
-    conn.execute(
-        "CREATE TABLE fs_inode (
-            ino INTEGER PRIMARY KEY AUTOINCREMENT,
-            mode INTEGER NOT NULL,
-            nlink INTEGER NOT NULL DEFAULT 0,
-            uid INTEGER NOT NULL DEFAULT 0,
-            gid INTEGER NOT NULL DEFAULT 0,
-            size INTEGER NOT NULL DEFAULT 0,
-            atime INTEGER NOT NULL,
-            mtime INTEGER NOT NULL,
-            ctime INTEGER NOT NULL,
-            rdev INTEGER NOT NULL DEFAULT 0,
-            atime_nsec INTEGER NOT NULL DEFAULT 0,
-            mtime_nsec INTEGER NOT NULL DEFAULT 0,
-            ctime_nsec INTEGER NOT NULL DEFAULT 0,
-            data_inline BLOB,
-            storage_kind INTEGER NOT NULL DEFAULT 0
-        )",
-        (),
-    )
-    .await?;
-    conn.execute(
-        "CREATE TABLE fs_dentry (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            parent_ino INTEGER NOT NULL,
-            ino INTEGER NOT NULL,
-            UNIQUE(parent_ino, name)
-        )",
-        (),
-    )
-    .await?;
-    conn.execute(
-        "CREATE INDEX idx_fs_dentry_parent ON fs_dentry(parent_ino, name)",
-        (),
-    )
-    .await?;
-    conn.execute(
-        "CREATE TABLE fs_data (
-            ino INTEGER NOT NULL,
-            chunk_index INTEGER NOT NULL,
-            data BLOB NOT NULL,
-            PRIMARY KEY (ino, chunk_index)
-        )",
-        (),
-    )
-    .await?;
-    conn.execute(
-        "CREATE TABLE fs_symlink (
-            ino INTEGER PRIMARY KEY,
-            target TEXT NOT NULL
-        )",
-        (),
-    )
-    .await?;
-    conn.execute(
-        "CREATE TABLE fs_whiteout (
-            path TEXT PRIMARY KEY,
-            parent_path TEXT NOT NULL,
-            created_at INTEGER NOT NULL
-        )",
-        (),
-    )
-    .await?;
-    conn.execute(
-        "CREATE INDEX idx_fs_whiteout_parent ON fs_whiteout(parent_path)",
-        (),
-    )
-    .await?;
-    conn.execute(
-        "CREATE TABLE fs_origin (
-            delta_ino INTEGER PRIMARY KEY,
-            base_ino INTEGER NOT NULL
-        )",
-        (),
-    )
-    .await?;
-    conn.execute(
-        "CREATE TABLE fs_overlay_config (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        )",
-        (),
-    )
-    .await?;
-    conn.execute(
-        "CREATE TABLE kv_store (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL,
-            created_at INTEGER DEFAULT (unixepoch()),
-            updated_at INTEGER DEFAULT (unixepoch())
-        )",
-        (),
-    )
-    .await?;
-    conn.execute(
-        "CREATE INDEX idx_kv_store_created_at ON kv_store(created_at)",
-        (),
-    )
-    .await?;
-    conn.execute(
-        "CREATE TABLE tool_calls (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            parameters TEXT,
-            result TEXT,
-            error TEXT,
-            status TEXT NOT NULL DEFAULT 'pending',
-            started_at INTEGER NOT NULL,
-            completed_at INTEGER,
-            duration_ms INTEGER
-        )",
-        (),
-    )
-    .await?;
-    conn.execute("CREATE INDEX idx_tool_calls_name ON tool_calls(name)", ())
-        .await?;
-    conn.execute(
-        "CREATE INDEX idx_tool_calls_started_at ON tool_calls(started_at)",
-        (),
-    )
-    .await?;
-
-    conn.execute(
-        "INSERT INTO fs_config (key, value) VALUES ('schema_version', ?)",
-        (V0_5_SCHEMA_VERSION,),
-    )
-    .await?;
-    conn.execute(
-        "INSERT INTO fs_config (key, value) VALUES ('chunk_size', ?)",
-        (V0_5_CHUNK_SIZE.to_string(),),
-    )
-    .await?;
-    conn.execute(
-        "INSERT INTO fs_config (key, value) VALUES ('inline_threshold', ?)",
-        (V0_5_INLINE_THRESHOLD.to_string(),),
-    )
-    .await?;
-
-    Ok(())
+    schema::ensure_current(conn)
+        .await
+        .map_err(anyhow::Error::from)
 }
 
 async fn copy_fs_config(source: &Connection, target: &Connection) -> AnyhowResult<()> {
     let mut rows = source
         .query(
             "SELECT key, value FROM fs_config
-             WHERE key NOT IN ('schema_version', 'chunk_size', 'inline_threshold')
+             WHERE key NOT IN (?, ?, ?)
              ORDER BY key",
-            (),
+            (
+                schema::CONFIG_SCHEMA_VERSION_KEY,
+                schema::CONFIG_CHUNK_SIZE_KEY,
+                schema::CONFIG_INLINE_THRESHOLD_KEY,
+            ),
         )
         .await?;
 
@@ -548,20 +256,26 @@ async fn copy_fs_config(source: &Connection, target: &Connection) -> AnyhowResul
 
     target
         .execute(
-            "INSERT OR REPLACE INTO fs_config (key, value) VALUES ('schema_version', ?)",
-            (V0_5_SCHEMA_VERSION,),
+            "INSERT OR REPLACE INTO fs_config (key, value) VALUES (?, ?)",
+            (schema::CONFIG_SCHEMA_VERSION_KEY, schema::CURRENT.as_str()),
         )
         .await?;
     target
         .execute(
-            "INSERT OR REPLACE INTO fs_config (key, value) VALUES ('chunk_size', ?)",
-            (V0_5_CHUNK_SIZE.to_string(),),
+            "INSERT OR REPLACE INTO fs_config (key, value) VALUES (?, ?)",
+            (
+                schema::CONFIG_CHUNK_SIZE_KEY,
+                DEFAULT_CHUNK_SIZE.to_string(),
+            ),
         )
         .await?;
     target
         .execute(
-            "INSERT OR REPLACE INTO fs_config (key, value) VALUES ('inline_threshold', ?)",
-            (V0_5_INLINE_THRESHOLD.to_string(),),
+            "INSERT OR REPLACE INTO fs_config (key, value) VALUES (?, ?)",
+            (
+                schema::CONFIG_INLINE_THRESHOLD_KEY,
+                DEFAULT_INLINE_THRESHOLD.to_string(),
+            ),
         )
         .await?;
     Ok(())
@@ -598,18 +312,18 @@ async fn migrate_inodes_and_file_data(
         let ctime_nsec = row_i64(&row, 12)?;
 
         let is_regular = (mode & S_IFMT) == S_IFREG;
-        let (storage_kind, data_inline) = if is_regular && (size as usize) <= V0_5_INLINE_THRESHOLD
-        {
-            let (bytes, dense) =
-                read_source_file_bytes(source, ino, size as usize, source_chunk_size).await?;
-            if dense {
-                (1_i64, Value::Blob(bytes))
+        let (storage_kind, data_inline) =
+            if is_regular && (size as usize) <= DEFAULT_INLINE_THRESHOLD {
+                let (bytes, dense) =
+                    read_source_file_bytes(source, ino, size as usize, source_chunk_size).await?;
+                if dense {
+                    (1_i64, Value::Blob(bytes))
+                } else {
+                    (0_i64, Value::Null)
+                }
             } else {
                 (0_i64, Value::Null)
-            }
-        } else {
-            (0_i64, Value::Null)
-        };
+            };
 
         target
             .execute(
@@ -682,7 +396,7 @@ async fn copy_source_file_chunks_to_target(
         let mut remaining = &chunk_data[..std::cmp::min(chunk_data.len(), size - source_offset)];
 
         while !remaining.is_empty() {
-            let next_target_index = (source_offset / V0_5_CHUNK_SIZE) as i64;
+            let next_target_index = (source_offset / DEFAULT_CHUNK_SIZE) as i64;
             if target_chunk_index != Some(next_target_index) {
                 flush_target_chunk(
                     target,
@@ -693,12 +407,12 @@ async fn copy_source_file_chunks_to_target(
                 )
                 .await?;
                 target_chunk_index = Some(next_target_index);
-                let chunk_start = next_target_index as usize * V0_5_CHUNK_SIZE;
-                let chunk_len = std::cmp::min(V0_5_CHUNK_SIZE, size - chunk_start);
+                let chunk_start = next_target_index as usize * DEFAULT_CHUNK_SIZE;
+                let chunk_len = std::cmp::min(DEFAULT_CHUNK_SIZE, size - chunk_start);
                 target_chunk = vec![0; chunk_len];
             }
 
-            let in_chunk_offset = source_offset % V0_5_CHUNK_SIZE;
+            let in_chunk_offset = source_offset % DEFAULT_CHUNK_SIZE;
             let copy_len = std::cmp::min(remaining.len(), target_chunk.len() - in_chunk_offset);
             target_chunk[in_chunk_offset..in_chunk_offset + copy_len]
                 .copy_from_slice(&remaining[..copy_len]);
@@ -984,7 +698,7 @@ async fn compare_regular_file_contents(
     target: &Connection,
 ) -> AnyhowResult<()> {
     let source_chunk_size = read_config_usize(source, "chunk_size", 4096).await?;
-    let target_chunk_size = read_config_usize(target, "chunk_size", V0_5_CHUNK_SIZE).await?;
+    let target_chunk_size = read_config_usize(target, "chunk_size", DEFAULT_CHUNK_SIZE).await?;
     let mut rows = source
         .query("SELECT ino, mode, size FROM fs_inode ORDER BY ino", ())
         .await?;
@@ -1113,17 +827,17 @@ async fn read_target_file_bytes(
 }
 
 async fn verify_target_v0_5_config(conn: &Connection) -> AnyhowResult<()> {
-    let schema_version = read_config_string(conn, "schema_version").await?;
-    if schema_version.as_deref() != Some(V0_5_SCHEMA_VERSION) {
-        anyhow::bail!("Target schema_version is not {V0_5_SCHEMA_VERSION}");
+    let schema_version = read_config_string(conn, schema::CONFIG_SCHEMA_VERSION_KEY).await?;
+    if schema_version.as_deref() != Some(schema::CURRENT.as_str()) {
+        anyhow::bail!("Target schema_version is not {}", schema::CURRENT);
     }
-    let chunk_size = read_config_usize(conn, "chunk_size", 0).await?;
-    if chunk_size != V0_5_CHUNK_SIZE {
-        anyhow::bail!("Target chunk_size is not {V0_5_CHUNK_SIZE}");
+    let chunk_size = read_config_usize(conn, schema::CONFIG_CHUNK_SIZE_KEY, 0).await?;
+    if chunk_size != DEFAULT_CHUNK_SIZE {
+        anyhow::bail!("Target chunk_size is not {DEFAULT_CHUNK_SIZE}");
     }
-    let inline_threshold = read_config_usize(conn, "inline_threshold", 0).await?;
-    if inline_threshold != V0_5_INLINE_THRESHOLD {
-        anyhow::bail!("Target inline_threshold is not {V0_5_INLINE_THRESHOLD}");
+    let inline_threshold = read_config_usize(conn, schema::CONFIG_INLINE_THRESHOLD_KEY, 0).await?;
+    if inline_threshold != DEFAULT_INLINE_THRESHOLD {
+        anyhow::bail!("Target inline_threshold is not {DEFAULT_INLINE_THRESHOLD}");
     }
     Ok(())
 }
@@ -1571,7 +1285,7 @@ mod tests {
     async fn detect_schema_version_for_test(
         conn: &turso::Connection,
     ) -> AnyhowResult<SchemaVersion> {
-        Ok(agentfs_sdk::schema::detect_schema_version(conn)
+        Ok(schema::detect_schema_version(conn)
             .await?
             .unwrap_or(SchemaVersion::V0_0))
     }
@@ -1604,7 +1318,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_migrate_v0_0_to_v0_4() {
+    async fn test_migrate_v0_0_to_current() {
         let (db, _file) = create_test_db_v0_0().await;
         let conn = db.connect().unwrap();
 
@@ -1614,21 +1328,16 @@ mod tests {
             SchemaVersion::V0_0
         );
 
-        // Apply migrations
-        let mut stdout = Vec::new();
-        apply_migrations(&conn, SchemaVersion::V0_0, &mut stdout)
-            .await
-            .unwrap();
+        schema::ensure_current(&conn).await.unwrap();
 
-        // Verify now at v0.4
         assert_eq!(
             detect_schema_version_for_test(&conn).await.unwrap(),
-            SchemaVersion::V0_4
+            schema::CURRENT
         );
     }
 
     #[tokio::test]
-    async fn test_migrate_v0_2_to_v0_4() {
+    async fn test_migrate_v0_2_to_current() {
         let (db, _file) = create_test_db_v0_2().await;
         let conn = db.connect().unwrap();
 
@@ -1638,16 +1347,11 @@ mod tests {
             SchemaVersion::V0_2
         );
 
-        // Apply migrations
-        let mut stdout = Vec::new();
-        apply_migrations(&conn, SchemaVersion::V0_2, &mut stdout)
-            .await
-            .unwrap();
+        schema::ensure_current(&conn).await.unwrap();
 
-        // Verify now at v0.4
         assert_eq!(
             detect_schema_version_for_test(&conn).await.unwrap(),
-            SchemaVersion::V0_4
+            schema::CURRENT
         );
     }
 
@@ -1656,19 +1360,12 @@ mod tests {
         let (db, _file) = create_test_db_v0_0().await;
         let conn = db.connect().unwrap();
 
-        // Apply migrations twice - should not error
-        let mut stdout = Vec::new();
-        apply_migrations(&conn, SchemaVersion::V0_0, &mut stdout)
-            .await
-            .unwrap();
-        apply_migrations(&conn, SchemaVersion::V0_0, &mut stdout)
-            .await
-            .unwrap();
+        schema::ensure_current(&conn).await.unwrap();
+        schema::ensure_current(&conn).await.unwrap();
 
-        // Should still be at v0.4
         assert_eq!(
             detect_schema_version_for_test(&conn).await.unwrap(),
-            SchemaVersion::V0_4
+            schema::CURRENT
         );
     }
 
@@ -1678,7 +1375,7 @@ mod tests {
         let source = temp_dir.path().join("source.db");
         let target = temp_dir.path().join("target.db");
         let small_content = b"inline payload".to_vec();
-        let large_content = patterned_bytes(V0_5_CHUNK_SIZE + 123, 0x42);
+        let large_content = patterned_bytes(DEFAULT_CHUNK_SIZE + 123, 0x42);
         let sparse_tail = b"tail!".to_vec();
 
         create_synthetic_v0_4_database(&source, &small_content, &large_content, &sparse_tail).await;
@@ -1725,13 +1422,14 @@ mod tests {
         assert!(matches!(row.get_value(1).unwrap(), Value::Null));
         assert_eq!(table_count_for_test(&conn, "fs_data", "ino = 4").await, 2);
 
-        let migrated_large = read_target_file_bytes(&conn, 4, large_content.len(), V0_5_CHUNK_SIZE)
-            .await
-            .unwrap();
+        let migrated_large =
+            read_target_file_bytes(&conn, 4, large_content.len(), DEFAULT_CHUNK_SIZE)
+                .await
+                .unwrap();
         assert_eq!(migrated_large, large_content);
 
         let sparse_size = 2 * 4096 + sparse_tail.len();
-        let migrated_sparse = read_target_file_bytes(&conn, 5, sparse_size, V0_5_CHUNK_SIZE)
+        let migrated_sparse = read_target_file_bytes(&conn, 5, sparse_size, DEFAULT_CHUNK_SIZE)
             .await
             .unwrap();
         let mut expected_sparse = vec![0; 2 * 4096];

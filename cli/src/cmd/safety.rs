@@ -1,8 +1,7 @@
 //! Production safety commands for local AgentFS databases.
 
-use agentfs_sdk::{AgentFSOptions, AGENTFS_SCHEMA_VERSION};
+use agentfs_sdk::{schema::integrity, AgentFSOptions};
 use anyhow::{Context, Result as AnyhowResult};
-use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -12,8 +11,8 @@ use turso::{Builder, Connection, EncryptionOpts, Value};
 
 const S_IFMT: i64 = 0o170000;
 const S_IFREG: i64 = 0o100000;
+#[cfg(test)]
 const S_IFDIR: i64 = 0o040000;
-const S_IFLNK: i64 = 0o120000;
 const STORAGE_CHUNKED: i64 = 0;
 const STORAGE_INLINE: i64 = 1;
 
@@ -29,59 +28,6 @@ struct PartialOriginRow {
     base_ctime_nsec: i64,
 }
 
-#[derive(Debug, Serialize)]
-pub struct IntegrityReport {
-    database: String,
-    ok: bool,
-    portable: bool,
-    origin_backed: bool,
-    partial_origin_rows: i64,
-    checks: Vec<IntegrityCheck>,
-}
-
-#[derive(Debug, Serialize)]
-struct IntegrityCheck {
-    name: String,
-    ok: bool,
-    detail: String,
-    violating_rows: Option<i64>,
-}
-
-impl IntegrityReport {
-    fn new(database: &Path) -> Self {
-        Self {
-            database: database.display().to_string(),
-            ok: true,
-            portable: true,
-            origin_backed: false,
-            partial_origin_rows: 0,
-            checks: Vec::new(),
-        }
-    }
-
-    fn push_check(
-        &mut self,
-        name: impl Into<String>,
-        ok: bool,
-        detail: impl Into<String>,
-        violating_rows: Option<i64>,
-    ) {
-        self.ok &= ok;
-        self.checks.push(IntegrityCheck {
-            name: name.into(),
-            ok,
-            detail: detail.into(),
-            violating_rows,
-        });
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct IntegrityOptions {
-    require_portable: bool,
-    check_base: bool,
-}
-
 /// Run integrity and schema-invariant checks for a local AgentFS database.
 pub async fn handle_integrity_command(
     stdout: &mut impl Write,
@@ -89,6 +35,7 @@ pub async fn handle_integrity_command(
     json: bool,
     require_portable: bool,
     check_base: bool,
+    checkpoint: bool,
     encryption: Option<&(String, String)>,
 ) -> AnyhowResult<()> {
     let db_path = resolve_local_db_path(&id_or_path)?;
@@ -98,18 +45,19 @@ pub async fn handle_integrity_command(
         .await
         .context("Failed to enable query_only mode")?;
 
-    let report = integrity_report(
+    let report = integrity::check(
         &conn,
-        &db_path,
-        IntegrityOptions {
-            require_portable,
-            check_base,
-        },
+        &integrity::CheckOpts::new(db_path.clone())
+            .require_portable(require_portable)
+            .check_base(check_base),
     )
     .await?;
     write_integrity_report(stdout, &report, json)?;
     if !report.ok {
         anyhow::bail!("integrity checks failed for {}", db_path.display());
+    }
+    if !checkpoint {
+        return Ok(());
     }
     drop(conn);
     drop(db);
@@ -121,6 +69,9 @@ pub async fn handle_integrity_command(
     drop(cleanup_conn);
     drop(cleanup_db);
     remove_sqlite_sidecars_after_checkpoint(&db_path)?;
+    if !json {
+        writeln!(stdout, "Checkpoint: complete")?;
+    }
     Ok(())
 }
 
@@ -180,13 +131,9 @@ pub async fn handle_backup_command(
             let backup_conn = backup_db
                 .connect()
                 .context("Failed to connect to backup database")?;
-            let report = integrity_report(
+            let report = integrity::check(
                 &backup_conn,
-                &target,
-                IntegrityOptions {
-                    require_portable: true,
-                    check_base: false,
-                },
+                &integrity::CheckOpts::new(target.clone()).require_portable(true),
             )
             .await?;
             if !report.ok {
@@ -292,13 +239,9 @@ async fn copy_and_materialize_database(
     ensure_no_partial_origin_rows(&target_conn).await?;
     checkpoint_materialized_target(&target_conn, target).await?;
 
-    let report = integrity_report(
+    let report = integrity::check(
         &target_conn,
-        target,
-        IntegrityOptions {
-            require_portable: true,
-            check_base: false,
-        },
+        &integrity::CheckOpts::new(target.to_path_buf()).require_portable(true),
     )
     .await?;
     if !report.ok {
@@ -320,13 +263,9 @@ async fn copy_and_materialize_database(
                 .connect()
                 .context("Failed to connect to materialized target database")?;
             ensure_no_partial_origin_rows(&verify_conn).await?;
-            let report = integrity_report(
+            let report = integrity::check(
                 &verify_conn,
-                target,
-                IntegrityOptions {
-                    require_portable: true,
-                    check_base: false,
-                },
+                &integrity::CheckOpts::new(target.to_path_buf()).require_portable(true),
             )
             .await?;
             if !report.ok {
@@ -767,629 +706,6 @@ async fn checkpoint_materialized_target(conn: &Connection, target_path: &Path) -
     Ok(())
 }
 
-async fn integrity_report(
-    conn: &Connection,
-    db_path: &Path,
-    options: IntegrityOptions,
-) -> AnyhowResult<IntegrityReport> {
-    let mut report = IntegrityReport::new(db_path);
-
-    let integrity_rows = query_string_column(conn, "PRAGMA integrity_check").await?;
-    report.push_check(
-        "pragma.integrity_check",
-        integrity_rows == ["ok".to_string()],
-        if integrity_rows == ["ok".to_string()] {
-            "ok".to_string()
-        } else {
-            format!("{integrity_rows:?}")
-        },
-        None,
-    );
-
-    let required_tables = [
-        "fs_config",
-        "fs_inode",
-        "fs_dentry",
-        "fs_data",
-        "fs_symlink",
-        "kv_store",
-        "tool_calls",
-    ];
-    let mut tables = BTreeMap::new();
-    for table in required_tables {
-        let exists = table_exists(conn, table).await?;
-        tables.insert(table.to_string(), exists);
-        report.push_check(
-            format!("schema.table.{table}"),
-            exists,
-            if exists { "present" } else { "missing" },
-            if exists { Some(0) } else { Some(1) },
-        );
-    }
-
-    if *tables.get("fs_config").unwrap_or(&false) {
-        check_config(conn, &mut report).await?;
-    }
-
-    let has_inode = *tables.get("fs_inode").unwrap_or(&false);
-    let has_dentry = *tables.get("fs_dentry").unwrap_or(&false);
-    let has_data = *tables.get("fs_data").unwrap_or(&false);
-    let has_symlink = *tables.get("fs_symlink").unwrap_or(&false);
-    if has_inode && has_data {
-        check_storage_invariants(conn, &mut report).await?;
-    }
-    if has_inode && has_dentry {
-        check_namespace_invariants(conn, &mut report).await?;
-    }
-    if has_inode && has_symlink {
-        check_symlink_invariants(conn, &mut report).await?;
-    }
-    check_portability_status(conn, &mut report, options.require_portable).await?;
-    check_optional_overlay_invariants(conn, &mut report, options.check_base).await?;
-
-    Ok(report)
-}
-
-async fn check_config(conn: &Connection, report: &mut IntegrityReport) -> AnyhowResult<()> {
-    let schema_version = config_string(conn, "schema_version").await?;
-    report.push_check(
-        "config.schema_version",
-        schema_version.as_deref() == Some(AGENTFS_SCHEMA_VERSION),
-        schema_version
-            .as_deref()
-            .map(|value| format!("found {value}"))
-            .unwrap_or_else(|| "missing".to_string()),
-        if schema_version.as_deref() == Some(AGENTFS_SCHEMA_VERSION) {
-            Some(0)
-        } else {
-            Some(1)
-        },
-    );
-
-    let chunk_size = config_i64(conn, "chunk_size").await?;
-    report.push_check(
-        "config.chunk_size",
-        chunk_size.is_some_and(|value| value > 0),
-        chunk_size
-            .map(|value| format!("found {value}"))
-            .unwrap_or_else(|| "missing or invalid".to_string()),
-        if chunk_size.is_some_and(|value| value > 0) {
-            Some(0)
-        } else {
-            Some(1)
-        },
-    );
-
-    let inline_threshold = config_i64(conn, "inline_threshold").await?;
-    let inline_ok = match (inline_threshold, chunk_size) {
-        (Some(inline), Some(chunk)) => inline >= 0 && inline <= chunk,
-        _ => false,
-    };
-    report.push_check(
-        "config.inline_threshold",
-        inline_ok,
-        inline_threshold
-            .map(|value| format!("found {value}"))
-            .unwrap_or_else(|| "missing or invalid".to_string()),
-        if inline_ok { Some(0) } else { Some(1) },
-    );
-
-    Ok(())
-}
-
-async fn check_storage_invariants(
-    conn: &Connection,
-    report: &mut IntegrityReport,
-) -> AnyhowResult<()> {
-    add_zero_count_check(
-        conn,
-        report,
-        "storage.kind_valid",
-        "SELECT COUNT(*) FROM fs_inode WHERE storage_kind NOT IN (0, 1)",
-    )
-    .await?;
-    add_zero_count_check(
-        conn,
-        report,
-        "storage.inline_has_no_chunks",
-        "SELECT COUNT(*)
-         FROM fs_inode i
-         WHERE i.storage_kind = 1
-           AND EXISTS (SELECT 1 FROM fs_data d WHERE d.ino = i.ino)",
-    )
-    .await?;
-    add_zero_count_check(
-        conn,
-        report,
-        "storage.chunked_has_no_inline_data",
-        "SELECT COUNT(*) FROM fs_inode WHERE storage_kind = 0 AND data_inline IS NOT NULL",
-    )
-    .await?;
-    add_zero_count_check(
-        conn,
-        report,
-        "storage.inline_size_matches_blob",
-        "SELECT COUNT(*)
-         FROM fs_inode
-         WHERE storage_kind = 1
-           AND (data_inline IS NULL OR COALESCE(length(data_inline), 0) != size)",
-    )
-    .await?;
-    add_zero_count_check(
-        conn,
-        report,
-        "storage.inline_only_regular_files",
-        &format!(
-            "SELECT COUNT(*) FROM fs_inode WHERE storage_kind = 1 AND (mode & {S_IFMT}) != {S_IFREG}"
-        ),
-    )
-    .await?;
-    add_zero_count_check(
-        conn,
-        report,
-        "storage.non_regular_has_no_inline_data",
-        &format!(
-            "SELECT COUNT(*) FROM fs_inode WHERE (mode & {S_IFMT}) != {S_IFREG} AND data_inline IS NOT NULL"
-        ),
-    )
-    .await?;
-    add_zero_count_check(
-        conn,
-        report,
-        "storage.chunks_reference_inodes",
-        "SELECT COUNT(*)
-         FROM fs_data d
-         LEFT JOIN fs_inode i ON i.ino = d.ino
-         WHERE i.ino IS NULL",
-    )
-    .await?;
-    add_zero_count_check(
-        conn,
-        report,
-        "storage.chunks_nonnegative_index",
-        "SELECT COUNT(*) FROM fs_data WHERE chunk_index < 0",
-    )
-    .await?;
-
-    if let Some(chunk_size) = config_i64(conn, "chunk_size").await? {
-        if chunk_size > 0 {
-            add_zero_count_check(
-                conn,
-                report,
-                "storage.chunk_length_within_chunk_size",
-                &format!("SELECT COUNT(*) FROM fs_data WHERE length(data) > {chunk_size}"),
-            )
-            .await?;
-        }
-    }
-    add_zero_count_check(
-        conn,
-        report,
-        "storage.chunks_only_regular_files",
-        &format!(
-            "SELECT COUNT(*)
-             FROM fs_data d
-             JOIN fs_inode i ON i.ino = d.ino
-             WHERE (i.mode & {S_IFMT}) != {S_IFREG}"
-        ),
-    )
-    .await?;
-
-    Ok(())
-}
-
-async fn check_namespace_invariants(
-    conn: &Connection,
-    report: &mut IntegrityReport,
-) -> AnyhowResult<()> {
-    add_exact_count_check(
-        conn,
-        report,
-        "namespace.root_inode",
-        &format!("SELECT COUNT(*) FROM fs_inode WHERE ino = 1 AND (mode & {S_IFMT}) = {S_IFDIR}"),
-        1,
-    )
-    .await?;
-    add_zero_count_check(
-        conn,
-        report,
-        "namespace.dentry_parent_exists",
-        "SELECT COUNT(*)
-         FROM fs_dentry d
-         LEFT JOIN fs_inode p ON p.ino = d.parent_ino
-         WHERE p.ino IS NULL",
-    )
-    .await?;
-    add_zero_count_check(
-        conn,
-        report,
-        "namespace.dentry_parent_is_directory",
-        &format!(
-            "SELECT COUNT(*)
-             FROM fs_dentry d
-             JOIN fs_inode p ON p.ino = d.parent_ino
-             WHERE (p.mode & {S_IFMT}) != {S_IFDIR}"
-        ),
-    )
-    .await?;
-    add_zero_count_check(
-        conn,
-        report,
-        "namespace.dentry_target_exists",
-        "SELECT COUNT(*)
-         FROM fs_dentry d
-         LEFT JOIN fs_inode i ON i.ino = d.ino
-         WHERE i.ino IS NULL",
-    )
-    .await?;
-    add_zero_count_check(
-        conn,
-        report,
-        "namespace.non_root_inode_has_dentry",
-        // nlink = 0 rows are POSIX orphans: files unlinked while open, whose
-        // reap is deferred until the last handle closes (and swept at the
-        // next mount after a crash). Dentry-less is legal only in that state.
-        "SELECT COUNT(*)
-         FROM fs_inode i
-         WHERE i.ino != 1
-           AND i.nlink != 0
-           AND NOT EXISTS (SELECT 1 FROM fs_dentry d WHERE d.ino = i.ino)",
-    )
-    .await?;
-    add_zero_count_check(
-        conn,
-        report,
-        "namespace.dentry_names_valid",
-        "SELECT COUNT(*)
-         FROM fs_dentry
-         WHERE name = '' OR name = '.' OR name = '..' OR instr(name, '/') > 0",
-    )
-    .await?;
-    add_zero_count_check(
-        conn,
-        report,
-        "namespace.non_directory_nlink_matches_dentries",
-        &format!(
-            "SELECT COUNT(*)
-             FROM fs_inode i
-             WHERE (i.mode & {S_IFMT}) != {S_IFDIR}
-               AND i.nlink != (SELECT COUNT(*) FROM fs_dentry d WHERE d.ino = i.ino)"
-        ),
-    )
-    .await?;
-    add_zero_count_check(
-        conn,
-        report,
-        "namespace.directory_nlink_positive",
-        &format!("SELECT COUNT(*) FROM fs_inode WHERE (mode & {S_IFMT}) = {S_IFDIR} AND nlink < 1"),
-    )
-    .await?;
-
-    Ok(())
-}
-
-async fn check_symlink_invariants(
-    conn: &Connection,
-    report: &mut IntegrityReport,
-) -> AnyhowResult<()> {
-    add_zero_count_check(
-        conn,
-        report,
-        "symlink.rows_reference_symlink_inodes",
-        &format!(
-            "SELECT COUNT(*)
-             FROM fs_symlink s
-             LEFT JOIN fs_inode i ON i.ino = s.ino
-             WHERE i.ino IS NULL OR (i.mode & {S_IFMT}) != {S_IFLNK}"
-        ),
-    )
-    .await?;
-    add_zero_count_check(
-        conn,
-        report,
-        "symlink.inodes_have_rows",
-        &format!(
-            "SELECT COUNT(*)
-             FROM fs_inode i
-             WHERE (i.mode & {S_IFMT}) = {S_IFLNK}
-               AND NOT EXISTS (SELECT 1 FROM fs_symlink s WHERE s.ino = i.ino)"
-        ),
-    )
-    .await
-}
-
-async fn check_portability_status(
-    conn: &Connection,
-    report: &mut IntegrityReport,
-    require_portable: bool,
-) -> AnyhowResult<()> {
-    let partial_origin_rows = if table_exists(conn, "fs_partial_origin").await? {
-        scalar_i64(conn, "SELECT COUNT(*) FROM fs_partial_origin").await?
-    } else {
-        0
-    };
-
-    report.partial_origin_rows = partial_origin_rows;
-    report.origin_backed = partial_origin_rows > 0;
-    report.portable = partial_origin_rows == 0;
-
-    report.push_check(
-        "overlay.portability_status",
-        true,
-        if report.portable {
-            "portable: no partial-origin rows".to_string()
-        } else {
-            format!("origin-backed: {partial_origin_rows} partial-origin row(s)")
-        },
-        Some(partial_origin_rows),
-    );
-
-    if require_portable {
-        report.push_check(
-            "overlay.require_portable",
-            report.portable,
-            if report.portable {
-                "portable requirement satisfied".to_string()
-            } else {
-                format!("portable requirement failed: {partial_origin_rows} partial-origin row(s)")
-            },
-            Some(partial_origin_rows),
-        );
-    }
-
-    Ok(())
-}
-
-async fn check_optional_overlay_invariants(
-    conn: &Connection,
-    report: &mut IntegrityReport,
-    check_base: bool,
-) -> AnyhowResult<()> {
-    if table_exists(conn, "fs_origin").await? {
-        add_zero_count_check(
-            conn,
-            report,
-            "overlay.origin_delta_inode_exists",
-            "SELECT COUNT(*)
-             FROM fs_origin o
-             LEFT JOIN fs_inode i ON i.ino = o.delta_ino
-             WHERE i.ino IS NULL",
-        )
-        .await?;
-    }
-
-    if table_exists(conn, "fs_partial_origin").await? {
-        add_zero_count_check(
-            conn,
-            report,
-            "overlay.partial_origin_delta_inode_exists",
-            "SELECT COUNT(*)
-             FROM fs_partial_origin p
-             LEFT JOIN fs_inode i ON i.ino = p.delta_ino
-             WHERE i.ino IS NULL",
-        )
-        .await?;
-        add_zero_count_check(
-            conn,
-            report,
-            "overlay.partial_origin_delta_inode_regular",
-            &format!(
-                "SELECT COUNT(*)
-                 FROM fs_partial_origin p
-                 LEFT JOIN fs_inode i ON i.ino = p.delta_ino
-                 WHERE i.ino IS NULL OR (i.mode & {S_IFMT}) != {S_IFREG}"
-            ),
-        )
-        .await?;
-        add_zero_count_check(
-            conn,
-            report,
-            "overlay.partial_origin_sizes_valid",
-            "SELECT COUNT(*)
-             FROM fs_partial_origin
-             WHERE base_size < 0 OR base_fingerprint_size < -1",
-        )
-        .await?;
-        add_zero_count_check(
-            conn,
-            report,
-            "overlay.partial_origin_paths_absolute",
-            "SELECT COUNT(*)
-             FROM fs_partial_origin
-             WHERE base_path = '' OR base_path NOT LIKE '/%' OR instr(base_path, '/../') > 0 OR base_path LIKE '%/..'",
-        )
-        .await?;
-        if check_base {
-            check_partial_origin_base_fingerprints(conn, report).await?;
-        }
-    }
-
-    if table_exists(conn, "fs_chunk_override").await? {
-        add_zero_count_check(
-            conn,
-            report,
-            "overlay.chunk_override_delta_inode_exists",
-            "SELECT COUNT(*)
-             FROM fs_chunk_override c
-             LEFT JOIN fs_inode i ON i.ino = c.delta_ino
-             WHERE i.ino IS NULL",
-        )
-        .await?;
-        add_zero_count_check(
-            conn,
-            report,
-            "overlay.chunk_override_nonnegative_index",
-            "SELECT COUNT(*) FROM fs_chunk_override WHERE chunk_index < 0",
-        )
-        .await?;
-        if table_exists(conn, "fs_partial_origin").await? {
-            add_zero_count_check(
-                conn,
-                report,
-                "overlay.chunk_override_references_partial_origin",
-                "SELECT COUNT(*)
-                 FROM fs_chunk_override c
-                 LEFT JOIN fs_partial_origin p ON p.delta_ino = c.delta_ino
-                 WHERE p.delta_ino IS NULL",
-            )
-            .await?;
-        } else {
-            add_zero_count_check(
-                conn,
-                report,
-                "overlay.chunk_override_requires_partial_origin_table",
-                "SELECT COUNT(*) FROM fs_chunk_override",
-            )
-            .await?;
-        }
-        add_zero_count_check(
-            conn,
-            report,
-            "overlay.chunk_override_unique",
-            "SELECT COUNT(*)
-             FROM (
-               SELECT delta_ino, chunk_index, COUNT(*) AS n
-               FROM fs_chunk_override
-               GROUP BY delta_ino, chunk_index
-               HAVING n > 1
-             )",
-        )
-        .await?;
-        if let Some(chunk_size) = config_i64(conn, "chunk_size").await? {
-            if chunk_size > 0 {
-                add_zero_count_check(
-                    conn,
-                    report,
-                    "overlay.chunk_override_index_in_range",
-                    &format!(
-                        "SELECT COUNT(*)
-                         FROM fs_chunk_override c
-                         JOIN fs_inode i ON i.ino = c.delta_ino
-                         WHERE c.chunk_index * {chunk_size} >= i.size"
-                    ),
-                )
-                .await?;
-            }
-        }
-    }
-
-    if table_exists(conn, "fs_whiteout").await? {
-        add_zero_count_check(
-            conn,
-            report,
-            "overlay.whiteout_paths_absolute",
-            "SELECT COUNT(*)
-             FROM fs_whiteout
-             WHERE path NOT LIKE '/%' OR parent_path NOT LIKE '/%'",
-        )
-        .await?;
-    }
-
-    Ok(())
-}
-
-async fn check_partial_origin_base_fingerprints(
-    conn: &Connection,
-    report: &mut IntegrityReport,
-) -> AnyhowResult<()> {
-    let partial_rows = load_partial_origin_rows(conn).await?;
-    if partial_rows.is_empty() {
-        report.push_check(
-            "overlay.partial_origin_base_fingerprints",
-            true,
-            "no partial-origin rows".to_string(),
-            Some(0),
-        );
-        return Ok(());
-    }
-
-    let base_root = match read_overlay_base_root(conn).await {
-        Ok(root) => root,
-        Err(err) => {
-            report.push_check(
-                "overlay.partial_origin_base_fingerprints",
-                false,
-                err.to_string(),
-                Some(partial_rows.len() as i64),
-            );
-            return Ok(());
-        }
-    };
-
-    let mut violations = 0;
-    let mut first_error = None;
-    for partial in &partial_rows {
-        let result = (|| -> AnyhowResult<()> {
-            let base_path = resolve_materialization_base_path(&base_root, &partial.base_path)?;
-            let metadata = fs::metadata(&base_path)
-                .with_context(|| format!("Failed to stat base file {}", base_path.display()))?;
-            validate_base_fingerprint(partial, &metadata, &base_path)
-        })();
-        if let Err(err) = result {
-            violations += 1;
-            if first_error.is_none() {
-                first_error = Some(err.to_string());
-            }
-        }
-    }
-
-    report.push_check(
-        "overlay.partial_origin_base_fingerprints",
-        violations == 0,
-        if violations == 0 {
-            format!("{} base fingerprint(s) valid", partial_rows.len())
-        } else {
-            format!(
-                "{violations} base fingerprint violation(s); first: {}",
-                first_error.unwrap_or_else(|| "unknown".to_string())
-            )
-        },
-        Some(violations),
-    );
-    Ok(())
-}
-
-async fn add_zero_count_check(
-    conn: &Connection,
-    report: &mut IntegrityReport,
-    name: &str,
-    sql: &str,
-) -> AnyhowResult<()> {
-    let count = scalar_i64(conn, sql).await?;
-    report.push_check(
-        name,
-        count == 0,
-        if count == 0 {
-            "0 violating rows".to_string()
-        } else {
-            format!("{count} violating rows")
-        },
-        Some(count),
-    );
-    Ok(())
-}
-
-async fn add_exact_count_check(
-    conn: &Connection,
-    report: &mut IntegrityReport,
-    name: &str,
-    sql: &str,
-    expected: i64,
-) -> AnyhowResult<()> {
-    let count = scalar_i64(conn, sql).await?;
-    report.push_check(
-        name,
-        count == expected,
-        format!("found {count}, expected {expected}"),
-        if count == expected {
-            Some(0)
-        } else {
-            Some((count - expected).abs())
-        },
-    );
-    Ok(())
-}
-
 async fn checkpoint_for_backup(conn: &Connection, source_path: &Path) -> AnyhowResult<()> {
     conn.execute("PRAGMA synchronous = FULL", ()).await?;
 
@@ -1456,7 +772,7 @@ fn copy_main_db_exclusive(source: &Path, target: &Path) -> AnyhowResult<()> {
 
 fn write_integrity_report(
     stdout: &mut impl Write,
-    report: &IntegrityReport,
+    report: &integrity::Report,
     json: bool,
 ) -> AnyhowResult<()> {
     if json {
@@ -1591,15 +907,6 @@ async fn table_exists(conn: &Connection, table: &str) -> AnyhowResult<bool> {
     Ok(rows.next().await?.is_some())
 }
 
-async fn query_string_column(conn: &Connection, sql: &str) -> AnyhowResult<Vec<String>> {
-    let mut rows = conn.query(sql, ()).await?;
-    let mut values = Vec::new();
-    while let Some(row) = rows.next().await? {
-        values.push(row.get::<String>(0)?);
-    }
-    Ok(values)
-}
-
 async fn scalar_i64(conn: &Connection, sql: &str) -> AnyhowResult<i64> {
     let mut rows = conn.query(sql, ()).await?;
     let row = rows.next().await?.context("query returned no rows")?;
@@ -1647,6 +954,17 @@ mod tests {
         agent.fs.drain_all().await.unwrap();
     }
 
+    fn db_family_stats(db_path: &Path) -> Vec<(String, u64, Option<std::time::SystemTime>)> {
+        ["", "-wal", "-shm"]
+            .into_iter()
+            .filter_map(|suffix| {
+                let path = PathBuf::from(format!("{}{}", db_path.display(), suffix));
+                let metadata = fs::metadata(&path).ok()?;
+                Some((suffix.to_string(), metadata.len(), metadata.modified().ok()))
+            })
+            .collect()
+    }
+
     #[tokio::test]
     async fn integrity_succeeds_for_valid_database() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -1665,12 +983,55 @@ mod tests {
             true,
             false,
             false,
+            false,
             None,
         )
         .await
         .unwrap();
         let json: JsonValue = serde_json::from_slice(&stdout).unwrap();
         assert_eq!(json["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn integrity_is_read_only_unless_checkpoint_requested() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("read-only.db");
+        {
+            let agent = AgentFS::open(AgentFSOptions::with_path(db_path.to_string_lossy()))
+                .await
+                .unwrap();
+            write_agent_file(&agent, "/hello.txt", b"hello").await;
+        }
+
+        let before = db_family_stats(&db_path);
+        let mut stdout = Vec::new();
+        handle_integrity_command(
+            &mut stdout,
+            db_path.to_string_lossy().to_string(),
+            false,
+            false,
+            false,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(db_family_stats(&db_path), before);
+
+        let mut checkpoint_stdout = Vec::new();
+        handle_integrity_command(
+            &mut checkpoint_stdout,
+            db_path.to_string_lossy().to_string(),
+            false,
+            false,
+            false,
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+        let output = String::from_utf8(checkpoint_stdout).unwrap();
+        assert!(output.contains("Checkpoint: complete"));
     }
 
     #[tokio::test]
@@ -1705,6 +1066,7 @@ mod tests {
             &mut stdout,
             db_path.to_string_lossy().to_string(),
             true,
+            false,
             false,
             false,
             None,
@@ -1746,6 +1108,7 @@ mod tests {
             &mut stdout,
             db_path.to_string_lossy().to_string(),
             true,
+            false,
             false,
             false,
             None,
@@ -1827,6 +1190,7 @@ mod tests {
             true,
             false,
             false,
+            false,
             Some(&encryption),
         )
         .await
@@ -1867,23 +1231,6 @@ mod tests {
                 .await
                 .unwrap();
             let conn = agent.get_connection().await.unwrap();
-            conn.execute(
-                "CREATE TABLE fs_partial_origin (
-                    delta_ino INTEGER PRIMARY KEY,
-                    base_ino INTEGER NOT NULL,
-                    base_path TEXT NOT NULL,
-                    base_size INTEGER NOT NULL,
-                    base_fingerprint_size INTEGER NOT NULL DEFAULT -1,
-                    base_mtime INTEGER NOT NULL DEFAULT 0,
-                    base_mtime_nsec INTEGER NOT NULL DEFAULT 0,
-                    base_ctime INTEGER NOT NULL DEFAULT 0,
-                    base_ctime_nsec INTEGER NOT NULL DEFAULT 0,
-                    created_at INTEGER NOT NULL
-                )",
-                (),
-            )
-            .await
-            .unwrap();
             conn.execute(
                 "INSERT INTO fs_partial_origin
                  (delta_ino, base_ino, base_path, base_size, created_at)
@@ -1983,44 +1330,8 @@ mod tests {
         .await
         .unwrap();
         conn.execute(
-            "CREATE TABLE fs_overlay_config (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )",
-            (),
-        )
-        .await
-        .unwrap();
-        conn.execute(
-            "INSERT INTO fs_overlay_config (key, value) VALUES ('base_path', ?)",
+            "INSERT OR REPLACE INTO fs_overlay_config (key, value) VALUES ('base_path', ?)",
             (base_dir.to_string_lossy().to_string(),),
-        )
-        .await
-        .unwrap();
-        conn.execute(
-            "CREATE TABLE fs_partial_origin (
-                delta_ino INTEGER PRIMARY KEY,
-                base_ino INTEGER NOT NULL,
-                base_path TEXT NOT NULL,
-                base_size INTEGER NOT NULL,
-                base_fingerprint_size INTEGER NOT NULL DEFAULT -1,
-                base_mtime INTEGER NOT NULL DEFAULT 0,
-                base_mtime_nsec INTEGER NOT NULL DEFAULT 0,
-                base_ctime INTEGER NOT NULL DEFAULT 0,
-                base_ctime_nsec INTEGER NOT NULL DEFAULT 0,
-                created_at INTEGER NOT NULL
-            )",
-            (),
-        )
-        .await
-        .unwrap();
-        conn.execute(
-            "CREATE TABLE fs_chunk_override (
-                delta_ino INTEGER NOT NULL,
-                chunk_index INTEGER NOT NULL,
-                PRIMARY KEY (delta_ino, chunk_index)
-            )",
-            (),
         )
         .await
         .unwrap();
@@ -2091,13 +1402,9 @@ mod tests {
             expected
         );
         let conn = agent.get_connection().await.unwrap();
-        let report = integrity_report(
+        let report = integrity::check(
             &conn,
-            db_path,
-            IntegrityOptions {
-                require_portable: true,
-                check_base: false,
-            },
+            &integrity::CheckOpts::new(db_path.to_path_buf()).require_portable(true),
         )
         .await
         .unwrap();

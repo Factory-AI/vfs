@@ -364,6 +364,7 @@ fn main() {
             json,
             require_portable,
             check_base,
+            checkpoint,
             key,
             cipher,
         } => {
@@ -375,6 +376,7 @@ fn main() {
                 json,
                 require_portable,
                 check_base,
+                checkpoint,
                 encryption.as_ref(),
             )) {
                 exit_with_error(e);

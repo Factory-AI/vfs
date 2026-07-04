@@ -49,7 +49,7 @@ pub use filesystem::{
     S_IFREG, S_IFSOCK,
 };
 pub use kvstore::KvStore;
-pub use schema::{SchemaVersion, AGENTFS_SCHEMA_VERSION};
+pub use schema::{SchemaVersion, AGENTFS_SCHEMA_VERSION, CURRENT};
 pub use toolcalls::{ToolCall, ToolCallStats, ToolCallStatus, ToolCalls};
 
 /// Directory containing agentfs databases
@@ -403,9 +403,10 @@ impl AgentFS {
             (None, pool)
         };
 
-        // Check schema version for existing databases
+        // Initialize or migrate schema for existing databases before any
+        // schema-owned callers read or write sidecar sections.
         let conn = pool.get_connection().await?;
-        schema::check_schema_version(&conn).await?;
+        schema::ensure_current(&conn).await?;
         drop(conn);
 
         let overlay_requested = options.base.is_some();

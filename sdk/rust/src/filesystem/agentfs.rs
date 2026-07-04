@@ -19,7 +19,7 @@ use super::{
 use crate::config::BatcherConfig;
 use crate::config::{CoreConfig, Geometry, DEFAULT_CHUNK_SIZE, DEFAULT_INLINE_THRESHOLD};
 use crate::connection_pool::{ConnectionPool, ConnectionPoolOptions};
-use crate::schema::{self, AGENTFS_SCHEMA_VERSION};
+use crate::schema;
 
 mod batcher;
 mod lifecycle;
@@ -94,80 +94,6 @@ fn remove_checkpointed_sidecars(path: &Path) -> Result<()> {
         std::fs::remove_file(&shm)?;
     }
     Ok(())
-}
-
-fn is_duplicate_column_error(err: &turso::Error) -> bool {
-    err.to_string()
-        .to_ascii_lowercase()
-        .contains("duplicate column")
-}
-
-#[derive(Clone, Copy)]
-struct ColumnSpec {
-    table_name: &'static str,
-    column_name: &'static str,
-    type_name: &'static str,
-    not_null: bool,
-    default_value: Option<&'static str>,
-}
-
-async fn add_column_idempotent(conn: &Connection, spec: ColumnSpec, sql: &str) -> Result<()> {
-    match conn.execute(sql, ()).await {
-        Ok(_) => Ok(()),
-        Err(err) if is_duplicate_column_error(&err) => ensure_column_matches(conn, spec).await,
-        Err(err) => Err(Error::Internal(format!(
-            "schema ALTER failed while adding {}.{}: {err}",
-            spec.table_name, spec.column_name
-        ))),
-    }
-}
-
-async fn ensure_column_matches(conn: &Connection, spec: ColumnSpec) -> Result<()> {
-    let mut rows = conn
-        .query(&format!("PRAGMA table_info({})", spec.table_name), ())
-        .await?;
-
-    while let Some(row) = rows.next().await? {
-        let column_name: String = row.get(1)?;
-        if column_name != spec.column_name {
-            continue;
-        }
-
-        let type_name: String = row.get(2)?;
-        let not_null: i64 = row.get(3)?;
-        let default_value = match row.get_value(4).ok() {
-            Some(Value::Text(value)) => Some(value.clone()),
-            Some(Value::Integer(value)) => Some(value.to_string()),
-            Some(Value::Null) | None => None,
-            Some(value) => Some(format!("{value:?}")),
-        };
-        let type_matches = type_name.eq_ignore_ascii_case(spec.type_name);
-        let not_null_matches = (not_null != 0) == spec.not_null;
-        let default_matches = default_value.as_deref() == spec.default_value;
-
-        if type_matches && not_null_matches && default_matches {
-            return Ok(());
-        }
-
-        return Err(Error::Internal(format!(
-            "schema column {}.{} already exists with incompatible definition: \
-             expected type={} not_null={} default={:?}; \
-             found type={} not_null={} default={:?}",
-            spec.table_name,
-            spec.column_name,
-            spec.type_name,
-            spec.not_null,
-            spec.default_value,
-            type_name,
-            not_null != 0,
-            default_value
-        )));
-    }
-
-    Err(Error::Internal(format!(
-        "schema ALTER reported duplicate column {}.{}, but PRAGMA table_info did not find it",
-        spec.table_name, spec.column_name
-    )))
 }
 
 /// LRU cache for directory entry lookups.
@@ -761,11 +687,8 @@ impl AgentFS {
     ) -> Result<Self> {
         let conn = pool.get_connection().await?;
 
-        // Refuse legacy schemas before initialization so v0.4 databases are not
-        // silently mutated into v0.5. Copy migration is handled separately.
-        schema::check_schema_version(&conn).await?;
-
-        // Initialize schema first
+        // Initialize or migrate schema first. The schema module owns DDL and
+        // stamps SQLite's user-version inside the DDL transaction.
         Self::initialize_schema(&conn).await?;
 
         // Get chunk_size from config (or use default)
@@ -861,178 +784,7 @@ impl AgentFS {
 
     /// Initialize the database schema
     pub async fn initialize_schema(conn: &Connection) -> Result<()> {
-        // Create config table
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS fs_config (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )",
-            (),
-        )
-        .await?;
-
-        // Create inode table
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS fs_inode (
-                ino INTEGER PRIMARY KEY AUTOINCREMENT,
-                mode INTEGER NOT NULL,
-                nlink INTEGER NOT NULL DEFAULT 0,
-                uid INTEGER NOT NULL DEFAULT 0,
-                gid INTEGER NOT NULL DEFAULT 0,
-                size INTEGER NOT NULL DEFAULT 0,
-                atime INTEGER NOT NULL,
-                mtime INTEGER NOT NULL,
-                ctime INTEGER NOT NULL,
-                rdev INTEGER NOT NULL DEFAULT 0,
-                data_inline BLOB,
-                storage_kind INTEGER NOT NULL DEFAULT 0
-            )",
-            (),
-        )
-        .await?;
-
-        // Add columns idempotently for already-upgraded databases. Only the
-        // duplicate-column case is safe to ignore; every other ALTER failure
-        // indicates schema corruption or an environmental database error.
-        add_column_idempotent(
-            conn,
-            ColumnSpec {
-                table_name: "fs_inode",
-                column_name: "atime_nsec",
-                type_name: "INTEGER",
-                not_null: true,
-                default_value: Some("0"),
-            },
-            "ALTER TABLE fs_inode ADD COLUMN atime_nsec INTEGER NOT NULL DEFAULT 0",
-        )
-        .await?;
-        add_column_idempotent(
-            conn,
-            ColumnSpec {
-                table_name: "fs_inode",
-                column_name: "mtime_nsec",
-                type_name: "INTEGER",
-                not_null: true,
-                default_value: Some("0"),
-            },
-            "ALTER TABLE fs_inode ADD COLUMN mtime_nsec INTEGER NOT NULL DEFAULT 0",
-        )
-        .await?;
-        add_column_idempotent(
-            conn,
-            ColumnSpec {
-                table_name: "fs_inode",
-                column_name: "ctime_nsec",
-                type_name: "INTEGER",
-                not_null: true,
-                default_value: Some("0"),
-            },
-            "ALTER TABLE fs_inode ADD COLUMN ctime_nsec INTEGER NOT NULL DEFAULT 0",
-        )
-        .await?;
-        add_column_idempotent(
-            conn,
-            ColumnSpec {
-                table_name: "fs_inode",
-                column_name: "data_inline",
-                type_name: "BLOB",
-                not_null: false,
-                default_value: None,
-            },
-            "ALTER TABLE fs_inode ADD COLUMN data_inline BLOB",
-        )
-        .await?;
-        add_column_idempotent(
-            conn,
-            ColumnSpec {
-                table_name: "fs_inode",
-                column_name: "storage_kind",
-                type_name: "INTEGER",
-                not_null: true,
-                default_value: Some("0"),
-            },
-            "ALTER TABLE fs_inode ADD COLUMN storage_kind INTEGER NOT NULL DEFAULT 0",
-        )
-        .await?;
-
-        // Create directory entry table
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS fs_dentry (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                parent_ino INTEGER NOT NULL,
-                ino INTEGER NOT NULL,
-                UNIQUE(parent_ino, name)
-            )",
-            (),
-        )
-        .await?;
-
-        // Create index for efficient path lookups
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_fs_dentry_parent
-            ON fs_dentry(parent_ino, name)",
-            (),
-        )
-        .await?;
-
-        // Create data chunks table
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS fs_data (
-                ino INTEGER NOT NULL,
-                chunk_index INTEGER NOT NULL,
-                data BLOB NOT NULL,
-                PRIMARY KEY (ino, chunk_index)
-            )",
-            (),
-        )
-        .await?;
-
-        // Create symlink table
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS fs_symlink (
-                ino INTEGER PRIMARY KEY,
-                target TEXT NOT NULL
-            )",
-            (),
-        )
-        .await?;
-
-        // Ensure chunk_size config exists
-        let mut rows = conn
-            .query("SELECT value FROM fs_config WHERE key = 'chunk_size'", ())
-            .await?;
-
-        if rows.next().await?.is_none() {
-            conn.execute(
-                "INSERT INTO fs_config (key, value) VALUES ('chunk_size', ?)",
-                (DEFAULT_CHUNK_SIZE.to_string(),),
-            )
-            .await?;
-        }
-
-        // Ensure inline_threshold config exists
-        let mut rows = conn
-            .query(
-                "SELECT value FROM fs_config WHERE key = 'inline_threshold'",
-                (),
-            )
-            .await?;
-
-        if rows.next().await?.is_none() {
-            conn.execute(
-                "INSERT INTO fs_config (key, value) VALUES ('inline_threshold', ?)",
-                (DEFAULT_INLINE_THRESHOLD.to_string(),),
-            )
-            .await?;
-        }
-
-        // Set schema version
-        conn.execute(
-            "INSERT OR REPLACE INTO fs_config (key, value) VALUES ('schema_version', ?)",
-            [AGENTFS_SCHEMA_VERSION],
-        )
-        .await?;
+        schema::ensure_current(conn).await?;
 
         // Ensure root directory exists with correct ownership
         let mut rows = conn
@@ -4628,14 +4380,14 @@ mod tests {
 
         let mut rows = conn
             .query(
-                "SELECT value FROM fs_config WHERE key = 'schema_version'",
-                (),
+                "SELECT value FROM fs_config WHERE key = ?",
+                (schema::CONFIG_SCHEMA_VERSION_KEY,),
             )
             .await?;
         let row = rows
             .next()
             .await?
-            .expect("schema_version config should exist");
+            .expect("schema version config should exist");
         let value = row
             .get_value(0)
             .ok()
@@ -4643,7 +4395,7 @@ mod tests {
                 Value::Text(s) => Some(s.clone()),
                 _ => None,
             })
-            .expect("schema_version should be a text value");
+            .expect("schema version should be a text value");
 
         assert_eq!(value, "0.5");
 
@@ -4662,26 +4414,14 @@ mod tests {
         conn.execute("CREATE VIEW fs_inode AS SELECT 1 AS ino", ())
             .await?;
 
-        let err = match add_column_idempotent(
-            &conn,
-            ColumnSpec {
-                table_name: "fs_inode",
-                column_name: "atime_nsec",
-                type_name: "INTEGER",
-                not_null: true,
-                default_value: Some("0"),
-            },
-            "ALTER TABLE fs_inode ADD COLUMN atime_nsec INTEGER NOT NULL DEFAULT 0",
-        )
-        .await
-        {
-            Ok(_) => panic!("non-duplicate schema ALTER errors must propagate"),
+        let err = match schema::ensure_current(&conn).await {
+            Ok(_) => panic!("non-duplicate schema DDL errors must propagate"),
             Err(err) => err,
         };
         let err_msg = err.to_string();
         assert!(
-            err_msg.contains("fs_inode.atime_nsec") && err_msg.contains("no such table: fs_inode"),
-            "error should preserve the failed ALTER reason, got: {err_msg}"
+            err_msg.contains("fs_inode"),
+            "error should preserve the failed DDL target, got: {err_msg}"
         );
 
         Ok(())
@@ -4705,9 +4445,12 @@ mod tests {
             .await?;
             conn.execute(
                 "INSERT INTO fs_config (key, value) VALUES
-                    ('schema_version', '0.5'),
-                    ('inline_threshold', '16384')",
-                (),
+                    (?, '0.5'),
+                    (?, '16384')",
+                (
+                    schema::CONFIG_SCHEMA_VERSION_KEY,
+                    schema::CONFIG_INLINE_THRESHOLD_KEY,
+                ),
             )
             .await?;
             conn.execute(
@@ -4797,22 +4540,22 @@ mod tests {
 
         let mut rows = conn
             .query(
-                "SELECT value FROM fs_config WHERE key = 'schema_version'",
-                (),
+                "SELECT value FROM fs_config WHERE key = ?",
+                (schema::CONFIG_SCHEMA_VERSION_KEY,),
             )
             .await?;
         let version: String = rows
             .next()
             .await?
-            .expect("schema_version config should exist")
+            .expect("schema version config should exist")
             .get(0)?;
-        assert_eq!(version, AGENTFS_SCHEMA_VERSION);
+        assert_eq!(version, schema::AGENTFS_SCHEMA_VERSION);
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_v04_database_is_rejected_without_inline_migration() -> Result<()> {
+    async fn test_v04_database_migrates_to_current_on_open() -> Result<()> {
         let dir = tempdir()?;
         let db_path = dir.path().join("legacy-v04.db");
 
@@ -4827,8 +4570,8 @@ mod tests {
             )
             .await?;
             conn.execute(
-                "INSERT INTO fs_config (key, value) VALUES ('schema_version', '0.4')",
-                (),
+                "INSERT INTO fs_config (key, value) VALUES (?, '0.4')",
+                (schema::CONFIG_SCHEMA_VERSION_KEY,),
             )
             .await?;
             conn.execute(
@@ -4852,16 +4595,14 @@ mod tests {
             .await?;
         }
 
-        let result =
-            crate::AgentFS::open(crate::AgentFSOptions::with_path(db_path.to_string_lossy())).await;
-        match result {
-            Err(Error::SchemaVersionMismatch { found, expected }) => {
-                assert_eq!(found, "0.4");
-                assert_eq!(expected, "0.5");
-            }
-            Err(err) => panic!("expected schema version mismatch, got {err}"),
-            Ok(_) => panic!("legacy v0.4 database should not open as v0.5"),
-        }
+        let agent =
+            crate::AgentFS::open(crate::AgentFSOptions::with_path(db_path.to_string_lossy()))
+                .await?;
+        let conn = agent.get_connection().await?;
+        assert_eq!(
+            schema::detect_schema_version(&conn).await?,
+            Some(schema::CURRENT)
+        );
 
         Ok(())
     }
