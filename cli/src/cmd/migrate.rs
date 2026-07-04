@@ -829,7 +829,11 @@ async fn read_target_file_bytes(
 async fn verify_target_v0_5_config(conn: &Connection) -> AnyhowResult<()> {
     let schema_version = read_config_string(conn, schema::CONFIG_SCHEMA_VERSION_KEY).await?;
     if schema_version.as_deref() != Some(schema::CURRENT.as_str()) {
-        anyhow::bail!("Target schema_version is not {}", schema::CURRENT);
+        anyhow::bail!(
+            "Target {} is not {}",
+            schema::CONFIG_SCHEMA_VERSION_KEY,
+            schema::CURRENT
+        );
     }
     let chunk_size = read_config_usize(conn, schema::CONFIG_CHUNK_SIZE_KEY, 0).await?;
     if chunk_size != DEFAULT_CHUNK_SIZE {
@@ -1505,6 +1509,101 @@ mod tests {
         assert_eq!(row.get::<String>(0).unwrap(), "/dir");
         assert_eq!(row_i64(&row, 1).unwrap(), 123);
         compare_optional_whiteouts(&source_conn, &target_conn)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_in_place_migrate_backfills_legacy_whiteout_parent_path() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("legacy-whiteout.db");
+        create_synthetic_v0_4_database(&db_path, b"small", b"larger than inline", b"tail").await;
+
+        let db = Builder::new_local(db_path.to_str().unwrap())
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        rewrite_whiteouts_without_parent_path(&conn).await;
+        drop(conn);
+        drop(db);
+
+        let mut stdout = Vec::new();
+        handle_migrate_command(&mut stdout, db_path.to_string_lossy().into_owned(), false)
+            .await
+            .unwrap();
+        let stdout = String::from_utf8(stdout).unwrap();
+        assert!(
+            stdout.contains("Migration completed successfully."),
+            "unexpected migrate output: {stdout}"
+        );
+
+        let db = Builder::new_local(db_path.to_str().unwrap())
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        let columns = get_table_columns(&conn, "fs_whiteout").await.unwrap();
+        assert!(
+            columns.iter().any(|column| column == "parent_path"),
+            "cli migrate did not add fs_whiteout.parent_path; columns={columns:?}"
+        );
+        let mut rows = conn
+            .query(
+                "SELECT parent_path, created_at FROM fs_whiteout WHERE path = '/dir/deleted'",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let parent_path = row.get::<String>(0).unwrap();
+        let created_at = row_i64(&row, 1).unwrap();
+        println!(
+            "cli migrate: fs_whiteout columns={columns:?}; /dir/deleted parent_path={parent_path}"
+        );
+        assert_eq!(parent_path, "/dir");
+        assert_eq!(created_at, 123);
+
+        let mut rows = conn.query("PRAGMA user_version", ()).await.unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row_i64(&row, 0).unwrap(), schema::CURRENT.user_version());
+    }
+
+    async fn rewrite_whiteouts_without_parent_path(conn: &Connection) {
+        conn.execute(
+            "CREATE TABLE fs_whiteout_legacy_rows (
+                path TEXT PRIMARY KEY,
+                created_at INTEGER NOT NULL
+            )",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO fs_whiteout_legacy_rows (path, created_at)
+             SELECT path, created_at FROM fs_whiteout",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute("DROP TABLE fs_whiteout", ()).await.unwrap();
+        conn.execute(
+            "CREATE TABLE fs_whiteout (
+                path TEXT PRIMARY KEY,
+                created_at INTEGER NOT NULL
+            )",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO fs_whiteout (path, created_at)
+             SELECT path, created_at FROM fs_whiteout_legacy_rows",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute("DROP TABLE fs_whiteout_legacy_rows", ())
             .await
             .unwrap();
     }

@@ -388,11 +388,14 @@ pub async fn ensure_current(conn: &Connection) -> Result<()> {
 
     let txn = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).await?;
     let result = async {
+        // Legacy overlay sidecar tables can predate columns that CURRENT_DDL
+        // indexes. Repair and backfill those columns before running any
+        // dependent CREATE INDEX statements from the single DDL list.
+        ensure_overlay_compat_columns(conn).await?;
         execute_current_ddl(conn).await?;
         if let Some(version) = detected {
             apply_pending_migrations(conn, version).await?;
         }
-        ensure_overlay_compat_columns(conn).await?;
         ensure_config_defaults(conn).await?;
         set_user_version(conn, CURRENT).await?;
         Ok(())
@@ -801,7 +804,8 @@ fn is_duplicate_column_error(err: &turso::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AgentFS, AgentFSOptions, DEFAULT_FILE_MODE};
+    use crate::{AgentFS, AgentFSOptions, KvStore, ToolCalls, DEFAULT_FILE_MODE};
+    use std::path::{Path, PathBuf};
     use tempfile::tempdir;
     use turso::Builder;
 
@@ -851,6 +855,37 @@ mod tests {
                 integrity::check(&conn, &integrity::CheckOpts::new(db_path.clone())).await?;
             assert!(report.ok, "integrity failed for migrated {version}");
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_whiteout_without_parent_path_migrates_for_sdk_openers() -> Result<()> {
+        let dir = tempdir()?;
+
+        let agent_path =
+            create_legacy_whiteout_fixture_file(dir.path(), "agent-open", SchemaVersion::V0_5)
+                .await?;
+        let agent = AgentFS::open(AgentFSOptions::with_path(agent_path.to_string_lossy())).await?;
+        assert_eq!(agent.fs.read_file("/file.txt").await?.unwrap(), b"abcdef");
+        drop(agent);
+        assert_legacy_whiteout_parent_path(&agent_path, "AgentFS::open").await?;
+
+        let kv_path =
+            create_legacy_whiteout_fixture_file(dir.path(), "kv-open", SchemaVersion::V0_5).await?;
+        let kv = KvStore::new(kv_path.to_str().unwrap()).await?;
+        kv.set("after", &serde_json::json!({ "ok": true })).await?;
+        drop(kv);
+        assert_legacy_whiteout_parent_path(&kv_path, "KvStore::new").await?;
+
+        let tool_path =
+            create_legacy_whiteout_fixture_file(dir.path(), "tool-open", SchemaVersion::V0_5)
+                .await?;
+        let tools = ToolCalls::new(tool_path.to_str().unwrap()).await?;
+        let id = tools.start("after", None).await?;
+        tools.success(id, None).await?;
+        drop(tools);
+        assert_legacy_whiteout_parent_path(&tool_path, "ToolCalls::new").await?;
+
         Ok(())
     }
 
@@ -909,6 +944,86 @@ mod tests {
             "unexpected error: {err}"
         );
 
+        Ok(())
+    }
+
+    async fn create_legacy_whiteout_fixture_file(
+        dir: &Path,
+        name: &str,
+        version: SchemaVersion,
+    ) -> Result<PathBuf> {
+        let db_path = dir.join(format!("{name}.db"));
+        let db = Builder::new_local(db_path.to_str().unwrap())
+            .build()
+            .await?;
+        let conn = db.connect()?;
+        create_legacy_fixture(&conn, version).await?;
+        add_legacy_whiteout_without_parent_path(&conn).await?;
+        drop(conn);
+        drop(db);
+        Ok(db_path)
+    }
+
+    async fn add_legacy_whiteout_without_parent_path(conn: &Connection) -> Result<()> {
+        conn.execute(
+            "CREATE TABLE fs_whiteout (
+                path TEXT PRIMARY KEY,
+                created_at INTEGER NOT NULL
+            )",
+            (),
+        )
+        .await?;
+        conn.execute(
+            "INSERT INTO fs_whiteout (path, created_at) VALUES
+             ('/dir/deleted', 123),
+             ('/top-level', 456)",
+            (),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn assert_legacy_whiteout_parent_path(db_path: &Path, label: &str) -> Result<()> {
+        let db = Builder::new_local(db_path.to_str().unwrap())
+            .build()
+            .await?;
+        let conn = db.connect()?;
+
+        let column_names = get_table_columns(&conn, "fs_whiteout")
+            .await?
+            .into_iter()
+            .map(|column| column.name)
+            .collect::<Vec<_>>();
+        assert!(
+            column_names.iter().any(|column| column == "parent_path"),
+            "{label} did not add fs_whiteout.parent_path; columns={column_names:?}"
+        );
+
+        let mut rows = conn
+            .query(
+                "SELECT path, parent_path, created_at
+                 FROM fs_whiteout
+                 ORDER BY path",
+                (),
+            )
+            .await?;
+        let mut migrated = Vec::new();
+        while let Some(row) = rows.next().await? {
+            migrated.push((
+                row.get::<String>(0)?,
+                row.get::<String>(1)?,
+                row.get::<i64>(2)?,
+            ));
+        }
+        println!("{label}: fs_whiteout columns={column_names:?}; rows={migrated:?}");
+        assert_eq!(
+            migrated,
+            vec![
+                ("/dir/deleted".to_string(), "/dir".to_string(), 123),
+                ("/top-level".to_string(), "/".to_string(), 456),
+            ]
+        );
+        assert_eq!(user_version(&conn).await?, CURRENT.user_version());
         Ok(())
     }
 

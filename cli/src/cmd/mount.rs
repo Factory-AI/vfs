@@ -95,12 +95,7 @@ fn mount_fuse(args: MountArgs) -> Result<()> {
     {
         let rt = crate::get_runtime();
         let db_path = opts.db_path()?;
-        let result: Result<(), SdkError> = rt.block_on(async {
-            let db = turso::Builder::new_local(&db_path).build().await?;
-            let conn = db.connect()?;
-            agentfs_sdk::schema::ensure_current(&conn).await?;
-            Ok(())
-        });
+        let result = rt.block_on(ensure_schema_current_for_mount_precheck(&db_path));
         if let Err(SdkError::SchemaVersionMismatch { found, expected }) = result {
             exit_schema_version_mismatch(&found, &expected, &args.id_or_path);
         }
@@ -222,6 +217,15 @@ fn mount_fuse(args: MountArgs) -> Result<()> {
             std::time::Duration::from_secs(10),
         )
     }
+}
+
+#[cfg(target_os = "linux")]
+async fn ensure_schema_current_for_mount_precheck(
+    db_path: &str,
+) -> std::result::Result<(), SdkError> {
+    let db = turso::Builder::new_local(db_path).build().await?;
+    let conn = db.connect()?;
+    agentfs_sdk::schema::ensure_current(&conn).await
 }
 
 /// Mount the agent filesystem using NFS over localhost.
@@ -659,4 +663,165 @@ fn exit_schema_version_mismatch(found: &str, expected: &str, id_or_path: &str) -
     eprintln!();
     crate::profiling::emit_cli_report();
     std::process::exit(1);
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::path::Path;
+    use tempfile::tempdir;
+    use turso::{Builder, Connection};
+
+    #[tokio::test]
+    async fn mount_precheck_backfills_legacy_whiteout_parent_path() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("legacy-whiteout.db");
+        create_currentish_db_with_legacy_whiteout(&db_path).await;
+
+        ensure_schema_current_for_mount_precheck(db_path.to_str().unwrap())
+            .await
+            .unwrap();
+
+        let db = Builder::new_local(db_path.to_str().unwrap())
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        let columns = table_columns(&conn, "fs_whiteout").await;
+        assert!(
+            columns.iter().any(|column| column == "parent_path"),
+            "mount precheck did not add fs_whiteout.parent_path; columns={columns:?}"
+        );
+        let mut rows = conn
+            .query(
+                "SELECT parent_path, created_at FROM fs_whiteout WHERE path = '/dir/deleted'",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let parent_path = row.get::<String>(0).unwrap();
+        let created_at = row.get::<i64>(1).unwrap();
+        println!(
+            "mount precheck: fs_whiteout columns={columns:?}; /dir/deleted parent_path={parent_path}"
+        );
+        assert_eq!(parent_path, "/dir");
+        assert_eq!(created_at, 123);
+    }
+
+    async fn create_currentish_db_with_legacy_whiteout(db_path: &Path) {
+        let db = Builder::new_local(db_path.to_str().unwrap())
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "CREATE TABLE fs_inode (
+                ino INTEGER PRIMARY KEY AUTOINCREMENT,
+                mode INTEGER NOT NULL,
+                nlink INTEGER NOT NULL DEFAULT 0,
+                uid INTEGER NOT NULL DEFAULT 0,
+                gid INTEGER NOT NULL DEFAULT 0,
+                size INTEGER NOT NULL DEFAULT 0,
+                atime INTEGER NOT NULL,
+                mtime INTEGER NOT NULL,
+                ctime INTEGER NOT NULL,
+                rdev INTEGER NOT NULL DEFAULT 0,
+                atime_nsec INTEGER NOT NULL DEFAULT 0,
+                mtime_nsec INTEGER NOT NULL DEFAULT 0,
+                ctime_nsec INTEGER NOT NULL DEFAULT 0,
+                data_inline BLOB,
+                storage_kind INTEGER NOT NULL DEFAULT 0
+            )",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE fs_dentry (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                parent_ino INTEGER NOT NULL,
+                ino INTEGER NOT NULL,
+                UNIQUE(parent_ino, name)
+            )",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE fs_data (
+                ino INTEGER NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                data BLOB NOT NULL,
+                PRIMARY KEY (ino, chunk_index)
+            )",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE fs_symlink (
+                ino INTEGER PRIMARY KEY,
+                target TEXT NOT NULL
+            )",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE fs_whiteout (
+                path TEXT PRIMARY KEY,
+                created_at INTEGER NOT NULL
+            )",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO fs_whiteout (path, created_at) VALUES ('/dir/deleted', 123)",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE kv_store (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                created_at INTEGER DEFAULT (unixepoch()),
+                updated_at INTEGER DEFAULT (unixepoch())
+            )",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE tool_calls (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                parameters TEXT,
+                result TEXT,
+                error TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                started_at INTEGER NOT NULL,
+                completed_at INTEGER,
+                duration_ms INTEGER
+            )",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn table_columns(conn: &Connection, table_name: &str) -> Vec<String> {
+        let mut rows = conn
+            .query(&format!("PRAGMA table_info({table_name})"), ())
+            .await
+            .unwrap();
+        let mut columns = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            columns.push(row.get::<String>(1).unwrap());
+        }
+        columns
+    }
 }

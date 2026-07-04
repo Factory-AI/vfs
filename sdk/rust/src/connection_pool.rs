@@ -392,10 +392,7 @@ mod tests {
         let conn1 = pool.get_connection().await.unwrap();
         conn1
             .execute(
-                concat!(
-                    "CREATE ",
-                    "TABLE items (id INTEGER PRIMARY KEY, value TEXT)"
-                ),
+                "CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT)",
                 (),
             )
             .await
