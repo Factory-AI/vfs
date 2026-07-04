@@ -15,10 +15,9 @@
 //! The HostFS base layer then accesses files through `/proc/self/fd/N`,
 //! bypassing the FUSE mount entirely.
 
-use super::group_paths_by_parent;
-use agentfs_core::{
-    AgentFS, AgentFSOptions, EncryptionConfig, HostFS, OverlayFS, PartialOriginPolicy,
-};
+use super::{default_allowed_paths, group_paths_by_parent};
+use crate::opts::RunOptions;
+use agentfs_core::{AgentFS, AgentFSOptions, HostFS, OverlayFS};
 use anyhow::{bail, Context, Result};
 use std::{
     cmp::Reverse,
@@ -44,42 +43,29 @@ const FUSE_MOUNT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1
 /// These are skipped when remounting the filesystem hierarchy as read-only.
 const SKIP_MOUNT_PREFIXES: &[&str] = &["/proc", "/sys", "/dev", "/tmp"];
 
-/// Default directories that are allowed to be writable.
-/// These are common application config/cache directories that many programs need.
-const DEFAULT_ALLOWED_DIRS: &[&str] = &[
-    ".amp",         // Amp config
-    ".cache",       // XDG cache directory (corepack, pip, etc.)
-    ".claude",      // Claude Code config
-    ".claude.json", // Claude Code config file
-    ".codex",       // OpenAI Codex config
-    ".gemini",      // Gemini CLI config
-    ".local",       // Local data directory
-    ".npm",         // npm local registry
-];
-
 /// Field index for mount point in /proc/self/mountinfo.
 /// Format: ID PARENT_ID MAJOR:MINOR ROOT MOUNT_POINT OPTIONS ...
 const MOUNTINFO_MOUNT_POINT_FIELD: usize = 4;
 
 /// Run a command in an overlay sandbox.
-#[allow(clippy::too_many_arguments)]
-pub async fn run(
-    allow: Vec<PathBuf>,
-    no_default_allows: bool,
-    session_id: Option<String>,
-    system: bool,
-    encryption: Option<(String, String)>,
-    partial_origin_policy: Option<PartialOriginPolicy>,
-    command: PathBuf,
-    args: Vec<String>,
-) -> Result<()> {
+pub async fn run(options: RunOptions) -> Result<()> {
+    let RunOptions {
+        allow,
+        no_default_allows,
+        session,
+        system,
+        encryption,
+        partial_origin_policy,
+        command,
+        args,
+    } = options;
     let cwd = std::env::current_dir().context("Failed to get current directory")?;
 
     // Build the list of allowed writable paths
     let allowed_paths = build_allowed_paths(&allow, no_default_allows)?;
 
     // Check if we're joining an existing session
-    let session = setup_run_directory(session_id)?;
+    let session = setup_run_directory(session)?;
 
     // If the FUSE mountpoint is already mounted, join the existing session
     if is_mountpoint(&session.fuse_mountpoint) {
@@ -116,11 +102,8 @@ pub async fn run(
         .context("Database path contains non-UTF8 characters")?;
     let mut options = AgentFSOptions::with_path(db_path_str)
         .with_core_config(crate::config::core_config_from_env());
-    if let Some((key, cipher)) = encryption {
-        options = options.with_encryption(EncryptionConfig {
-            hex_key: key,
-            cipher,
-        });
+    if let Some(encryption) = encryption {
+        options = options.with_encryption(encryption);
     }
     let agentfs = AgentFS::open(options)
         .await
@@ -757,13 +740,7 @@ fn build_allowed_paths(user_allowed: &[PathBuf], no_default_allows: bool) -> Res
     // Add default allowed directories unless disabled
     if !no_default_allows {
         if let Some(home) = dirs::home_dir() {
-            for dir in DEFAULT_ALLOWED_DIRS {
-                let path = home.join(dir);
-                // Only add if the path exists
-                if path.exists() {
-                    allowed.push(path);
-                }
-            }
+            allowed.extend(default_allowed_paths(&home));
         }
     }
 

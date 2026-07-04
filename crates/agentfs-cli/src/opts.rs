@@ -69,6 +69,31 @@ impl From<PartialOriginMode> for agentfs_core::PartialOriginMode {
     }
 }
 
+/// Resolved knobs for `agentfs run`.
+///
+/// One struct threaded through `cmd/run/*` so adding a run knob touches the
+/// clap arm, this struct, and the platform backend that consumes it — not a
+/// parallel parameter list in every platform file.
+#[derive(Debug)]
+pub struct RunOptions {
+    /// Additional host directories granted read/write access in the sandbox.
+    pub allow: Vec<PathBuf>,
+    /// Skip the built-in `DEFAULT_ALLOWED_DIRS` grants.
+    pub no_default_allows: bool,
+    /// Session identifier for sharing a delta layer across runs.
+    pub session: Option<String>,
+    /// Allow other system users to access the mount (FUSE allow_other).
+    pub system: bool,
+    /// Delta-layer encryption, already validated at the CLI edge.
+    pub encryption: Option<agentfs_core::EncryptionConfig>,
+    /// Partial-origin copy-up policy resolved from CLI flags.
+    pub partial_origin_policy: Option<agentfs_core::PartialOriginPolicy>,
+    /// Command to execute inside the sandbox.
+    pub command: PathBuf,
+    /// Arguments for the command.
+    pub args: Vec<String>,
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "agentfs")]
 #[command(version = env!("AGENTFS_VERSION"))]

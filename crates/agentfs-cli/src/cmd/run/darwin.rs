@@ -7,9 +7,8 @@
 //! Sandboxing is enforced using macOS sandbox-exec with dynamically generated
 //! profiles that restrict file writes to the NFS mountpoint and allowed paths.
 
-use agentfs_core::{
-    AgentFS, AgentFSOptions, EncryptionConfig, FileSystem, HostFS, OverlayFS, PartialOriginPolicy,
-};
+use crate::opts::RunOptions;
+use agentfs_core::{AgentFS, AgentFSOptions, FileSystem, HostFS, OverlayFS};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -118,21 +117,21 @@ fn generate_sandbox_profile(config: &SandboxConfig) -> String {
 }
 
 /// Run the command in a Darwin sandbox.
-#[allow(clippy::too_many_arguments)]
-pub async fn run(
-    allow: Vec<PathBuf>,
-    no_default_allows: bool,
-    session_id: Option<String>,
-    _system: bool,
-    encryption: Option<(String, String)>,
-    partial_origin_policy: Option<PartialOriginPolicy>,
-    command: PathBuf,
-    args: Vec<String>,
-) -> Result<()> {
+pub async fn run(options: RunOptions) -> Result<()> {
+    let RunOptions {
+        allow,
+        no_default_allows,
+        session,
+        system: _,
+        encryption,
+        partial_origin_policy,
+        command,
+        args,
+    } = options;
     let cwd = std::env::current_dir().context("Failed to get current directory")?;
     let home = dirs::home_dir().context("Failed to get home directory")?;
 
-    let session = setup_run_directory(session_id, allow, no_default_allows, &cwd, &home)?;
+    let session = setup_run_directory(session, allow, no_default_allows, &cwd, &home)?;
 
     // Check if we're joining an existing session
     if is_mountpoint(&session.mountpoint) {
@@ -159,11 +158,8 @@ pub async fn run(
     let encrypted = encryption.is_some();
     let mut options = AgentFSOptions::with_path(db_path_str)
         .with_core_config(crate::config::core_config_from_env());
-    if let Some((key, cipher)) = encryption {
-        options = options.with_encryption(EncryptionConfig {
-            hex_key: key,
-            cipher,
-        });
+    if let Some(encryption) = encryption {
+        options = options.with_encryption(encryption);
     }
     let agentfs = AgentFS::open(options)
         .await
@@ -270,20 +266,6 @@ struct RunSession {
     cwd: PathBuf,
 }
 
-/// Default directories in HOME that are allowed to be writable.
-/// These are common application config/cache directories that many programs need.
-const DEFAULT_ALLOWED_DIRS: &[&str] = &[
-    ".amp",         // Amp config
-    ".claude",      // Claude Code config
-    ".claude.json", // Claude Code config file
-    ".gemini",      // Gemini CLI config
-    ".local",       // Local data directory
-    ".npm",         // npm local registry
-    ".config",      // XDG config directory
-    ".cache",       // XDG cache directory
-    ".bun",         // Used by opencode to install packages at runtime
-];
-
 /// Create a run directory with database and mountpoint paths.
 ///
 /// If `session_id` is provided, uses that as the run ID (allowing multiple
@@ -306,12 +288,7 @@ fn setup_run_directory(
     // Build allowed paths list
     let mut allow_paths = user_allow_paths;
     if !no_default_allows {
-        for dir in DEFAULT_ALLOWED_DIRS {
-            let path = home.join(dir);
-            if path.exists() {
-                allow_paths.push(path);
-            }
-        }
+        allow_paths.extend(super::default_allowed_paths(home));
     }
 
     // Create zsh config directory with custom prompt

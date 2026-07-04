@@ -142,21 +142,23 @@ fn main() {
             command,
             args,
         } => {
-            let encryption = parse_encryption(key, cipher);
-            let partial_origin_policy =
-                partial_origin_policy(partial_origin, partial_origin_threshold_bytes);
-            let command = command.unwrap_or_else(default_shell);
-            let rt = get_runtime();
-            if let Err(e) = rt.block_on(cmd::handle_run_command(
+            let encryption = parse_encryption(key, cipher)
+                .map(|(hex_key, cipher)| agentfs_core::EncryptionConfig { hex_key, cipher });
+            let options = agentfs_cli::opts::RunOptions {
                 allow,
                 no_default_allows,
                 session,
                 system,
                 encryption,
-                partial_origin_policy,
-                command,
+                partial_origin_policy: partial_origin_policy(
+                    partial_origin,
+                    partial_origin_threshold_bytes,
+                ),
+                command: command.unwrap_or_else(default_shell),
                 args,
-            )) {
+            };
+            let rt = get_runtime();
+            if let Err(e) = rt.block_on(cmd::handle_run_command(options)) {
                 exit_with_error(format_args!("{e:?}"));
             }
         }
