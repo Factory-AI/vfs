@@ -741,6 +741,18 @@ impl FileSystem for OverlayFS {
         newparent_ino: i64,
         newname: &str,
     ) -> Result<()> {
+        self.rename_with_replaced_ino(oldparent_ino, oldname, newparent_ino, newname)
+            .await
+            .map(|_| ())
+    }
+
+    async fn rename_with_replaced_ino(
+        &self,
+        oldparent_ino: i64,
+        oldname: &str,
+        newparent_ino: i64,
+        newname: &str,
+    ) -> Result<Option<i64>> {
         trace!(
             "OverlayFS::rename: oldparent={}, oldname={}, newparent={}, newname={}",
             oldparent_ino,
@@ -776,6 +788,11 @@ impl FileSystem for OverlayFS {
         if src_stats.is_directory() && self.resolves_to_visible_base_directory(&old_path).await? {
             return Err(FsError::CrossDevice.into());
         }
+
+        let replaced_ino = self
+            .lookup(newparent_ino, newname)
+            .await?
+            .map(|stats| stats.ino);
 
         // Remove any destination whiteout before source copy-up. The whiteout
         // mutation runs in its own IMMEDIATE transaction and can fail under
@@ -820,7 +837,7 @@ impl FileSystem for OverlayFS {
             self.create_whiteout(&old_path).await?;
         }
 
-        Ok(())
+        Ok(replaced_ino)
     }
 
     async fn statfs(&self) -> Result<FilesystemStats> {

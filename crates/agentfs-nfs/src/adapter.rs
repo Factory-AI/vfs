@@ -571,12 +571,7 @@ impl NFSFileSystem for AgentNFS {
         let fs = self.fs.clone();
 
         let replaced_ino = fs
-            .lookup(to_dir_fs_ino, to_name)
-            .await
-            .map_err(error_to_nfsstat)?
-            .map(|stats| stats.ino);
-
-        fs.rename(from_dir_fs_ino, from_name, to_dir_fs_ino, to_name)
+            .rename_with_replaced_ino(from_dir_fs_ino, from_name, to_dir_fs_ino, to_name)
             .await
             .map_err(error_to_nfsstat)?;
         if let Some(ino) = replaced_ino {
@@ -690,8 +685,10 @@ impl NFSFileSystem for AgentNFS {
 mod tests {
     use super::*;
     use crate::server::vfs::NFSFileSystem;
-    use agentfs_core::{AgentFS, AgentFSOptions};
+    use agentfs_core::fs::AgentFS as CoreAgentFS;
+    use agentfs_core::{AgentFS, AgentFSOptions, HostFS, OverlayFS};
     use std::sync::Arc;
+    use tempfile::TempDir;
 
     async fn test_nfs() -> AgentNFS {
         let agent = AgentFS::open(AgentFSOptions::ephemeral())
@@ -699,6 +696,27 @@ mod tests {
             .expect("ephemeral AgentFS opens");
         let fs: Arc<dyn FileSystem> = Arc::new(agent.fs);
         AgentNFS::new(fs)
+    }
+
+    async fn overlay_nfs_with_base_file() -> (AgentNFS, TempDir, TempDir) {
+        let base_dir = tempfile::tempdir().expect("base tempdir is created");
+        std::fs::write(base_dir.path().join("base.txt"), b"base").expect("base file is written");
+        let base: Arc<dyn FileSystem> =
+            Arc::new(HostFS::new(base_dir.path()).expect("host fs opens base dir"));
+
+        let delta_dir = tempfile::tempdir().expect("delta tempdir is created");
+        let db_path = delta_dir.path().join("delta.db");
+        let delta = CoreAgentFS::new(db_path.to_str().expect("delta DB path is UTF-8"))
+            .await
+            .expect("delta AgentFS opens");
+        let overlay = OverlayFS::new(base, delta);
+        overlay
+            .init(base_dir.path().to_str().expect("base path is UTF-8"))
+            .await
+            .expect("overlay schema initializes");
+        let fs: Arc<dyn FileSystem> = Arc::new(overlay);
+
+        (AgentNFS::new(fs), base_dir, delta_dir)
     }
 
     #[tokio::test]
@@ -757,6 +775,44 @@ mod tests {
 
         let readdirplus_fh = nfs.id_to_readdirplus_fh(7);
         assert!(nfs.fh_has_write_authority(&readdirplus_fh, 7));
+    }
+
+    #[tokio::test]
+    async fn overlay_base_read_write_read_returns_post_write_bytes() {
+        let (nfs, _base_dir, _delta_dir) = overlay_nfs_with_base_file().await;
+
+        let ino = nfs
+            .lookup(1, &b"base.txt".to_vec().into())
+            .await
+            .expect("base file lookup succeeds");
+        let (before, before_eof) = nfs
+            .read(ino, 0, 64)
+            .await
+            .expect("initial base read succeeds");
+        assert_eq!(before, b"base");
+        assert!(before_eof);
+
+        let post_write = b"post-write";
+        let (write_attrs, durability) = nfs
+            .write(ino, 0, post_write, AckDurability::Committed)
+            .await
+            .expect("write copy-up succeeds");
+        assert_eq!(durability, AckDurability::Committed);
+        assert_eq!(write_attrs.size, post_write.len() as u64);
+
+        let (after, after_eof) = nfs
+            .read(ino, 0, 64)
+            .await
+            .expect("post-write read succeeds");
+        assert_eq!(
+            after, post_write,
+            "read handle cached before copy-up must not serve stale base bytes"
+        );
+        assert!(after_eof);
+
+        let attrs_after = nfs.getattr(ino).await.expect("post-write getattr succeeds");
+        assert_eq!(attrs_after.size, post_write.len() as u64);
+        assert_eq!(attrs_after.size, after.len() as u64);
     }
 
     #[tokio::test]

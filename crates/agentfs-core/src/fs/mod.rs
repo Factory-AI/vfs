@@ -438,6 +438,29 @@ pub trait FileSystem: Send + Sync {
         newname: &str,
     ) -> Result<()>;
 
+    /// Rename/move a file or directory and return the inode replaced at the
+    /// destination, if any.
+    ///
+    /// Implementations with transactional namespace state should override this
+    /// so the destination inode is resolved in the same operation that performs
+    /// the replacement. The default preserves legacy semantics for simple
+    /// passthrough filesystems.
+    async fn rename_with_replaced_ino(
+        &self,
+        oldparent_ino: i64,
+        oldname: &str,
+        newparent_ino: i64,
+        newname: &str,
+    ) -> Result<Option<i64>> {
+        let replaced_ino = self
+            .lookup(newparent_ino, newname)
+            .await?
+            .map(|stats| stats.ino);
+        self.rename(oldparent_ino, oldname, newparent_ino, newname)
+            .await?;
+        Ok(replaced_ino)
+    }
+
     /// Get filesystem statistics.
     async fn statfs(&self) -> Result<FilesystemStats>;
 

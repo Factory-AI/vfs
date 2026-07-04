@@ -1330,6 +1330,18 @@ impl FileSystem for AgentFS {
         newparent_ino: i64,
         newname: &str,
     ) -> Result<()> {
+        self.rename_with_replaced_ino(oldparent_ino, oldname, newparent_ino, newname)
+            .await
+            .map(|_| ())
+    }
+
+    async fn rename_with_replaced_ino(
+        &self,
+        oldparent_ino: i64,
+        oldname: &str,
+        newparent_ino: i64,
+        newname: &str,
+    ) -> Result<Option<i64>> {
         if newname.len() > MAX_NAME_LEN {
             return Err(FsError::NameTooLong.into());
         }
@@ -1522,7 +1534,7 @@ impl FileSystem for AgentFS {
                 }
                 self.cache_dentry(newparent_ino, newname, src_ino);
 
-                Ok(())
+                Ok(replaced_dst_ino)
             }
             Err(e) => {
                 let _ = txn.rollback().await;

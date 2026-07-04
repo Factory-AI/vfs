@@ -8,8 +8,10 @@
 use crate::error::Result;
 use crate::fs::{agentfs::ReapHook, BoxedFile, FileSystem};
 use async_trait::async_trait;
+use lru::LruCache;
 use parking_lot::Mutex;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use turso::Connection;
 
@@ -59,98 +61,80 @@ impl Handle {
 #[derive(Clone, Debug)]
 struct TokenEntry {
     ino: i64,
+    last_used: u64,
 }
 
 #[derive(Clone)]
 struct OpenEntry {
     handle: Handle,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct OpenKey {
-    ino: i64,
-    authority: Authority,
+    write_capable: bool,
 }
 
 struct HandleTableInner {
-    token_capacity: usize,
-    open_capacity: usize,
-    tokens: HashMap<u64, TokenEntry>,
-    token_lru: VecDeque<u64>,
-    open_handles: HashMap<OpenKey, OpenEntry>,
-    open_lru: VecDeque<OpenKey>,
+    tokens: LruCache<u64, TokenEntry>,
+    tokens_by_ino: HashMap<i64, HashSet<u64>>,
+    token_clock: u64,
+    open_handles: LruCache<i64, OpenEntry>,
 }
 
 impl HandleTableInner {
     fn new(token_capacity: usize, open_capacity: usize) -> Self {
         Self {
-            token_capacity,
-            open_capacity,
-            tokens: HashMap::new(),
-            token_lru: VecDeque::new(),
-            open_handles: HashMap::new(),
-            open_lru: VecDeque::new(),
+            tokens: LruCache::new(
+                NonZeroUsize::new(token_capacity).expect("token capacity must be non-zero"),
+            ),
+            tokens_by_ino: HashMap::new(),
+            token_clock: 0,
+            open_handles: LruCache::new(
+                NonZeroUsize::new(open_capacity).expect("open capacity must be non-zero"),
+            ),
         }
+    }
+
+    fn next_token_stamp(&mut self) -> u64 {
+        let stamp = self.token_clock;
+        self.token_clock = self.token_clock.wrapping_add(1);
+        stamp
+    }
+
+    fn remove_token_from_index(&mut self, ino: i64, token: u64) {
+        if let Some(tokens) = self.tokens_by_ino.get_mut(&ino) {
+            tokens.remove(&token);
+            if tokens.is_empty() {
+                self.tokens_by_ino.remove(&ino);
+            }
+        }
+    }
+
+    fn insert_token(&mut self, ino: i64, token: u64) {
+        let stamp = self.next_token_stamp();
+        if let Some((evicted_token, evicted_entry)) = self.tokens.push(
+            token,
+            TokenEntry {
+                ino,
+                last_used: stamp,
+            },
+        ) {
+            self.remove_token_from_index(evicted_entry.ino, evicted_token);
+        }
+        self.tokens_by_ino.entry(ino).or_default().insert(token);
     }
 
     fn touch_token(&mut self, token: u64) {
-        if let Some(pos) = self
-            .token_lru
-            .iter()
-            .position(|candidate| *candidate == token)
-        {
-            self.token_lru.remove(pos);
-        }
-        self.token_lru.push_back(token);
-    }
-
-    fn touch_open(&mut self, key: OpenKey) {
-        if let Some(pos) = self.open_lru.iter().position(|candidate| *candidate == key) {
-            self.open_lru.remove(pos);
-        }
-        self.open_lru.push_back(key);
-    }
-
-    fn evict_lru_token_if_needed(&mut self) {
-        while self.tokens.len() >= self.token_capacity {
-            let Some(victim) = self.token_lru.pop_front() else {
-                break;
-            };
-            self.tokens.remove(&victim);
-        }
-    }
-
-    fn evict_lru_open_if_needed(&mut self) {
-        while self.open_handles.len() >= self.open_capacity {
-            let Some(victim) = self.open_lru.pop_front() else {
-                break;
-            };
-            self.open_handles.remove(&victim);
+        let stamp = self.next_token_stamp();
+        if let Some(entry) = self.tokens.get_mut(&token) {
+            entry.last_used = stamp;
         }
     }
 
     fn invalidate_ino(&mut self, ino: i64) {
-        let tokens_to_remove: Vec<u64> = self
-            .tokens
-            .iter()
-            .filter_map(|(token, entry)| (entry.ino == ino).then_some(*token))
-            .collect();
-        for token in tokens_to_remove {
-            self.tokens.remove(&token);
+        if let Some(tokens) = self.tokens_by_ino.remove(&ino) {
+            for token in tokens {
+                self.tokens.pop(&token);
+            }
         }
-        self.token_lru
-            .retain(|token| self.tokens.contains_key(token));
 
-        let open_to_remove: Vec<OpenKey> = self
-            .open_handles
-            .keys()
-            .filter_map(|key| (key.ino == ino).then_some(*key))
-            .collect();
-        for key in open_to_remove {
-            self.open_handles.remove(&key);
-        }
-        self.open_lru
-            .retain(|key| self.open_handles.contains_key(key));
+        self.open_handles.pop(&ino);
     }
 }
 
@@ -185,12 +169,10 @@ impl HandleTable {
     /// authority.
     pub fn try_grant_write_authority_with_token(&self, ino: i64, token: u64) -> bool {
         let mut inner = self.inner.lock();
-        if inner.tokens.contains_key(&token) {
+        if inner.tokens.peek(&token).is_some() {
             return false;
         }
-        inner.evict_lru_token_if_needed();
-        inner.tokens.insert(token, TokenEntry { ino });
-        inner.touch_token(token);
+        inner.insert_token(ino, token);
         true
     }
 
@@ -198,7 +180,7 @@ impl HandleTable {
         let mut inner = self.inner.lock();
         let has_authority = inner
             .tokens
-            .get(&token)
+            .peek(&token)
             .map(|entry| entry.ino == ino)
             .unwrap_or(false);
         if has_authority {
@@ -212,37 +194,43 @@ impl HandleTable {
     /// without stripping CREATE-captured write authority.
     pub fn authority_token_for_ino(&self, ino: i64) -> Option<u64> {
         let mut inner = self.inner.lock();
-        let token = inner
-            .token_lru
-            .iter()
-            .rev()
-            .find(|token| {
-                inner
-                    .tokens
-                    .get(token)
-                    .map(|entry| entry.ino == ino)
-                    .unwrap_or(false)
-            })
-            .copied();
+        let token = inner.tokens_by_ino.get(&ino).and_then(|tokens| {
+            tokens
+                .iter()
+                .filter_map(|token| {
+                    inner
+                        .tokens
+                        .peek(token)
+                        .map(|entry| (*token, entry.last_used))
+                })
+                .max_by_key(|(_, last_used)| *last_used)
+                .map(|(token, _)| token)
+        });
         if let Some(token) = token {
             inner.touch_token(token);
         }
         token
     }
 
-    /// Open and cache one handle per (inode, authority) pair.
+    /// Open and cache one handle per inode.
+    ///
+    /// A write request upgrades a read-resolved entry by replacing the cached
+    /// file with an `O_RDWR` open. Overlay copy-up happens during that write
+    /// open, so later reads must reuse the upgraded file rather than a stale
+    /// base-layer read handle.
     pub async fn open_cached(
         &self,
         fs: &Arc<dyn FileSystem>,
         ino: i64,
         authority: Authority,
     ) -> Result<Handle> {
-        let key = OpenKey { ino, authority };
+        let needs_write = matches!(authority, Authority::Write);
         {
             let mut inner = self.inner.lock();
-            if let Some(entry) = inner.open_handles.get(&key).cloned() {
-                inner.touch_open(key);
-                return Ok(entry.handle);
+            if let Some(entry) = inner.open_handles.get(&ino).cloned() {
+                if !needs_write || entry.write_capable {
+                    return Ok(entry.handle);
+                }
             }
         }
 
@@ -254,18 +242,19 @@ impl HandleTable {
         };
 
         let mut inner = self.inner.lock();
-        if let Some(entry) = inner.open_handles.get(&key).cloned() {
-            inner.touch_open(key);
-            return Ok(entry.handle);
+        if let Some(entry) = inner.open_handles.get(&ino).cloned() {
+            if !needs_write || entry.write_capable {
+                return Ok(entry.handle);
+            }
         }
-        inner.evict_lru_open_if_needed();
-        inner.open_handles.insert(
-            key,
+
+        inner.open_handles.push(
+            ino,
             OpenEntry {
                 handle: handle.clone(),
+                write_capable: needs_write,
             },
         );
-        inner.touch_open(key);
         Ok(handle)
     }
 
@@ -349,6 +338,33 @@ mod tests {
         table.invalidate_ino(stats.ino);
         let reopened = table.open_cached(&fs, stats.ino, Authority::Read).await?;
         assert!(!Arc::ptr_eq(first.file(), reopened.file()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn open_cached_upgrades_read_handle_on_first_write_open() -> Result<()> {
+        let agent = AgentFS::open(AgentFSOptions::ephemeral()).await?;
+        let fs: Arc<dyn FileSystem> = Arc::new(agent.fs);
+        let (stats, _file) = fs
+            .create_file(1, "upgrade.txt", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        let table = HandleTable::with_limits(4, 4);
+
+        let read = table.open_cached(&fs, stats.ino, Authority::Read).await?;
+        assert_eq!(read.authority(), Authority::Read);
+
+        let write = table.open_cached(&fs, stats.ino, Authority::Write).await?;
+        assert_eq!(write.authority(), Authority::Write);
+        assert!(
+            !Arc::ptr_eq(read.file(), write.file()),
+            "write open must replace a previously read-only cached file"
+        );
+
+        let reread = table.open_cached(&fs, stats.ino, Authority::Read).await?;
+        assert!(
+            Arc::ptr_eq(write.file(), reread.file()),
+            "reads after a write upgrade must reuse the write-capable file"
+        );
         Ok(())
     }
 
