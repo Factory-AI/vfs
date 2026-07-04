@@ -21,6 +21,7 @@ from typing import Any
 
 OUTPUT_TAIL_CHARS = 8000
 DEFAULT_CLEANUP_TIMEOUT = 10.0
+FINAL_UNMOUNT_SETTLE_TIMEOUT = 0.5
 STALE_BYTES = b"before-base-content\n"
 FRESH_BYTES = b"after-base-content-with-new-size\n"
 MOUNTINFO_ESCAPE_RE = re.compile(r"\\([0-7]{3})")
@@ -227,6 +228,7 @@ def unmount(mountpoint: Path, cleanup_timeout: float = DEFAULT_CLEANUP_TIMEOUT) 
             retry = run_cleanup_command(["fusermount3", "-u", str(mountpoint)], cleanup_timeout, mountpoint)
             report["commands"].append(retry)
 
+    wait_for_unmount(mountpoint, FINAL_UNMOUNT_SETTLE_TIMEOUT)
     report["mounted_after"] = is_mounted(mountpoint)
     return report
 
@@ -504,7 +506,18 @@ def main() -> int:
     runs = []
     interrupted = False
     for label, env, noopen in legs:
-        run = run_leg(label, env, noopen, agentfs_bin, args.timeout, args.cleanup_timeout)
+        leg_started = time.perf_counter()
+        try:
+            run = run_leg(label, env, noopen, agentfs_bin, args.timeout, args.cleanup_timeout)
+        except KeyboardInterrupt as exc:
+            run = {
+                "label": label,
+                "passed": False,
+                "phase": "interrupted",
+                "interrupted": True,
+                "duration_seconds": time.perf_counter() - leg_started,
+                "interrupt": str(exc) or "keyboard interrupt",
+            }
         runs.append(run)
         if run.get("interrupted"):
             interrupted = True
