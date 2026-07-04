@@ -1,0 +1,29 @@
+cli/src/fuser/ll/notify.rs
+  s_b4cd4a534f088f::t_4b28f3ad1db883 1-4
+cli/tests/test-fuse-sigint-panic-census.sh
+  s_b4cd4a534f088f::t_fd2f3aef601afe 320-329,333-336,344-347,359-360
+scripts/validation/bench-compare.py
+  s_b4cd4a534f088f::t_a98100177e4f0e 2-8,221-227
+scripts/validation/git-workload-benchmark.py
+  s_b4cd4a534f088f::t_640f55497d1e25 636-638
+sdk/rust/src/filesystem/agentfs.rs
+  s_b4cd4a534f088f::t_bd38086eb96ad5 44,55-59,5662-5684,6750-6759
+sdk/rust/src/lib.rs
+  s_b4cd4a534f088f::t_d6ad10c96e4144 392-395,492-495
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "fb660406c1e0d982238d8036fea7c54ac4a2b37d",
+  "prompts": {},
+  "sessions": {
+    "s_b4cd4a534f088f": {
+      "agent_id": {
+        "tool": "droid",
+        "id": "f44715c3-35d3-43cf-9718-6b00d7e2a885",
+        "model": "unknown"
+      },
+      "human_author": "factory-ain3sh <ainesh@factory.ai>"
+    }
+  }
+}
