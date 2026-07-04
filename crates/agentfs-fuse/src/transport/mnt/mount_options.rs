@@ -4,7 +4,7 @@ use std::io::ErrorKind;
 /// Mount options accepted by the FUSE filesystem type
 /// See 'man mount.fuse' for details.
 #[derive(Debug, Eq, PartialEq, Hash, Clone)]
-pub enum MountOption {
+pub(crate) enum MountOption {
     /// Set the name of the source in mtab
     FSName(String),
 
@@ -21,7 +21,7 @@ pub enum MountOption {
     DefaultPermissions,
 }
 
-pub fn check_option_conflicts(options: &[MountOption]) -> Result<(), io::Error> {
+pub(crate) fn check_option_conflicts(options: &[MountOption]) -> Result<(), io::Error> {
     if options.contains(&MountOption::AllowOther) && options.contains(&MountOption::AllowRoot) {
         Err(io::Error::new(
             ErrorKind::InvalidInput,
@@ -33,7 +33,7 @@ pub fn check_option_conflicts(options: &[MountOption]) -> Result<(), io::Error> 
 }
 
 // Format option to be passed to libfuse or kernel
-pub fn option_to_string(option: &MountOption) -> String {
+pub(crate) fn option_to_string(option: &MountOption) -> String {
     match option {
         MountOption::FSName(name) => format!("fsname={name}"),
         MountOption::AutoUnmount => "auto_unmount".to_string(),

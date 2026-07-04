@@ -181,14 +181,6 @@ pub enum ReaddirPlusMode {
 }
 
 impl ReaddirPlusMode {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            ReaddirPlusMode::Off => "off",
-            ReaddirPlusMode::Auto => "auto",
-            ReaddirPlusMode::Always => "always",
-        }
-    }
-
     pub(crate) fn profile_value(self) -> u64 {
         match self {
             ReaddirPlusMode::Off => READDIRPLUS_MODE_OFF,
@@ -214,9 +206,9 @@ pub struct FuseKernelCacheConfig {
 
 impl FuseKernelCacheConfig {
     pub(crate) fn record_profile(&self) {
-        crate::profiling::set_fuse_ttl_ms(self.entry_ttl_ms, self.attr_ttl_ms, self.neg_ttl_ms);
-        crate::profiling::set_fuse_keepcache_enabled(self.keepcache_enabled);
-        crate::profiling::set_fuse_readdirplus_mode(self.readdirplus_mode.profile_value());
+        crate::telemetry::set_fuse_ttl_ms(self.entry_ttl_ms, self.attr_ttl_ms, self.neg_ttl_ms);
+        crate::telemetry::set_fuse_keepcache_enabled(self.keepcache_enabled);
+        crate::telemetry::set_fuse_readdirplus_mode(self.readdirplus_mode.profile_value());
     }
 }
 

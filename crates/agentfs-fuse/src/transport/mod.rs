@@ -12,31 +12,28 @@
 )]
 
 use libc::{c_int, ENOSYS, EPERM};
-use log::debug;
 use std::cmp::min;
 use std::ffi::OsStr;
-use std::io;
 use std::path::Path;
 use std::time::SystemTime;
+use tracing::debug;
 
-pub use ll::fuse_abi::consts;
-pub use ll::fuse_abi::fuse_forget_one;
-pub use ll::fuse_abi::FUSE_ROOT_ID;
-pub use ll::TimeOrNow;
-pub use mnt::mount_options::MountOption;
-pub use notify::Notifier;
-pub use reply::ReplyPoll;
-pub use reply::ReplyXattr;
-pub use reply::{Reply, ReplyAttr, ReplyData, ReplyEmpty, ReplyEntry, ReplyOpen};
-pub use reply::{
+pub(crate) use ll::fuse_abi::consts;
+pub(crate) use ll::fuse_abi::fuse_forget_one;
+pub(crate) use ll::TimeOrNow;
+pub(crate) use mnt::mount_options::check_option_conflicts;
+pub(crate) use mnt::mount_options::MountOption;
+pub(crate) use reply::ReplyPoll;
+pub(crate) use reply::ReplyXattr;
+pub(crate) use reply::{ReplyAttr, ReplyData, ReplyEmpty, ReplyEntry, ReplyOpen};
+pub(crate) use reply::{
     ReplyBmap, ReplyCreate, ReplyDirectory, ReplyDirectoryPlus, ReplyIoctl, ReplyLock, ReplyLseek,
     ReplyStatfs, ReplyWrite,
 };
-pub use request::Request;
-pub use session::{Session, SessionACL, SessionUnmounter};
+pub(crate) use request::Request;
+pub(crate) use session::{Session, SessionUnmounter};
 
 use ll::fuse_abi::consts::*;
-use mnt::mount_options::check_option_conflicts;
 use session::MAX_WRITE_SIZE;
 
 mod channel;
@@ -61,7 +58,7 @@ const fn default_init_flags(#[allow(unused_variables)] capabilities: u64) -> u64
 
 /// File types
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum FileType {
+pub(crate) enum FileType {
     /// Named pipe (`S_IFIFO`)
     NamedPipe,
     /// Character device (`S_IFCHR`)
@@ -80,42 +77,42 @@ pub enum FileType {
 
 /// File attributes
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct FileAttr {
+pub(crate) struct FileAttr {
     /// Inode number
-    pub ino: u64,
+    pub(crate) ino: u64,
     /// Size in bytes
-    pub size: u64,
+    pub(crate) size: u64,
     /// Size in blocks
-    pub blocks: u64,
+    pub(crate) blocks: u64,
     /// Time of last access
-    pub atime: SystemTime,
+    pub(crate) atime: SystemTime,
     /// Time of last modification
-    pub mtime: SystemTime,
+    pub(crate) mtime: SystemTime,
     /// Time of last change
-    pub ctime: SystemTime,
+    pub(crate) ctime: SystemTime,
     /// Time of creation retained for compatibility with the higher-level attribute type
-    pub crtime: SystemTime,
+    pub(crate) crtime: SystemTime,
     /// Kind of file (directory, file, pipe, etc)
-    pub kind: FileType,
+    pub(crate) kind: FileType,
     /// Permissions
-    pub perm: u16,
+    pub(crate) perm: u16,
     /// Number of hard links
-    pub nlink: u32,
+    pub(crate) nlink: u32,
     /// User id
-    pub uid: u32,
+    pub(crate) uid: u32,
     /// Group id
-    pub gid: u32,
+    pub(crate) gid: u32,
     /// Rdev
-    pub rdev: u32,
+    pub(crate) rdev: u32,
     /// Block size
-    pub blksize: u32,
+    pub(crate) blksize: u32,
     /// Platform attribute flags retained for compatibility with the higher-level attribute type
-    pub flags: u32,
+    pub(crate) flags: u32,
 }
 
 /// Configuration of the fuse kernel module connection
 #[derive(Debug)]
-pub struct KernelConfig {
+pub(crate) struct KernelConfig {
     capabilities: u64,
     requested: u64,
     max_readahead: u32,
@@ -141,7 +138,7 @@ impl KernelConfig {
     }
 
     /// Set the maximum write size for a single request
-    pub fn set_max_write(&mut self, value: u32) -> Result<u32, u32> {
+    pub(crate) fn set_max_write(&mut self, value: u32) -> Result<u32, u32> {
         if value == 0 {
             return Err(1);
         }
@@ -154,7 +151,7 @@ impl KernelConfig {
     }
 
     /// Set the maximum readahead size
-    pub fn set_max_readahead(&mut self, value: u32) -> Result<u32, u32> {
+    pub(crate) fn set_max_readahead(&mut self, value: u32) -> Result<u32, u32> {
         if value == 0 {
             return Err(1);
         }
@@ -167,7 +164,7 @@ impl KernelConfig {
     }
 
     /// Add a set of capabilities
-    pub fn add_capabilities(&mut self, capabilities_to_add: u64) -> Result<(), u64> {
+    pub(crate) fn add_capabilities(&mut self, capabilities_to_add: u64) -> Result<(), u64> {
         if capabilities_to_add & self.capabilities != capabilities_to_add {
             return Err(capabilities_to_add - (capabilities_to_add & self.capabilities));
         }
@@ -196,7 +193,7 @@ impl KernelConfig {
 /// Implementations MUST handle their own interior-mutability (e.g. `Mutex`, `RwLock`,
 /// atomics) for any mutable state they keep.
 #[allow(clippy::too_many_arguments)]
-pub trait Filesystem: Send + Sync + 'static {
+pub(crate) trait Filesystem: Send + Sync + 'static {
     /// Initialize filesystem.
     fn init(&self, _req: &Request, _config: &mut KernelConfig) -> Result<(), c_int> {
         Ok(())
@@ -655,23 +652,4 @@ pub trait Filesystem: Send + Sync + 'static {
         );
         reply.error(ENOSYS);
     }
-}
-
-/// Mount the given filesystem to the given mountpoint. This function will
-/// not return until the filesystem is unmounted.
-pub fn mount2<FS: Filesystem, P: AsRef<Path>>(
-    filesystem: FS,
-    mountpoint: P,
-    options: &[MountOption],
-    config: crate::fuse_config::FuseConfig,
-) -> io::Result<()> {
-    check_option_conflicts(options)?;
-    Session::new(
-        filesystem,
-        mountpoint.as_ref(),
-        options,
-        config.dispatch_mode,
-        config.uring,
-    )
-    .and_then(|mut se| se.run())
 }

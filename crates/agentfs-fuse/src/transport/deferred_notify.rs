@@ -1,12 +1,12 @@
-use log::debug;
 use std::{
     ffi::{OsStr, OsString},
     sync::mpsc,
 };
+use tracing::debug;
 
 /// A queued invalidation operation to be flushed by the notify thread.
 #[derive(Debug)]
-pub enum NotifyOp {
+pub(crate) enum NotifyOp {
     InvalEntry { parent: u64, name: OsString },
     InvalInode { ino: u64, offset: i64, len: i64 },
 }
@@ -24,7 +24,7 @@ pub enum NotifyOp {
 /// to a dedicated background thread that writes to /dev/fuse independently
 /// of the session loop.
 #[derive(Debug, Clone)]
-pub struct DeferredNotifier {
+pub(crate) struct DeferredNotifier {
     tx: mpsc::Sender<NotifyOp>,
 }
 
@@ -33,7 +33,7 @@ impl DeferredNotifier {
         Self { tx }
     }
 
-    pub fn inval_entry(&self, parent: u64, name: &OsStr) {
+    pub(crate) fn inval_entry(&self, parent: u64, name: &OsStr) {
         if let Err(e) = self.tx.send(NotifyOp::InvalEntry {
             parent,
             name: name.to_os_string(),
@@ -42,7 +42,7 @@ impl DeferredNotifier {
         }
     }
 
-    pub fn inval_inode(&self, ino: u64, offset: i64, len: i64) {
+    pub(crate) fn inval_inode(&self, ino: u64, offset: i64, len: i64) {
         if let Err(e) = self.tx.send(NotifyOp::InvalInode { ino, offset, len }) {
             debug!("deferred inval_inode send failed (notify thread gone?): {e}");
         }

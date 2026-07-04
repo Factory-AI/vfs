@@ -21,7 +21,7 @@
 //! reply synchronously, so each ring's submission queue is effectively
 //! single-threaded (guarded by a mutex that is never contended in practice).
 //!
-//! Runtime enable/depth/spin settings are parsed by `crate::fuse_config` and
+//! Runtime enable/depth/spin settings are parsed by `crate::adapter::config` and
 //! passed into the session. This transport reads no environment variables.
 
 #![cfg(target_os = "linux")]
@@ -34,9 +34,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use log::{debug, error, warn};
+use tracing::{debug, error, warn};
 
-use crate::fuse_config::UringConfig;
+use crate::adapter::config::UringConfig;
 
 use super::channel::ChannelSender;
 use super::deferred_notify::DeferredNotifier;
@@ -508,7 +508,7 @@ struct QueueThreadConfig {
 /// thread (handlers are synchronous), so the submission mutex is uncontended;
 /// the next loop iteration submits it.
 #[derive(Debug, Clone)]
-pub struct UringSender {
+pub(crate) struct UringSender {
     queue: Arc<QueueShared>,
     slot: usize,
     commit_id: u64,
@@ -855,7 +855,7 @@ fn handle_request<FS: Filesystem>(
         (buf, commit_id, unique)
     };
 
-    crate::profiling::record_fuse_uring_request();
+    crate::telemetry::record_fuse_uring_request();
 
     let sender = ChannelSender::Uring(UringSender {
         queue: queue.clone(),
@@ -868,7 +868,7 @@ fn handle_request<FS: Filesystem>(
             // Mirror the legacy worker pool's concurrency accounting so the
             // serialization gates observe uring-side parallelism too.
             let concurrent = active_dispatches.fetch_add(1, Ordering::AcqRel) + 1;
-            crate::profiling::record_fuse_dispatch_concurrency(concurrent);
+            crate::telemetry::record_fuse_dispatch_concurrency(concurrent);
             request.dispatch(shared);
             active_dispatches.fetch_sub(1, Ordering::AcqRel);
             // Every op the kernel routes through uring expects a reply

@@ -53,13 +53,7 @@ libc = { workspace = true }
 
 # Linux-only dependencies for FUSE functionality
 [target.'cfg(target_os = "linux")'.dependencies]
-# Vendored fuser dependencies (pure-Rust FUSE implementation)
-log = { workspace = true }
-memchr = { workspace = true }
-page_size = { workspace = true }
-smallvec = { workspace = true }
-zerocopy = { workspace = true }
-nix = { workspace = true }
+agentfs-fuse = { workspace = true }
 
 # macOS dependencies for NFS functionality (no FUSE - uses nfsserve instead)
 [target.'cfg(target_os = "macos")'.dependencies]

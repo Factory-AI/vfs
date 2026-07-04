@@ -14,16 +14,78 @@ use agentfs_core::telemetry::DEFAULT_PROFILE_ENABLED;
 
 use crate::config::DEFAULT_CLONE_TIMINGS_ENABLED;
 
+// Transitional M5 state: the runtime FUSE config has moved to the sealed
+// agentfs-fuse crate, while the pre-cli-split knob ledger still lives here.
+// Keep these defaults byte-for-byte aligned with agentfs_fuse::adapter::config
+// until m5-cli-thinning moves the ledger to its final crate.
 #[cfg(target_os = "linux")]
-use crate::fuse_config::{
-    ReaddirPlusMode, UringConfig, DEFAULT_AUTO_PERCENT, DEFAULT_DRAIN_ON_FORGET,
-    DEFAULT_DRAIN_ON_RELEASE, DEFAULT_FUSE_CACHE_DIR, DEFAULT_FUSE_FLUSH_INVAL,
-    DEFAULT_FUSE_KEEPCACHE, DEFAULT_FUSE_NEG_TTL_MS, DEFAULT_FUSE_NOFLUSH, DEFAULT_FUSE_NOOPEN,
-    DEFAULT_FUSE_POSITIVE_TTL_MS, DEFAULT_FUSE_QUEUE, DEFAULT_FUSE_SELF_INVAL,
-    DEFAULT_FUSE_STICKY_KEEPCACHE_DROP, DEFAULT_FUSE_SYNC_INVAL, DEFAULT_FUSE_WORKERS,
-    DEFAULT_FUSE_WRITEBACK, DEFAULT_INO_FILES_CAP, DEFAULT_QUEUE_MEMORY_PERCENT,
-    DEFAULT_URING_DEPTH,
-};
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct DefaultToken(&'static str);
+
+#[cfg(target_os = "linux")]
+impl DefaultToken {
+    const fn as_str(self) -> &'static str {
+        self.0
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct UringConfig {
+    enabled: bool,
+    spin_us: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl Default for UringConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            spin_us: 0,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+const DEFAULT_AUTO_PERCENT: u8 = 50;
+#[cfg(target_os = "linux")]
+const DEFAULT_DRAIN_ON_FORGET: bool = false;
+#[cfg(target_os = "linux")]
+const DEFAULT_DRAIN_ON_RELEASE: bool = false;
+#[cfg(target_os = "linux")]
+const DEFAULT_FUSE_CACHE_DIR: bool = true;
+#[cfg(target_os = "linux")]
+const DEFAULT_FUSE_FLUSH_INVAL: bool = false;
+#[cfg(target_os = "linux")]
+const DEFAULT_FUSE_KEEPCACHE: bool = true;
+#[cfg(target_os = "linux")]
+const DEFAULT_FUSE_NEG_TTL_MS: u64 = 1000;
+#[cfg(target_os = "linux")]
+const DEFAULT_FUSE_NOFLUSH: bool = true;
+#[cfg(target_os = "linux")]
+const DEFAULT_FUSE_NOOPEN: bool = true;
+#[cfg(target_os = "linux")]
+const DEFAULT_FUSE_POSITIVE_TTL_MS: u64 = 10_000;
+#[cfg(target_os = "linux")]
+const DEFAULT_FUSE_QUEUE: DefaultToken = DefaultToken("derived");
+#[cfg(target_os = "linux")]
+const DEFAULT_FUSE_READDIRPLUS: DefaultToken = DefaultToken("always");
+#[cfg(target_os = "linux")]
+const DEFAULT_FUSE_SELF_INVAL: bool = false;
+#[cfg(target_os = "linux")]
+const DEFAULT_FUSE_STICKY_KEEPCACHE_DROP: bool = false;
+#[cfg(target_os = "linux")]
+const DEFAULT_FUSE_SYNC_INVAL: bool = false;
+#[cfg(target_os = "linux")]
+const DEFAULT_FUSE_WORKERS: DefaultToken = DefaultToken("auto");
+#[cfg(target_os = "linux")]
+const DEFAULT_FUSE_WRITEBACK: bool = true;
+#[cfg(target_os = "linux")]
+const DEFAULT_INO_FILES_CAP: usize = 65_536;
+#[cfg(target_os = "linux")]
+const DEFAULT_QUEUE_MEMORY_PERCENT: u8 = 25;
+#[cfg(target_os = "linux")]
+const DEFAULT_URING_DEPTH: usize = 4;
 
 /// Knob class required by the architecture.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -140,7 +202,7 @@ impl DefaultValue {
             #[cfg(target_os = "linux")]
             Self::FuseKeepcache => render_bool(DEFAULT_FUSE_KEEPCACHE).to_string(),
             #[cfg(target_os = "linux")]
-            Self::FuseReaddirPlus => ReaddirPlusMode::default().as_str().to_string(),
+            Self::FuseReaddirPlus => DEFAULT_FUSE_READDIRPLUS.as_str().to_string(),
             #[cfg(target_os = "linux")]
             Self::FuseSyncInval => render_bool(DEFAULT_FUSE_SYNC_INVAL).to_string(),
             #[cfg(target_os = "linux")]

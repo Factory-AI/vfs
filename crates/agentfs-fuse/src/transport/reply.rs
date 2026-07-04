@@ -16,17 +16,17 @@ use super::ll::{
     INodeNo,
 };
 use libc::c_int;
-use log::{error, warn};
 use std::convert::AsRef;
 use std::ffi::OsStr;
 use std::fmt;
 use std::io::IoSlice;
 use std::time::Duration;
+use tracing::{error, warn};
 
 use super::{FileAttr, FileType};
 
 /// Generic reply callback to send data
-pub trait ReplySender: Send + Sync + Unpin + 'static {
+pub(crate) trait ReplySender: Send + Sync + Unpin + 'static {
     /// Send data.
     fn send(&self, data: &[IoSlice<'_>]) -> std::io::Result<()>;
 }
@@ -38,7 +38,7 @@ impl fmt::Debug for Box<dyn ReplySender> {
 }
 
 /// Generic reply trait
-pub trait Reply {
+pub(crate) trait Reply {
     /// Create a new reply for the given request
     fn new<S: ReplySender>(unique: u64, sender: S) -> Self;
 }
@@ -80,7 +80,7 @@ impl ReplyRaw {
     }
 
     /// Reply to a request with the given error code
-    pub fn error(self, err: c_int) {
+    pub(crate) fn error(self, err: c_int) {
         assert_ne!(err, 0);
         self.send_ll(&ll::Response::new_error(ll::Errno::from_i32(err)));
     }
@@ -102,7 +102,7 @@ impl Drop for ReplyRaw {
 /// Empty reply
 ///
 #[derive(Debug)]
-pub struct ReplyEmpty {
+pub(crate) struct ReplyEmpty {
     reply: ReplyRaw,
 }
 
@@ -116,12 +116,16 @@ impl Reply for ReplyEmpty {
 
 impl ReplyEmpty {
     /// Reply to a request with nothing
-    pub fn ok(self) {
+    pub(crate) fn ok(self) {
         self.reply.send_ll(&ll::Response::new_empty());
     }
 
     /// Reply to a request with the given error code
-    pub fn error(self, err: c_int) {
+    #[allow(
+        dead_code,
+        reason = "AgentFS statfs path currently replies only success"
+    )]
+    pub(crate) fn error(self, err: c_int) {
         self.reply.error(err);
     }
 }
@@ -130,7 +134,7 @@ impl ReplyEmpty {
 /// Data reply
 ///
 #[derive(Debug)]
-pub struct ReplyData {
+pub(crate) struct ReplyData {
     reply: ReplyRaw,
 }
 
@@ -144,12 +148,16 @@ impl Reply for ReplyData {
 
 impl ReplyData {
     /// Reply to a request with the given data
-    pub fn data(self, data: &[u8]) {
+    pub(crate) fn data(self, data: &[u8]) {
         self.reply.send_ll(&ll::Response::new_slice(data));
     }
 
     /// Reply to a request with the given error code
-    pub fn error(self, err: c_int) {
+    #[allow(
+        dead_code,
+        reason = "AgentFS statfs path currently replies only success"
+    )]
+    pub(crate) fn error(self, err: c_int) {
         self.reply.error(err);
     }
 }
@@ -158,7 +166,7 @@ impl ReplyData {
 /// Entry reply
 ///
 #[derive(Debug)]
-pub struct ReplyEntry {
+pub(crate) struct ReplyEntry {
     reply: ReplyRaw,
 }
 
@@ -172,12 +180,13 @@ impl Reply for ReplyEntry {
 
 impl ReplyEntry {
     /// Reply to a request with the given entry
-    pub fn entry(self, ttl: &Duration, attr: &FileAttr, generation: u64) {
+    #[allow(dead_code, reason = "adapter uses separate TTL entry replies")]
+    pub(crate) fn entry(self, ttl: &Duration, attr: &FileAttr, generation: u64) {
         self.entry_with_ttls(ttl, ttl, attr, generation);
     }
 
     /// Reply to a request with the given entry and separate entry/attribute TTLs.
-    pub fn entry_with_ttls(
+    pub(crate) fn entry_with_ttls(
         self,
         entry_ttl: &Duration,
         attr_ttl: &Duration,
@@ -194,12 +203,16 @@ impl ReplyEntry {
     }
 
     /// Reply to a lookup with a cacheable negative entry.
-    pub fn negative(self, ttl: &Duration) {
+    pub(crate) fn negative(self, ttl: &Duration) {
         self.reply.send_ll(&ll::Response::new_negative_entry(*ttl));
     }
 
     /// Reply to a request with the given error code
-    pub fn error(self, err: c_int) {
+    #[allow(
+        dead_code,
+        reason = "AgentFS statfs path currently replies only success"
+    )]
+    pub(crate) fn error(self, err: c_int) {
         self.reply.error(err);
     }
 }
@@ -208,7 +221,7 @@ impl ReplyEntry {
 /// Attribute Reply
 ///
 #[derive(Debug)]
-pub struct ReplyAttr {
+pub(crate) struct ReplyAttr {
     reply: ReplyRaw,
 }
 
@@ -222,13 +235,13 @@ impl Reply for ReplyAttr {
 
 impl ReplyAttr {
     /// Reply to a request with the given attribute
-    pub fn attr(self, ttl: &Duration, attr: &FileAttr) {
+    pub(crate) fn attr(self, ttl: &Duration, attr: &FileAttr) {
         self.reply
             .send_ll(&ll::Response::new_attr(ttl, &attr.into()));
     }
 
     /// Reply to a request with the given error code
-    pub fn error(self, err: c_int) {
+    pub(crate) fn error(self, err: c_int) {
         self.reply.error(err);
     }
 }
@@ -237,7 +250,7 @@ impl ReplyAttr {
 /// Open Reply
 ///
 #[derive(Debug)]
-pub struct ReplyOpen {
+pub(crate) struct ReplyOpen {
     reply: ReplyRaw,
 }
 
@@ -251,13 +264,13 @@ impl Reply for ReplyOpen {
 
 impl ReplyOpen {
     /// Reply to a request with the given open result
-    pub fn opened(self, fh: u64, flags: u32) {
+    pub(crate) fn opened(self, fh: u64, flags: u32) {
         self.reply
             .send_ll(&ll::Response::new_open(ll::FileHandle(fh), flags));
     }
 
     /// Reply to a request with the given error code
-    pub fn error(self, err: c_int) {
+    pub(crate) fn error(self, err: c_int) {
         self.reply.error(err);
     }
 }
@@ -266,7 +279,7 @@ impl ReplyOpen {
 /// Write Reply
 ///
 #[derive(Debug)]
-pub struct ReplyWrite {
+pub(crate) struct ReplyWrite {
     reply: ReplyRaw,
 }
 
@@ -280,12 +293,12 @@ impl Reply for ReplyWrite {
 
 impl ReplyWrite {
     /// Reply to a request with the number of bytes written
-    pub fn written(self, size: u32) {
+    pub(crate) fn written(self, size: u32) {
         self.reply.send_ll(&ll::Response::new_write(size));
     }
 
     /// Reply to a request with the given error code
-    pub fn error(self, err: c_int) {
+    pub(crate) fn error(self, err: c_int) {
         self.reply.error(err);
     }
 }
@@ -294,7 +307,7 @@ impl ReplyWrite {
 /// Statfs Reply
 ///
 #[derive(Debug)]
-pub struct ReplyStatfs {
+pub(crate) struct ReplyStatfs {
     reply: ReplyRaw,
 }
 
@@ -309,7 +322,7 @@ impl Reply for ReplyStatfs {
 impl ReplyStatfs {
     /// Reply to a statfs request with filesystem information
     #[allow(clippy::too_many_arguments)]
-    pub fn statfs(
+    pub(crate) fn statfs(
         self,
         blocks: u64,
         bfree: u64,
@@ -326,7 +339,11 @@ impl ReplyStatfs {
     }
 
     /// Reply to a request with the given error code
-    pub fn error(self, err: c_int) {
+    #[allow(
+        dead_code,
+        reason = "AgentFS statfs path currently replies only success"
+    )]
+    pub(crate) fn error(self, err: c_int) {
         self.reply.error(err);
     }
 }
@@ -335,7 +352,7 @@ impl ReplyStatfs {
 /// Create reply
 ///
 #[derive(Debug)]
-pub struct ReplyCreate {
+pub(crate) struct ReplyCreate {
     reply: ReplyRaw,
 }
 
@@ -351,14 +368,22 @@ impl ReplyCreate {
     /// Reply to a request with a newly created file entry and its newly open file handle
     /// # Panics
     /// When attempting to use kernel passthrough. Use `opened_passthrough()` instead.
-    pub fn created(self, ttl: &Duration, attr: &FileAttr, generation: u64, fh: u64, flags: u32) {
+    #[allow(dead_code, reason = "adapter uses separate TTL create replies")]
+    pub(crate) fn created(
+        self,
+        ttl: &Duration,
+        attr: &FileAttr,
+        generation: u64,
+        fh: u64,
+        flags: u32,
+    ) {
         self.created_with_ttls(ttl, ttl, attr, generation, fh, flags);
     }
 
     /// Reply to a request with a newly created file entry and separate entry/attribute TTLs.
     /// # Panics
     /// When attempting to use kernel passthrough. Use `opened_passthrough()` instead.
-    pub fn created_with_ttls(
+    pub(crate) fn created_with_ttls(
         self,
         entry_ttl: &Duration,
         attr_ttl: &Duration,
@@ -378,7 +403,7 @@ impl ReplyCreate {
     }
 
     /// Reply to a request with the given error code
-    pub fn error(self, err: c_int) {
+    pub(crate) fn error(self, err: c_int) {
         self.reply.error(err);
     }
 }
@@ -387,7 +412,7 @@ impl ReplyCreate {
 /// Lock Reply
 ///
 #[derive(Debug)]
-pub struct ReplyLock {
+pub(crate) struct ReplyLock {
     reply: ReplyRaw,
 }
 
@@ -401,7 +426,11 @@ impl Reply for ReplyLock {
 
 impl ReplyLock {
     /// Reply to a request with a file lock
-    pub fn locked(self, start: u64, end: u64, typ: i32, pid: u32) {
+    #[allow(
+        dead_code,
+        reason = "success reply retained for unsupported lock operation"
+    )]
+    pub(crate) fn locked(self, start: u64, end: u64, typ: i32, pid: u32) {
         self.reply.send_ll(&ll::Response::new_lock(&ll::Lock {
             range: (start, end),
             typ,
@@ -410,7 +439,7 @@ impl ReplyLock {
     }
 
     /// Reply to a request with the given error code
-    pub fn error(self, err: c_int) {
+    pub(crate) fn error(self, err: c_int) {
         self.reply.error(err);
     }
 }
@@ -419,7 +448,7 @@ impl ReplyLock {
 /// Bmap Reply
 ///
 #[derive(Debug)]
-pub struct ReplyBmap {
+pub(crate) struct ReplyBmap {
     reply: ReplyRaw,
 }
 
@@ -433,12 +462,16 @@ impl Reply for ReplyBmap {
 
 impl ReplyBmap {
     /// Reply to a request with a bmap
-    pub fn bmap(self, block: u64) {
+    #[allow(
+        dead_code,
+        reason = "success reply retained for unsupported bmap operation"
+    )]
+    pub(crate) fn bmap(self, block: u64) {
         self.reply.send_ll(&ll::Response::new_bmap(block));
     }
 
     /// Reply to a request with the given error code
-    pub fn error(self, err: c_int) {
+    pub(crate) fn error(self, err: c_int) {
         self.reply.error(err);
     }
 }
@@ -447,7 +480,7 @@ impl ReplyBmap {
 /// Ioctl Reply
 ///
 #[derive(Debug)]
-pub struct ReplyIoctl {
+pub(crate) struct ReplyIoctl {
     reply: ReplyRaw,
 }
 
@@ -461,13 +494,17 @@ impl Reply for ReplyIoctl {
 
 impl ReplyIoctl {
     /// Reply to a request with an ioctl
-    pub fn ioctl(self, result: i32, data: &[u8]) {
+    #[allow(
+        dead_code,
+        reason = "success reply retained for unsupported ioctl operation"
+    )]
+    pub(crate) fn ioctl(self, result: i32, data: &[u8]) {
         self.reply
             .send_ll(&ll::Response::new_ioctl(result, &[IoSlice::new(data)]));
     }
 
     /// Reply to a request with the given error code
-    pub fn error(self, err: c_int) {
+    pub(crate) fn error(self, err: c_int) {
         self.reply.error(err);
     }
 }
@@ -476,7 +513,7 @@ impl ReplyIoctl {
 /// Poll Reply
 ///
 #[derive(Debug)]
-pub struct ReplyPoll {
+pub(crate) struct ReplyPoll {
     reply: ReplyRaw,
 }
 
@@ -490,12 +527,16 @@ impl Reply for ReplyPoll {
 
 impl ReplyPoll {
     /// Reply to a request with ready poll events
-    pub fn poll(self, revents: u32) {
+    #[allow(
+        dead_code,
+        reason = "success reply retained for unsupported poll operation"
+    )]
+    pub(crate) fn poll(self, revents: u32) {
         self.reply.send_ll(&ll::Response::new_poll(revents));
     }
 
     /// Reply to a request with the given error code
-    pub fn error(self, err: c_int) {
+    pub(crate) fn error(self, err: c_int) {
         self.reply.error(err);
     }
 }
@@ -504,14 +545,14 @@ impl ReplyPoll {
 /// Directory reply
 ///
 #[derive(Debug)]
-pub struct ReplyDirectory {
+pub(crate) struct ReplyDirectory {
     reply: ReplyRaw,
     data: DirEntList,
 }
 
 impl ReplyDirectory {
     /// Creates a new `ReplyDirectory` with a specified buffer size.
-    pub fn new<S: ReplySender>(unique: u64, sender: S, size: usize) -> ReplyDirectory {
+    pub(crate) fn new<S: ReplySender>(unique: u64, sender: S, size: usize) -> ReplyDirectory {
         ReplyDirectory {
             reply: Reply::new(unique, sender),
             data: DirEntList::new(size),
@@ -522,7 +563,17 @@ impl ReplyDirectory {
     /// A transparent offset value can be provided for each entry. The kernel uses these
     /// value to request the next entries in further readdir calls
     #[must_use]
-    pub fn add<T: AsRef<OsStr>>(&mut self, ino: u64, offset: i64, kind: FileType, name: T) -> bool {
+    #[allow(
+        dead_code,
+        reason = "READDIRPLUS path is the active directory reply path"
+    )]
+    pub(crate) fn add<T: AsRef<OsStr>>(
+        &mut self,
+        ino: u64,
+        offset: i64,
+        kind: FileType,
+        name: T,
+    ) -> bool {
         let name = name.as_ref();
         self.data.push(&DirEntry::new(
             INodeNo(ino),
@@ -533,12 +584,12 @@ impl ReplyDirectory {
     }
 
     /// Reply to a request with the filled directory buffer
-    pub fn ok(self) {
+    pub(crate) fn ok(self) {
         self.reply.send_ll(&self.data.into());
     }
 
     /// Reply to a request with the given error code
-    pub fn error(self, err: c_int) {
+    pub(crate) fn error(self, err: c_int) {
         self.reply.error(err);
     }
 }
@@ -547,14 +598,14 @@ impl ReplyDirectory {
 /// `DirectoryPlus` reply
 ///
 #[derive(Debug)]
-pub struct ReplyDirectoryPlus {
+pub(crate) struct ReplyDirectoryPlus {
     reply: ReplyRaw,
     buf: DirEntPlusList,
 }
 
 impl ReplyDirectoryPlus {
     /// Creates a new `ReplyDirectory` with a specified buffer size.
-    pub fn new<S: ReplySender>(unique: u64, sender: S, size: usize) -> ReplyDirectoryPlus {
+    pub(crate) fn new<S: ReplySender>(unique: u64, sender: S, size: usize) -> ReplyDirectoryPlus {
         ReplyDirectoryPlus {
             reply: Reply::new(unique, sender),
             buf: DirEntPlusList::new(size),
@@ -564,7 +615,8 @@ impl ReplyDirectoryPlus {
     /// Add an entry to the directory reply buffer. Returns true if the buffer is full.
     /// A transparent offset value can be provided for each entry. The kernel uses these
     /// value to request the next entries in further readdir calls
-    pub fn add<T: AsRef<OsStr>>(
+    #[allow(dead_code, reason = "adapter uses separate TTL readdirplus entries")]
+    pub(crate) fn add<T: AsRef<OsStr>>(
         &mut self,
         ino: u64,
         offset: i64,
@@ -578,7 +630,7 @@ impl ReplyDirectoryPlus {
 
     /// Add an entry to the directory-plus reply buffer with separate entry/attribute TTLs.
     #[allow(clippy::too_many_arguments)]
-    pub fn add_with_ttls<T: AsRef<OsStr>>(
+    pub(crate) fn add_with_ttls<T: AsRef<OsStr>>(
         &mut self,
         ino: u64,
         offset: i64,
@@ -601,12 +653,12 @@ impl ReplyDirectoryPlus {
     }
 
     /// Reply to a request with the filled directory buffer
-    pub fn ok(self) {
+    pub(crate) fn ok(self) {
         self.reply.send_ll(&self.buf.into());
     }
 
     /// Reply to a request with the given error code
-    pub fn error(self, err: c_int) {
+    pub(crate) fn error(self, err: c_int) {
         self.reply.error(err);
     }
 }
@@ -615,7 +667,7 @@ impl ReplyDirectoryPlus {
 /// Xattr reply
 ///
 #[derive(Debug)]
-pub struct ReplyXattr {
+pub(crate) struct ReplyXattr {
     reply: ReplyRaw,
 }
 
@@ -629,17 +681,25 @@ impl Reply for ReplyXattr {
 
 impl ReplyXattr {
     /// Reply to a request with the size of an extended attribute
-    pub fn size(self, size: u32) {
+    #[allow(
+        dead_code,
+        reason = "success reply retained for unsupported xattr operation"
+    )]
+    pub(crate) fn size(self, size: u32) {
         self.reply.send_ll(&ll::Response::new_xattr_size(size));
     }
 
     /// Reply to a request with the data of an extended attribute
-    pub fn data(self, data: &[u8]) {
+    #[allow(
+        dead_code,
+        reason = "success reply retained for unsupported xattr operation"
+    )]
+    pub(crate) fn data(self, data: &[u8]) {
         self.reply.send_ll(&ll::Response::new_slice(data));
     }
 
     /// Reply to a request with the given error code.
-    pub fn error(self, err: c_int) {
+    pub(crate) fn error(self, err: c_int) {
         self.reply.error(err);
     }
 }
@@ -648,7 +708,7 @@ impl ReplyXattr {
 /// Lseek Reply
 ///
 #[derive(Debug)]
-pub struct ReplyLseek {
+pub(crate) struct ReplyLseek {
     reply: ReplyRaw,
 }
 
@@ -662,12 +722,16 @@ impl Reply for ReplyLseek {
 
 impl ReplyLseek {
     /// Reply to a request with seeked offset
-    pub fn offset(self, offset: i64) {
+    #[allow(
+        dead_code,
+        reason = "success reply retained for unsupported lseek operation"
+    )]
+    pub(crate) fn offset(self, offset: i64) {
         self.reply.send_ll(&ll::Response::new_lseek(offset));
     }
 
     /// Reply to a request with the given error code
-    pub fn error(self, err: c_int) {
+    pub(crate) fn error(self, err: c_int) {
         self.reply.error(err);
     }
 }

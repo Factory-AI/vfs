@@ -13,7 +13,7 @@ use super::{
 
 /// A handle by which the application can send notifications to the server
 #[derive(Debug, Clone)]
-pub struct Notifier(ChannelSender);
+pub(crate) struct Notifier(ChannelSender);
 
 impl Notifier {
     pub(crate) fn new(cs: ChannelSender) -> Self {
@@ -24,7 +24,7 @@ impl Notifier {
     /// # Errors
     /// Returns an error if the notification data is too large.
     /// Returns an error if the kernel rejects the notification.
-    pub fn inval_entry(&self, parent: u64, name: &OsStr) -> io::Result<()> {
+    pub(crate) fn inval_entry(&self, parent: u64, name: &OsStr) -> io::Result<()> {
         let notif = Notification::new_inval_entry(parent, name).map_err(Self::too_big_err)?;
         self.send_inval(notify_code::FUSE_NOTIFY_INVAL_ENTRY, &notif)
     }
@@ -33,7 +33,7 @@ impl Notifier {
     /// data in the given range)
     /// # Errors
     /// Returns an error if the kernel rejects the notification.
-    pub fn inval_inode(&self, ino: u64, offset: i64, len: i64) -> io::Result<()> {
+    pub(crate) fn inval_inode(&self, ino: u64, offset: i64, len: i64) -> io::Result<()> {
         let notif = Notification::new_inval_inode(ino, offset, len);
         self.send_inval(notify_code::FUSE_NOTIFY_INVAL_INODE, &notif)
     }

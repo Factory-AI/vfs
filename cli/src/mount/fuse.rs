@@ -41,7 +41,7 @@ pub(super) fn mount_fuse(
     fs: Arc<dyn agentfs_core::FileSystem>,
     opts: MountOpts,
 ) -> Result<MountHandle> {
-    use crate::fuse::FuseMountOptions;
+    use agentfs_fuse::FuseMountOptions;
 
     let fuse_opts = FuseMountOptions {
         mountpoint: opts.mountpoint.clone(),
@@ -60,7 +60,7 @@ pub(super) fn mount_fuse(
     let fs_arc: Arc<dyn agentfs_core::FileSystem> = Arc::new(ReadWriteLaneFsAdapter::new(fs));
 
     let rt = crate::get_runtime();
-    let fuse_session = crate::fuse::spawn_mount(fs_arc, fuse_opts, rt)?;
+    let fuse_session = agentfs_fuse::mount(fs_arc, fuse_opts, rt)?;
 
     if !wait_for_mount(&mountpoint, timeout) {
         anyhow::bail!("FUSE mount did not become ready within {:?}", timeout);
@@ -111,12 +111,9 @@ impl ReadWriteLaneFsAdapter {
     }
 
     async fn enter_read_lane(&self) -> ReadLaneGuard<'_> {
-        let _wait_timer =
-            crate::profiling::timer(&crate::profiling::FUSE_COUNTERS.fuse_read_lane_wait);
         let guard = self.lanes.read().await;
 
-        let active_reads = self.active_reads.fetch_add(1, Ordering::Relaxed) + 1;
-        crate::profiling::record_fuse_read_lane_concurrency(active_reads);
+        self.active_reads.fetch_add(1, Ordering::Relaxed);
 
         ReadLaneGuard {
             active_reads: &self.active_reads,
@@ -125,10 +122,7 @@ impl ReadWriteLaneFsAdapter {
     }
 
     async fn enter_write_lane(&self) -> RwLockWriteGuard<'_, ()> {
-        let _wait_timer =
-            crate::profiling::timer(&crate::profiling::FUSE_COUNTERS.fuse_write_lane_wait);
-        let guard = self.lanes.write().await;
-        guard
+        self.lanes.write().await
     }
 
     async fn lock_read_fs(&self) -> ReadLaneGuard<'_> {

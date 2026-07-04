@@ -24,7 +24,7 @@ use std::{
 #[cfg(target_os = "linux")]
 use crate::cmd::init::open_agentfs;
 #[cfg(target_os = "linux")]
-use crate::fuse::FuseMountOptions;
+use agentfs_fuse::FuseMountOptions;
 
 pub use crate::opts::MountBackend;
 
@@ -188,7 +188,7 @@ fn mount_fuse(args: MountArgs) -> Result<()> {
         // Run the session on its own thread so termination signals can tear
         // the mount down; the default disposition would kill the process
         // without unmounting, stranding a dead mount table entry.
-        let mut session = crate::fuse::spawn_mount(fs, fuse_opts, rt)?;
+        let mut session = agentfs_fuse::mount(fs, fuse_opts, rt)?;
         let interrupted = crate::get_runtime().block_on(async {
             tokio::select! {
                 result = crate::mount::shutdown_signal() => result.map(|_| true),

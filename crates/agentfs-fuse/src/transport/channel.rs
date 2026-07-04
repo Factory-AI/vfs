@@ -14,7 +14,7 @@ use super::reply::ReplySender;
 
 /// A raw communication channel to the FUSE kernel driver
 #[derive(Debug)]
-pub struct Channel {
+pub(crate) struct Channel {
     device: Arc<File>,
 }
 
@@ -33,7 +33,7 @@ impl Channel {
     }
 
     /// Receives data up to the capacity of the given buffer (can block).
-    pub fn receive(&self, buffer: &mut [u8]) -> io::Result<usize> {
+    pub(crate) fn receive(&self, buffer: &mut [u8]) -> io::Result<usize> {
         let rc = unsafe {
             libc::read(
                 self.device.as_raw_fd(),
@@ -56,7 +56,7 @@ impl Channel {
     /// Returns a sender object for this channel. The sender object can be
     /// used to send to the channel. Multiple sender objects can be used
     /// and they can safely be sent to other threads.
-    pub fn sender(&self) -> ChannelSender {
+    pub(crate) fn sender(&self) -> ChannelSender {
         ChannelSender::Fd {
             device: self.device.clone(),
         }
@@ -66,7 +66,7 @@ impl Channel {
 /// Reply target for a FUSE request: either the classic /dev/fuse writev path
 /// or a fuse-over-io_uring ring entry commit.
 #[derive(Clone, Debug)]
-pub enum ChannelSender {
+pub(crate) enum ChannelSender {
     Fd {
         device: Arc<File>,
     },

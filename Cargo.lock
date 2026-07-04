@@ -53,6 +53,7 @@ version = "0.6.4"
 dependencies = [
  "aegis",
  "agentfs-core",
+ "agentfs-fuse",
  "anyhow",
  "async-trait",
  "base64",
@@ -64,17 +65,12 @@ dependencies = [
  "filetime",
  "hex",
  "libc",
- "log",
- "memchr",
- "nix",
  "num-derive",
  "num-traits",
- "page_size",
  "parking_lot",
  "serde",
  "serde_json",
  "sha1",
- "smallvec",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -82,7 +78,6 @@ dependencies = [
  "tracing-subscriber",
  "turso",
  "uuid",
- "zerocopy",
 ]
 
 [[package]]
@@ -104,6 +99,26 @@ dependencies = [
  "tokio",
  "tracing",
  "turso",
+]
+
+[[package]]
+name = "agentfs-fuse"
+version = "0.6.4"
+dependencies = [
+ "agentfs-core",
+ "anyhow",
+ "async-trait",
+ "libc",
+ "memchr",
+ "nix",
+ "page_size",
+ "parking_lot",
+ "smallvec",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "turso",
+ "zerocopy",
 ]
 
 [[package]]

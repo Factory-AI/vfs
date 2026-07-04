@@ -6,7 +6,6 @@
 //! for filesystem operations under its mount point.
 
 use libc::{EAGAIN, EINTR, ENODEV, ENOENT};
-use log::{debug, warn};
 use nix::unistd::geteuid;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -19,8 +18,9 @@ use std::sync::{
 };
 use std::thread;
 use std::time::Instant;
+use tracing::{debug, warn};
 
-use crate::fuse_config::{DispatchMode, UringConfig, FUSE_REQUEST_BUFFER_SIZE};
+use crate::adapter::config::{DispatchMode, UringConfig, FUSE_REQUEST_BUFFER_SIZE};
 
 use std::sync::mpsc;
 
@@ -34,7 +34,7 @@ use super::{channel::Channel, mnt::Mount};
 
 /// The max size of write requests from the kernel. The absolute minimum is 4k,
 /// FUSE recommends at least 128k, max 16M. Linux defaults to 128k.
-pub const MAX_WRITE_SIZE: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_WRITE_SIZE: usize = 16 * 1024 * 1024;
 
 /// Size of the buffer for reading a request from the kernel. Since the kernel may send
 /// up to `MAX_WRITE_SIZE` bytes in a write request, we use that value plus some extra space.
@@ -42,7 +42,7 @@ const BUFFER_SIZE: usize = FUSE_REQUEST_BUFFER_SIZE;
 
 #[derive(Default, Debug, Eq, PartialEq)]
 /// How requests should be filtered based on the calling UID.
-pub enum SessionACL {
+pub(crate) enum SessionACL {
     /// Allow requests from any user. Corresponds to the `allow_other` mount option.
     All,
     /// Allow requests from root. Corresponds to the `allow_root` mount option.
@@ -54,7 +54,7 @@ pub enum SessionACL {
 
 /// The session data structure
 #[derive(Debug)]
-pub struct Session<FS: Filesystem> {
+pub(crate) struct Session<FS: Filesystem> {
     /// Shared session state and filesystem operation implementations.
     pub(crate) shared: Arc<SessionShared<FS>>,
     /// Communication channel to the kernel driver
@@ -163,7 +163,7 @@ fn dispatch_request<FS: Filesystem>(
     request: Request,
 ) {
     let concurrent = active_dispatches.fetch_add(1, Ordering::AcqRel) + 1;
-    crate::profiling::record_fuse_dispatch_concurrency(concurrent);
+    crate::telemetry::record_fuse_dispatch_concurrency(concurrent);
     let _guard = ActiveDispatchGuard { active_dispatches };
     request.dispatch(shared);
 }
@@ -173,8 +173,8 @@ fn dispatch_queued_request<FS: Filesystem>(
     active_dispatches: &AtomicU64,
     queued: QueuedRequest,
 ) {
-    crate::profiling::record_fuse_dispatch_parallel_task();
-    crate::profiling::record_fuse_dispatch_wait(queued.enqueued_at.elapsed());
+    crate::telemetry::record_fuse_dispatch_parallel_task();
+    crate::telemetry::record_fuse_dispatch_wait(queued.enqueued_at.elapsed());
     dispatch_request(shared, active_dispatches, queued.request);
 }
 
@@ -202,7 +202,7 @@ impl<FS: Filesystem> Session<FS> {
     /// Create a new session by mounting the given filesystem to the given mountpoint
     /// # Errors
     /// Returns an error if the options are incorrect, or if the fuse device can't be mounted.
-    pub fn new<P: AsRef<Path>>(
+    pub(crate) fn new<P: AsRef<Path>>(
         filesystem: FS,
         mountpoint: P,
         options: &[MountOption],
@@ -259,7 +259,7 @@ impl<FS: Filesystem> Session<FS> {
     /// may run concurrent by spawning threads.
     /// # Errors
     /// Returns any final error when the session comes to an end.
-    pub fn run(&mut self) -> io::Result<()> {
+    pub(crate) fn run(&mut self) -> io::Result<()> {
         let notify_rx = self.notify_rx.take().expect("run() called more than once");
         let notifier = self.notifier();
         let notify_handle = thread::spawn(move || {
@@ -301,7 +301,7 @@ impl<FS: Filesystem> Session<FS> {
         let result = match self.dispatch_mode {
             DispatchMode::Serial => {
                 tracing::info!("resolved FUSE dispatch mode: serial");
-                crate::profiling::set_fuse_workers_configured(0);
+                crate::telemetry::set_fuse_workers_configured(0);
                 self.run_serial(deferred.clone())
             }
             DispatchMode::Parallel {
@@ -313,7 +313,7 @@ impl<FS: Filesystem> Session<FS> {
                     queue_capacity,
                     "resolved FUSE dispatch mode: parallel"
                 );
-                crate::profiling::set_fuse_workers_configured(workers as u64);
+                crate::telemetry::set_fuse_workers_configured(workers as u64);
                 self.run_parallel(deferred.clone(), workers, queue_capacity)
             }
         };
@@ -390,11 +390,11 @@ impl<FS: Filesystem> Session<FS> {
                 let lane_depth = lane_depths[lane].fetch_add(1, Ordering::AcqRel) + 1;
                 match lane_senders[lane].try_send(queued) {
                     Ok(()) => {
-                        crate::profiling::record_fuse_worker_queue_depth(depth);
+                        crate::telemetry::record_fuse_worker_queue_depth(depth);
                         Ok(())
                     }
                     Err(mpsc::TrySendError::Full(queued)) => {
-                        crate::profiling::record_fuse_dispatch_inline_fallback();
+                        crate::telemetry::record_fuse_dispatch_inline_fallback();
                         lane_senders[lane].send(queued).map_err(|_| {
                             queue_depth.fetch_sub(1, Ordering::AcqRel);
                             lane_depths[lane].fetch_sub(1, Ordering::AcqRel);
@@ -403,15 +403,15 @@ impl<FS: Filesystem> Session<FS> {
                                 "FUSE dispatch worker queue disconnected",
                             )
                         })?;
-                        crate::profiling::record_fuse_worker_queue_depth(depth);
-                        crate::profiling::record_fuse_worker_queue_depth(lane_depth);
+                        crate::telemetry::record_fuse_worker_queue_depth(depth);
+                        crate::telemetry::record_fuse_worker_queue_depth(lane_depth);
                         Ok(())
                     }
                     Err(mpsc::TrySendError::Disconnected(queued)) => {
                         queue_depth.fetch_sub(1, Ordering::AcqRel);
                         lane_depths[lane].fetch_sub(1, Ordering::AcqRel);
                         drop(queued);
-                        crate::profiling::record_fuse_dispatch_inline_fallback();
+                        crate::telemetry::record_fuse_dispatch_inline_fallback();
                         Err(io::Error::new(
                             io::ErrorKind::BrokenPipe,
                             "FUSE dispatch worker queue disconnected",
@@ -470,7 +470,7 @@ impl<FS: Filesystem> Session<FS> {
     }
 
     /// Returns a thread-safe object that can be used to unmount the Filesystem
-    pub fn unmount_callable(&mut self) -> SessionUnmounter {
+    pub(crate) fn unmount_callable(&mut self) -> SessionUnmounter {
         SessionUnmounter {
             mount: self.mount.clone(),
             device: self.ch.device(),
@@ -480,14 +480,14 @@ impl<FS: Filesystem> Session<FS> {
     }
 
     /// Returns an object that can be used to send notifications to the kernel
-    pub fn notifier(&self) -> Notifier {
+    pub(crate) fn notifier(&self) -> Notifier {
         Notifier::new(self.ch.sender())
     }
 }
 
 #[derive(Debug)]
 /// A thread-safe object that can be used to unmount a Filesystem
-pub struct SessionUnmounter {
+pub(crate) struct SessionUnmounter {
     mount: Arc<Mutex<Option<(PathBuf, Mount)>>>,
     device: Arc<std::fs::File>,
     #[cfg(target_os = "linux")]
@@ -496,7 +496,7 @@ pub struct SessionUnmounter {
 
 impl SessionUnmounter {
     /// Unmount the filesystem
-    pub fn unmount(&mut self) -> io::Result<()> {
+    pub(crate) fn unmount(&mut self) -> io::Result<()> {
         #[cfg(target_os = "linux")]
         self.uring_control.shutdown_and_join();
         #[cfg(target_os = "linux")]

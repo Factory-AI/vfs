@@ -90,6 +90,11 @@ mod tests {
                 repo_root.join("cli").join("src"),
                 SourceKind::Cli,
             ),
+            SourceRoot::new(
+                "crates/agentfs-fuse/src",
+                repo_root.join("crates").join("agentfs-fuse").join("src"),
+                SourceKind::Fuse,
+            ),
         ];
         let mut offenders = Vec::new();
         for source_root in &source_roots {
@@ -118,6 +123,7 @@ mod tests {
     enum SourceKind {
         Sdk,
         Cli,
+        Fuse,
     }
 
     fn scan_rs_files(source_root: &SourceRoot, path: &Path, offenders: &mut Vec<String>) {
@@ -185,6 +191,7 @@ mod tests {
                         .next()
                         .is_some_and(|component| component.as_os_str() == "config")
             }
+            SourceKind::Fuse => rel == Path::new("adapter/config.rs"),
         }
     }
 

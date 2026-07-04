@@ -7,11 +7,11 @@
 //! on demand from it.
 
 use super::ll::{fuse_abi as abi, Errno, Response};
-use log::{debug, error, warn};
 use std::convert::TryFrom;
 use std::convert::TryInto;
 use std::path::Path;
 use std::sync::Arc;
+use tracing::{debug, error, warn};
 
 use super::channel::ChannelSender;
 use super::deferred_notify::DeferredNotifier;
@@ -24,9 +24,9 @@ use super::Filesystem;
 use super::{ll, KernelConfig};
 
 /// Classify a parsed request into a per-op latency slot (see
-/// `crate::profiling::FuseOpSlot`).
-fn fuse_op_slot(op: &ll::Operation<'_>) -> crate::profiling::FuseOpSlot {
-    use crate::profiling::FuseOpSlot as Slot;
+/// `crate::telemetry::FuseOpSlot`).
+fn fuse_op_slot(op: &ll::Operation<'_>) -> crate::telemetry::FuseOpSlot {
+    use crate::telemetry::FuseOpSlot as Slot;
     match op {
         ll::Operation::Lookup(_) => Slot::Lookup,
         ll::Operation::GetAttr(_) => Slot::GetAttr,
@@ -111,7 +111,7 @@ impl std::fmt::Debug for AlignedRequestBuf {
 /// reading the next kernel message.  Parsing of `ll::AnyRequest` happens on demand inside
 /// `dispatch`, borrowing from the owned buffer for the duration of the call.
 #[derive(Debug)]
-pub struct Request {
+pub(crate) struct Request {
     /// Channel sender for sending the reply
     ch: ChannelSender,
     /// Deferred notifier for enqueueing cache invalidations
@@ -147,7 +147,7 @@ impl Request {
     }
 
     /// Returns the deferred-cache-invalidation handle tied to this session.
-    pub fn deferred_notifier(&self) -> &DeferredNotifier {
+    pub(crate) fn deferred_notifier(&self) -> &DeferredNotifier {
         &self.deferred
     }
 
@@ -156,7 +156,7 @@ impl Request {
             .expect("header validated at construction time")
     }
 
-    pub fn notifier(&self) -> Notifier {
+    pub(crate) fn notifier(&self) -> Notifier {
         Notifier::new(self.ch.for_notify())
     }
 
@@ -176,28 +176,16 @@ impl Request {
         }
     }
 
-    /// Returns the unique identifier of this request
-    #[inline]
-    pub fn unique(&self) -> u64 {
-        self.request().unique().into()
-    }
-
     /// Returns the uid of this request
     #[inline]
-    pub fn uid(&self) -> u32 {
+    pub(crate) fn uid(&self) -> u32 {
         self.request().uid()
     }
 
     /// Returns the gid of this request
     #[inline]
-    pub fn gid(&self) -> u32 {
+    pub(crate) fn gid(&self) -> u32 {
         self.request().gid()
-    }
-
-    /// Returns the pid of this request
-    #[inline]
-    pub fn pid(&self) -> u32 {
-        self.request().pid()
     }
 
     /// Dispatch request to the given filesystem. This calls the appropriate filesystem
@@ -210,7 +198,7 @@ impl Request {
         debug!("{}", parsed);
         let unique = parsed.unique();
         let op_slot = parsed.operation().ok().map(|op| fuse_op_slot(&op));
-        let _op_timer = op_slot.map(crate::profiling::fuse_op_timer);
+        let _op_timer = op_slot.map(crate::telemetry::fuse_op_timer);
 
         let res = match self.dispatch_req(shared, &parsed) {
             Ok(Some(resp)) => resp,

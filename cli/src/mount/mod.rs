@@ -95,7 +95,7 @@ pub struct MountHandle {
 pub(crate) enum MountHandleInner {
     #[cfg(target_os = "linux")]
     Fuse {
-        session: Option<crate::fuse::FuseSessionHandle>,
+        session: Option<agentfs_fuse::SessionHandle>,
     },
     Nfs {
         shutdown: CancellationToken,

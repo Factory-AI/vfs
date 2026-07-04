@@ -9,7 +9,6 @@
 use super::is_mounted;
 use super::mount_options::{option_to_string, MountOption};
 use libc::c_int;
-use log::{debug, error};
 use std::ffi::{CStr, CString, OsStr};
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -23,19 +22,23 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::{mem, ptr};
+use tracing::{debug, error};
 
 const FUSERMOUNT_BIN: &str = "fusermount";
 const FUSERMOUNT3_BIN: &str = "fusermount3";
 const FUSERMOUNT_COMM_ENV: &str = "_FUSE_COMMFD";
 
 #[derive(Debug)]
-pub struct Mount {
+pub(crate) struct Mount {
     mountpoint: CString,
     auto_unmount_socket: Option<UnixStream>,
     fuse_device: Arc<File>,
 }
 impl Mount {
-    pub fn new(mountpoint: &Path, options: &[MountOption]) -> io::Result<(Arc<File>, Mount)> {
+    pub(crate) fn new(
+        mountpoint: &Path,
+        options: &[MountOption],
+    ) -> io::Result<(Arc<File>, Mount)> {
         let mountpoint = mountpoint.canonicalize()?;
         let (file, sock) = fuse_mount_pure(mountpoint.as_os_str(), options)?;
         let file = Arc::new(file);
@@ -387,12 +390,12 @@ fn fuse_mount_sys(mountpoint: &OsStr, options: &[MountOption]) -> Result<Option<
 }
 
 #[derive(PartialEq)]
-pub enum MountOptionGroup {
+pub(crate) enum MountOptionGroup {
     KernelOption,
     Fusermount,
 }
 
-pub fn option_group(option: &MountOption) -> MountOptionGroup {
+pub(crate) fn option_group(option: &MountOption) -> MountOptionGroup {
     match option {
         MountOption::FSName(_) => MountOptionGroup::Fusermount,
         MountOption::AutoUnmount => MountOptionGroup::Fusermount,

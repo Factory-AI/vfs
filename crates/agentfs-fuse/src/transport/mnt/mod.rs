@@ -4,12 +4,12 @@
 //! This is a Linux-only pure-Rust implementation.
 
 mod fuse_pure;
-pub mod mount_options;
+pub(crate) mod mount_options;
 
 use std::fs::File;
 use std::io;
 
-pub use fuse_pure::Mount;
+pub(crate) use fuse_pure::Mount;
 use std::ffi::CStr;
 
 #[inline]
