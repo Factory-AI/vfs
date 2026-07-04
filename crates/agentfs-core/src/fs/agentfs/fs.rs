@@ -13,7 +13,7 @@ use turso::transaction::{Transaction, TransactionBehavior};
 use turso::Value;
 
 use crate::error::Error;
-use crate::fs::{DirEntry, FileSystem, TimeChange};
+use crate::fs::{DirEntry, DirEntryPage, FileSystem, TimeChange};
 
 use super::batcher::PendingTimeChange;
 use super::*;
@@ -267,6 +267,109 @@ impl FileSystem for AgentFS {
         }
 
         Ok(Some(entries))
+    }
+
+    async fn readdir_plus_after(
+        &self,
+        ino: i64,
+        start_after: i64,
+        max_entries: usize,
+    ) -> Result<Option<DirEntryPage>> {
+        crate::telemetry::record_readdir_plus();
+        self.drain_all().await?;
+        let conn = self.pool.get_connection().await?;
+
+        // Check if inode exists and is a directory
+        if let Some(mode) = store::mode(&conn, ino).await? {
+            if (mode & S_IFMT) != super::S_IFDIR {
+                return Err(FsError::NotADirectory.into());
+            }
+        } else {
+            return Ok(None);
+        }
+
+        let start_after_name = if start_after > 0 {
+            let mut stmt = conn
+                .prepare_cached("SELECT name FROM fs_dentry WHERE parent_ino = ? AND ino = ?")
+                .await?;
+            let mut rows = stmt.query((ino, start_after)).await?;
+            match rows.next().await? {
+                Some(row) => Some(
+                    row.get_value(0)
+                        .ok()
+                        .and_then(|v| match v {
+                            Value::Text(s) => Some(s.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_default(),
+                ),
+                None => {
+                    return Ok(Some(DirEntryPage {
+                        entries: Vec::new(),
+                        end: true,
+                    }));
+                }
+            }
+        } else {
+            None
+        };
+
+        let fetch_limit = max_entries.saturating_add(1).min(i64::MAX as usize) as i64;
+        let mut stmt = if start_after_name.is_some() {
+            conn.prepare_cached(
+                "SELECT d.name, i.ino, i.mode, i.nlink, i.uid, i.gid, i.size, i.atime, i.mtime, i.ctime, i.rdev, i.atime_nsec, i.mtime_nsec, i.ctime_nsec
+                FROM fs_dentry d
+                JOIN fs_inode i ON d.ino = i.ino
+                WHERE d.parent_ino = ? AND d.name > ?
+                ORDER BY d.name
+                LIMIT ?",
+            )
+            .await?
+        } else {
+            conn.prepare_cached(
+                "SELECT d.name, i.ino, i.mode, i.nlink, i.uid, i.gid, i.size, i.atime, i.mtime, i.ctime, i.rdev, i.atime_nsec, i.mtime_nsec, i.ctime_nsec
+                FROM fs_dentry d
+                JOIN fs_inode i ON d.ino = i.ino
+                WHERE d.parent_ino = ?
+                ORDER BY d.name
+                LIMIT ?",
+            )
+            .await?
+        };
+
+        let mut rows = if let Some(start_after_name) = start_after_name {
+            stmt.query((ino, start_after_name, fetch_limit)).await?
+        } else {
+            stmt.query((ino, fetch_limit)).await?
+        };
+
+        let mut entries = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let name = row
+                .get_value(0)
+                .ok()
+                .and_then(|v| {
+                    if let Value::Text(s) = v {
+                        Some(s.clone())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default();
+
+            if name.is_empty() {
+                continue;
+            }
+
+            let stats = store::stats_from_row_at(&row, 1)?;
+
+            self.cache_attr(stats.clone());
+            entries.push(DirEntry { name, stats });
+        }
+
+        let end = entries.len() <= max_entries;
+        entries.truncate(max_entries);
+        Ok(Some(DirEntryPage { entries, end }))
     }
 
     async fn chmod(&self, ino: i64, mode: u32) -> Result<()> {

@@ -4,6 +4,7 @@ use super::nfs;
 use super::permissions;
 use super::rpc::*;
 use super::xdr::*;
+use agentfs_core::fs::MAX_NAME_LEN;
 use agentfs_core::semantics::{access, AckDurability};
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use num_derive::{FromPrimitive, ToPrimitive};
@@ -657,7 +658,7 @@ pub async fn nfsproc3_pathconf(
     let res = PATHCONF3resok {
         obj_attributes: obj_attr,
         linkmax: 0,
-        name_max: 32768,
+        name_max: MAX_NAME_LEN as u32,
         no_trunc: true,
         chown_restricted: true,
         case_insensitive: false,
@@ -967,7 +968,7 @@ pub async fn nfsproc3_readdirplus(
         return Ok(());
     }*/
     // subtract off the final entryplus* field (which must be false) and the eof
-    let max_bytes_allowed = args.maxcount as usize - 128;
+    let max_bytes_allowed = (args.maxcount as usize).saturating_sub(128);
     // args.dircount is bytes of just fileid, name, cookie.
     // This is hard to ballpark, so we just divide it by 16
     let estimated_max_results = args.dircount / 16;
@@ -975,7 +976,7 @@ pub async fn nfsproc3_readdirplus(
     let mut ctr = 0;
     match context
         .vfs
-        .readdir(dirid, args.cookie, estimated_max_results as usize)
+        .readdir(dirid, args.cookie, (estimated_max_results as usize).max(1))
         .await
     {
         Ok(result) => {
@@ -1119,14 +1120,14 @@ pub async fn nfsproc3_readdir(
     debug!(" -- Dir version {:?}", dirversion);
     let has_version = args.cookieverf != nfs::cookieverf3::default();
     // subtract off the final entryplus* field (which must be false) and the eof
-    let max_bytes_allowed = args.dircount as usize - 128;
+    let max_bytes_allowed = (args.dircount as usize).saturating_sub(128);
     // args.dircount is bytes of just fileid, name, cookie.
     // This is hard to ballpark, so we just divide it by 16
     let estimated_max_results = args.dircount / 16;
     let mut ctr = 0;
     match context
         .vfs
-        .readdir_simple(dirid, estimated_max_results as usize)
+        .readdir_simple(dirid, args.cookie, (estimated_max_results as usize).max(1))
         .await
     {
         Ok(result) => {
@@ -2833,6 +2834,7 @@ mod tests {
     use crate::server::rpc::{accept_body, accepted_reply, reply_body, rpc_body, rpc_msg};
     use crate::server::transaction_tracker::{TransactionTracker, DEFAULT_REPLY_CACHE_CAPACITY};
     use crate::server::vfs::NFSFileSystem;
+    use agentfs_core::fs::MAX_NAME_LEN;
     use agentfs_core::{AgentFS as AgentSdk, AgentFSOptions, FileSystem};
     use std::io::Cursor;
     use std::path::Path;
@@ -2976,14 +2978,41 @@ mod tests {
     }
 
     fn serialize_readdirplus_args(root_fh: nfs::nfs_fh3) -> Vec<u8> {
+        serialize_readdirplus_page_args(root_fh, 0, 8192, 8192)
+    }
+
+    fn serialize_readdir_args(
+        root_fh: nfs::nfs_fh3,
+        cookie: nfs::cookie3,
+        dircount: u32,
+    ) -> Vec<u8> {
+        let mut input = Vec::new();
+        let mut cursor = Cursor::new(&mut input);
+        READDIR3args {
+            dir: root_fh,
+            cookie,
+            cookieverf: nfs::cookieverf3::default(),
+            dircount,
+        }
+        .serialize(&mut cursor)
+        .expect("serialize READDIR args");
+        input
+    }
+
+    fn serialize_readdirplus_page_args(
+        root_fh: nfs::nfs_fh3,
+        cookie: nfs::cookie3,
+        dircount: u32,
+        maxcount: u32,
+    ) -> Vec<u8> {
         let mut input = Vec::new();
         let mut cursor = Cursor::new(&mut input);
         READDIRPLUS3args {
             dir: root_fh,
-            cookie: 0,
+            cookie,
             cookieverf: nfs::cookieverf3::default(),
-            dircount: 8192,
-            maxcount: 8192,
+            dircount,
+            maxcount,
         }
         .serialize(&mut cursor)
         .expect("serialize READDIRPLUS args");
@@ -3019,6 +3048,143 @@ mod tests {
         .serialize(&mut cursor)
         .expect("serialize SETATTR size args");
         input
+    }
+
+    #[derive(Clone, Copy)]
+    enum ReaddirProcedure {
+        Readdir,
+        ReaddirPlus,
+    }
+
+    struct ReaddirPage {
+        names: Vec<Vec<u8>>,
+        cookies: Vec<nfs::cookie3>,
+        eof: bool,
+    }
+
+    async fn create_numbered_files(context: &RPCContext, count: usize) -> Vec<Vec<u8>> {
+        let mut names = Vec::with_capacity(count);
+        for index in 0..count {
+            let name = format!("entry-{index:04}").into_bytes();
+            context
+                .vfs
+                .create(
+                    1,
+                    &name.clone().into(),
+                    nfs::sattr3::default(),
+                    &context.auth,
+                )
+                .await
+                .expect("numbered file create succeeds");
+            names.push(name);
+        }
+        names
+    }
+
+    async fn read_readdir_page(
+        context: &RPCContext,
+        procedure: ReaddirProcedure,
+        cookie: nfs::cookie3,
+    ) -> ReaddirPage {
+        let root = context.vfs.id_to_fh(1);
+        let mut input = Cursor::new(match procedure {
+            ReaddirProcedure::Readdir => serialize_readdir_args(root, cookie, 512),
+            ReaddirProcedure::ReaddirPlus => {
+                serialize_readdirplus_page_args(root, cookie, 512, 1200)
+            }
+        });
+        let mut output = Vec::new();
+        match procedure {
+            ReaddirProcedure::Readdir => nfsproc3_readdir(6, &mut input, &mut output, context)
+                .await
+                .expect("READDIR handler"),
+            ReaddirProcedure::ReaddirPlus => {
+                nfsproc3_readdirplus(7, &mut input, &mut output, context)
+                    .await
+                    .expect("READDIRPLUS handler")
+            }
+        }
+
+        let mut cursor = Cursor::new(output);
+        parse_rpc_success(&mut cursor);
+        let status = parse_nfs_status(&mut cursor);
+        assert!(matches!(status, nfs::nfsstat3::NFS3_OK));
+        let mut dir_attr = nfs::post_op_attr::Void;
+        dir_attr
+            .deserialize(&mut cursor)
+            .expect("deserialize dir attrs");
+        let mut cookieverf = nfs::cookieverf3::default();
+        cookieverf
+            .deserialize(&mut cursor)
+            .expect("deserialize cookie verifier");
+
+        let mut names = Vec::new();
+        let mut cookies = Vec::new();
+        loop {
+            let mut has_entry = false;
+            has_entry
+                .deserialize(&mut cursor)
+                .expect("deserialize entry presence");
+            if !has_entry {
+                break;
+            }
+            match procedure {
+                ReaddirProcedure::Readdir => {
+                    let mut entry = entry3::default();
+                    entry.deserialize(&mut cursor).expect("deserialize entry");
+                    names.push(entry.name.to_vec());
+                    cookies.push(entry.cookie);
+                }
+                ReaddirProcedure::ReaddirPlus => {
+                    let mut entry = entryplus3::default();
+                    entry
+                        .deserialize(&mut cursor)
+                        .expect("deserialize entryplus");
+                    names.push(entry.name.to_vec());
+                    cookies.push(entry.cookie);
+                }
+            }
+        }
+        let mut eof = false;
+        eof.deserialize(&mut cursor).expect("deserialize eof");
+        assert_eq!(
+            names.len(),
+            cookies.len(),
+            "every returned entry carries a pagination cookie"
+        );
+        assert!(
+            !names.is_empty() || eof,
+            "a non-final page must make progress with at least one entry"
+        );
+        ReaddirPage {
+            names,
+            cookies,
+            eof,
+        }
+    }
+
+    async fn collect_readdir_pages(
+        context: &RPCContext,
+        procedure: ReaddirProcedure,
+    ) -> Vec<ReaddirPage> {
+        let mut pages = Vec::new();
+        let mut cookie = 0;
+        for _ in 0..64 {
+            let page = read_readdir_page(context, procedure, cookie).await;
+            if let Some(next_cookie) = page.cookies.last().copied() {
+                assert!(
+                    page.eof || next_cookie != cookie,
+                    "pagination did not honor cookie {cookie}: page repeated the same final cookie"
+                );
+                cookie = next_cookie;
+            }
+            let eof = page.eof;
+            pages.push(page);
+            if eof {
+                return pages;
+            }
+        }
+        panic!("READDIR pagination did not reach EOF within the safety bound");
     }
 
     #[test]
@@ -3082,6 +3248,118 @@ mod tests {
         }
         println!("adapter=nfs access_conformance mismatches={mismatches}");
         assert_eq!(mismatches, 0);
+    }
+
+    #[tokio::test]
+    async fn readdir_and_readdirplus_honor_cookies_without_duplicates_or_skips() {
+        let (context, _fs) = test_context().await;
+        let expected = create_numbered_files(&context, 24).await;
+
+        for procedure in [ReaddirProcedure::Readdir, ReaddirProcedure::ReaddirPlus] {
+            let pages = collect_readdir_pages(&context, procedure).await;
+            assert!(
+                pages.len() > 1,
+                "test must force pagination across multiple pages"
+            );
+
+            for (index, page) in pages.iter().enumerate() {
+                assert_eq!(
+                    page.eof,
+                    index + 1 == pages.len(),
+                    "eof must be false until the final page"
+                );
+            }
+
+            let mut flat = Vec::new();
+            for page in &pages {
+                flat.extend(page.names.iter().cloned());
+            }
+            let mut unique = flat.clone();
+            unique.sort();
+            unique.dedup();
+
+            println!(
+                "procedure={} pages={} total={} unique={} first_entries={:?}",
+                match procedure {
+                    ReaddirProcedure::Readdir => "READDIR",
+                    ReaddirProcedure::ReaddirPlus => "READDIRPLUS",
+                },
+                pages.len(),
+                flat.len(),
+                unique.len(),
+                pages
+                    .iter()
+                    .map(|page| String::from_utf8_lossy(&page.names[0]).into_owned())
+                    .collect::<Vec<_>>()
+            );
+
+            assert_eq!(
+                unique.len(),
+                flat.len(),
+                "pagination returned duplicate entries"
+            );
+            assert_eq!(unique, expected, "pagination skipped or reordered entries");
+        }
+    }
+
+    #[tokio::test]
+    async fn pathconf_name_max_and_create_limits_match_sdk_enforcement() {
+        let (context, _fs) = test_context().await;
+        let mut input = Cursor::new({
+            let mut bytes = Vec::new();
+            context
+                .vfs
+                .id_to_fh(1)
+                .serialize(&mut bytes)
+                .expect("serialize PATHCONF handle");
+            bytes
+        });
+        let mut output = Vec::new();
+
+        nfsproc3_pathconf(8, &mut input, &mut output, &context)
+            .await
+            .expect("PATHCONF handler");
+
+        let mut cursor = Cursor::new(output);
+        parse_rpc_success(&mut cursor);
+        let status = parse_nfs_status(&mut cursor);
+        assert!(matches!(status, nfs::nfsstat3::NFS3_OK));
+        let mut pathconf = PATHCONF3resok::default();
+        pathconf
+            .deserialize(&mut cursor)
+            .expect("deserialize PATHCONF result");
+        println!(
+            "pathconf.name_max={} sdk.MAX_NAME_LEN={}",
+            pathconf.name_max, MAX_NAME_LEN
+        );
+        assert_eq!(pathconf.name_max, MAX_NAME_LEN as u32);
+
+        let ok_name = vec![b'a'; MAX_NAME_LEN];
+        context
+            .vfs
+            .create(1, &ok_name.into(), nfs::sattr3::default(), &context.auth)
+            .await
+            .expect("255-byte filename create succeeds");
+
+        let too_long_name = vec![b'b'; MAX_NAME_LEN + 1];
+        let err = context
+            .vfs
+            .create(
+                1,
+                &too_long_name.into(),
+                nfs::sattr3::default(),
+                &context.auth,
+            )
+            .await
+            .expect_err("256-byte filename create fails");
+        assert!(matches!(err, nfs::nfsstat3::NFS3ERR_NAMETOOLONG));
+
+        let fsinfo = context.vfs.fsinfo(1).await.expect("FSINFO succeeds");
+        assert_eq!(
+            fsinfo.rtpref,
+            1024 * 1024,
+            "rtpref should match the 1MiB macOS mount rsize preference"
+        );
     }
 
     async fn create_readonly_file(context: &RPCContext) -> nfs::nfs_fh3 {

@@ -263,6 +263,45 @@
     }
 
     #[tokio::test]
+    async fn readdir_plus_after_returns_bounded_cookie_pages() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        let expected: Vec<String> = (0..96).map(|index| format!("entry-{index:04}")).collect();
+        for name in &expected {
+            FileSystem::create_file(&fs, ROOT_INO, name, DEFAULT_FILE_MODE, 0, 0).await?;
+        }
+
+        let page_size = 7;
+        let mut cookie = 0;
+        let mut seen = Vec::new();
+        let mut page_count = 0;
+        loop {
+            let page = FileSystem::readdir_plus_after(&fs, ROOT_INO, cookie, page_size)
+                .await?
+                .expect("root directory exists");
+            page_count += 1;
+            assert!(
+                page.entries.len() <= page_size,
+                "page returned {} entries despite a limit of {page_size}",
+                page.entries.len()
+            );
+            if !page.end {
+                assert!(!page.entries.is_empty(), "non-final page must progress");
+            }
+            if let Some(last) = page.entries.last() {
+                cookie = last.stats.ino;
+            }
+            seen.extend(page.entries.into_iter().map(|entry| entry.name));
+            if page.end {
+                break;
+            }
+        }
+
+        assert!(page_count > 1, "test must exercise multiple pages");
+        assert_eq!(seen, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn corrupt_mode_mutations_return_corrupt_without_namespace_changes() -> Result<()> {
         let (fs, _dir) = create_test_fs().await?;
         FileSystem::mkdir(&fs, ROOT_INO, "dir", 0o755, 0, 0).await?;

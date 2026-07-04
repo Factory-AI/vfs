@@ -204,10 +204,11 @@ pub trait NFSFileSystem: Sync {
     async fn readdir_simple(
         &self,
         dirid: fileid3,
+        start_after: fileid3,
         count: usize,
     ) -> Result<ReadDirSimpleResult, nfsstat3> {
         Ok(ReadDirSimpleResult::from_readdir_result(
-            &self.readdir(dirid, 0, count).await?,
+            &self.readdir(dirid, start_after, count).await?,
         ))
     }
 
@@ -235,7 +236,7 @@ pub trait NFSFileSystem: Sync {
         let res = fsinfo3 {
             obj_attributes: dir_attr,
             rtmax: 1024 * 1024,
-            rtpref: 1024 * 124,
+            rtpref: 1024 * 1024,
             rtmult: 1024 * 1024,
             wtmax: 1024 * 1024,
             wtpref: 1024 * 1024,

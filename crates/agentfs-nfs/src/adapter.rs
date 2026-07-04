@@ -615,8 +615,8 @@ impl NFSFileSystem for AgentNFS {
 
         let fs = self.fs.clone();
 
-        let entries = fs
-            .readdir_plus(dir_fs_ino)
+        let page = fs
+            .readdir_plus_after(dir_fs_ino, start_after as i64, max_entries.max(1))
             .await
             .map_err(error_to_nfsstat)?
             .ok_or(nfsstat3::NFS3ERR_NOENT)?;
@@ -625,27 +625,11 @@ impl NFSFileSystem for AgentNFS {
 
         let mut result = ReadDirResult {
             entries: Vec::new(),
-            end: false,
+            end: page.end,
         };
 
-        // Find start position if start_after is specified
-        let mut skip = start_after > 0;
-        let mut skipped_count = 0;
-
-        for entry in entries.iter() {
+        for entry in page.entries {
             let ino = entry.stats.ino as fileid3;
-
-            if skip {
-                if ino == start_after {
-                    skip = false;
-                }
-                skipped_count += 1;
-                continue;
-            }
-
-            if result.entries.len() >= max_entries {
-                break;
-            }
 
             result.entries.push(DirEntry {
                 fileid: ino,
@@ -653,9 +637,6 @@ impl NFSFileSystem for AgentNFS {
                 attr: self.stats_to_fattr(&entry.stats),
             });
         }
-
-        // Mark as end if we've returned all remaining entries
-        result.end = result.entries.len() + skipped_count >= entries.len();
 
         Ok(result)
     }

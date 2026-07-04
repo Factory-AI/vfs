@@ -153,6 +153,15 @@ pub struct DirEntry {
     pub stats: Stats,
 }
 
+/// A cookie-addressed directory page.
+#[derive(Debug, Clone)]
+pub struct DirEntryPage {
+    /// Entries after the requested cookie, up to the requested page limit.
+    pub entries: Vec<DirEntry>,
+    /// Whether this page reached the end of the directory.
+    pub end: bool,
+}
+
 /// Kernel-cache coherence class for an inode.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum KernelCachePolicy {
@@ -285,6 +294,39 @@ pub trait FileSystem: Send + Sync {
     ///
     /// Returns `Ok(None)` if the directory does not exist.
     async fn readdir_plus(&self, ino: i64) -> Result<Option<Vec<DirEntry>>>;
+
+    /// List a bounded page of directory entries after `start_after`.
+    ///
+    /// `start_after` is the inode cookie returned with the previous entry. A
+    /// zero cookie starts at the beginning. Implementations with an ordered
+    /// directory index should override this method so callers do not need to
+    /// enumerate all prior entries for every page.
+    async fn readdir_plus_after(
+        &self,
+        ino: i64,
+        start_after: i64,
+        max_entries: usize,
+    ) -> Result<Option<DirEntryPage>> {
+        let Some(entries) = self.readdir_plus(ino).await? else {
+            return Ok(None);
+        };
+
+        let start = if start_after > 0 {
+            entries
+                .iter()
+                .position(|entry| entry.stats.ino == start_after)
+                .map(|index| index + 1)
+                .unwrap_or(entries.len())
+        } else {
+            0
+        };
+        let end = start.saturating_add(max_entries).min(entries.len());
+
+        Ok(Some(DirEntryPage {
+            entries: entries[start..end].to_vec(),
+            end: end >= entries.len(),
+        }))
+    }
 
     /// Change file mode/permissions by inode.
     async fn chmod(&self, ino: i64, mode: u32) -> Result<()>;
