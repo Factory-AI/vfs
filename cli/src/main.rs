@@ -13,12 +13,10 @@ fn parse_encryption(key: Option<String>, cipher: Option<String>) -> Option<(Stri
     match (key, cipher) {
         (Some(key), Some(cipher)) => Some((key, cipher)),
         (Some(_), None) => {
-            eprintln!("Error: --cipher is required when using --key");
-            std::process::exit(1);
+            exit_with_error("--cipher is required when using --key");
         }
         (None, Some(_)) => {
-            eprintln!("Error: --key is required when using --cipher");
-            std::process::exit(1);
+            exit_with_error("--key is required when using --cipher");
         }
         (None, None) => None,
     }
@@ -44,6 +42,16 @@ fn partial_origin_policy(
     }
 }
 
+fn exit_with_error(message: impl std::fmt::Display) -> ! {
+    eprintln!("Error: {message}");
+    exit_with_code(1);
+}
+
+fn exit_with_code(code: i32) -> ! {
+    agentfs::profiling::emit_cli_report();
+    std::process::exit(code);
+}
+
 fn main() {
     let _ = tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer())
@@ -57,7 +65,14 @@ fn main() {
 
     CompleteEnv::with_factory(Args::command).complete();
     let _profile_report = agentfs::profiling::install_cli_sink();
-    let args = Args::parse();
+    let args = match Args::try_parse() {
+        Ok(args) => args,
+        Err(error) => {
+            let code = error.exit_code();
+            let _ = error.print();
+            exit_with_code(code);
+        }
+    };
 
     match args.command {
         Command::Init {
@@ -82,8 +97,7 @@ fn main() {
                 command,
                 backend,
             )) {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
+                exit_with_error(e);
             }
         }
         Command::Sync {
@@ -93,22 +107,19 @@ fn main() {
             SyncCommand::Pull => {
                 let rt = get_runtime();
                 if let Err(e) = rt.block_on(cmd::sync::handle_pull_command(id_or_path)) {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
+                    exit_with_error(e);
                 }
             }
             SyncCommand::Push => {
                 let rt = get_runtime();
                 if let Err(e) = rt.block_on(cmd::sync::handle_push_command(id_or_path)) {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
+                    exit_with_error(e);
                 }
             }
             SyncCommand::Checkpoint => {
                 let rt = get_runtime();
                 if let Err(e) = rt.block_on(cmd::sync::handle_checkpoint_command(id_or_path)) {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
+                    exit_with_error(e);
                 }
             }
             SyncCommand::Stats => {
@@ -117,8 +128,7 @@ fn main() {
                     &mut std::io::stdout(),
                     id_or_path,
                 )) {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
+                    exit_with_error(e);
                 }
             }
         },
@@ -149,8 +159,7 @@ fn main() {
                 command,
                 args,
             )) {
-                eprintln!("Error: {e:?}");
-                std::process::exit(1);
+                exit_with_error(format_args!("{e:?}"));
             }
         }
         #[cfg(unix)]
@@ -167,8 +176,7 @@ fn main() {
             if let Err(e) = rt.block_on(cmd::exec::handle_exec_command(
                 id_or_path, command, args, backend, encryption,
             )) {
-                eprintln!("Error: {e:?}");
-                std::process::exit(1);
+                exit_with_error(format_args!("{e:?}"));
             }
         }
         #[cfg(unix)]
@@ -183,8 +191,7 @@ fn main() {
             if let Err(e) = rt.block_on(cmd::clone::handle_clone_command(
                 id_or_path, source, name, backend, verify,
             )) {
-                eprintln!("Error: {e:?}");
-                std::process::exit(1);
+                exit_with_error(format_args!("{e:?}"));
             }
         }
         Command::Mount {
@@ -216,23 +223,20 @@ fn main() {
                         partial_origin_threshold_bytes,
                     ),
                 }) {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
+                    exit_with_error(e);
                 }
             }
             (None, None) => {
                 cmd::mount::list_mounts(&mut std::io::stdout());
             }
             _ => {
-                eprintln!("Error: both ID_OR_PATH and MOUNTPOINT are required to mount");
-                std::process::exit(1);
+                exit_with_error("both ID_OR_PATH and MOUNTPOINT are required to mount");
             }
         },
         Command::Diff { id_or_path } => {
             let rt = get_runtime();
             if let Err(e) = rt.block_on(cmd::fs::diff_filesystem(id_or_path)) {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
+                exit_with_error(e);
             }
         }
         Command::Timeline {
@@ -254,8 +258,7 @@ fn main() {
                 &id_or_path,
                 &options,
             )) {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
+                exit_with_error(e);
             }
         }
         Command::Fs {
@@ -274,8 +277,7 @@ fn main() {
                         &fs_path,
                         encryption.as_ref(),
                     )) {
-                        eprintln!("Error: {}", e);
-                        std::process::exit(1);
+                        exit_with_error(e);
                     }
                 }
                 FsCommand::Cat { file_path } => {
@@ -285,8 +287,7 @@ fn main() {
                         &file_path,
                         encryption.as_ref(),
                     )) {
-                        eprintln!("Error: {}", e);
-                        std::process::exit(1);
+                        exit_with_error(e);
                     }
                 }
                 FsCommand::Write { file_path, content } => {
@@ -296,8 +297,7 @@ fn main() {
                         &content,
                         encryption.as_ref(),
                     )) {
-                        eprintln!("Error: {}", e);
-                        std::process::exit(1);
+                        exit_with_error(e);
                     }
                 }
             }
@@ -312,8 +312,7 @@ fn main() {
             eprintln!("Warning: `agentfs nfs` is deprecated, use `agentfs serve nfs` instead");
             let rt = get_runtime();
             if let Err(e) = rt.block_on(cmd::nfs::handle_nfs_command(id_or_path, bind, port)) {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
+                exit_with_error(e);
             }
         }
         Command::McpServer { id_or_path, tools } => {
@@ -324,8 +323,7 @@ fn main() {
             if let Err(e) = rt.block_on(cmd::mcp_server::handle_mcp_server_command(
                 id_or_path, tools,
             )) {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
+                exit_with_error(e);
             }
         }
         Command::Serve { command } => match command {
@@ -337,8 +335,7 @@ fn main() {
             } => {
                 let rt = get_runtime();
                 if let Err(e) = rt.block_on(cmd::nfs::handle_nfs_command(id_or_path, bind, port)) {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
+                    exit_with_error(e);
                 }
             }
             ServeCommand::Mcp { id_or_path, tools } => {
@@ -346,22 +343,19 @@ fn main() {
                 if let Err(e) = rt.block_on(cmd::mcp_server::handle_mcp_server_command(
                     id_or_path, tools,
                 )) {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
+                    exit_with_error(e);
                 }
             }
         },
         Command::Ps => {
             if let Err(e) = cmd::ps::list_ps(&mut std::io::stdout()) {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
+                exit_with_error(e);
             }
         }
         Command::Prune { command } => match command {
             PruneCommand::Mounts { force } => {
                 if let Err(e) = cmd::mount::prune_mounts(force) {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
+                    exit_with_error(e);
                 }
             }
         },
@@ -383,8 +377,7 @@ fn main() {
                 check_base,
                 encryption.as_ref(),
             )) {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
+                exit_with_error(e);
             }
         }
         Command::Backup {
@@ -405,8 +398,7 @@ fn main() {
                 materialize,
                 encryption.as_ref(),
             )) {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
+                exit_with_error(e);
             }
         }
         Command::Materialize {
@@ -425,8 +417,7 @@ fn main() {
                 verify,
                 encryption.as_ref(),
             )) {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
+                exit_with_error(e);
             }
         }
         Command::Migrate {
@@ -439,8 +430,7 @@ fn main() {
                 id_or_path,
                 dry_run,
             )) {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
+                exit_with_error(e);
             }
         }
         Command::MigrateV0_5 {
@@ -457,8 +447,7 @@ fn main() {
                 verify,
                 overwrite_target,
             )) {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
+                exit_with_error(e);
             }
         }
     }

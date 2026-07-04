@@ -53,6 +53,7 @@ pub async fn run(
             eprintln!("Joining existing session: {}", session.session_id);
             eprintln!();
             let outcome = run_command_in_mount(&session, command, args).await?;
+            crate::profiling::emit_cli_report();
             std::process::exit(exit_code_for_outcome(outcome));
         } else {
             eprintln!("Cleaning up stale NFS mount...");
@@ -145,6 +146,7 @@ pub async fn run(
     eprintln!("To see what changed:");
     eprintln!("  agentfs diff {}", session.session_id);
 
+    crate::profiling::emit_cli_report();
     std::process::exit(exit_code_for_outcome(outcome?));
 }
 

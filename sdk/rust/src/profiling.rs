@@ -19,6 +19,8 @@ static CHECKPOINT_SEQ: AtomicU64 = AtomicU64::new(0);
 static REGISTRY: std::sync::OnceLock<Mutex<Vec<&'static dyn TelemetrySection>>> =
     std::sync::OnceLock::new();
 
+pub const DEFAULT_PROFILE_ENABLED: bool = false;
+
 /// A named domain of telemetry counters.
 pub trait TelemetrySection: Sync {
     fn name(&self) -> &'static str;
@@ -364,7 +366,9 @@ pub fn is_enabled() -> bool {
     }
     #[cfg(not(test))]
     {
-        *ENABLED.get_or_init(|| crate::config::EnvReader::new().bool("AGENTFS_PROFILE", false))
+        *ENABLED.get_or_init(|| {
+            crate::config::EnvReader::new().bool("AGENTFS_PROFILE", DEFAULT_PROFILE_ENABLED)
+        })
     }
 }
 

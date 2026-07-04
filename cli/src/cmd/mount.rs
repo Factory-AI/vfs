@@ -657,5 +657,6 @@ fn exit_schema_version_mismatch(found: &str, expected: &str, id_or_path: &str) -
     eprintln!();
     eprintln!("    agentfs migrate {}", id_or_path);
     eprintln!();
+    crate::profiling::emit_cli_report();
     std::process::exit(1);
 }

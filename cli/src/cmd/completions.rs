@@ -76,35 +76,33 @@ pub fn handle_completions(command: CompletionsCommand) {
         CompletionsCommand::Install { shell } => {
             let shell = match shell.or_else(Shell::detect) {
                 Some(s) => s,
-                None => {
-                    eprintln!(
-                        "Error: Could not detect current shell. Please specify a shell explicitly."
-                    );
-                    std::process::exit(1)
-                }
+                None => exit_with_error(
+                    "Could not detect current shell. Please specify a shell explicitly.",
+                ),
             };
             if let Err(err) = install(shell) {
-                eprintln!("Error: {err}");
-                std::process::exit(1)
+                exit_with_error(err);
             }
         }
         CompletionsCommand::Uninstall { shell } => {
             let shell = match shell.or_else(Shell::detect) {
                 Some(s) => s,
-                None => {
-                    eprintln!(
-                        "Error: Could not detect current shell. Please specify a shell explicitly."
-                    );
-                    std::process::exit(1)
-                }
+                None => exit_with_error(
+                    "Could not detect current shell. Please specify a shell explicitly.",
+                ),
             };
             if let Err(err) = uninstall(shell) {
-                eprintln!("Error: {err}");
-                std::process::exit(1)
+                exit_with_error(err);
             }
         }
         CompletionsCommand::Show => show(),
     }
+}
+
+fn exit_with_error(message: impl std::fmt::Display) -> ! {
+    eprintln!("Error: {message}");
+    crate::profiling::emit_cli_report();
+    std::process::exit(1)
 }
 
 fn install(shell: Shell) -> io::Result<()> {

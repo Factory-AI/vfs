@@ -33,6 +33,19 @@ pub(crate) const DEFAULT_AUTO_PERCENT: u8 = 50;
 pub(crate) const DEFAULT_QUEUE_MEMORY_PERCENT: u8 = 25;
 pub(crate) const DEFAULT_INO_FILES_CAP: usize = 65_536;
 pub(crate) const DEFAULT_URING_DEPTH: usize = 4;
+pub(crate) const DEFAULT_FUSE_WORKERS: &str = "auto";
+pub(crate) const DEFAULT_FUSE_QUEUE: &str = "derived";
+pub(crate) const DEFAULT_FUSE_WRITEBACK: bool = true;
+pub(crate) const DEFAULT_FUSE_KEEPCACHE: bool = true;
+pub(crate) const DEFAULT_FUSE_SYNC_INVAL: bool = false;
+pub(crate) const DEFAULT_FUSE_SELF_INVAL: bool = false;
+pub(crate) const DEFAULT_DRAIN_ON_RELEASE: bool = false;
+pub(crate) const DEFAULT_DRAIN_ON_FORGET: bool = false;
+pub(crate) const DEFAULT_FUSE_FLUSH_INVAL: bool = false;
+pub(crate) const DEFAULT_FUSE_NOFLUSH: bool = true;
+pub(crate) const DEFAULT_FUSE_NOOPEN: bool = true;
+pub(crate) const DEFAULT_FUSE_CACHE_DIR: bool = true;
+pub(crate) const DEFAULT_FUSE_STICKY_KEEPCACHE_DROP: bool = false;
 const MAX_URING_DEPTH: usize = 64;
 const MAX_URING_SPIN_US: u64 = 1000;
 
@@ -115,14 +128,23 @@ impl DispatchMode {
 }
 
 /// Kernel readdirplus policy.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
 pub enum ReaddirPlusMode {
     Off,
     Auto,
+    #[default]
     Always,
 }
 
 impl ReaddirPlusMode {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            ReaddirPlusMode::Off => "off",
+            ReaddirPlusMode::Auto => "auto",
+            ReaddirPlusMode::Always => "always",
+        }
+    }
+
     pub(crate) fn profile_value(self) -> u64 {
         match self {
             ReaddirPlusMode::Off => READDIRPLUS_MODE_OFF,
@@ -222,15 +244,15 @@ impl FuseConfig {
     pub(crate) fn from_env() -> Self {
         let reader = EnvReader::new();
         let dispatch_mode = DispatchMode::from_env();
-        let drain_on_release = reader.bool("AGENTFS_DRAIN_ON_RELEASE", false);
-        let noflush_requested = reader.bool("AGENTFS_FUSE_NOFLUSH", true);
+        let drain_on_release = reader.bool("AGENTFS_DRAIN_ON_RELEASE", DEFAULT_DRAIN_ON_RELEASE);
+        let noflush_requested = reader.bool("AGENTFS_FUSE_NOFLUSH", DEFAULT_FUSE_NOFLUSH);
         let noflush = noflush_requested && !drain_on_release;
         if noflush_requested && !noflush {
             tracing::warn!(
                 "AGENTFS_FUSE_NOFLUSH disabled: AGENTFS_DRAIN_ON_RELEASE needs the close-time FLUSH"
             );
         }
-        let noopen_requested = reader.bool("AGENTFS_FUSE_NOOPEN", true);
+        let noopen_requested = reader.bool("AGENTFS_FUSE_NOOPEN", DEFAULT_FUSE_NOOPEN);
         let noopen = noopen_requested && !drain_on_release;
         if noopen_requested && !noopen {
             tracing::warn!(
@@ -246,19 +268,23 @@ impl FuseConfig {
             ),
             attr_ttl_ms: env_duration_ms("AGENTFS_FUSE_ATTR_TTL_MS", DEFAULT_FUSE_POSITIVE_TTL_MS),
             neg_ttl_ms: env_duration_ms("AGENTFS_FUSE_NEG_TTL_MS", DEFAULT_FUSE_NEG_TTL_MS),
-            writeback_cache_requested: reader.bool("AGENTFS_FUSE_WRITEBACK", true),
-            keepcache_requested: reader.bool("AGENTFS_FUSE_KEEPCACHE", true),
+            writeback_cache_requested: reader
+                .bool("AGENTFS_FUSE_WRITEBACK", DEFAULT_FUSE_WRITEBACK),
+            keepcache_requested: reader.bool("AGENTFS_FUSE_KEEPCACHE", DEFAULT_FUSE_KEEPCACHE),
             readdirplus_requested: readdirplus_mode_from_env(),
             sync_inval: sync_inval_from_env(reader, dispatch_mode),
-            self_inval: reader.bool("AGENTFS_FUSE_SELF_INVAL", false),
+            self_inval: reader.bool("AGENTFS_FUSE_SELF_INVAL", DEFAULT_FUSE_SELF_INVAL),
             drain_on_release,
-            drain_on_forget: reader.bool("AGENTFS_DRAIN_ON_FORGET", false),
-            flush_inval_always: reader.bool("AGENTFS_FUSE_FLUSH_INVAL", false),
+            drain_on_forget: reader.bool("AGENTFS_DRAIN_ON_FORGET", DEFAULT_DRAIN_ON_FORGET),
+            flush_inval_always: reader.bool("AGENTFS_FUSE_FLUSH_INVAL", DEFAULT_FUSE_FLUSH_INVAL),
             noflush,
             noopen,
             ino_files_cap: env_usize_min("AGENTFS_FUSE_INO_FILES_CAP", DEFAULT_INO_FILES_CAP, 16),
-            cache_dir_requested: reader.bool("AGENTFS_FUSE_CACHE_DIR", true),
-            keepcache_sticky_drop: reader.bool("AGENTFS_FUSE_STICKY_KEEPCACHE_DROP", false),
+            cache_dir_requested: reader.bool("AGENTFS_FUSE_CACHE_DIR", DEFAULT_FUSE_CACHE_DIR),
+            keepcache_sticky_drop: reader.bool(
+                "AGENTFS_FUSE_STICKY_KEEPCACHE_DROP",
+                DEFAULT_FUSE_STICKY_KEEPCACHE_DROP,
+            ),
             uring: UringConfig::from_env(reader),
         };
         emit_kernel_cache_interlock_warnings(&config);
@@ -333,6 +359,7 @@ fn emit_kernel_cache_interlock_warnings(config: &FuseConfig) {
 }
 
 fn readdirplus_mode_from_env() -> ReaddirPlusMode {
+    let default = ReaddirPlusMode::default();
     match std::env::var("AGENTFS_FUSE_READDIRPLUS") {
         Ok(value)
             if value.eq_ignore_ascii_case("off")
@@ -356,23 +383,23 @@ fn readdirplus_mode_from_env() -> ReaddirPlusMode {
             tracing::warn!(
                 "Ignoring invalid AGENTFS_FUSE_READDIRPLUS={:?}; using default {:?}",
                 value,
-                ReaddirPlusMode::Always
+                default
             );
-            ReaddirPlusMode::Always
+            default
         }
-        Err(VarError::NotPresent) => ReaddirPlusMode::Always,
+        Err(VarError::NotPresent) => default,
         Err(VarError::NotUnicode(value)) => {
             tracing::warn!(
                 ?value,
                 "Ignoring non-Unicode AGENTFS_FUSE_READDIRPLUS; using default"
             );
-            ReaddirPlusMode::Always
+            default
         }
     }
 }
 
 fn sync_inval_from_env(reader: EnvReader, dispatch_mode: DispatchMode) -> bool {
-    let sync_requested = reader.bool("AGENTFS_FUSE_SYNC_INVAL", false);
+    let sync_requested = reader.bool("AGENTFS_FUSE_SYNC_INVAL", DEFAULT_FUSE_SYNC_INVAL);
     if dispatch_mode.is_serial() && sync_requested {
         tracing::info!(
             "AGENTFS_FUSE_SYNC_INVAL requested with AGENTFS_FUSE_WORKERS=serial; using deferred invalidation to avoid notify/reply deadlock"

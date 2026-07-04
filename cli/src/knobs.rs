@@ -5,15 +5,24 @@
 //! options, and the first-class partial-origin CLI policy flags.
 
 use agentfs_sdk::{
-    DEFAULT_PARTIAL_ORIGIN_THRESHOLD_BYTES, DEFAULT_WRITE_BATCH_BYTES,
+    CoreConfig, DEFAULT_PARTIAL_ORIGIN_THRESHOLD_BYTES, DEFAULT_WRITE_BATCH_BYTES,
     DEFAULT_WRITE_BATCH_GLOBAL_BYTES, DEFAULT_WRITE_BATCH_MS, DEFAULT_WRITE_BATCH_TXN_BYTES,
     DEFAULT_WRITE_BATCH_TXN_INODES,
 };
 
+use agentfs_sdk::profiling::DEFAULT_PROFILE_ENABLED;
+
+use crate::config::DEFAULT_CLONE_TIMINGS_ENABLED;
+
 #[cfg(target_os = "linux")]
 use crate::fuse_config::{
-    DEFAULT_AUTO_PERCENT, DEFAULT_FUSE_NEG_TTL_MS, DEFAULT_FUSE_POSITIVE_TTL_MS,
-    DEFAULT_INO_FILES_CAP, DEFAULT_QUEUE_MEMORY_PERCENT, DEFAULT_URING_DEPTH,
+    ReaddirPlusMode, UringConfig, DEFAULT_AUTO_PERCENT, DEFAULT_DRAIN_ON_FORGET,
+    DEFAULT_DRAIN_ON_RELEASE, DEFAULT_FUSE_CACHE_DIR, DEFAULT_FUSE_FLUSH_INVAL,
+    DEFAULT_FUSE_KEEPCACHE, DEFAULT_FUSE_NEG_TTL_MS, DEFAULT_FUSE_NOFLUSH, DEFAULT_FUSE_NOOPEN,
+    DEFAULT_FUSE_POSITIVE_TTL_MS, DEFAULT_FUSE_QUEUE, DEFAULT_FUSE_SELF_INVAL,
+    DEFAULT_FUSE_STICKY_KEEPCACHE_DROP, DEFAULT_FUSE_SYNC_INVAL, DEFAULT_FUSE_WORKERS,
+    DEFAULT_FUSE_WRITEBACK, DEFAULT_INO_FILES_CAP, DEFAULT_QUEUE_MEMORY_PERCENT,
+    DEFAULT_URING_DEPTH,
 };
 
 /// Knob class required by the architecture.
@@ -38,12 +47,52 @@ impl KnobClass {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum DefaultValue {
     Literal(&'static str),
+    Unset,
+    Removed,
+    CloneTimingsEnabled,
+    ProfileEnabled,
+    CoreOverlayReads,
+    CoreKeepcacheDelta,
+    CoreDrainOnSetattr,
+    PartialOriginMode,
     WriteBatchMs,
     WriteBatchBytes,
     WriteBatchGlobalBytes,
     WriteBatchTxnInodes,
     WriteBatchTxnBytes,
     PartialOriginThresholdBytes,
+    #[cfg(target_os = "linux")]
+    FuseWorkers,
+    #[cfg(target_os = "linux")]
+    FuseQueue,
+    #[cfg(target_os = "linux")]
+    FuseWriteback,
+    #[cfg(target_os = "linux")]
+    FuseKeepcache,
+    #[cfg(target_os = "linux")]
+    FuseReaddirPlus,
+    #[cfg(target_os = "linux")]
+    FuseSyncInval,
+    #[cfg(target_os = "linux")]
+    FuseSelfInval,
+    #[cfg(target_os = "linux")]
+    FuseDrainOnRelease,
+    #[cfg(target_os = "linux")]
+    FuseDrainOnForget,
+    #[cfg(target_os = "linux")]
+    FuseFlushInval,
+    #[cfg(target_os = "linux")]
+    FuseNoflush,
+    #[cfg(target_os = "linux")]
+    FuseNoopen,
+    #[cfg(target_os = "linux")]
+    FuseCacheDir,
+    #[cfg(target_os = "linux")]
+    FuseStickyKeepcacheDrop,
+    #[cfg(target_os = "linux")]
+    FuseUringEnabled,
+    #[cfg(target_os = "linux")]
+    FuseUringSpinUs,
     #[cfg(target_os = "linux")]
     FusePositiveTtlMs,
     #[cfg(target_os = "linux")]
@@ -62,12 +111,60 @@ impl DefaultValue {
     pub fn render(self) -> String {
         match self {
             Self::Literal(value) => value.to_string(),
+            Self::Unset => "unset".to_string(),
+            Self::Removed => "removed".to_string(),
+            Self::CloneTimingsEnabled => render_bool(DEFAULT_CLONE_TIMINGS_ENABLED).to_string(),
+            Self::ProfileEnabled => render_bool(DEFAULT_PROFILE_ENABLED).to_string(),
+            Self::CoreOverlayReads => render_bool(CoreConfig::default().overlay_reads).to_string(),
+            Self::CoreKeepcacheDelta => {
+                render_bool(CoreConfig::default().keepcache_delta).to_string()
+            }
+            Self::CoreDrainOnSetattr => {
+                render_bool(CoreConfig::default().drain_on_setattr).to_string()
+            }
+            Self::PartialOriginMode => {
+                partial_origin_mode_as_str(CoreConfig::default().partial_origin.mode).to_string()
+            }
             Self::WriteBatchMs => DEFAULT_WRITE_BATCH_MS.to_string(),
             Self::WriteBatchBytes => DEFAULT_WRITE_BATCH_BYTES.to_string(),
             Self::WriteBatchGlobalBytes => DEFAULT_WRITE_BATCH_GLOBAL_BYTES.to_string(),
             Self::WriteBatchTxnInodes => DEFAULT_WRITE_BATCH_TXN_INODES.to_string(),
             Self::WriteBatchTxnBytes => DEFAULT_WRITE_BATCH_TXN_BYTES.to_string(),
             Self::PartialOriginThresholdBytes => DEFAULT_PARTIAL_ORIGIN_THRESHOLD_BYTES.to_string(),
+            #[cfg(target_os = "linux")]
+            Self::FuseWorkers => DEFAULT_FUSE_WORKERS.to_string(),
+            #[cfg(target_os = "linux")]
+            Self::FuseQueue => DEFAULT_FUSE_QUEUE.to_string(),
+            #[cfg(target_os = "linux")]
+            Self::FuseWriteback => render_bool(DEFAULT_FUSE_WRITEBACK).to_string(),
+            #[cfg(target_os = "linux")]
+            Self::FuseKeepcache => render_bool(DEFAULT_FUSE_KEEPCACHE).to_string(),
+            #[cfg(target_os = "linux")]
+            Self::FuseReaddirPlus => ReaddirPlusMode::default().as_str().to_string(),
+            #[cfg(target_os = "linux")]
+            Self::FuseSyncInval => render_bool(DEFAULT_FUSE_SYNC_INVAL).to_string(),
+            #[cfg(target_os = "linux")]
+            Self::FuseSelfInval => render_bool(DEFAULT_FUSE_SELF_INVAL).to_string(),
+            #[cfg(target_os = "linux")]
+            Self::FuseDrainOnRelease => render_bool(DEFAULT_DRAIN_ON_RELEASE).to_string(),
+            #[cfg(target_os = "linux")]
+            Self::FuseDrainOnForget => render_bool(DEFAULT_DRAIN_ON_FORGET).to_string(),
+            #[cfg(target_os = "linux")]
+            Self::FuseFlushInval => render_bool(DEFAULT_FUSE_FLUSH_INVAL).to_string(),
+            #[cfg(target_os = "linux")]
+            Self::FuseNoflush => render_bool(DEFAULT_FUSE_NOFLUSH).to_string(),
+            #[cfg(target_os = "linux")]
+            Self::FuseNoopen => render_bool(DEFAULT_FUSE_NOOPEN).to_string(),
+            #[cfg(target_os = "linux")]
+            Self::FuseCacheDir => render_bool(DEFAULT_FUSE_CACHE_DIR).to_string(),
+            #[cfg(target_os = "linux")]
+            Self::FuseStickyKeepcacheDrop => {
+                render_bool(DEFAULT_FUSE_STICKY_KEEPCACHE_DROP).to_string()
+            }
+            #[cfg(target_os = "linux")]
+            Self::FuseUringEnabled => render_bool(UringConfig::default().enabled).to_string(),
+            #[cfg(target_os = "linux")]
+            Self::FuseUringSpinUs => UringConfig::default().spin_us.to_string(),
             #[cfg(target_os = "linux")]
             Self::FusePositiveTtlMs => DEFAULT_FUSE_POSITIVE_TTL_MS.to_string(),
             #[cfg(target_os = "linux")]
@@ -81,6 +178,22 @@ impl DefaultValue {
             #[cfg(target_os = "linux")]
             Self::FuseUringDepth => DEFAULT_URING_DEPTH.to_string(),
         }
+    }
+}
+
+fn render_bool(value: bool) -> &'static str {
+    if value {
+        "true"
+    } else {
+        "false"
+    }
+}
+
+fn partial_origin_mode_as_str(mode: agentfs_sdk::PartialOriginMode) -> &'static str {
+    match mode {
+        agentfs_sdk::PartialOriginMode::Off => "off",
+        agentfs_sdk::PartialOriginMode::On => "on",
+        agentfs_sdk::PartialOriginMode::Auto => "auto",
     }
 }
 
@@ -163,13 +276,16 @@ impl Knob {
 const CORE_OWNER: &str = "agentfs-sdk config";
 const FUSE_OWNER: &str = "agentfs FUSE config";
 const CLI_OWNER: &str = "agentfs CLI edge";
+#[cfg(test)]
+const KNOBS_DOC_REGEN_ENV: &str = "AGENTFS_UPDATE_KNOBS";
+const KNOBS_DOC_REGEN_COMMAND: &str = "AGENTFS_UPDATE_KNOBS=1 cargo +nightly test -p agentfs knobs::tests::generated_knobs_doc_matches_declarations -- --exact";
 
 #[cfg(target_os = "linux")]
 const LINUX_FUSE_KNOBS: &[Knob] = &[
     Knob::product(
         "AGENTFS_FUSE_WORKERS",
         "env",
-        DefaultValue::Literal("auto"),
+        DefaultValue::FuseWorkers,
         FUSE_OWNER,
         "FUSE request dispatch mode. auto sizes from CPU and memory budgets; serial disables kernel-cache acceleration for safety.",
         "fuse_config::tests::workers_config_feeds_dispatch_and_cache_policy",
@@ -193,7 +309,7 @@ const LINUX_FUSE_KNOBS: &[Knob] = &[
     Knob::product(
         "AGENTFS_FUSE_QUEUE",
         "env",
-        DefaultValue::Literal("derived"),
+        DefaultValue::FuseQueue,
         FUSE_OWNER,
         "FUSE worker request queue capacity; unset derives from worker count and queue memory budget.",
         "fuse_config::tests::workers_config_feeds_dispatch_and_cache_policy",
@@ -233,7 +349,7 @@ const LINUX_FUSE_KNOBS: &[Knob] = &[
     Knob::product(
         "AGENTFS_FUSE_WRITEBACK",
         "env",
-        DefaultValue::Literal("true"),
+        DefaultValue::FuseWriteback,
         FUSE_OWNER,
         "Enables FUSE writeback cache and the SDK write batcher when the CLI opens core config.",
         "fuse_config::tests::serial_dispatch_disables_kernel_cache_policy",
@@ -241,7 +357,7 @@ const LINUX_FUSE_KNOBS: &[Knob] = &[
     Knob::product(
         "AGENTFS_FUSE_KEEPCACHE",
         "env",
-        DefaultValue::Literal("true"),
+        DefaultValue::FuseKeepcache,
         FUSE_OWNER,
         "Allows eligible read-only base files to use FOPEN_KEEP_CACHE.",
         "fuse_config::tests::serial_dispatch_disables_kernel_cache_policy",
@@ -249,7 +365,7 @@ const LINUX_FUSE_KNOBS: &[Knob] = &[
     Knob::product(
         "AGENTFS_FUSE_READDIRPLUS",
         "env",
-        DefaultValue::Literal("always"),
+        DefaultValue::FuseReaddirPlus,
         FUSE_OWNER,
         "Kernel READDIRPLUS policy.",
         "fuse_config::tests::invalid_readdirplus_warns_and_defaults_on",
@@ -257,7 +373,7 @@ const LINUX_FUSE_KNOBS: &[Knob] = &[
     Knob::product(
         "AGENTFS_FUSE_SYNC_INVAL",
         "env",
-        DefaultValue::Literal("false"),
+        DefaultValue::FuseSyncInval,
         FUSE_OWNER,
         "Requests synchronous kernel invalidation; serial dispatch keeps deferred invalidation for deadlock safety.",
         "fuse_config::tests::serial_dispatch_disables_kernel_cache_policy",
@@ -265,7 +381,7 @@ const LINUX_FUSE_KNOBS: &[Knob] = &[
     Knob::sunset(
         "AGENTFS_FUSE_SELF_INVAL",
         "env",
-        DefaultValue::Literal("false"),
+        DefaultValue::FuseSelfInval,
         FUSE_OWNER,
         "Compatibility path that restores notify-on-self-mutation behavior.",
         "Remove after adapter cache extraction proves self-invalidation suppression through VAL-FUSE cache and coherence gates.",
@@ -274,7 +390,7 @@ const LINUX_FUSE_KNOBS: &[Knob] = &[
     Knob::sunset(
         "AGENTFS_DRAIN_ON_RELEASE",
         "env",
-        DefaultValue::Literal("false"),
+        DefaultValue::FuseDrainOnRelease,
         FUSE_OWNER,
         "Compatibility path that restores commit-on-close and disables noopen/noflush.",
         "Remove after N=2 consecutive milestones with VAL-FUSE-015, noopen, and noflush off-leg gates green.",
@@ -283,7 +399,7 @@ const LINUX_FUSE_KNOBS: &[Knob] = &[
     Knob::sunset(
         "AGENTFS_DRAIN_ON_FORGET",
         "env",
-        DefaultValue::Literal("false"),
+        DefaultValue::FuseDrainOnForget,
         FUSE_OWNER,
         "Compatibility path that restores drain-on-forget.",
         "Remove after lifecycle and FORGET-driven cleanup gates are green for N=2 consecutive milestones.",
@@ -292,7 +408,7 @@ const LINUX_FUSE_KNOBS: &[Knob] = &[
     Knob::sunset(
         "AGENTFS_FUSE_FLUSH_INVAL",
         "env",
-        DefaultValue::Literal("false"),
+        DefaultValue::FuseFlushInval,
         FUSE_OWNER,
         "Compatibility path that restores invalidate-on-every-FLUSH.",
         "Remove after noflush coherence gates are green for N=2 consecutive milestones.",
@@ -300,14 +416,14 @@ const LINUX_FUSE_KNOBS: &[Knob] = &[
     ),
     Knob::kill_switch(
         "AGENTFS_FUSE_NOFLUSH",
-        DefaultValue::Literal("true"),
+        DefaultValue::FuseNoflush,
         FUSE_OWNER,
         "Disables close-time FLUSH by returning ENOSYS after the kernel has written dirty pages.",
         "VAL-FUSE-007 default leg and VAL-FUSE-008 off leg",
     ),
     Knob::kill_switch(
         "AGENTFS_FUSE_NOOPEN",
-        DefaultValue::Literal("true"),
+        DefaultValue::FuseNoopen,
         FUSE_OWNER,
         "Disables per-file OPEN/RELEASE by returning ENOSYS when the kernel supports no-open.",
         "VAL-FUSE-003 default leg and VAL-FUSE-004 off leg",
@@ -323,7 +439,7 @@ const LINUX_FUSE_KNOBS: &[Knob] = &[
     Knob::product(
         "AGENTFS_FUSE_CACHE_DIR",
         "env",
-        DefaultValue::Literal("true"),
+        DefaultValue::FuseCacheDir,
         FUSE_OWNER,
         "Directory-entry cache fast path, effective only when keepcache remains enabled.",
         "VAL-FUSE-011 and VAL-FUSE-018",
@@ -331,7 +447,7 @@ const LINUX_FUSE_KNOBS: &[Knob] = &[
     Knob::sunset(
         "AGENTFS_FUSE_STICKY_KEEPCACHE_DROP",
         "env",
-        DefaultValue::Literal("false"),
+        DefaultValue::FuseStickyKeepcacheDrop,
         FUSE_OWNER,
         "Compatibility path that restores old sticky keepcache-drop behavior after mutation.",
         "Remove after keep-cache fingerprint gates are green for N=2 consecutive milestones.",
@@ -339,7 +455,7 @@ const LINUX_FUSE_KNOBS: &[Knob] = &[
     ),
     Knob::kill_switch(
         "AGENTFS_FUSE_URING",
-        DefaultValue::Literal("true"),
+        DefaultValue::FuseUringEnabled,
         FUSE_OWNER,
         "FUSE-over-io_uring transport attempt. Set false to force the legacy /dev/fuse path.",
         "VAL-FUSE-009 uring leg and VAL-FUSE-010 off leg",
@@ -355,7 +471,7 @@ const LINUX_FUSE_KNOBS: &[Knob] = &[
     Knob::sunset(
         "AGENTFS_FUSE_URING_SPIN_US",
         "env",
-        DefaultValue::Literal("0"),
+        DefaultValue::FuseUringSpinUs,
         FUSE_OWNER,
         "Compatibility tuning for io_uring busy-poll spin before blocking.",
         "Remove after uring teardown and performance gates are green for N=2 consecutive milestones.",
@@ -370,7 +486,7 @@ const ACTIVE_COMMON_KNOBS: &[Knob] = &[
     Knob::product(
         "AGENTFS_KEY",
         "env or --key",
-        DefaultValue::Literal("unset"),
+        DefaultValue::Unset,
         CLI_OWNER,
         "Hex-encoded local encryption key for CLI commands that open a database.",
         "opts clap env binding",
@@ -378,7 +494,7 @@ const ACTIVE_COMMON_KNOBS: &[Knob] = &[
     Knob::product(
         "AGENTFS_CIPHER",
         "env or --cipher",
-        DefaultValue::Literal("unset"),
+        DefaultValue::Unset,
         CLI_OWNER,
         "Encryption cipher paired with AGENTFS_KEY or --key.",
         "opts clap env binding",
@@ -386,7 +502,7 @@ const ACTIVE_COMMON_KNOBS: &[Knob] = &[
     Knob::sunset(
         "AGENTFS_CLONE_TIMINGS",
         "env",
-        DefaultValue::Literal("false"),
+        DefaultValue::CloneTimingsEnabled,
         CLI_OWNER,
         "Ad hoc clone timing printout for local performance investigations.",
         "Remove after telemetry registry exposes clone timing through the single report sink.",
@@ -395,7 +511,7 @@ const ACTIVE_COMMON_KNOBS: &[Knob] = &[
     Knob::product(
         "AGENTFS_PROFILE",
         "env",
-        DefaultValue::Literal("false"),
+        DefaultValue::ProfileEnabled,
         CORE_OWNER,
         "Enables profiling counters and summaries.",
         "VAL-CONF-011 and VAL-CONF-014",
@@ -403,7 +519,7 @@ const ACTIVE_COMMON_KNOBS: &[Knob] = &[
     Knob::sunset(
         "AGENTFS_OVERLAY_READS",
         "env",
-        DefaultValue::Literal("true"),
+        DefaultValue::CoreOverlayReads,
         CORE_OWNER,
         "Tier-4 pending-write read overlay rollback path.",
         "Remove after PendingView/stat coherence and overlay read gates are green for N=2 consecutive milestones.",
@@ -412,7 +528,7 @@ const ACTIVE_COMMON_KNOBS: &[Knob] = &[
     Knob::product(
         "AGENTFS_KEEPCACHE_DELTA",
         "env",
-        DefaultValue::Literal("true"),
+        DefaultValue::CoreKeepcacheDelta,
         CORE_OWNER,
         "Allows DB-backed delta files to participate in keep-cache eligibility.",
         "VAL-FUSE-014",
@@ -460,7 +576,7 @@ const ACTIVE_COMMON_KNOBS: &[Knob] = &[
     Knob::sunset(
         "AGENTFS_DRAIN_ON_SETATTR",
         "env",
-        DefaultValue::Literal("true"),
+        DefaultValue::CoreDrainOnSetattr,
         CORE_OWNER,
         "Compatibility path that drains pending writes before setattr operations.",
         "Remove after PendingView/stat coherence and setattr tests are green for N=2 consecutive milestones.",
@@ -469,7 +585,7 @@ const ACTIVE_COMMON_KNOBS: &[Knob] = &[
     Knob::product(
         "--partial-origin",
         "cli flag",
-        DefaultValue::Literal("off"),
+        DefaultValue::PartialOriginMode,
         CLI_OWNER,
         "First-class partial-origin copy-up policy: off, on, or auto.",
         "partial_origin::legacy_env_does_not_override_cli_off",
@@ -487,7 +603,7 @@ const ACTIVE_COMMON_KNOBS: &[Knob] = &[
 const DELETED_COMPAT_KNOBS: &[Knob] = &[Knob::sunset(
     concat!("AGENTFS_OVERLAY_", "PARTIAL_ORIGIN"),
     "deleted env compat",
-    DefaultValue::Literal("removed"),
+    DefaultValue::Removed,
     CORE_OWNER,
     "Removed legacy env compatibility path superseded by --partial-origin.",
     "Already removed in M3. Do not reintroduce; use --partial-origin or --partial-origin-threshold-bytes.",
@@ -512,7 +628,9 @@ pub fn generated_knobs_doc() -> String {
     let active = active_knobs();
     let mut out = String::new();
     out.push_str("# AgentFS Runtime Knobs\n\n");
-    out.push_str("<!-- Generated by `cargo test -p agentfs knobs::tests::generated_knobs_doc_matches_declarations -- --exact`. Do not edit by hand. -->\n\n");
+    out.push_str("<!-- Generated by `cargo +nightly test -p agentfs knobs::tests::generated_knobs_doc_matches_declarations -- --exact`. To regenerate: `");
+    out.push_str(KNOBS_DOC_REGEN_COMMAND);
+    out.push_str("`. Do not edit by hand. -->\n\n");
     out.push_str(
         "Every active runtime knob is declared here with an architecture class. Defaults are rendered from the typed config declarations used by the SDK/core and FUSE adapter config modules.\n\n",
     );
@@ -573,13 +691,46 @@ mod tests {
 
         let docs_path = repo_root().join("docs").join("KNOBS.md");
         let expected = generated_knobs_doc();
+        if std::env::var_os(KNOBS_DOC_REGEN_ENV).is_some() {
+            std::fs::write(&docs_path, &expected)
+                .unwrap_or_else(|err| panic!("failed to rewrite {}: {err}", docs_path.display()));
+        }
         let actual = std::fs::read_to_string(&docs_path)
             .unwrap_or_else(|err| panic!("failed to read {}: {err}", docs_path.display()));
-        assert_eq!(
-            actual,
-            expected,
-            "{} is stale; regenerate it from cli::knobs::generated_knobs_doc()",
-            docs_path.display()
+        assert_eq!(actual, expected, "{}", stale_knobs_doc_message(&docs_path));
+    }
+
+    #[test]
+    fn generated_knobs_doc_documents_regeneration_command() {
+        let doc = generated_knobs_doc();
+        assert!(
+            doc.contains(KNOBS_DOC_REGEN_COMMAND),
+            "generated KNOBS.md must document the one-command regeneration flow"
+        );
+    }
+
+    #[test]
+    fn stale_knobs_doc_message_names_regeneration_command() {
+        let message = stale_knobs_doc_message(&repo_root().join("docs").join("KNOBS.md"));
+        assert!(
+            message.contains(KNOBS_DOC_REGEN_COMMAND),
+            "drift failure message must name the regeneration command"
+        );
+    }
+
+    #[test]
+    fn knob_ledger_defaults_are_code_backed() {
+        let literal_defaults = active_knobs()
+            .iter()
+            .chain(deleted_compat_knobs())
+            .filter_map(|knob| match knob.default {
+                DefaultValue::Literal(value) => Some(format!("{}={value}", knob.name)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            literal_defaults.is_empty(),
+            "knob defaults must render from code Default impls or constants, not hand-written literals: {literal_defaults:?}"
         );
     }
 
@@ -672,6 +823,14 @@ mod tests {
             .iter()
             .find(|knob| knob.name == name)
             .unwrap_or_else(|| panic!("missing knob declaration for {name}"))
+    }
+
+    fn stale_knobs_doc_message(docs_path: &Path) -> String {
+        format!(
+            "{} is stale; regenerate it with:\n    {}",
+            docs_path.display(),
+            KNOBS_DOC_REGEN_COMMAND
+        )
     }
 
     fn assert_unique_names<'a>(knobs: impl Iterator<Item = &'a Knob>) {

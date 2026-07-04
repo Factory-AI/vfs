@@ -104,6 +104,7 @@ pub async fn handle_clone_command(
         Ok(summary) => summary,
         Err(error) => {
             if let Some(interrupted) = error.downcast_ref::<InterruptedSignal>() {
+                crate::profiling::emit_cli_report();
                 std::process::exit(128 + interrupted.0);
             }
             return Err(error);

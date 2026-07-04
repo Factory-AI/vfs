@@ -9,6 +9,8 @@ const TURSO_AUTH_TOKEN_ENV: &str = "TURSO_DB_AUTH_TOKEN";
 #[cfg(target_os = "linux")]
 const FUSE_WRITEBACK_ENV: &str = "AGENTFS_FUSE_WRITEBACK";
 
+pub(crate) const DEFAULT_CLONE_TIMINGS_ENABLED: bool = false;
+
 pub(crate) fn core_config_from_env() -> CoreConfig {
     let mut config = CoreConfig::from_env();
 
@@ -23,7 +25,7 @@ pub(crate) fn core_config_from_env() -> CoreConfig {
 pub(crate) fn clone_timings_enabled() -> bool {
     EnvReader::new()
         .string(CLONE_TIMINGS_ENV)
-        .is_some_and(|value| value == "1")
+        .map_or(DEFAULT_CLONE_TIMINGS_ENABLED, |value| value == "1")
 }
 
 pub(crate) fn current_shell_path() -> Option<String> {
