@@ -1,26 +1,31 @@
+mod copyup;
+mod fs;
+mod maps;
+mod partial;
+mod whiteouts;
+
 use crate::error::{Error, Result};
 use crate::schema;
 use async_trait::async_trait;
+use parking_lot::{Mutex, RwLock};
 use std::{
     collections::{HashMap, HashSet},
-    sync::{
-        atomic::{AtomicI64, Ordering},
-        Arc, Mutex, RwLock,
-    },
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
-use tracing::trace;
-use turso::transaction::{Transaction, TransactionBehavior};
 use turso::{Connection, Value};
 
 use super::{
     agentfs::{AgentFS, ReapHook},
-    BoxedFile, DirEntry, File, FileSystem, FilesystemStats, FsError, Stats, TimeChange, WriteRange,
+    FileSystem, Stats,
 };
 
+use maps::{InodeInfo, Layer, OverlayMaps};
+use partial::{OverlayPartialFile, PartialOrigin};
+
 /// Root inode number (matches FUSE convention)
-const ROOT_INO: i64 = 1;
-const STORAGE_CHUNKED: i64 = 0;
+pub(super) const ROOT_INO: i64 = 1;
+pub(super) const STORAGE_CHUNKED: i64 = 0;
 pub const DEFAULT_PARTIAL_ORIGIN_THRESHOLD_BYTES: u64 = 1024 * 1024;
 
 /// Explicit policy for partial-origin copy-up of regular base files.
@@ -78,12 +83,12 @@ impl PartialOriginPolicy {
     }
 }
 
-fn current_timestamp() -> Result<(i64, i64)> {
+pub(super) fn current_timestamp() -> Result<(i64, i64)> {
     let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
     Ok((dur.as_secs() as i64, dur.subsec_nanos() as i64))
 }
 
-fn is_write_open(flags: i32) -> bool {
+pub(super) fn is_write_open(flags: i32) -> bool {
     (flags & libc::O_ACCMODE) != libc::O_RDONLY || (flags & libc::O_TRUNC) != 0
 }
 
@@ -102,82 +107,38 @@ impl ReapHook for OverlaySidecarReapHook {
     }
 }
 
-fn parent_path_for_whiteout(path: &str) -> String {
-    if path == "/" {
-        return "/".to_string();
-    }
-
-    let trimmed = path.trim_end_matches('/');
-    match trimmed.rfind('/') {
-        Some(0) | None => "/".to_string(),
-        Some(index) => trimmed[..index].to_string(),
-    }
-}
-
-/// Which layer an inode belongs to
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum Layer {
-    Delta,
-    Base,
-}
-
-/// Information about an inode in the overlay filesystem
-#[derive(Debug, Clone)]
-struct InodeInfo {
-    /// Which layer this inode lives in
-    layer: Layer,
-    /// The inode number in the underlying layer
-    underlying_ino: i64,
-    /// Virtual path (for whiteout and copy-up operations)
-    path: String,
-}
-
-#[derive(Debug, Clone)]
-struct PartialOrigin {
-    base_path: String,
-    base_fingerprint_size: i64,
-    base_mtime: i64,
-    base_mtime_nsec: u32,
-    base_ctime: i64,
-    base_ctime_nsec: u32,
-}
-
-struct OverlayPartialFile {
-    delta: AgentFS,
-    base: Arc<dyn FileSystem>,
-    base_file: BoxedFile,
-    origin: PartialOrigin,
-    overlay_ino: i64,
-    delta_ino: i64,
-    chunk_size: usize,
-}
-
 /// A copy-on-write overlay filesystem using inode-based operations.
 ///
-/// Combines a read-only base layer with a writable delta layer (AgentFS).
+/// Combines a read-only base layer with a writable delta layer (`AgentFS`).
 /// All modifications are written to the delta layer, while reads fall back
 /// to the base layer if not found in delta.
+///
+/// # Directory opacity
+///
+/// This overlay deliberately has no opaque-directory concept. If a base
+/// directory is removed through the overlay and later recreated at the same
+/// path, base children can resurface on `readdir`, and the base-directory
+/// rename guard will still return `EXDEV` while that base path is visible.
+/// That diverges from kernel overlayfs, but it is the accepted AgentFS
+/// behavior. The `resolves_to_visible_base_directory` signal must stay shared
+/// by both readdir base-child merging and the rename guard if opacity is ever
+/// revisited.
 pub struct OverlayFS {
     /// The underlying read-only base filesystem
     base: Arc<dyn FileSystem>,
     /// The delta layer where modifications go
     delta: AgentFS,
-    /// Map from overlay inode to underlying layer info
-    inode_map: RwLock<HashMap<i64, InodeInfo>>,
-    /// Reverse map: (layer, underlying_ino) -> overlay_ino
-    reverse_map: RwLock<HashMap<(Layer, i64), i64>>,
-    /// Map from path to overlay inode (for path-based operations)
-    path_map: RwLock<HashMap<String, i64>>,
-    /// Serializes multi-map overlay inode updates.
-    map_lock: Mutex<()>,
-    /// Next inode number to allocate
-    next_ino: AtomicI64,
+    /// Overlay inode maps, reverse maps, path maps, allocator, and lookup refs.
+    maps: Mutex<OverlayMaps>,
     /// Set of whiteout paths (deleted from base)
     whiteouts: RwLock<HashSet<String>>,
     /// Origin mapping: delta_ino -> base_ino (for copy-up consistency)
     origin_map: RwLock<HashMap<i64, i64>>,
     /// Explicit policy for chunk-granularity base fallback.
     partial_origin_policy: PartialOriginPolicy,
+    /// Test-only fault injection for whiteout transaction rollback coverage.
+    #[cfg(test)]
+    whiteout_fault: Mutex<Option<String>>,
 }
 
 impl OverlayFS {
@@ -216,33 +177,15 @@ impl OverlayFS {
     ) -> Self {
         delta.register_reap_hook(Self::sidecar_reap_hook());
 
-        let mut inode_map = HashMap::new();
-        let mut reverse_map = HashMap::new();
-        let mut path_map = HashMap::new();
-
-        // Root inode maps to delta's root (inode 1)
-        inode_map.insert(
-            ROOT_INO,
-            InodeInfo {
-                layer: Layer::Delta,
-                underlying_ino: 1,
-                path: "/".to_string(),
-            },
-        );
-        reverse_map.insert((Layer::Delta, 1), ROOT_INO);
-        path_map.insert("/".to_string(), ROOT_INO);
-
         Self {
             base,
             delta,
-            inode_map: RwLock::new(inode_map),
-            reverse_map: RwLock::new(reverse_map),
-            path_map: RwLock::new(path_map),
-            map_lock: Mutex::new(()),
-            next_ino: AtomicI64::new(2),
+            maps: Mutex::new(OverlayMaps::new()),
             whiteouts: RwLock::new(HashSet::new()),
             origin_map: RwLock::new(HashMap::new()),
             partial_origin_policy,
+            #[cfg(test)]
+            whiteout_fault: Mutex::new(None),
         }
     }
 
@@ -276,7 +219,7 @@ impl OverlayFS {
                 paths.push(path);
             }
         }
-        let mut whiteouts = self.whiteouts.write().unwrap();
+        let mut whiteouts = self.whiteouts.write();
         for path in paths {
             whiteouts.insert(path);
         }
@@ -298,207 +241,24 @@ impl OverlayFS {
         Ok(())
     }
 
-    /// Load origin mappings from database
+    /// Load origin mappings from database.
     async fn load_origins(&self, conn: &Connection) -> Result<()> {
-        let result = conn
+        let mut rows = conn
             .query("SELECT delta_ino, base_ino FROM fs_origin", ())
-            .await;
-        if let Ok(mut rows) = result {
-            let mut mappings = Vec::new();
-            while let Some(row) = rows.next().await? {
-                let delta_ino = row.get_value(0).ok().and_then(|v| v.as_integer().copied());
-                let base_ino = row.get_value(1).ok().and_then(|v| v.as_integer().copied());
-                if let (Some(d), Some(b)) = (delta_ino, base_ino) {
-                    mappings.push((d, b));
-                }
-            }
-            let mut origins = self.origin_map.write().unwrap();
-            for (d, b) in mappings {
-                origins.insert(d, b);
-            }
-        }
-        Ok(())
-    }
-
-    /// Check if a path is whiteout (deleted from base)
-    fn is_whiteout(&self, path: &str) -> bool {
-        let whiteouts = self.whiteouts.read().unwrap();
-        // Check path and all ancestors
-        let mut current = String::new();
-        for component in path.split('/').filter(|s| !s.is_empty()) {
-            current = format!("{}/{}", current, component);
-            if whiteouts.contains(&current) {
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Create a whiteout for a path
-    async fn create_whiteout(&self, path: &str) -> Result<()> {
-        let conn = self.delta.get_connection().await?;
-        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
-        let parent_path = parent_path_for_whiteout(path);
-        conn.execute(
-            "INSERT OR REPLACE INTO fs_whiteout (path, parent_path, created_at) VALUES (?, ?, ?)",
-            (path, parent_path, now),
-        )
-        .await?;
-        self.whiteouts.write().unwrap().insert(path.to_string());
-        Ok(())
-    }
-
-    /// Remove a whiteout
-    async fn remove_whiteout(&self, path: &str) -> Result<()> {
-        if !self.whiteouts.read().unwrap().contains(path) {
-            return Ok(());
-        }
-        let conn = self.delta.get_connection().await?;
-        conn.execute("DELETE FROM fs_whiteout WHERE path = ?", (path,))
             .await?;
-        self.whiteouts.write().unwrap().remove(path);
+        let mut mappings = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let delta_ino = row.get_value(0).ok().and_then(|v| v.as_integer().copied());
+            let base_ino = row.get_value(1).ok().and_then(|v| v.as_integer().copied());
+            if let (Some(d), Some(b)) = (delta_ino, base_ino) {
+                mappings.push((d, b));
+            }
+        }
+        let mut origins = self.origin_map.write();
+        for (d, b) in mappings {
+            origins.insert(d, b);
+        }
         Ok(())
-    }
-
-    /// Get child whiteouts for a directory
-    fn get_child_whiteouts(&self, dir_path: &str) -> HashSet<String> {
-        let whiteouts = self.whiteouts.read().unwrap();
-        let prefix = if dir_path == "/" {
-            "/".to_string()
-        } else {
-            format!("{}/", dir_path)
-        };
-        whiteouts
-            .iter()
-            .filter_map(|p| {
-                if dir_path == "/" {
-                    // Direct children of root
-                    let trimmed = p.trim_start_matches('/');
-                    if !trimmed.contains('/') {
-                        Some(trimmed.to_string())
-                    } else {
-                        None
-                    }
-                } else if p.starts_with(&prefix) {
-                    let rest = &p[prefix.len()..];
-                    if !rest.contains('/') {
-                        Some(rest.to_string())
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
-    /// Allocate a new overlay inode number
-    fn alloc_ino(&self) -> i64 {
-        self.next_ino.fetch_add(1, Ordering::Relaxed)
-    }
-
-    /// Get or create an overlay inode for a layer inode
-    fn get_or_create_overlay_ino(&self, layer: Layer, underlying_ino: i64, path: &str) -> i64 {
-        let _map_guard = self.map_lock.lock().unwrap();
-        // Check reverse map first
-        {
-            let reverse = self.reverse_map.read().unwrap();
-            if let Some(&ino) = reverse.get(&(layer, underlying_ino)) {
-                return ino;
-            }
-        }
-
-        // Allocate new inode
-        let ino = self.alloc_ino();
-        {
-            let mut inode_map = self.inode_map.write().unwrap();
-            inode_map.insert(
-                ino,
-                InodeInfo {
-                    layer,
-                    underlying_ino,
-                    path: path.to_string(),
-                },
-            );
-        }
-        {
-            let mut reverse = self.reverse_map.write().unwrap();
-            reverse.insert((layer, underlying_ino), ino);
-        }
-        {
-            let mut path_map = self.path_map.write().unwrap();
-            path_map.insert(path.to_string(), ino);
-        }
-
-        ino
-    }
-
-    /// Refresh an existing overlay inode mapping to point at a new backing inode/path.
-    ///
-    /// This is used when we intentionally reuse an existing overlay inode number
-    /// (for stability), but the underlying layer/path has changed (for example after
-    /// a base file is copied-up and then renamed in delta).
-    fn refresh_overlay_mapping(
-        &self,
-        overlay_ino: i64,
-        new_layer: Layer,
-        new_underlying_ino: i64,
-        new_path: &str,
-    ) {
-        let _map_guard = self.map_lock.lock().unwrap();
-        let old_path = {
-            let mut inode_map = self.inode_map.write().unwrap();
-            let Some(info) = inode_map.get_mut(&overlay_ino) else {
-                return;
-            };
-            let old_path = info.path.clone();
-            info.layer = new_layer;
-            info.underlying_ino = new_underlying_ino;
-            info.path = new_path.to_string();
-            old_path
-        };
-
-        {
-            let mut reverse = self.reverse_map.write().unwrap();
-            reverse.insert((new_layer, new_underlying_ino), overlay_ino);
-        }
-
-        {
-            let mut path_map = self.path_map.write().unwrap();
-            if path_map.get(&old_path).copied() == Some(overlay_ino) {
-                path_map.remove(&old_path);
-            }
-            path_map.insert(new_path.to_string(), overlay_ino);
-        }
-    }
-
-    /// Get inode info for an overlay inode
-    fn get_inode_info(&self, ino: i64) -> Option<InodeInfo> {
-        self.inode_map.read().unwrap().get(&ino).cloned()
-    }
-
-    fn live_origin_overlay_ino(&self, base_ino: i64, path: &str) -> Option<i64> {
-        let overlay_ino = {
-            let reverse = self.reverse_map.read().unwrap();
-            reverse.get(&(Layer::Base, base_ino)).copied()?
-        };
-        let info = self.get_inode_info(overlay_ino)?;
-        if info.path == path {
-            Some(overlay_ino)
-        } else {
-            None
-        }
-    }
-
-    /// Build path from parent inode and name
-    fn build_path(&self, parent_ino: i64, name: &str) -> Result<String> {
-        let info = self.get_inode_info(parent_ino).ok_or(FsError::NotFound)?;
-        Ok(if info.path == "/" {
-            format!("/{}", name)
-        } else {
-            format!("{}/{}", info.path, name)
-        })
     }
 
     /// Get a reference to the base layer
@@ -510,1889 +270,13 @@ impl OverlayFS {
     pub fn delta(&self) -> &AgentFS {
         &self.delta
     }
-
-    /// Store origin mapping for copy-up
-    async fn add_origin_mapping(&self, delta_ino: i64, base_ino: i64) -> Result<()> {
-        let conn = self.delta.get_connection().await?;
-        conn.execute(
-            "INSERT OR REPLACE INTO fs_origin (delta_ino, base_ino) VALUES (?, ?)",
-            (delta_ino, base_ino),
-        )
-        .await?;
-        self.origin_map.write().unwrap().insert(delta_ino, base_ino);
-        Ok(())
-    }
-
-    /// Get origin inode for a delta inode
-    fn get_origin_ino(&self, delta_ino: i64) -> Option<i64> {
-        self.origin_map.read().unwrap().get(&delta_ino).copied()
-    }
-
-    async fn partial_origin_for_delta(&self, delta_ino: i64) -> Result<Option<PartialOrigin>> {
-        let conn = self.delta.get_connection().await?;
-        let mut rows = conn
-            .query(
-                "SELECT base_path, base_size, base_fingerprint_size,
-                        base_mtime, base_mtime_nsec, base_ctime, base_ctime_nsec
-                 FROM fs_partial_origin WHERE delta_ino = ?",
-                (delta_ino,),
-            )
-            .await?;
-        if let Some(row) = rows.next().await? {
-            let base_path = match row.get_value(0)? {
-                Value::Text(path) => path,
-                _ => {
-                    return Err(Error::Internal(
-                        "invalid partial origin base_path".to_string(),
-                    ))
-                }
-            };
-            let base_size = row
-                .get_value(1)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .ok_or_else(|| Error::Internal("invalid partial origin base_size".to_string()))?;
-            let base_fingerprint_size = row
-                .get_value(2)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(base_size);
-            let base_mtime = row
-                .get_value(3)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0);
-            let base_mtime_nsec = row
-                .get_value(4)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0) as u32;
-            let base_ctime = row
-                .get_value(5)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0);
-            let base_ctime_nsec = row
-                .get_value(6)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0) as u32;
-            Ok(Some(PartialOrigin {
-                base_path,
-                base_fingerprint_size: if base_fingerprint_size < 0 {
-                    base_size
-                } else {
-                    base_fingerprint_size
-                },
-                base_mtime,
-                base_mtime_nsec,
-                base_ctime,
-                base_ctime_nsec,
-            }))
-        } else {
-            Ok(None)
-        }
-    }
-
-    async fn add_partial_origin_mapping(
-        &self,
-        delta_ino: i64,
-        base_ino: i64,
-        base_path: &str,
-        base_stats: &Stats,
-    ) -> Result<()> {
-        let conn = self.delta.get_connection().await?;
-        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
-        conn.execute(
-            "INSERT OR REPLACE INTO fs_partial_origin (
-                delta_ino, base_ino, base_path, base_size, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5)",
-            (delta_ino, base_ino, base_path, base_stats.size, now),
-        )
-        .await?;
-        conn.execute(
-            "UPDATE fs_partial_origin
-             SET base_fingerprint_size = ?1, base_mtime = ?2, base_mtime_nsec = ?3
-             WHERE delta_ino = ?4",
-            (
-                base_stats.size,
-                base_stats.mtime,
-                base_stats.mtime_nsec as i64,
-                delta_ino,
-            ),
-        )
-        .await?;
-        conn.execute(
-            "UPDATE fs_partial_origin
-             SET base_ctime = ?1, base_ctime_nsec = ?2
-             WHERE delta_ino = ?3",
-            (base_stats.ctime, base_stats.ctime_nsec as i64, delta_ino),
-        )
-        .await?;
-        Ok(())
-    }
-
-    async fn resolve_base_path(&self, path: &str) -> Result<Option<Stats>> {
-        let mut ino = ROOT_INO;
-        if path == "/" {
-            return self.base.getattr(ino).await;
-        }
-
-        let mut stats = None;
-        for component in path.split('/').filter(|s| !s.is_empty()) {
-            let Some(next) = self.base.lookup(ino, component).await? else {
-                return Ok(None);
-            };
-            ino = next.ino;
-            stats = Some(next);
-        }
-        Ok(stats)
-    }
-
-    async fn resolves_to_visible_base_directory(&self, path: &str) -> Result<bool> {
-        if self.is_whiteout(path) {
-            return Ok(false);
-        }
-
-        Ok(self
-            .resolve_base_path(path)
-            .await?
-            .is_some_and(|stats| stats.is_directory()))
-    }
-
-    fn validate_partial_origin(&self, origin: &PartialOrigin, stats: &Stats) -> Result<()> {
-        if stats.size != origin.base_fingerprint_size {
-            return Err(Error::Internal(format!(
-                "partial-origin base changed for {} (stored size={}, current size={})",
-                origin.base_path, origin.base_fingerprint_size, stats.size
-            )));
-        }
-        if stats.mtime != origin.base_mtime
-            || stats.mtime_nsec != origin.base_mtime_nsec
-            || stats.ctime != origin.base_ctime
-            || stats.ctime_nsec != origin.base_ctime_nsec
-        {
-            return Err(Error::Internal(format!(
-                "partial-origin base changed for {} (stored mtime={}.{}, current mtime={}.{}, stored ctime={}.{}, current ctime={}.{})",
-                origin.base_path,
-                origin.base_mtime,
-                origin.base_mtime_nsec,
-                stats.mtime,
-                stats.mtime_nsec,
-                origin.base_ctime,
-                origin.base_ctime_nsec,
-                stats.ctime,
-                stats.ctime_nsec
-            )));
-        }
-        Ok(())
-    }
-
-    async fn cleanup_partial_origin_if_unlinked(&self, delta_ino: i64) -> Result<()> {
-        let conn = self.delta.get_connection().await?;
-        let mut rows = conn
-            .query("SELECT 1 FROM fs_inode WHERE ino = ?", (delta_ino,))
-            .await?;
-        if rows.next().await?.is_some() {
-            return Ok(());
-        }
-
-        conn.execute("DELETE FROM fs_origin WHERE delta_ino = ?", (delta_ino,))
-            .await?;
-        conn.execute(
-            "DELETE FROM fs_chunk_override WHERE delta_ino = ?",
-            (delta_ino,),
-        )
-        .await?;
-        conn.execute(
-            "DELETE FROM fs_partial_origin WHERE delta_ino = ?",
-            (delta_ino,),
-        )
-        .await?;
-        Ok(())
-    }
-
-    /// Promote an overlay inode from base layer to delta layer.
-    ///
-    /// When a directory that was originally looked up from base gets a
-    /// corresponding directory created in delta (via ensure_parent_dirs),
-    /// we need to update the overlay inode to point to delta. This ensures
-    /// that operations like readdir and unlink will check the delta layer.
-    fn promote_to_delta(&self, path: &str, delta_ino: i64) {
-        let _map_guard = self.map_lock.lock().unwrap();
-        let path_map = self.path_map.read().unwrap();
-        let overlay_ino = match path_map.get(path) {
-            Some(&ino) => ino,
-            None => return, // No existing mapping, nothing to promote
-        };
-        drop(path_map);
-
-        // Update the inode mapping to point to delta
-        let mut inode_map = self.inode_map.write().unwrap();
-        if let Some(info) = inode_map.get_mut(&overlay_ino) {
-            if info.layer == Layer::Base {
-                let old_base_ino = info.underlying_ino;
-                info.layer = Layer::Delta;
-                info.underlying_ino = delta_ino;
-
-                // Update reverse map: add delta mapping (keep base mapping for origin lookups)
-                drop(inode_map);
-                let mut reverse = self.reverse_map.write().unwrap();
-                reverse.remove(&(Layer::Base, old_base_ino));
-                reverse.insert((Layer::Delta, delta_ino), overlay_ino);
-            }
-        }
-    }
-
-    /// Resolve the delta-layer inode for a parent directory.
-    ///
-    /// If the parent's overlay inode already maps to Delta, returns the underlying
-    /// inode directly. Otherwise, walks the delta filesystem from root using the
-    /// stored path. Returns Ok(None) if any path component is missing in delta.
-    async fn resolve_delta_parent(&self, info: &InodeInfo) -> Result<Option<i64>> {
-        if info.layer == Layer::Delta {
-            return Ok(Some(info.underlying_ino));
-        }
-        let mut ino: i64 = 1;
-        for comp in info.path.split('/').filter(|s| !s.is_empty()) {
-            match FileSystem::lookup(&self.delta, ino, comp).await? {
-                Some(s) if s.is_directory() => ino = s.ino,
-                Some(_) => return Ok(None),
-                None => return Ok(None),
-            }
-        }
-        Ok(Some(ino))
-    }
-
-    /// Ensure parent directories exist in delta layer
-    async fn ensure_parent_dirs(&self, path: &str, uid: u32, gid: u32) -> Result<()> {
-        let components: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-
-        let mut current_path = String::new();
-        let mut current_delta_ino: i64 = 1; // Delta root
-        let mut current_base_ino: i64 = 1; // Base root
-
-        for component in components.iter().take(components.len().saturating_sub(1)) {
-            current_path = format!("{}/{}", current_path, component);
-
-            // Remove any whiteout for this path
-            self.remove_whiteout(&current_path).await?;
-
-            // Check if directory exists in delta
-            if let Some(stats) =
-                FileSystem::lookup(&self.delta, current_delta_ino, component).await?
-            {
-                if stats.is_directory() {
-                    current_delta_ino = stats.ino;
-                    // Advance base in parallel so it stays in sync
-                    if let Some(bs) = self.base.lookup(current_base_ino, component).await? {
-                        current_base_ino = bs.ino;
-                    }
-                    continue;
-                } else {
-                    return Err(FsError::NotADirectory.into());
-                }
-            }
-
-            // Not in delta, check base (using the base inode, not delta inode)
-            let base_stats = self.base.lookup(current_base_ino, component).await?;
-            let (dir_uid, dir_gid, origin_base_ino) = if let Some(s) = &base_stats {
-                let base_ino = s.ino;
-                current_base_ino = base_ino;
-                (s.uid, s.gid, Some(base_ino))
-            } else {
-                (uid, gid, None)
-            };
-
-            // Create directory in delta
-            let new_stats = FileSystem::mkdir(
-                &self.delta,
-                current_delta_ino,
-                component,
-                0o755,
-                dir_uid,
-                dir_gid,
-            )
-            .await?;
-            current_delta_ino = new_stats.ino;
-
-            // Create origin mapping if directory exists in base, so that
-            // lookups return consistent overlay inodes
-            if let Some(base_ino) = origin_base_ino {
-                self.add_origin_mapping(new_stats.ino, base_ino).await?;
-                // Promote the overlay inode to delta so readdir/unlink will check delta
-                self.promote_to_delta(&current_path, new_stats.ino);
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Copy a file from base to delta for modification
-    async fn copy_up(&self, path: &str, base_ino: i64) -> Result<i64> {
-        // Parse path to get parent and name
-        let components: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-        if components.is_empty() {
-            return Err(FsError::RootOperation.into());
-        }
-        let name = components.last().unwrap();
-
-        // Check if already copied up - walk delta to find parent and check for file
-        let mut parent_ino: i64 = 1;
-        let mut found_parent = true;
-        for comp in components.iter().take(components.len() - 1) {
-            if let Some(stats) = FileSystem::lookup(&self.delta, parent_ino, comp).await? {
-                parent_ino = stats.ino;
-            } else {
-                found_parent = false;
-                break;
-            }
-        }
-
-        // If parent exists in delta, check if file already exists there
-        if found_parent {
-            if let Some(stats) = FileSystem::lookup(&self.delta, parent_ino, name).await? {
-                // Already copied up, return delta inode
-                return Ok(stats.ino);
-            }
-        }
-
-        // Get base stats
-        let base_stats = self
-            .base
-            .getattr(base_ino)
-            .await?
-            .ok_or(FsError::NotFound)?;
-
-        // Ensure parent directories exist
-        self.ensure_parent_dirs(path, base_stats.uid, base_stats.gid)
-            .await?;
-
-        // Look up parent in delta by walking the path
-        let mut parent_ino: i64 = 1; // Start at delta root
-        for comp in components.iter().take(components.len() - 1) {
-            let stats = FileSystem::lookup(&self.delta, parent_ino, comp)
-                .await?
-                .ok_or(FsError::NotFound)?;
-            parent_ino = stats.ino;
-        }
-
-        // Copy based on file type
-        let delta_ino = if base_stats.is_symlink() {
-            let target = self
-                .base
-                .readlink(base_ino)
-                .await?
-                .ok_or(FsError::NotFound)?;
-            let stats = FileSystem::symlink(
-                &self.delta,
-                parent_ino,
-                name,
-                &target,
-                base_stats.uid,
-                base_stats.gid,
-            )
-            .await?;
-            stats.ino
-        } else if base_stats.is_directory() {
-            let stats = FileSystem::mkdir(
-                &self.delta,
-                parent_ino,
-                name,
-                base_stats.mode & 0o7777,
-                base_stats.uid,
-                base_stats.gid,
-            )
-            .await?;
-            stats.ino
-        } else {
-            // Regular file - read content and create
-            let base_file = self.base.open(base_ino, libc::O_RDONLY).await?;
-            let content = base_file.pread(0, base_stats.size as u64).await?;
-
-            let (stats, delta_file) = FileSystem::create_file(
-                &self.delta,
-                parent_ino,
-                name,
-                base_stats.mode,
-                base_stats.uid,
-                base_stats.gid,
-            )
-            .await?;
-            delta_file.pwrite(0, &content).await?;
-            stats.ino
-        };
-
-        // Store origin mapping
-        self.add_origin_mapping(delta_ino, base_ino).await?;
-
-        Ok(delta_ino)
-    }
-
-    /// Copy-up a file and update the inode mapping so subsequent operations
-    /// go to the delta layer. Returns the delta inode.
-    async fn copy_up_and_update_mapping(&self, overlay_ino: i64, info: &InodeInfo) -> Result<i64> {
-        let delta_ino = self.copy_up(&info.path, info.underlying_ino).await?;
-
-        // Update the inode mapping to point to delta
-        let _map_guard = self.map_lock.lock().unwrap();
-        {
-            let mut inode_map = self.inode_map.write().unwrap();
-            inode_map.insert(
-                overlay_ino,
-                InodeInfo {
-                    layer: Layer::Delta,
-                    underlying_ino: delta_ino,
-                    path: info.path.clone(),
-                },
-            );
-        }
-        {
-            let mut reverse_map = self.reverse_map.write().unwrap();
-            // Keep the base mapping so lookups via origin still return the same overlay inode
-            // (Layer::Base, base_ino) -> overlay_ino is kept
-            // Add the delta mapping as well
-            reverse_map.insert((Layer::Delta, delta_ino), overlay_ino);
-        }
-
-        Ok(delta_ino)
-    }
-
-    async fn partial_copy_up_and_update_mapping(
-        &self,
-        overlay_ino: i64,
-        info: &InodeInfo,
-    ) -> Result<i64> {
-        let components: Vec<&str> = info.path.split('/').filter(|s| !s.is_empty()).collect();
-        if components.is_empty() {
-            return Err(FsError::RootOperation.into());
-        }
-        let name = components.last().unwrap();
-
-        let base_stats = match self.resolve_base_path(&info.path).await? {
-            Some(stats) => stats,
-            None => self
-                .base
-                .getattr(info.underlying_ino)
-                .await?
-                .ok_or(FsError::NotFound)?,
-        };
-        if !base_stats.is_file() {
-            return self.copy_up_and_update_mapping(overlay_ino, info).await;
-        }
-
-        self.ensure_parent_dirs(&info.path, base_stats.uid, base_stats.gid)
-            .await?;
-
-        let mut parent_ino = ROOT_INO;
-        for comp in components.iter().take(components.len() - 1) {
-            let stats = FileSystem::lookup(&self.delta, parent_ino, comp)
-                .await?
-                .ok_or(FsError::NotFound)?;
-            parent_ino = stats.ino;
-        }
-
-        if let Some(stats) = FileSystem::lookup(&self.delta, parent_ino, name).await? {
-            self.refresh_overlay_mapping(overlay_ino, Layer::Delta, stats.ino, &info.path);
-            return Ok(stats.ino);
-        }
-
-        let (stats, _file) = FileSystem::create_file(
-            &self.delta,
-            parent_ino,
-            name,
-            base_stats.mode,
-            base_stats.uid,
-            base_stats.gid,
-        )
-        .await?;
-        let delta_ino = stats.ino;
-
-        let conn = self.delta.get_connection().await?;
-        conn.execute(
-            "UPDATE fs_inode
-             SET mode = ?, uid = ?, gid = ?, size = ?, atime = ?, mtime = ?, ctime = ?,
-                 atime_nsec = ?, mtime_nsec = ?, ctime_nsec = ?, data_inline = NULL, storage_kind = ?
-             WHERE ino = ?",
-            (
-                base_stats.mode as i64,
-                base_stats.uid as i64,
-                base_stats.gid as i64,
-                base_stats.size,
-                base_stats.atime,
-                base_stats.mtime,
-                base_stats.ctime,
-                base_stats.atime_nsec as i64,
-                base_stats.mtime_nsec as i64,
-                base_stats.ctime_nsec as i64,
-                STORAGE_CHUNKED,
-                delta_ino,
-            ),
-        )
-        .await?;
-        self.delta.invalidate_attr(delta_ino);
-
-        self.add_origin_mapping(delta_ino, info.underlying_ino)
-            .await?;
-        self.add_partial_origin_mapping(delta_ino, info.underlying_ino, &info.path, &base_stats)
-            .await?;
-        self.refresh_overlay_mapping(overlay_ino, Layer::Delta, delta_ino, &info.path);
-
-        Ok(delta_ino)
-    }
-
-    async fn partial_file_for_delta(
-        &self,
-        overlay_ino: i64,
-        delta_ino: i64,
-        flags: i32,
-    ) -> Result<BoxedFile> {
-        if let Some(origin) = self.partial_origin_for_delta(delta_ino).await? {
-            let base_stats = self
-                .resolve_base_path(&origin.base_path)
-                .await?
-                .ok_or(FsError::NotFound)?;
-            self.validate_partial_origin(&origin, &base_stats)?;
-            let base_file = self.base.open(base_stats.ino, libc::O_RDONLY).await?;
-
-            // Tier Two Axis C: HostFS passthrough for unmodified delta files.
-            //
-            // A partial-origin delta inode that has zero chunk overrides, zero
-            // full chunks, no inline override, and a size matching the base is
-            // byte-identical to the base file. In that case the
-            // OverlayPartialFile wrapper would do a chunk-merge that always
-            // hits the "no override; read from base" branch -- the SQLite
-            // round trip is pure overhead. Returning the HostFS fd directly
-            // sends pread() straight to the kernel VFS for every read on this
-            // handle, which is most of the cost on `git status` / `git diff`
-            // / agent stat-storms over a working tree that was copy-up'd but
-            // not modified.
-            //
-            // Restricted to read-only opens: a write open MUST go through the
-            // OverlayPartialFile wrapper so writes land as `fs_chunk_override`
-            // rows in the delta DB and never touch the real base file
-            // (no-real-write invariant from Tier One).
-            if !is_write_open(flags) {
-                crate::profiling::record_base_fast_open_passthrough_attempted();
-                if self
-                    .delta_has_no_content_overrides(delta_ino, base_stats.size)
-                    .await?
-                {
-                    crate::profiling::record_base_fast_open_passthrough_succeeded();
-                    return Ok(base_file);
-                }
-                crate::profiling::record_base_fast_open_passthrough_fallback();
-            }
-
-            let file: BoxedFile = Arc::new(OverlayPartialFile {
-                delta: self.delta.clone(),
-                base: self.base.clone(),
-                base_file,
-                origin,
-                overlay_ino,
-                delta_ino,
-                chunk_size: self.delta.chunk_size(),
-            });
-            if (flags & libc::O_TRUNC) != 0 {
-                file.truncate(0).await?;
-            }
-            Ok(file)
-        } else {
-            FileSystem::open(&self.delta, delta_ino, flags).await
-        }
-    }
-
-    /// Returns true if the delta inode has no content modifications: no chunk
-    /// overrides, no full chunks, no inline override, and size matches the
-    /// base. Such a delta is purely a metadata copy and reads can bypass the
-    /// `OverlayPartialFile` merge path entirely.
-    ///
-    /// This is the cheap "is this file unmodified?" check that Tier Two Axis
-    /// C uses to decide whether `partial_file_for_delta` can short-circuit to
-    /// a HostFS fd.
-    async fn delta_has_no_content_overrides(&self, delta_ino: i64, base_size: i64) -> Result<bool> {
-        let conn = self.delta.get_connection().await?;
-
-        // Any per-chunk override?
-        let mut rows = conn
-            .query(
-                "SELECT 1 FROM fs_chunk_override WHERE delta_ino = ? LIMIT 1",
-                (delta_ino,),
-            )
-            .await?;
-        if rows.next().await?.is_some() {
-            return Ok(false);
-        }
-
-        // Any full chunk in fs_data? (Should be implied by no overrides for
-        // partial-origin files, but check defensively in case of a
-        // partial-origin → fully-overridden transition.)
-        let mut rows = conn
-            .query("SELECT 1 FROM fs_data WHERE ino = ? LIMIT 1", (delta_ino,))
-            .await?;
-        if rows.next().await?.is_some() {
-            return Ok(false);
-        }
-
-        // Size match + no inline override?
-        let mut rows = conn
-            .query(
-                "SELECT size, data_inline FROM fs_inode WHERE ino = ?",
-                (delta_ino,),
-            )
-            .await?;
-        let Some(row) = rows.next().await? else {
-            return Ok(false);
-        };
-        let delta_size: i64 = row
-            .get(0)
-            .map_err(|e| Error::Internal(format!("fs_inode.size read failed: {e}")))?;
-        if delta_size != base_size {
-            return Ok(false);
-        }
-        let inline_value = row
-            .get_value(1)
-            .map_err(|e| Error::Internal(format!("fs_inode.data_inline read failed: {e}")))?;
-        let inline_empty = match inline_value {
-            Value::Null => true,
-            Value::Blob(blob) => blob.is_empty(),
-            _ => true,
-        };
-        if !inline_empty {
-            return Ok(false);
-        }
-
-        Ok(true)
-    }
-}
-
-#[async_trait]
-impl File for OverlayPartialFile {
-    async fn pread(&self, offset: u64, size: u64) -> Result<Vec<u8>> {
-        self.validate_current_origin().await?;
-        let conn = self.delta.get_connection().await?;
-        let file_size = self.delta_file_size_with_conn(&conn).await?;
-        if offset >= file_size || size == 0 {
-            return Ok(Vec::new());
-        }
-
-        let read_len = std::cmp::min(size, file_size - offset) as usize;
-        let chunk_size = self.chunk_size as u64;
-        let mut result = Vec::with_capacity(read_len);
-
-        while result.len() < read_len {
-            let current_offset = offset + result.len() as u64;
-            let chunk_index = current_offset / chunk_size;
-            let offset_in_chunk = (current_offset % chunk_size) as usize;
-            let take = std::cmp::min(
-                self.chunk_size - offset_in_chunk,
-                read_len.saturating_sub(result.len()),
-            );
-
-            let chunk = self.read_merged_chunk_with_conn(&conn, chunk_index).await?;
-            result.extend_from_slice(&chunk[offset_in_chunk..offset_in_chunk + take]);
-        }
-
-        Ok(result)
-    }
-
-    async fn pwrite(&self, offset: u64, data: &[u8]) -> Result<()> {
-        if data.is_empty() {
-            return Ok(());
-        }
-        self.pwrite_ranges(vec![WriteRange {
-            offset,
-            data: data.to_vec(),
-        }])
-        .await
-    }
-
-    async fn pwrite_ranges(&self, ranges: Vec<WriteRange>) -> Result<()> {
-        if ranges.iter().all(|range| range.data.is_empty()) {
-            return Ok(());
-        }
-        let conn = self.delta.get_connection().await?;
-        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
-
-        let result: Result<()> = async {
-            let mut new_size = self.delta_file_size_with_conn(&conn).await?;
-            for range in ranges {
-                if range.data.is_empty() {
-                    continue;
-                }
-                let write_end = range
-                    .offset
-                    .checked_add(range.data.len() as u64)
-                    .ok_or_else(|| Error::Internal("file write offset overflow".to_string()))?;
-                new_size = std::cmp::max(new_size, write_end);
-                let chunk_size = self.chunk_size as u64;
-                let mut written = 0usize;
-
-                while written < range.data.len() {
-                    let current_offset = range.offset + written as u64;
-                    let chunk_index = current_offset / chunk_size;
-                    let offset_in_chunk = (current_offset % chunk_size) as usize;
-                    let remaining_in_chunk = self.chunk_size - offset_in_chunk;
-                    let to_write = std::cmp::min(remaining_in_chunk, range.data.len() - written);
-
-                    let mut chunk = self
-                        .read_merged_chunk_with_conn(&conn, chunk_index)
-                        .await?;
-                    chunk[offset_in_chunk..offset_in_chunk + to_write]
-                        .copy_from_slice(&range.data[written..written + to_write]);
-
-                    conn.execute(
-                        "INSERT OR REPLACE INTO fs_data (ino, chunk_index, data) VALUES (?, ?, ?)",
-                        (
-                            self.delta_ino,
-                            chunk_index as i64,
-                            Value::Blob(chunk),
-                        ),
-                    )
-                    .await?;
-                    conn.execute(
-                        "INSERT OR IGNORE INTO fs_chunk_override (delta_ino, chunk_index) VALUES (?, ?)",
-                        (self.delta_ino, chunk_index as i64),
-                    )
-                    .await?;
-
-                    written += to_write;
-                }
-            }
-
-            let (now_secs, now_nsec) = current_timestamp()?;
-            conn.execute(
-                "UPDATE fs_inode
-                 SET size = ?, data_inline = NULL, storage_kind = ?, mtime = ?, ctime = ?,
-                     mtime_nsec = ?, ctime_nsec = ?
-                 WHERE ino = ?",
-                (
-                    new_size as i64,
-                    STORAGE_CHUNKED,
-                    now_secs,
-                    now_secs,
-                    now_nsec,
-                    now_nsec,
-                    self.delta_ino,
-                ),
-            )
-            .await?;
-            Ok(())
-        }
-        .await;
-
-        match result {
-            Ok(()) => {
-                txn.commit().await?;
-                self.delta.invalidate_attr(self.delta_ino);
-                Ok(())
-            }
-            Err(e) => {
-                let _ = txn.rollback().await;
-                Err(e)
-            }
-        }
-    }
-
-    async fn truncate(&self, size: u64) -> Result<()> {
-        let conn = self.delta.get_connection().await?;
-        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
-
-        let result: Result<()> = async {
-            let current_size = self.delta_file_size_with_conn(&conn).await?;
-            let chunk_size = self.chunk_size as u64;
-
-            if size == 0 {
-                conn.execute("DELETE FROM fs_data WHERE ino = ?", (self.delta_ino,))
-                    .await?;
-                conn.execute(
-                    "DELETE FROM fs_chunk_override WHERE delta_ino = ?",
-                    (self.delta_ino,),
-                )
-                .await?;
-            } else if size < current_size {
-                let last_chunk = (size - 1) / chunk_size;
-                conn.execute(
-                    "DELETE FROM fs_data WHERE ino = ? AND chunk_index > ?",
-                    (self.delta_ino, last_chunk as i64),
-                )
-                .await?;
-                conn.execute(
-                    "DELETE FROM fs_chunk_override WHERE delta_ino = ? AND chunk_index > ?",
-                    (self.delta_ino, last_chunk as i64),
-                )
-                .await?;
-
-                let end_in_last_chunk = ((size - 1) % chunk_size + 1) as usize;
-                if self.chunk_is_override_with_conn(&conn, last_chunk).await? {
-                    let mut chunk = self
-                        .delta_chunk_with_conn(&conn, last_chunk)
-                        .await?
-                        .unwrap_or_default();
-                    if chunk.len() > end_in_last_chunk {
-                        chunk.truncate(end_in_last_chunk);
-                        conn.execute(
-                            "UPDATE fs_data SET data = ? WHERE ino = ? AND chunk_index = ?",
-                            (Value::Blob(chunk), self.delta_ino, last_chunk as i64),
-                        )
-                        .await?;
-                    }
-                }
-            }
-
-            let origin_base_size = self.partial_base_size_with_conn(&conn).await?;
-            if size < origin_base_size {
-                conn.execute(
-                    "UPDATE fs_partial_origin SET base_size = ? WHERE delta_ino = ?",
-                    (size as i64, self.delta_ino),
-                )
-                .await?;
-            }
-
-            let (now_secs, now_nsec) = current_timestamp()?;
-            conn.execute(
-                "UPDATE fs_inode
-                 SET size = ?, data_inline = NULL, storage_kind = ?, mtime = ?, ctime = ?,
-                     mtime_nsec = ?, ctime_nsec = ?
-                 WHERE ino = ?",
-                (
-                    size as i64,
-                    STORAGE_CHUNKED,
-                    now_secs,
-                    now_secs,
-                    now_nsec,
-                    now_nsec,
-                    self.delta_ino,
-                ),
-            )
-            .await?;
-            Ok(())
-        }
-        .await;
-
-        match result {
-            Ok(()) => {
-                txn.commit().await?;
-                self.delta.invalidate_attr(self.delta_ino);
-                Ok(())
-            }
-            Err(e) => {
-                let _ = txn.rollback().await;
-                Err(e)
-            }
-        }
-    }
-
-    async fn fsync(&self) -> Result<()> {
-        self.delta.fsync().await
-    }
-
-    async fn fstat(&self) -> Result<Stats> {
-        let mut stats = FileSystem::getattr(&self.delta, self.delta_ino)
-            .await?
-            .ok_or(FsError::NotFound)?;
-        stats.ino = self.overlay_ino;
-        Ok(stats)
-    }
-}
-
-impl OverlayPartialFile {
-    async fn resolve_origin_base_stats(&self) -> Result<Option<Stats>> {
-        let mut ino = ROOT_INO;
-        if self.origin.base_path == "/" {
-            return self.base.getattr(ino).await;
-        }
-
-        let mut stats = None;
-        for component in self.origin.base_path.split('/').filter(|s| !s.is_empty()) {
-            let Some(next) = self.base.lookup(ino, component).await? else {
-                return Ok(None);
-            };
-            ino = next.ino;
-            stats = Some(next);
-        }
-        Ok(stats)
-    }
-
-    async fn validate_current_origin(&self) -> Result<()> {
-        let stats = self
-            .resolve_origin_base_stats()
-            .await?
-            .ok_or(FsError::NotFound)?;
-        if stats.size != self.origin.base_fingerprint_size
-            || stats.mtime != self.origin.base_mtime
-            || stats.mtime_nsec != self.origin.base_mtime_nsec
-            || stats.ctime != self.origin.base_ctime
-            || stats.ctime_nsec != self.origin.base_ctime_nsec
-        {
-            return Err(Error::Internal(format!(
-                "partial-origin base changed for {}",
-                self.origin.base_path
-            )));
-        }
-        Ok(())
-    }
-
-    async fn delta_file_size_with_conn(&self, conn: &Connection) -> Result<u64> {
-        let mut rows = conn
-            .query("SELECT size FROM fs_inode WHERE ino = ?", (self.delta_ino,))
-            .await?;
-        if let Some(row) = rows.next().await? {
-            Ok(row
-                .get_value(0)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0) as u64)
-        } else {
-            Err(FsError::NotFound.into())
-        }
-    }
-
-    async fn partial_base_size_with_conn(&self, conn: &Connection) -> Result<u64> {
-        let mut rows = conn
-            .query(
-                "SELECT base_size FROM fs_partial_origin WHERE delta_ino = ?",
-                (self.delta_ino,),
-            )
-            .await?;
-        if let Some(row) = rows.next().await? {
-            Ok(row
-                .get_value(0)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0) as u64)
-        } else {
-            Err(FsError::NotFound.into())
-        }
-    }
-
-    async fn chunk_is_override_with_conn(
-        &self,
-        conn: &Connection,
-        chunk_index: u64,
-    ) -> Result<bool> {
-        let mut rows = conn
-            .query(
-                "SELECT 1 FROM fs_chunk_override WHERE delta_ino = ? AND chunk_index = ?",
-                (self.delta_ino, chunk_index as i64),
-            )
-            .await?;
-        Ok(rows.next().await?.is_some())
-    }
-
-    async fn delta_chunk_with_conn(
-        &self,
-        conn: &Connection,
-        chunk_index: u64,
-    ) -> Result<Option<Vec<u8>>> {
-        let mut rows = conn
-            .query(
-                "SELECT data FROM fs_data WHERE ino = ? AND chunk_index = ?",
-                (self.delta_ino, chunk_index as i64),
-            )
-            .await?;
-        if let Some(row) = rows.next().await? {
-            match row.get_value(0) {
-                Ok(Value::Blob(data)) => Ok(Some(data)),
-                _ => Ok(Some(Vec::new())),
-            }
-        } else {
-            Ok(None)
-        }
-    }
-
-    async fn read_merged_chunk_with_conn(
-        &self,
-        conn: &Connection,
-        chunk_index: u64,
-    ) -> Result<Vec<u8>> {
-        if self.chunk_is_override_with_conn(conn, chunk_index).await? {
-            let mut chunk = self
-                .delta_chunk_with_conn(conn, chunk_index)
-                .await?
-                .unwrap_or_default();
-            chunk.resize(self.chunk_size, 0);
-            return Ok(chunk);
-        }
-
-        let base_size = self.partial_base_size_with_conn(conn).await?;
-        let chunk_start = chunk_index
-            .checked_mul(self.chunk_size as u64)
-            .ok_or_else(|| Error::Internal("chunk offset overflow".to_string()))?;
-        let mut chunk = if chunk_start < base_size {
-            self.validate_current_origin().await?;
-            let readable = std::cmp::min(self.chunk_size as u64, base_size - chunk_start);
-            self.base_file.pread(chunk_start, readable).await?
-        } else {
-            Vec::new()
-        };
-        chunk.resize(self.chunk_size, 0);
-        Ok(chunk)
-    }
-}
-
-#[async_trait]
-impl FileSystem for OverlayFS {
-    async fn lookup(&self, parent_ino: i64, name: &str) -> Result<Option<Stats>> {
-        crate::profiling::record_lookup();
-        trace!(
-            "OverlayFS::lookup: parent_ino={}, name={}",
-            parent_ino,
-            name
-        );
-
-        let parent_info = self.get_inode_info(parent_ino).ok_or(FsError::NotFound)?;
-        let path = self.build_path(parent_ino, name)?;
-
-        // Check for whiteout
-        if self.is_whiteout(&path) {
-            crate::profiling::record_lookup_whiteout();
-            crate::profiling::record_negative_lookup();
-            return Ok(None);
-        }
-
-        // Try delta first
-        let delta_parent_ino = self.resolve_delta_parent(&parent_info).await?;
-
-        // Look up in delta (only if we resolved the correct parent)
-        if let Some(delta_stats) = match delta_parent_ino {
-            Some(ino) => {
-                crate::profiling::record_lookup_delta();
-                self.delta.lookup(ino, name).await?
-            }
-            None => None,
-        } {
-            let delta_ino = delta_stats.ino;
-            let ino = self.get_or_create_overlay_ino(Layer::Delta, delta_ino, &path);
-            let mut stats = delta_stats;
-
-            // Origin mapping: reuse an existing Base overlay inode for stable
-            // numbering within a session.  After remount the base_ino stored in
-            // the mapping may be stale (the new HostFS has a fresh inode cache),
-            // so only use it when the reverse_map already contains a live entry.
-            // Otherwise keep the Delta overlay inode — the downstream code
-            // already walks base from root when the parent is tagged Delta.
-            if let Some(base_ino) = self.get_origin_ino(stats.ino) {
-                if let Some(existing_ino) = self.live_origin_overlay_ino(base_ino, &path) {
-                    self.refresh_overlay_mapping(existing_ino, Layer::Delta, delta_ino, &path);
-                    stats.ino = existing_ino;
-                } else {
-                    stats.ino = ino;
-                }
-            } else {
-                stats.ino = ino;
-            }
-
-            return Ok(Some(stats));
-        }
-
-        // Try base
-        let base_parent_ino = if parent_info.layer == Layer::Base {
-            parent_info.underlying_ino
-        } else {
-            // Need to find corresponding base parent by path
-            // For root, use base root (1)
-            if parent_info.path == "/" {
-                1
-            } else {
-                // Walk the base to find the parent
-                let mut base_ino: i64 = 1;
-                let components: Vec<_> = parent_info
-                    .path
-                    .split('/')
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                crate::profiling::record_path_resolution(components.len() as u64);
-                for comp in components {
-                    if let Some(s) = self.base.lookup(base_ino, comp).await? {
-                        base_ino = s.ino;
-                    } else {
-                        crate::profiling::record_negative_lookup();
-                        return Ok(None);
-                    }
-                }
-                base_ino
-            }
-        };
-
-        crate::profiling::record_lookup_base();
-        if let Some(base_stats) = self.base.lookup(base_parent_ino, name).await? {
-            let ino = self.get_or_create_overlay_ino(Layer::Base, base_stats.ino, &path);
-            let mut stats = base_stats;
-            stats.ino = ino;
-            return Ok(Some(stats));
-        }
-
-        crate::profiling::record_negative_lookup();
-        Ok(None)
-    }
-
-    async fn getattr(&self, ino: i64) -> Result<Option<Stats>> {
-        crate::profiling::record_getattr();
-        crate::profiling::record_attr_cache_miss();
-        trace!("OverlayFS::getattr: ino={}", ino);
-
-        let info = match self.get_inode_info(ino) {
-            Some(i) => i,
-            None => return Ok(None),
-        };
-        if info.layer == Layer::Base && self.is_whiteout(&info.path) {
-            crate::profiling::record_lookup_whiteout();
-            return Ok(None);
-        }
-
-        let stats = match info.layer {
-            Layer::Delta => FileSystem::getattr(&self.delta, info.underlying_ino).await?,
-            Layer::Base => self.base.getattr(info.underlying_ino).await?,
-        };
-
-        Ok(stats.map(|mut s| {
-            s.ino = ino;
-            s
-        }))
-    }
-
-    async fn readlink(&self, ino: i64) -> Result<Option<String>> {
-        trace!("OverlayFS::readlink: ino={}", ino);
-
-        let info = self.get_inode_info(ino).ok_or(FsError::NotFound)?;
-        if info.layer == Layer::Base && self.is_whiteout(&info.path) {
-            return Ok(None);
-        }
-
-        match info.layer {
-            Layer::Delta => FileSystem::readlink(&self.delta, info.underlying_ino).await,
-            Layer::Base => self.base.readlink(info.underlying_ino).await,
-        }
-    }
-
-    async fn readdir(&self, ino: i64) -> Result<Option<Vec<String>>> {
-        crate::profiling::record_readdir();
-        trace!("OverlayFS::readdir: ino={}", ino);
-
-        let info = self.get_inode_info(ino).ok_or(FsError::NotFound)?;
-        let child_whiteouts = self.get_child_whiteouts(&info.path);
-
-        let mut entries = HashSet::new();
-
-        // Get delta entries
-        if info.layer == Layer::Delta {
-            if let Some(delta_entries) = self.delta.readdir(info.underlying_ino).await? {
-                for entry in delta_entries {
-                    let entry_path = if info.path == "/" {
-                        format!("/{}", entry)
-                    } else {
-                        format!("{}/{}", info.path, entry)
-                    };
-                    if !self.is_whiteout(&entry_path) && !child_whiteouts.contains(&entry) {
-                        entries.insert(entry);
-                    }
-                }
-            }
-        }
-
-        // Get base entries (need to resolve base inode from path)
-        let base_ino = if info.layer == Layer::Base {
-            Some(info.underlying_ino)
-        } else {
-            // Walk base to find corresponding directory
-            let components: Vec<&str> = info.path.split('/').filter(|s| !s.is_empty()).collect();
-            let mut ino: i64 = 1;
-            let mut found_all = true;
-            crate::profiling::record_path_resolution(components.len() as u64);
-            for comp in &components {
-                if let Some(s) = self.base.lookup(ino, comp).await? {
-                    ino = s.ino;
-                } else {
-                    found_all = false;
-                    break;
-                }
-            }
-            if found_all {
-                Some(ino)
-            } else {
-                None
-            }
-        };
-
-        if let Some(base_ino) = base_ino {
-            if let Some(base_entries) = self.base.readdir(base_ino).await? {
-                for entry in base_entries {
-                    let entry_path = if info.path == "/" {
-                        format!("/{}", entry)
-                    } else {
-                        format!("{}/{}", info.path, entry)
-                    };
-                    if !self.is_whiteout(&entry_path) && !child_whiteouts.contains(&entry) {
-                        entries.insert(entry);
-                    }
-                }
-            }
-        }
-
-        let mut result: Vec<_> = entries.into_iter().collect();
-        result.sort();
-        Ok(Some(result))
-    }
-
-    async fn readdir_plus(&self, ino: i64) -> Result<Option<Vec<DirEntry>>> {
-        crate::profiling::record_readdir_plus();
-        trace!("OverlayFS::readdir_plus: ino={}", ino);
-
-        let info = self.get_inode_info(ino).ok_or(FsError::NotFound)?;
-        let child_whiteouts = self.get_child_whiteouts(&info.path);
-
-        let mut entries_map: HashMap<String, DirEntry> = HashMap::new();
-
-        // Get base entries first (so delta can override)
-        let base_ino = if info.layer == Layer::Base {
-            Some(info.underlying_ino)
-        } else {
-            let components: Vec<&str> = info.path.split('/').filter(|s| !s.is_empty()).collect();
-            let mut ino: i64 = 1;
-            let mut found_all = true;
-            crate::profiling::record_path_resolution(components.len() as u64);
-            for comp in &components {
-                if let Some(s) = self.base.lookup(ino, comp).await? {
-                    ino = s.ino;
-                } else {
-                    found_all = false;
-                    break;
-                }
-            }
-            if found_all {
-                Some(ino)
-            } else {
-                None
-            }
-        };
-
-        if let Some(base_ino) = base_ino {
-            if let Some(base_entries) = self.base.readdir_plus(base_ino).await? {
-                for mut entry in base_entries {
-                    let entry_path = if info.path == "/" {
-                        format!("/{}", entry.name)
-                    } else {
-                        format!("{}/{}", info.path, entry.name)
-                    };
-
-                    if !self.is_whiteout(&entry_path) && !child_whiteouts.contains(&entry.name) {
-                        let overlay_ino = self.get_or_create_overlay_ino(
-                            Layer::Base,
-                            entry.stats.ino,
-                            &entry_path,
-                        );
-                        entry.stats.ino = overlay_ino;
-                        entries_map.insert(entry.name.clone(), entry);
-                    }
-                }
-            }
-        }
-
-        // Get delta entries (override base)
-        if info.layer == Layer::Delta {
-            if let Some(delta_entries) = self.delta.readdir_plus(info.underlying_ino).await? {
-                for mut entry in delta_entries {
-                    let entry_path = if info.path == "/" {
-                        format!("/{}", entry.name)
-                    } else {
-                        format!("{}/{}", info.path, entry.name)
-                    };
-                    if self.is_whiteout(&entry_path) || child_whiteouts.contains(&entry.name) {
-                        continue;
-                    }
-
-                    // Check for origin mapping
-                    let delta_ino = entry.stats.ino;
-                    if let Some(base_ino) = self.get_origin_ino(entry.stats.ino) {
-                        let overlay_ino =
-                            self.get_or_create_overlay_ino(Layer::Delta, delta_ino, &entry_path);
-                        if let Some(existing_ino) =
-                            self.live_origin_overlay_ino(base_ino, &entry_path)
-                        {
-                            self.refresh_overlay_mapping(
-                                existing_ino,
-                                Layer::Delta,
-                                delta_ino,
-                                &entry_path,
-                            );
-                            entry.stats.ino = existing_ino;
-                        } else {
-                            entry.stats.ino = overlay_ino;
-                        }
-                    } else {
-                        let overlay_ino = self.get_or_create_overlay_ino(
-                            Layer::Delta,
-                            entry.stats.ino,
-                            &entry_path,
-                        );
-                        entry.stats.ino = overlay_ino;
-                    }
-
-                    entries_map.insert(entry.name.clone(), entry);
-                }
-            }
-        }
-
-        let mut result: Vec<_> = entries_map.into_values().collect();
-        result.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(Some(result))
-    }
-
-    async fn chmod(&self, ino: i64, mode: u32) -> Result<()> {
-        trace!("OverlayFS::chmod: ino={}, mode={:o}", ino, mode);
-
-        let info = self.get_inode_info(ino).ok_or(FsError::NotFound)?;
-        if info.layer == Layer::Base && self.is_whiteout(&info.path) {
-            return Err(FsError::NotFound.into());
-        }
-
-        let delta_ino = match info.layer {
-            Layer::Delta => info.underlying_ino,
-            Layer::Base => {
-                let base_stats = self
-                    .base
-                    .getattr(info.underlying_ino)
-                    .await?
-                    .ok_or(FsError::NotFound)?;
-                if self.partial_origin_policy.permits(&base_stats) {
-                    self.partial_copy_up_and_update_mapping(ino, &info).await?
-                } else {
-                    self.copy_up_and_update_mapping(ino, &info).await?
-                }
-            }
-        };
-
-        self.delta.chmod(delta_ino, mode).await
-    }
-
-    async fn chown(&self, ino: i64, uid: Option<u32>, gid: Option<u32>) -> Result<()> {
-        trace!(
-            "OverlayFS::chown: ino={}, uid={:?}, gid={:?}",
-            ino,
-            uid,
-            gid
-        );
-
-        let info = self.get_inode_info(ino).ok_or(FsError::NotFound)?;
-        if info.layer == Layer::Base && self.is_whiteout(&info.path) {
-            return Err(FsError::NotFound.into());
-        }
-
-        let delta_ino = match info.layer {
-            Layer::Delta => info.underlying_ino,
-            Layer::Base => {
-                let base_stats = self
-                    .base
-                    .getattr(info.underlying_ino)
-                    .await?
-                    .ok_or(FsError::NotFound)?;
-                if self.partial_origin_policy.permits(&base_stats) {
-                    self.partial_copy_up_and_update_mapping(ino, &info).await?
-                } else {
-                    self.copy_up_and_update_mapping(ino, &info).await?
-                }
-            }
-        };
-
-        self.delta.chown(delta_ino, uid, gid).await
-    }
-
-    async fn utimens(&self, ino: i64, atime: TimeChange, mtime: TimeChange) -> Result<()> {
-        trace!("OverlayFS::utimens: ino={}", ino);
-
-        let info = self.get_inode_info(ino).ok_or(FsError::NotFound)?;
-        if info.layer == Layer::Base && self.is_whiteout(&info.path) {
-            return Err(FsError::NotFound.into());
-        }
-
-        let delta_ino = match info.layer {
-            Layer::Delta => info.underlying_ino,
-            Layer::Base => {
-                let base_stats = self
-                    .base
-                    .getattr(info.underlying_ino)
-                    .await?
-                    .ok_or(FsError::NotFound)?;
-                if self.partial_origin_policy.permits(&base_stats) {
-                    self.partial_copy_up_and_update_mapping(ino, &info).await?
-                } else {
-                    self.copy_up_and_update_mapping(ino, &info).await?
-                }
-            }
-        };
-
-        self.delta.utimens(delta_ino, atime, mtime).await
-    }
-
-    async fn keep_cache_for_read_open(&self, ino: i64, flags: i32) -> Result<Option<Stats>> {
-        if is_write_open(flags) {
-            return Ok(None);
-        }
-
-        let info = self.get_inode_info(ino).ok_or(FsError::NotFound)?;
-        match info.layer {
-            Layer::Base => {
-                if self.is_whiteout(&info.path) {
-                    return Ok(None);
-                }
-                let Some(stats) = self.base.getattr(info.underlying_ino).await? else {
-                    return Ok(None);
-                };
-                Ok(stats.is_file().then_some(stats))
-            }
-            // Delta (DB-backed) files inherit the AgentFS keep-cache policy:
-            // the adapter fingerprint guard revalidates per open.
-            Layer::Delta => {
-                FileSystem::keep_cache_for_read_open(&self.delta, info.underlying_ino, flags).await
-            }
-        }
-    }
-
-    fn delta_keep_cache_fast_path(&self) -> bool {
-        self.delta.delta_keep_cache_fast_path()
-    }
-
-    async fn open(&self, ino: i64, flags: i32) -> Result<BoxedFile> {
-        trace!("OverlayFS::open: ino={}", ino);
-
-        let info = self.get_inode_info(ino).ok_or(FsError::NotFound)?;
-        if info.layer == Layer::Base && self.is_whiteout(&info.path) {
-            return Err(FsError::NotFound.into());
-        }
-
-        match info.layer {
-            Layer::Delta => {
-                return self
-                    .partial_file_for_delta(ino, info.underlying_ino, flags)
-                    .await;
-            }
-            Layer::Base if !is_write_open(flags) => {
-                return self.base.open(info.underlying_ino, flags).await;
-            }
-            Layer::Base => {
-                let base_stats = self
-                    .base
-                    .getattr(info.underlying_ino)
-                    .await?
-                    .ok_or(FsError::NotFound)?;
-                if self.partial_origin_policy.permits(&base_stats) {
-                    let delta_ino = self.partial_copy_up_and_update_mapping(ino, &info).await?;
-                    return self.partial_file_for_delta(ino, delta_ino, flags).await;
-                }
-            }
-        }
-
-        let delta_ino = self.copy_up_and_update_mapping(ino, &info).await?;
-
-        FileSystem::open(&self.delta, delta_ino, flags).await
-    }
-
-    async fn mkdir(
-        &self,
-        parent_ino: i64,
-        name: &str,
-        mode: u32,
-        uid: u32,
-        gid: u32,
-    ) -> Result<Stats> {
-        trace!("OverlayFS::mkdir: parent_ino={}, name={}", parent_ino, name);
-
-        let parent_info = self.get_inode_info(parent_ino).ok_or(FsError::NotFound)?;
-        let path = self.build_path(parent_ino, name)?;
-
-        // Check if already exists
-        if self.lookup(parent_ino, name).await?.is_some() {
-            return Err(FsError::AlreadyExists.into());
-        }
-
-        // Remove whiteout if exists
-        self.remove_whiteout(&path).await?;
-
-        // Ensure parent dirs exist in delta
-        self.ensure_parent_dirs(&path, uid, gid).await?;
-
-        let delta_parent_ino = self
-            .resolve_delta_parent(&parent_info)
-            .await?
-            .ok_or(FsError::NotFound)?;
-
-        let mut stats =
-            FileSystem::mkdir(&self.delta, delta_parent_ino, name, mode, uid, gid).await?;
-        let overlay_ino = self.get_or_create_overlay_ino(Layer::Delta, stats.ino, &path);
-        stats.ino = overlay_ino;
-
-        Ok(stats)
-    }
-
-    async fn create_file(
-        &self,
-        parent_ino: i64,
-        name: &str,
-        mode: u32,
-        uid: u32,
-        gid: u32,
-    ) -> Result<(Stats, BoxedFile)> {
-        trace!(
-            "OverlayFS::create_file: parent_ino={}, name={}",
-            parent_ino,
-            name
-        );
-
-        let parent_info = self.get_inode_info(parent_ino).ok_or(FsError::NotFound)?;
-        let path = self.build_path(parent_ino, name)?;
-
-        // Remove whiteout if exists
-        self.remove_whiteout(&path).await?;
-
-        // Ensure parent dirs exist in delta
-        self.ensure_parent_dirs(&path, uid, gid).await?;
-
-        let delta_parent_ino = self
-            .resolve_delta_parent(&parent_info)
-            .await?
-            .ok_or(FsError::NotFound)?;
-
-        let (mut stats, file) =
-            FileSystem::create_file(&self.delta, delta_parent_ino, name, mode, uid, gid).await?;
-        let overlay_ino = self.get_or_create_overlay_ino(Layer::Delta, stats.ino, &path);
-        stats.ino = overlay_ino;
-
-        Ok((stats, file))
-    }
-
-    async fn mknod(
-        &self,
-        parent_ino: i64,
-        name: &str,
-        mode: u32,
-        rdev: u64,
-        uid: u32,
-        gid: u32,
-    ) -> Result<Stats> {
-        trace!("OverlayFS::mknod: parent_ino={}, name={}", parent_ino, name);
-
-        let parent_info = self.get_inode_info(parent_ino).ok_or(FsError::NotFound)?;
-        let path = self.build_path(parent_ino, name)?;
-
-        self.remove_whiteout(&path).await?;
-        self.ensure_parent_dirs(&path, uid, gid).await?;
-
-        let delta_parent_ino = self
-            .resolve_delta_parent(&parent_info)
-            .await?
-            .ok_or(FsError::NotFound)?;
-
-        let mut stats =
-            FileSystem::mknod(&self.delta, delta_parent_ino, name, mode, rdev, uid, gid).await?;
-        let overlay_ino = self.get_or_create_overlay_ino(Layer::Delta, stats.ino, &path);
-        stats.ino = overlay_ino;
-
-        Ok(stats)
-    }
-
-    async fn symlink(
-        &self,
-        parent_ino: i64,
-        name: &str,
-        target: &str,
-        uid: u32,
-        gid: u32,
-    ) -> Result<Stats> {
-        trace!(
-            "OverlayFS::symlink: parent_ino={}, name={}, target={}",
-            parent_ino,
-            name,
-            target
-        );
-
-        let parent_info = self.get_inode_info(parent_ino).ok_or(FsError::NotFound)?;
-        let path = self.build_path(parent_ino, name)?;
-
-        self.remove_whiteout(&path).await?;
-        self.ensure_parent_dirs(&path, uid, gid).await?;
-
-        let delta_parent_ino = self
-            .resolve_delta_parent(&parent_info)
-            .await?
-            .ok_or(FsError::NotFound)?;
-
-        let mut stats =
-            FileSystem::symlink(&self.delta, delta_parent_ino, name, target, uid, gid).await?;
-        let overlay_ino = self.get_or_create_overlay_ino(Layer::Delta, stats.ino, &path);
-        stats.ino = overlay_ino;
-
-        Ok(stats)
-    }
-
-    async fn unlink(&self, parent_ino: i64, name: &str) -> Result<()> {
-        trace!(
-            "OverlayFS::unlink: parent_ino={}, name={}",
-            parent_ino,
-            name
-        );
-
-        let parent_info = self.get_inode_info(parent_ino).ok_or(FsError::NotFound)?;
-        let path = self.build_path(parent_ino, name)?;
-
-        // Check if it exists
-        let stats = self
-            .lookup(parent_ino, name)
-            .await?
-            .ok_or(FsError::NotFound)?;
-        if stats.is_directory() {
-            return Err(FsError::IsADirectory.into());
-        }
-
-        // Try to remove from delta. Walk the delta layer to find the parent,
-        // since the overlay parent may map to Base even when a copy-up exists in delta.
-        if let Some(dpi) = self.resolve_delta_parent(&parent_info).await? {
-            let removed_delta_ino = FileSystem::lookup(&self.delta, dpi, name)
-                .await?
-                .map(|stats| stats.ino);
-            match FileSystem::unlink(&self.delta, dpi, name).await {
-                Ok(()) => {}
-                Err(crate::error::Error::Fs(FsError::NotFound)) => {}
-                Err(e) => return Err(e),
-            }
-            if let Some(delta_ino) = removed_delta_ino {
-                self.cleanup_partial_origin_if_unlinked(delta_ino).await?;
-            }
-        }
-
-        // If the file is still visible through the overlay after delta removal,
-        // it must be coming from the base layer — create a whiteout to hide it.
-        if self.lookup(parent_ino, name).await?.is_some() {
-            self.create_whiteout(&path).await?;
-        }
-
-        Ok(())
-    }
-
-    async fn rmdir(&self, parent_ino: i64, name: &str) -> Result<()> {
-        trace!("OverlayFS::rmdir: parent_ino={}, name={}", parent_ino, name);
-
-        let parent_info = self.get_inode_info(parent_ino).ok_or(FsError::NotFound)?;
-        let path = self.build_path(parent_ino, name)?;
-
-        // Check if it exists and is a directory
-        let stats = self
-            .lookup(parent_ino, name)
-            .await?
-            .ok_or(FsError::NotFound)?;
-        if !stats.is_directory() {
-            return Err(FsError::NotADirectory.into());
-        }
-
-        // Check if directory is empty (in overlay view)
-        let dir_entries = self.readdir(stats.ino).await?.unwrap_or_default();
-        if !dir_entries.is_empty() {
-            return Err(FsError::NotEmpty.into());
-        }
-
-        // Try to remove from delta. Walk the delta layer to find the parent,
-        // since the overlay parent may map to Base even when a copy-up exists in delta.
-        if let Some(dpi) = self.resolve_delta_parent(&parent_info).await? {
-            match FileSystem::rmdir(&self.delta, dpi, name).await {
-                Ok(()) => {}
-                Err(crate::error::Error::Fs(FsError::NotFound)) => {}
-                Err(e) => return Err(e),
-            }
-        }
-
-        // If the directory is still visible through the overlay after delta removal,
-        // it must be coming from the base layer — create a whiteout to hide it.
-        if self.lookup(parent_ino, name).await?.is_some() {
-            self.create_whiteout(&path).await?;
-        }
-
-        Ok(())
-    }
-
-    async fn link(&self, ino: i64, newparent_ino: i64, newname: &str) -> Result<Stats> {
-        trace!(
-            "OverlayFS::link: ino={}, newparent_ino={}, newname={}",
-            ino,
-            newparent_ino,
-            newname
-        );
-
-        let info = self.get_inode_info(ino).ok_or(FsError::NotFound)?;
-        let parent_info = self
-            .get_inode_info(newparent_ino)
-            .ok_or(FsError::NotFound)?;
-        let new_path = self.build_path(newparent_ino, newname)?;
-
-        // Ensure file is in delta (copy up if needed)
-        let delta_ino = if info.layer == Layer::Delta {
-            info.underlying_ino
-        } else {
-            self.copy_up(&info.path, info.underlying_ino).await?
-        };
-
-        self.remove_whiteout(&new_path).await?;
-        self.ensure_parent_dirs(&new_path, 0, 0).await?;
-
-        // Resolve delta parent AFTER ensure_parent_dirs so the directories exist.
-        let delta_parent_ino = self
-            .resolve_delta_parent(&parent_info)
-            .await?
-            .ok_or(FsError::NotFound)?;
-
-        let mut stats = FileSystem::link(&self.delta, delta_ino, delta_parent_ino, newname).await?;
-        stats.ino = ino; // Keep original overlay inode
-
-        Ok(stats)
-    }
-
-    async fn rename(
-        &self,
-        oldparent_ino: i64,
-        oldname: &str,
-        newparent_ino: i64,
-        newname: &str,
-    ) -> Result<()> {
-        trace!(
-            "OverlayFS::rename: oldparent={}, oldname={}, newparent={}, newname={}",
-            oldparent_ino,
-            oldname,
-            newparent_ino,
-            newname
-        );
-
-        let old_parent_info = self
-            .get_inode_info(oldparent_ino)
-            .ok_or(FsError::NotFound)?;
-        let new_parent_info = self
-            .get_inode_info(newparent_ino)
-            .ok_or(FsError::NotFound)?;
-        let old_path = self.build_path(oldparent_ino, oldname)?;
-        let new_path = self.build_path(newparent_ino, newname)?;
-
-        // Get source stats
-        let src_stats = self
-            .lookup(oldparent_ino, oldname)
-            .await?
-            .ok_or(FsError::NotFound)?;
-        let src_info = self
-            .get_inode_info(src_stats.ino)
-            .ok_or(FsError::NotFound)?;
-
-        // A base-origin directory copy-up only creates the directory itself,
-        // not its subtree. ensure_parent_dirs can promote such a directory to
-        // Layer::Delta after a single child write, so the layer tag alone is not
-        // a safe origin test. If the old path still resolves to a visible base
-        // directory, return EXDEV so user-space callers such as `mv` perform
-        // copy+delete.
-        if src_stats.is_directory() && self.resolves_to_visible_base_directory(&old_path).await? {
-            return Err(FsError::CrossDevice.into());
-        }
-
-        // Ensure source is in delta first.
-        let delta_src_ino = if src_info.layer == Layer::Base {
-            self.copy_up(&old_path, src_info.underlying_ino).await?
-        } else {
-            src_info.underlying_ino
-        };
-
-        // Remove whiteout at destination
-        self.remove_whiteout(&new_path).await?;
-        self.ensure_parent_dirs(&new_path, 0, 0).await?;
-
-        // Resolve delta parents AFTER copy_up / ensure_parent_dirs,
-        // since those create the parent directories in delta.
-        let delta_src_parent_ino = self
-            .resolve_delta_parent(&old_parent_info)
-            .await?
-            .ok_or(FsError::NotFound)?;
-        let delta_dst_parent_ino = self
-            .resolve_delta_parent(&new_parent_info)
-            .await?
-            .ok_or(FsError::NotFound)?;
-
-        // Perform rename in delta
-        FileSystem::rename(
-            &self.delta,
-            delta_src_parent_ino,
-            oldname,
-            delta_dst_parent_ino,
-            newname,
-        )
-        .await?;
-        self.refresh_overlay_mapping(src_stats.ino, Layer::Delta, delta_src_ino, &new_path);
-
-        // If the old file is still visible through the overlay after the rename,
-        // it must be coming from the base layer — create a whiteout to hide it.
-        if self.lookup(oldparent_ino, oldname).await?.is_some() {
-            self.create_whiteout(&old_path).await?;
-        }
-
-        Ok(())
-    }
-
-    async fn statfs(&self) -> Result<FilesystemStats> {
-        FileSystem::statfs(&self.delta).await
-    }
-
-    async fn drain_inode_writes(&self, ino: i64) -> Result<()> {
-        let info = self.get_inode_info(ino).ok_or(FsError::NotFound)?;
-        match info.layer {
-            Layer::Delta => FileSystem::drain_inode_writes(&self.delta, info.underlying_ino).await,
-            Layer::Base => self.base.drain_inode_writes(info.underlying_ino).await,
-        }
-    }
-
-    async fn drain_all(&self) -> Result<()> {
-        FileSystem::drain_all(&self.delta).await?;
-        self.base.drain_all().await?;
-        Ok(())
-    }
-
-    async fn finalize(&self) -> Result<()> {
-        FileSystem::finalize(&self.delta).await?;
-        self.base.finalize().await?;
-        Ok(())
-    }
-
-    async fn retain_lookup(&self, ino: i64, nlookup: u64) -> Result<()> {
-        let info = self.get_inode_info(ino).ok_or(FsError::NotFound)?;
-        match info.layer {
-            Layer::Delta => {
-                FileSystem::retain_lookup(&self.delta, info.underlying_ino, nlookup).await
-            }
-            Layer::Base => self.base.retain_lookup(info.underlying_ino, nlookup).await,
-        }
-    }
-
-    async fn forget(&self, ino: i64, nlookup: u64) {
-        // Look up the inode info to determine which layer it belongs to
-        let info = match self.get_inode_info(ino) {
-            Some(i) => i,
-            None => return, // Unknown inode, nothing to forget
-        };
-
-        // Pass through to the appropriate layer
-        match info.layer {
-            Layer::Delta => {
-                // Delta (AgentFS) doesn't cache fds, but call it anyway for completeness
-                FileSystem::forget(&self.delta, info.underlying_ino, nlookup).await;
-            }
-            Layer::Base => {
-                // Base layer (HostFS) caches O_PATH fds and needs forget
-                self.base.forget(info.underlying_ino, nlookup).await;
-            }
-        }
-
-        // Note: We don't remove from inode_map here because the overlay layer's
-        // inode mapping is relatively lightweight (no fd). The base layer's
-        // forget handles the actual fd cleanup.
-    }
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
     use crate::filesystem::HostFS;
+    use crate::filesystem::{FsError, TimeChange};
     use crate::DEFAULT_FILE_MODE;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
@@ -5048,6 +2932,156 @@ mod tests {
         // Verify it's gone
         let deleted = overlay.lookup(parent_stats.ino, "newsubdir").await?;
         assert!(deleted.is_none(), "newsubdir should be deleted after rmdir");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn overlay_lookup_forget_prunes_maps() -> Result<()> {
+        let base_dir = tempdir()?;
+        for index in 0..128 {
+            std::fs::write(
+                base_dir.path().join(format!("file-{index:03}.txt")),
+                format!("base-{index:03}"),
+            )?;
+        }
+
+        let base = Arc::new(HostFS::new(base_dir.path())?);
+        let delta_dir = tempdir()?;
+        let db_path = delta_dir.path().join("delta.db");
+        let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+        let overlay = OverlayFS::new(base, delta);
+        overlay.init(base_dir.path().to_str().unwrap()).await?;
+
+        let baseline = overlay.debug_map_counts();
+        let mut looked_up = Vec::new();
+        for index in 0..128 {
+            let name = format!("file-{index:03}.txt");
+            let stats = overlay.lookup(ROOT_INO, &name).await?.unwrap();
+            looked_up.push(stats.ino);
+        }
+
+        let peak = overlay.debug_map_counts();
+        assert!(
+            peak.inode_entries >= baseline.inode_entries + looked_up.len(),
+            "lookup should create overlay mappings; baseline={baseline:?}, peak={peak:?}"
+        );
+
+        for ino in looked_up {
+            overlay.forget(ino, 1).await;
+        }
+
+        let final_counts = overlay.debug_map_counts();
+        assert_eq!(
+            final_counts, baseline,
+            "FORGET should prune lookup-only overlay mappings back to baseline"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn overlay_load_origins_propagates_select_errors() -> Result<()> {
+        let (overlay, _base_dir, _delta_dir) = create_test_overlay().await?;
+        let conn = overlay.delta().get_connection().await?;
+        conn.execute("DROP TABLE fs_origin", ()).await?;
+
+        let result = overlay.load().await;
+        assert!(
+            result.is_err(),
+            "load_origins must propagate a failed fs_origin SELECT"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn overlay_whiteout_failures_roll_back() -> Result<()> {
+        let base_dir = tempdir()?;
+        std::fs::write(base_dir.path().join("unlink.txt"), b"unlink")?;
+        std::fs::create_dir(base_dir.path().join("empty-dir"))?;
+        std::fs::write(base_dir.path().join("rename-src.txt"), b"rename")?;
+        std::fs::write(base_dir.path().join("rename-dst.txt"), b"destination")?;
+
+        let base = Arc::new(HostFS::new(base_dir.path())?);
+        let delta_dir = tempdir()?;
+        let db_path = delta_dir.path().join("delta.db");
+        let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+        let overlay = OverlayFS::new(base, delta);
+        overlay.init(base_dir.path().to_str().unwrap()).await?;
+
+        overlay.fail_next_whiteout_for_test("unlink injected whiteout failure");
+        let unlink_result = overlay.unlink(ROOT_INO, "unlink.txt").await;
+        assert!(unlink_result.is_err());
+        assert!(
+            overlay.lookup(ROOT_INO, "unlink.txt").await?.is_some(),
+            "failed unlink must leave the base path visible"
+        );
+        assert_eq!(
+            scalar_i64(
+                &overlay,
+                "SELECT COUNT(*) FROM fs_whiteout WHERE path = '/unlink.txt'"
+            )
+            .await?,
+            0,
+            "failed unlink must not leave a half-applied whiteout"
+        );
+
+        overlay.fail_next_whiteout_for_test("rmdir injected whiteout failure");
+        let rmdir_result = overlay.rmdir(ROOT_INO, "empty-dir").await;
+        assert!(rmdir_result.is_err());
+        assert!(
+            overlay.lookup(ROOT_INO, "empty-dir").await?.is_some(),
+            "failed rmdir must leave the base directory visible"
+        );
+        assert_eq!(
+            scalar_i64(
+                &overlay,
+                "SELECT COUNT(*) FROM fs_whiteout WHERE path = '/empty-dir'",
+            )
+            .await?,
+            0,
+            "failed rmdir must not leave a half-applied whiteout"
+        );
+
+        overlay.unlink(ROOT_INO, "rename-dst.txt").await?;
+        assert!(overlay.lookup(ROOT_INO, "rename-dst.txt").await?.is_none());
+        assert_eq!(
+            scalar_i64(
+                &overlay,
+                "SELECT COUNT(*) FROM fs_whiteout WHERE path = '/rename-dst.txt'",
+            )
+            .await?,
+            1
+        );
+
+        overlay.fail_next_whiteout_for_test("rename injected whiteout failure");
+        let rename_result = overlay
+            .rename(ROOT_INO, "rename-src.txt", ROOT_INO, "rename-dst.txt")
+            .await;
+        assert!(rename_result.is_err());
+        assert!(
+            overlay.lookup(ROOT_INO, "rename-src.txt").await?.is_some(),
+            "failed rename must leave the source path visible"
+        );
+        assert!(
+            overlay.lookup(ROOT_INO, "rename-dst.txt").await?.is_none(),
+            "failed rename must preserve the destination whiteout"
+        );
+        assert_eq!(
+            scalar_i64(
+                &overlay,
+                "SELECT COUNT(*) FROM fs_whiteout WHERE path = '/rename-dst.txt'",
+            )
+            .await?,
+            1,
+            "failed rename must roll back the attempted whiteout removal"
+        );
+        assert_eq!(
+            scalar_i64(&overlay, "SELECT COUNT(*) FROM fs_origin").await?,
+            0,
+            "failed rename must not copy up the source before the whiteout transaction succeeds"
+        );
 
         Ok(())
     }

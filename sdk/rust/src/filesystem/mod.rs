@@ -3,7 +3,7 @@ pub mod agentfs;
 pub mod hostfs_darwin;
 #[cfg(target_os = "linux")]
 pub mod hostfs_linux;
-pub mod overlayfs;
+pub mod overlay;
 
 use crate::error::Result;
 use async_trait::async_trait;
@@ -16,7 +16,7 @@ pub use agentfs::{AgentFS, ImportEntry, ImportOptions, ImportSession, ImportedEn
 pub use hostfs_darwin::HostFS;
 #[cfg(target_os = "linux")]
 pub use hostfs_linux::HostFS;
-pub use overlayfs::{
+pub use overlay::{
     OverlayFS, PartialOriginMode, PartialOriginPolicy, DEFAULT_PARTIAL_ORIGIN_THRESHOLD_BYTES,
 };
 
