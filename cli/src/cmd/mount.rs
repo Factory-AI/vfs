@@ -1,6 +1,7 @@
 use agentfs_core::{
     error::Error as SdkError, AgentFSOptions, FileSystem, HostFS, OverlayFS, PartialOriginPolicy,
 };
+use agentfs_nfs::{serve, NfsServeOptions};
 use anyhow::{Context, Result};
 use std::{
     path::{Path, PathBuf},
@@ -10,8 +11,6 @@ use std::{
 use turso::value::Value;
 
 use crate::mount::{mount_fs, MountOpts};
-use crate::nfs::AgentNFS;
-use crate::nfsserve::tcp::NFSTcp;
 
 #[cfg(target_os = "linux")]
 use agentfs_core::{get_mounts, Mount};
@@ -319,21 +318,18 @@ async fn mount_nfs_backend(args: MountArgs) -> Result<()> {
         // Handle drops automatically when we exit this scope
     } else {
         // Daemon mode: use manual NFS server setup for persistent background operation
-        let nfs = AgentNFS::new(fs);
         let port = find_available_port(DEFAULT_NFS_PORT)?;
 
-        let bind_addr = format!("127.0.0.1:{}", port);
-        let listener = crate::nfsserve::tcp::NFSTcpListener::bind(&bind_addr, nfs)
-            .await
-            .context("Failed to bind NFS server")?;
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let _server_handle = serve(
+            fs,
+            NfsServeOptions::new("127.0.0.1", port),
+            shutdown.clone(),
+        )
+        .await
+        .context("Failed to bind NFS server")?;
 
         eprintln!("Starting NFS server on 127.0.0.1:{}", port);
-
-        tokio::spawn(async move {
-            if let Err(e) = listener.handle_forever().await {
-                eprintln!("NFS server error: {}", e);
-            }
-        });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         nfs_mount(port, &mountpoint)?;

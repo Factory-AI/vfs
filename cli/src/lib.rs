@@ -9,12 +9,6 @@ pub mod sandbox;
 pub mod daemon;
 
 #[cfg(unix)]
-pub mod nfsserve;
-
-#[cfg(unix)]
-pub mod nfs;
-
-#[cfg(unix)]
 pub mod mount;
 
 pub fn get_runtime() -> tokio::runtime::Runtime {

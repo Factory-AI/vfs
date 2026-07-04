@@ -54,19 +54,16 @@ dependencies = [
  "aegis",
  "agentfs-core",
  "agentfs-fuse",
+ "agentfs-nfs",
  "anyhow",
  "async-trait",
  "base64",
- "byteorder",
  "chrono",
  "clap",
  "clap_complete",
  "dirs",
- "filetime",
  "hex",
  "libc",
- "num-derive",
- "num-traits",
  "parking_lot",
  "serde",
  "serde_json",
@@ -119,6 +116,25 @@ dependencies = [
  "tracing",
  "turso",
  "zerocopy",
+]
+
+[[package]]
+name = "agentfs-nfs"
+version = "0.6.4"
+dependencies = [
+ "agentfs-core",
+ "anyhow",
+ "async-trait",
+ "byteorder",
+ "filetime",
+ "libc",
+ "num-derive",
+ "num-traits",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

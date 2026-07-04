@@ -1,6 +1,6 @@
 use super::nfs;
 use super::nfs::*;
-pub use super::rpc::auth_unix;
+pub(crate) use super::rpc::auth_unix;
 use async_trait::async_trait;
 use std::cmp::Ordering;
 use std::sync::OnceLock;

@@ -5,6 +5,7 @@
 //! it as their root filesystem.
 
 use agentfs_core::{agentfs_dir, AgentFSOptions, FileSystem, HostFS, OverlayFS};
+use agentfs_nfs::{serve, NfsServeOptions};
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,7 +13,6 @@ use tokio::signal;
 use tokio_util::sync::CancellationToken;
 
 use crate::cmd::init::open_agentfs;
-use crate::nfs::AgentNFS;
 
 /// Handle the `nfs` command - start a standalone NFS server.
 pub async fn handle_nfs_command(id_or_path: String, bind: String, port: u32) -> Result<()> {
@@ -46,37 +46,33 @@ pub async fn handle_nfs_command(id_or_path: String, bind: String, port: u32) -> 
         Arc::new(agentfs.fs)
     };
 
-    // Create NFS adapter
-    let nfs = AgentNFS::new(fs);
-
     // Bind NFS server
-    let bind_addr_str = format!("{}:{}", bind, port);
-    let listener = crate::nfsserve::tcp::NFSTcpListener::bind(&bind_addr_str, nfs)
-        .await
-        .with_context(|| format!("Failed to bind NFS server to {}", bind_addr_str))?;
+    let shutdown = CancellationToken::new();
+    let server_handle = serve(
+        fs,
+        NfsServeOptions::new(bind.clone(), port),
+        shutdown.clone(),
+    )
+    .await
+    .with_context(|| format!("Failed to bind NFS server to {bind}:{port}"))?;
+    let listen_addr = server_handle.local_addr();
+    let listen_port = u32::from(server_handle.local_port());
 
     // Print server info
     eprintln!();
     eprintln!("AgentFS NFS Server");
     eprintln!("  Database: {}", db_path.display());
-    eprintln!("  Listening: {}", bind_addr_str);
+    eprintln!("  Listening: {}", listen_addr);
     eprintln!("  Export: /");
     eprintln!();
     eprintln!("Mount from client:");
     eprintln!(
         "  mount -t nfs -o vers=3,tcp,port={},mountport={},nolock {}:/ /mnt",
-        port, port, bind
+        listen_port, listen_port, bind
     );
     eprintln!();
     eprintln!("Press Ctrl+C to stop.");
     eprintln!();
-
-    // Spawn the NFS server task
-    use crate::nfsserve::tcp::NFSTcp;
-    let shutdown = CancellationToken::new();
-    let server_shutdown = shutdown.clone();
-    let server_handle =
-        tokio::spawn(async move { listener.handle_until_cancelled(server_shutdown).await });
 
     // Wait for Ctrl+C
     signal::ctrl_c()
@@ -88,8 +84,8 @@ pub async fn handle_nfs_command(id_or_path: String, bind: String, port: u32) -> 
 
     shutdown.cancel();
     server_handle
+        .join()
         .await
-        .context("NFS server task failed to join")?
         .context("NFS server shutdown failed")?;
 
     Ok(())

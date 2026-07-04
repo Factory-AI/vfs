@@ -10,14 +10,12 @@
 use agentfs_core::{
     AgentFS, AgentFSOptions, EncryptionConfig, FileSystem, HostFS, OverlayFS, PartialOriginPolicy,
 };
+use agentfs_nfs::{serve, NfsServeOptions, ServerHandle};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-
-use crate::nfs::AgentNFS;
-use crate::nfsserve::tcp::NFSTcp;
 
 use crate::cmd::supervise::{
     supervise_command, supervise_mounted_command, ChildOutcome, MountedCommandBackend,
@@ -99,23 +97,18 @@ pub async fn run(
 
     let fs: Arc<dyn FileSystem> = Arc::new(overlay);
 
-    // Create NFS adapter
-    let nfs = AgentNFS::new(fs);
-
     // Find an available port
     let port = find_available_port(DEFAULT_NFS_PORT)?;
 
     // Start NFS server in background
-    let bind_addr = format!("127.0.0.1:{}", port);
-    let listener = crate::nfsserve::tcp::NFSTcpListener::bind(&bind_addr, nfs)
-        .await
-        .context("Failed to bind NFS server")?;
-
-    // Spawn the NFS server task
     let shutdown = CancellationToken::new();
-    let server_shutdown = shutdown.clone();
-    let server_handle =
-        tokio::spawn(async move { listener.handle_until_cancelled(server_shutdown).await });
+    let server_handle = serve(
+        fs,
+        NfsServeOptions::new("127.0.0.1", port),
+        shutdown.clone(),
+    )
+    .await
+    .context("Failed to bind NFS server")?;
 
     // Give the server a moment to start
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -127,7 +120,6 @@ pub async fn run(
 
     let mount_backend = DarwinNfsRunMount {
         mountpoint: session.mountpoint.clone(),
-        shutdown,
         server_handle: Some(server_handle),
     };
     let command_display = command.display().to_string();
@@ -152,8 +144,7 @@ pub async fn run(
 
 struct DarwinNfsRunMount {
     mountpoint: PathBuf,
-    shutdown: CancellationToken,
-    server_handle: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
+    server_handle: Option<ServerHandle>,
 }
 
 impl MountedCommandBackend for DarwinNfsRunMount {
@@ -166,15 +157,11 @@ impl MountedCommandBackend for DarwinNfsRunMount {
     }
 
     fn shutdown_server(&mut self) -> ShutdownFuture<'_> {
-        let shutdown = self.shutdown.clone();
         let server_handle = self.server_handle.take();
         Box::pin(async move {
-            shutdown.cancel();
             if let Some(handle) = server_handle {
-                handle
-                    .await
-                    .context("NFS server task failed to join")?
-                    .context("NFS server shutdown failed")?;
+                handle.cancel();
+                handle.join().await.context("NFS server shutdown failed")?;
             }
             Ok(())
         })

@@ -2,7 +2,6 @@ use super::context::RPCContext;
 use super::rpcwire::*;
 use super::transaction_tracker::TransactionTracker;
 use super::vfs::NFSFileSystem;
-use anyhow;
 use async_trait::async_trait;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -15,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
 
 /// A NFS Tcp Connection Handler
-pub struct NFSTcpListener<T: NFSFileSystem + Send + Sync + 'static> {
+pub(crate) struct NFSTcpListener<T: NFSFileSystem + Send + Sync + 'static> {
     listener: TcpListener,
     port: u16,
     arcfs: Arc<T>,
@@ -110,17 +109,12 @@ async fn process_socket(
 }
 
 #[async_trait]
-pub trait NFSTcp: Send + Sync {
+pub(crate) trait NFSTcp: Send + Sync {
     /// Gets the true listening port. Useful if the bound port number is 0
     fn get_listen_port(&self) -> u16;
 
     /// Gets the true listening IP. Useful on windows when the IP may be random
     fn get_listen_ip(&self) -> IpAddr;
-
-    /// Loops forever and never returns handling all incoming connections.
-    async fn handle_forever(&self) -> io::Result<()> {
-        self.handle_until_cancelled(CancellationToken::new()).await
-    }
 
     /// Handles incoming connections until the cancellation token is triggered.
     async fn handle_until_cancelled(&self, shutdown: CancellationToken) -> io::Result<()>;
@@ -280,11 +274,11 @@ fn log_connection_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nfs::AgentNFS;
-    use crate::nfsserve::nfs;
-    use crate::nfsserve::rpc::{self, accept_body, accepted_reply, reply_body, rpc_body, rpc_msg};
-    use crate::nfsserve::vfs::NFSFileSystem;
-    use crate::nfsserve::xdr::XDR;
+    use crate::adapter::AgentNFS;
+    use crate::server::nfs;
+    use crate::server::rpc::{self, accept_body, accepted_reply, reply_body, rpc_body, rpc_msg};
+    use crate::server::vfs::NFSFileSystem;
+    use crate::server::xdr::XDR;
     use agentfs_core::{AgentFS as AgentSdk, AgentFSOptions, FileSystem, DEFAULT_FILE_MODE};
     use std::io::Cursor;
     use tokio::io::AsyncReadExt;

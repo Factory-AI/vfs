@@ -1,5 +1,4 @@
 // this is just a complete enumeration of everything in the RFC
-#![allow(dead_code)]
 // And its nice to keep the original RFC names and case
 #![allow(non_camel_case_types)]
 
@@ -11,11 +10,9 @@ use std::io::{Read, Write};
 // Transcribed from RFC 1057 Appendix A
 
 pub const PROGRAM: u32 = 100005;
-pub const VERSION: u32 = 3;
 
 pub type fhandle3 = Vec<u8>;
 pub type dirpath = Vec<u8>;
-pub type name = Vec<u8>;
 
 #[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug, FromPrimitive, ToPrimitive)]

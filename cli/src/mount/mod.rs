@@ -22,7 +22,6 @@ use anyhow::Result;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio_util::sync::CancellationToken;
 
 pub use crate::opts::MountBackend;
 
@@ -98,8 +97,7 @@ pub(crate) enum MountHandleInner {
         session: Option<agentfs_fuse::SessionHandle>,
     },
     Nfs {
-        shutdown: CancellationToken,
-        server_handle: Option<tokio::task::JoinHandle<()>>,
+        server_handle: Option<agentfs_nfs::ServerHandle>,
     },
 }
 
@@ -157,12 +155,11 @@ impl Drop for MountHandle {
                     );
                 }
             }
-            MountHandleInner::Nfs {
-                shutdown,
-                server_handle,
-            } => {
+            MountHandleInner::Nfs { server_handle } => {
                 // Signal the NFS server to shut down
-                shutdown.cancel();
+                if let Some(handle) = server_handle.as_ref() {
+                    handle.cancel();
+                }
 
                 // Unmount the NFS filesystem
                 if let Err(e) = unmount(&self.mountpoint, self.backend, self.lazy_unmount) {
@@ -173,7 +170,7 @@ impl Drop for MountHandle {
                     );
                 }
 
-                if let Some(handle) = server_handle.take() {
+                if let Some(mut handle) = server_handle.take() {
                     let deadline = std::time::Instant::now() + Duration::from_secs(5);
                     while !handle.is_finished() && std::time::Instant::now() < deadline {
                         std::thread::sleep(Duration::from_millis(10));

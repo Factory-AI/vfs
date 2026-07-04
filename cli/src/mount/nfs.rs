@@ -5,8 +5,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
-use crate::nfs::AgentNFS;
-use crate::nfsserve::tcp::NFSTcp;
+use agentfs_nfs::{serve, NfsServeOptions};
 
 use super::{MountBackend, MountHandle, MountHandleInner, MountOpts};
 
@@ -82,22 +81,16 @@ pub(super) async fn mount_nfs(
 ) -> Result<MountHandle> {
     use tokio_util::sync::CancellationToken;
 
-    let nfs = AgentNFS::new(fs);
-
     let port = find_available_port(DEFAULT_NFS_PORT)?;
 
-    let bind_addr = format!("127.0.0.1:{}", port);
-    let listener = crate::nfsserve::tcp::NFSTcpListener::bind(&bind_addr, nfs)
-        .await
-        .context("Failed to bind NFS server")?;
-
     let shutdown = CancellationToken::new();
-    let server_shutdown = shutdown.clone();
-    let server_handle = tokio::spawn(async move {
-        if let Err(e) = listener.handle_until_cancelled(server_shutdown).await {
-            eprintln!("NFS server error: {}", e);
-        }
-    });
+    let server_handle = serve(
+        fs,
+        NfsServeOptions::new("127.0.0.1", port),
+        shutdown.clone(),
+    )
+    .await
+    .context("Failed to bind NFS server")?;
 
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -108,7 +101,6 @@ pub(super) async fn mount_nfs(
         backend: MountBackend::Nfs,
         lazy_unmount: opts.lazy_unmount,
         inner: MountHandleInner::Nfs {
-            shutdown,
             server_handle: Some(server_handle),
         },
     })

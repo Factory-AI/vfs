@@ -1,11 +1,9 @@
 // this is just a complete enumeration of everything in the RFC
-#![allow(dead_code)]
 // And its nice to keep the original RFC names and case
 #![allow(non_camel_case_types)]
 
 use super::xdr::*;
 use byteorder::{ReadBytesExt, WriteBytesExt};
-use filetime;
 use num_derive::{FromPrimitive, ToPrimitive};
 use num_traits::cast::FromPrimitive;
 use std::fmt;
@@ -21,16 +19,9 @@ pub const VERSION: u32 = 3;
 
 // Section 2.4 Sizes
 //
-/// The maximum size in bytes of the opaque file handle.
-pub const NFS3_FHSIZE: u32 = 64;
-
 /// The size in bytes of the opaque cookie verifier passed by
 /// READDIR and READDIRPLUS.
 pub const NFS3_COOKIEVERFSIZE: u32 = 8;
-
-/// The size in bytes of the opaque verifier used for
-/// exclusive CREATE.
-pub const NFS3_CREATEVERFSIZE: u32 = 8;
 
 /// The size in bytes of the opaque verifier used for
 /// asynchronous WRITE.
@@ -43,9 +34,6 @@ pub struct nfsstring(pub Vec<u8>);
 impl nfsstring {
     pub fn len(&self) -> usize {
         self.0.len()
-    }
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
     }
 }
 impl From<Vec<u8>> for nfsstring {
@@ -87,7 +75,6 @@ pub type nfspath3 = nfsstring;
 pub type fileid3 = u64;
 pub type cookie3 = u64;
 pub type cookieverf3 = [opaque; NFS3_COOKIEVERFSIZE as usize];
-pub type createverf3 = [opaque; NFS3_CREATEVERFSIZE as usize];
 pub type writeverf3 = [opaque; NFS3_WRITEVERFSIZE as usize];
 pub type uid3 = u32;
 pub type gid3 = u32;
@@ -279,9 +266,6 @@ XDRStruct!(
 // Section 3.3.19. Procedure 19: FSINFO - Get static file system Information
 // The following constants are used in fsinfo to construct the bitmask 'properties',
 // which represents the file system properties.
-
-/// If this bit is 1 (TRUE), the file system supports hard links.
-pub const FSF_LINK: u32 = 0x0001;
 
 /// If this bit is 1 (TRUE), the file system supports symbolic links.
 pub const FSF_SYMLINK: u32 = 0x0002;

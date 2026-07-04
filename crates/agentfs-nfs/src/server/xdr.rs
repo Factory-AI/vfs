@@ -14,7 +14,6 @@ pub trait XDR {
 /// Serializes a basic enumeration.
 /// Casts everything as u32 BigEndian
 #[allow(non_camel_case_types)]
-#[macro_export]
 macro_rules! XDREnumSerde {
     ($t:ident) => {
         impl XDR for $t {
@@ -161,7 +160,6 @@ impl XDR for Vec<u32> {
 }
 
 #[allow(non_camel_case_types)]
-#[macro_export]
 macro_rules! XDRStruct {
     (
         $t:ident,
@@ -195,7 +193,6 @@ macro_rules! XDRStruct {
 /// The serde methods can be generated with XDRBoolUnion(pre_op_attr, attributes, wcc_attr)
 /// The "true" type must have the Default trait
 #[allow(non_camel_case_types)]
-#[macro_export]
 macro_rules! XDRBoolUnion {
     (
         $t:ident, $enumcase:ident, $enumtype:ty
@@ -228,7 +225,3 @@ macro_rules! XDRBoolUnion {
         }
     };
 }
-
-pub(crate) use XDRBoolUnion;
-pub(crate) use XDREnumSerde;
-pub(crate) use XDRStruct;

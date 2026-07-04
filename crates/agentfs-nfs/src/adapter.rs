@@ -10,11 +10,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use libc::{O_RDONLY, O_RDWR};
 
-use crate::nfsserve::nfs::{
+use crate::server::nfs::{
     fattr3, fileid3, filename3, ftype3, nfs_fh3, nfspath3, nfsstat3, nfstime3, sattr3, set_atime,
     set_gid3, set_mode3, set_mtime, set_size3, set_uid3, specdata3,
 };
-use crate::nfsserve::vfs::{auth_unix, DirEntry, NFSFileSystem, ReadDirResult};
+use crate::server::vfs::{auth_unix, DirEntry, NFSFileSystem, ReadDirResult};
 use agentfs_core::error::Error as SdkError;
 use agentfs_core::fs::FsError;
 use agentfs_core::{
@@ -63,7 +63,7 @@ fn error_to_nfsstat(e: SdkError) -> nfsstat3 {
 }
 
 /// NFS adapter that wraps an AgentFS FileSystem.
-pub struct AgentNFS {
+pub(crate) struct AgentNFS {
     /// The underlying concurrency-safe filesystem.
     fs: Arc<dyn FileSystem>,
     /// Server-local generation number embedded in opaque file handles.
@@ -676,7 +676,7 @@ impl NFSFileSystem for AgentNFS {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nfsserve::vfs::NFSFileSystem;
+    use crate::server::vfs::NFSFileSystem;
     use agentfs_core::{AgentFS, AgentFSOptions};
     use std::sync::Arc;
 

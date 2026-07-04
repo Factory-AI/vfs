@@ -2133,7 +2133,10 @@ impl AgentFSFuse {
         }
     }
 
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "emergency pre-Tier-4 parity helper kept for one milestone"
+    )]
     fn drain_inode_writes(&self, ino: u64) -> Result<(), SdkError> {
         // Kept for emergency parity with pre-Tier-4 paths; not called on the
         // hot read path because the SDK overlay handles read-after-write

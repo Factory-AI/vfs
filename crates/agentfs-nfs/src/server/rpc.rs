@@ -1,5 +1,4 @@
 // this is just a complete enumeration of everything in the RFC
-#![allow(dead_code)]
 // And its nice to keep the original RFC names and case
 #![allow(non_camel_case_types)]
 

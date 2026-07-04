@@ -1,11 +1,11 @@
-#![cfg_attr(feature = "strict", deny(warnings))]
+#[macro_use]
+pub(crate) mod xdr;
 
 mod context;
-pub mod permissions;
-pub mod rpc;
+mod permissions;
+pub(crate) mod rpc;
 mod rpcwire;
 mod write_counter;
-pub mod xdr;
 
 mod mount;
 mod mount_handlers;
@@ -13,9 +13,9 @@ mod mount_handlers;
 mod portmap;
 mod portmap_handlers;
 
-pub mod nfs;
+pub(crate) mod nfs;
 mod nfs_handlers;
 
-pub mod tcp;
+pub(crate) mod tcp;
 mod transaction_tracker;
-pub mod vfs;
+pub(crate) mod vfs;

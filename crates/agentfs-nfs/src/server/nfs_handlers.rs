@@ -1,5 +1,4 @@
 #![allow(clippy::upper_case_acronyms)]
-#![allow(dead_code)]
 use super::context::RPCContext;
 use super::nfs;
 use super::permissions;
@@ -2923,10 +2922,10 @@ pub async fn nfsproc3_mknod(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nfs::AgentNFS;
-    use crate::nfsserve::rpc::{accept_body, accepted_reply, reply_body, rpc_body, rpc_msg};
-    use crate::nfsserve::transaction_tracker::TransactionTracker;
-    use crate::nfsserve::vfs::NFSFileSystem;
+    use crate::adapter::AgentNFS;
+    use crate::server::rpc::{accept_body, accepted_reply, reply_body, rpc_body, rpc_msg};
+    use crate::server::transaction_tracker::TransactionTracker;
+    use crate::server::vfs::NFSFileSystem;
     use agentfs_core::{AgentFS as AgentSdk, AgentFSOptions, FileSystem};
     use std::io::Cursor;
     use std::path::Path;
