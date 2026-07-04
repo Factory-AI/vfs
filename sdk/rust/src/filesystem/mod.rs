@@ -58,6 +58,9 @@ pub enum FsError {
 
     #[error("Filename too long")]
     NameTooLong,
+
+    #[error("Filesystem metadata is corrupt: {0}")]
+    Corrupt(String),
 }
 
 impl FsError {
@@ -76,6 +79,7 @@ impl FsError {
             FsError::InvalidRename => libc::EINVAL,
             FsError::CrossDevice => libc::EXDEV,
             FsError::NameTooLong => libc::ENAMETOOLONG,
+            FsError::Corrupt(_) => libc::EIO,
         }
     }
 }

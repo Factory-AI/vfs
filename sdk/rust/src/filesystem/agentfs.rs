@@ -2,7 +2,7 @@ use crate::error::{Error, Result};
 use async_trait::async_trait;
 use lru::LruCache;
 use parking_lot::RwLock;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -22,6 +22,12 @@ use crate::config::{
 };
 use crate::connection_pool::{ConnectionPool, ConnectionPoolOptions};
 use crate::schema::{self, AGENTFS_SCHEMA_VERSION};
+
+mod store;
+use store::{normalize_write_ranges, NormalizedWriteRange, WriteRangeRef};
+
+#[cfg(test)]
+use store::dense_after_inline_write_batch;
 
 const ROOT_INO: i64 = 1;
 const STORAGE_CHUNKED: i64 = 0;
@@ -847,24 +853,19 @@ impl AgentFSWriteBatcher {
                         data: range.data.as_slice(),
                     })
                     .collect();
-                let file = AgentFSFile {
-                    pool: self.pool.clone(),
-                    ino: *ino,
+                let geometry = Geometry {
                     chunk_size: self.chunk_size,
                     inline_threshold: self.inline_threshold,
-                    attr_cache: self.attr_cache.clone(),
-                    write_batcher: None,
-                    overlay_reads: true,
-                    _open_guard: None,
                 };
-                match file
-                    .pwrite_ranges_inode_with_conn(
-                        &conn,
-                        &normalized_refs,
-                        preserve_times.get(ino).copied().unwrap_or(false),
-                        pending_times.get(ino),
-                    )
-                    .await
+                match store::write_ranges(
+                    &conn,
+                    *ino,
+                    geometry,
+                    &normalized_refs,
+                    preserve_times.get(ino).copied().unwrap_or(false),
+                    pending_times.get(ino),
+                )
+                .await
                 {
                     Ok(()) => {}
                     // The file was unlinked / renamed-over while its writes were
@@ -1492,139 +1493,15 @@ pub struct AgentFSFile {
     /// Same semantics as the field on `AgentFS`; cloned at open time so the
     /// hot read/write path doesn't have to chase an extra indirection.
     overlay_reads: bool,
-    /// None only for the batcher's ephemeral internal handles; user-visible
-    /// handles register so unlink defers inode reaping while they live.
+    /// Present for user-visible handles so unlink defers inode reaping while
+    /// they live. This remains optional until lifecycle extraction flattens
+    /// the handle construction API.
     _open_guard: Option<OpenInodeGuard>,
-}
-
-struct FileStorage {
-    size: u64,
-    storage_kind: i64,
-    inline_data: Option<Vec<u8>>,
-}
-
-struct WriteRangeRef<'a> {
-    offset: u64,
-    data: &'a [u8],
-}
-
-#[derive(Clone)]
-struct NormalizedWriteRange {
-    offset: u64,
-    data: Vec<u8>,
-}
-
-impl NormalizedWriteRange {
-    fn end(&self) -> u64 {
-        self.offset + self.data.len() as u64
-    }
 }
 
 fn current_timestamp() -> Result<(i64, i64)> {
     let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
     Ok((dur.as_secs() as i64, dur.subsec_nanos() as i64))
-}
-
-fn normalize_write_ranges(ranges: &[WriteRangeRef<'_>]) -> Result<Vec<NormalizedWriteRange>> {
-    let mut merged_ranges: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
-
-    for range in ranges {
-        if range.data.is_empty() {
-            continue;
-        }
-
-        let data_len = u64::try_from(range.data.len())
-            .map_err(|_| Error::Internal("file write length overflow".to_string()))?;
-        let write_start = range.offset;
-        let write_end = write_start
-            .checked_add(data_len)
-            .ok_or_else(|| Error::Internal("file write offset overflow".to_string()))?;
-        let mut start = write_start;
-        let mut end = write_end;
-        let mut existing_ranges = Vec::new();
-
-        if let Some((&prev_start, prev_data)) = merged_ranges.range(..=write_start).next_back() {
-            let prev_end = prev_start
-                .checked_add(prev_data.len() as u64)
-                .ok_or_else(|| Error::Internal("file write offset overflow".to_string()))?;
-
-            if prev_end >= write_start {
-                let prev_data = prev_data.clone();
-                merged_ranges.remove(&prev_start);
-
-                start = prev_start;
-                end = end.max(prev_end);
-                existing_ranges.push((prev_start, prev_data));
-            }
-        }
-
-        loop {
-            let next = merged_ranges
-                .range(start..)
-                .next()
-                .map(|(&next_start, next_data)| (next_start, next_data.clone()));
-
-            let Some((next_start, next_data)) = next else {
-                break;
-            };
-
-            if next_start > end {
-                break;
-            }
-
-            let next_end = next_start
-                .checked_add(next_data.len() as u64)
-                .ok_or_else(|| Error::Internal("file write offset overflow".to_string()))?;
-            merged_ranges.remove(&next_start);
-
-            end = end.max(next_end);
-            existing_ranges.push((next_start, next_data));
-        }
-
-        let merged_len = usize::try_from(end - start)
-            .map_err(|_| Error::Internal("file write range too large".to_string()))?;
-        let mut merged = vec![0; merged_len];
-        for (range_start, range_data) in existing_ranges {
-            let range_offset = usize::try_from(range_start - start)
-                .map_err(|_| Error::Internal("file write range too large".to_string()))?;
-            merged[range_offset..range_offset + range_data.len()].copy_from_slice(&range_data);
-        }
-
-        let write_offset = usize::try_from(write_start - start)
-            .map_err(|_| Error::Internal("file write range too large".to_string()))?;
-        merged[write_offset..write_offset + range.data.len()].copy_from_slice(range.data);
-
-        merged_ranges.insert(start, merged);
-    }
-
-    Ok(merged_ranges
-        .into_iter()
-        .map(|(offset, data)| NormalizedWriteRange { offset, data })
-        .collect())
-}
-
-fn dense_after_inline_write_batch(
-    current_size: u64,
-    new_size: u64,
-    ranges: &[NormalizedWriteRange],
-) -> bool {
-    let mut covered_end = current_size;
-
-    for range in ranges {
-        let range_end = range.end();
-        if range_end <= covered_end {
-            continue;
-        }
-        if range.offset > covered_end {
-            return false;
-        }
-        covered_end = range_end;
-        if covered_end >= new_size {
-            return true;
-        }
-    }
-
-    covered_end >= new_size
 }
 
 #[async_trait]
@@ -1663,7 +1540,7 @@ impl File for AgentFSFile {
         };
 
         let conn = self.pool.get_connection().await?;
-        let metadata = self.file_storage_with_conn(&conn).await?;
+        let metadata = store::file_storage(&conn, self.ino).await?;
         let effective_size = match pending_max_end {
             Some(end) => metadata.size.max(end),
             None => metadata.size,
@@ -1680,9 +1557,15 @@ impl File for AgentFSFile {
             0
         };
         let mut result = if base_window > 0 {
-            let mut buf = self
-                .read_inode_with_conn(&conn, offset, base_window)
-                .await?;
+            let mut buf = store::read_from_storage(
+                &conn,
+                self.ino,
+                self.geometry(),
+                &metadata,
+                offset,
+                base_window,
+            )
+            .await?;
             buf.resize(read_size as usize, 0);
             buf
         } else {
@@ -1736,9 +1619,8 @@ impl File for AgentFSFile {
         let conn = self.pool.get_connection().await?;
         let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
         let ranges = [WriteRangeRef { offset, data }];
-        let result = self
-            .pwrite_ranges_inode_with_conn(&conn, &ranges, false, None)
-            .await;
+        let result =
+            store::write_ranges(&conn, self.ino, self.geometry(), &ranges, false, None).await;
         match result {
             Ok(()) => {
                 txn.commit().await?;
@@ -1774,9 +1656,8 @@ impl File for AgentFSFile {
                 data: range.data.as_slice(),
             })
             .collect();
-        let result = self
-            .pwrite_ranges_inode_with_conn(&conn, &range_refs, false, None)
-            .await;
+        let result =
+            store::write_ranges(&conn, self.ino, self.geometry(), &range_refs, false, None).await;
         match result {
             Ok(()) => {
                 txn.commit().await?;
@@ -1817,7 +1698,7 @@ impl File for AgentFSFile {
         self.drain_writes().await?;
         let conn = self.pool.get_connection().await?;
         let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
-        let result = self.truncate_inode_with_conn(&conn, new_size).await;
+        let result = store::truncate(&conn, self.ino, self.geometry(), new_size).await;
         match result {
             Ok(()) => {
                 txn.commit().await?;
@@ -1862,7 +1743,7 @@ impl File for AgentFSFile {
         let mut rows = stmt.query((self.ino,)).await?;
 
         if let Some(row) = rows.next().await? {
-            let stats = AgentFS::build_stats_from_row(&row)?;
+            let stats = store::stats_from_row(&row)?;
             self.attr_cache.insert(stats.clone());
             Ok(stats)
         } else {
@@ -1881,596 +1762,11 @@ impl File for AgentFSFile {
 }
 
 impl AgentFSFile {
-    async fn read_inode_with_conn(
-        &self,
-        conn: &Connection,
-        offset: u64,
-        size: u64,
-    ) -> Result<Vec<u8>> {
-        let metadata = self.file_storage_with_conn(conn).await?;
-
-        if offset >= metadata.size || size == 0 {
-            return Ok(Vec::new());
+    fn geometry(&self) -> Geometry {
+        Geometry {
+            chunk_size: self.chunk_size,
+            inline_threshold: self.inline_threshold,
         }
-
-        let size = std::cmp::min(size, metadata.size - offset);
-        if metadata.storage_kind == STORAGE_INLINE {
-            let mut result = Vec::with_capacity(size as usize);
-            let inline_data = metadata.inline_data.unwrap_or_default();
-            let start = offset as usize;
-            let requested = size as usize;
-
-            if start < inline_data.len() {
-                let available = std::cmp::min(inline_data.len() - start, requested);
-                result.extend_from_slice(&inline_data[start..start + available]);
-            }
-
-            if result.len() < requested {
-                result.resize(requested, 0);
-            }
-
-            return Ok(result);
-        }
-
-        self.read_chunked_inode_with_conn(conn, offset, size).await
-    }
-
-    async fn read_chunked_inode_with_conn(
-        &self,
-        conn: &Connection,
-        offset: u64,
-        size: u64,
-    ) -> Result<Vec<u8>> {
-        let chunk_size = self.chunk_size as u64;
-        let start_chunk = offset / chunk_size;
-        let end_chunk = (offset + size).saturating_sub(1) / chunk_size;
-
-        let mut stmt = conn
-            .prepare_cached("SELECT chunk_index, data FROM fs_data WHERE ino = ? AND chunk_index >= ? AND chunk_index <= ? ORDER BY chunk_index")
-            .await?;
-        crate::profiling::record_chunk_read_query();
-        let mut rows = stmt
-            .query((self.ino, start_chunk as i64, end_chunk as i64))
-            .await?;
-
-        let mut result = Vec::with_capacity(size as usize);
-        let start_offset_in_chunk = (offset % chunk_size) as usize;
-        let mut next_expected_chunk = start_chunk;
-        let mut chunks_read = 0u64;
-
-        while let Some(row) = rows.next().await? {
-            chunks_read += 1;
-            let chunk_index = row
-                .get_value(0)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0) as u64;
-
-            while next_expected_chunk < chunk_index && result.len() < size as usize {
-                let skip = if next_expected_chunk == start_chunk {
-                    start_offset_in_chunk
-                } else {
-                    0
-                };
-                let zeros_needed =
-                    std::cmp::min(chunk_size as usize - skip, size as usize - result.len());
-                result.extend(std::iter::repeat_n(0u8, zeros_needed));
-                next_expected_chunk += 1;
-            }
-
-            if let Ok(Value::Blob(chunk_data)) = row.get_value(1) {
-                let skip = if chunk_index == start_chunk {
-                    start_offset_in_chunk
-                } else {
-                    0
-                };
-                if skip >= chunk_data.len() {
-                    let zeros_needed =
-                        std::cmp::min(chunk_size as usize - skip, size as usize - result.len());
-                    result.extend(std::iter::repeat_n(0u8, zeros_needed));
-                } else {
-                    let remaining = size as usize - result.len();
-                    let take = std::cmp::min(chunk_data.len() - skip, remaining);
-                    result.extend_from_slice(&chunk_data[skip..skip + take]);
-
-                    let chunk_end = skip + take;
-                    if chunk_end < chunk_size as usize && result.len() < size as usize {
-                        let zeros_needed = std::cmp::min(
-                            chunk_size as usize - chunk_end,
-                            size as usize - result.len(),
-                        );
-                        result.extend(std::iter::repeat_n(0u8, zeros_needed));
-                    }
-                }
-            }
-            next_expected_chunk = chunk_index + 1;
-        }
-
-        if result.len() < size as usize {
-            result.resize(size as usize, 0);
-        }
-
-        crate::profiling::record_chunk_read_chunks(chunks_read);
-        Ok(result)
-    }
-
-    /// `preserve_times`: when true (deferred batcher commits racing an explicit
-    /// chmod/chown/utimens), leave mtime/ctime untouched instead of stamping
-    /// the commit time — the explicitly-set attributes logically happened
-    /// after these writes and must win. `explicit_times`: stashed setattr
-    /// values folded into the inode UPDATE itself (see
-    /// `write_commit_time_sets`).
-    async fn pwrite_ranges_inode_with_conn(
-        &self,
-        conn: &Connection,
-        ranges: &[WriteRangeRef<'_>],
-        preserve_times: bool,
-        explicit_times: Option<&PendingTimeChange>,
-    ) -> Result<()> {
-        let ranges = normalize_write_ranges(ranges)?;
-        if ranges.is_empty() {
-            return Ok(());
-        }
-
-        let metadata = self.file_storage_with_conn(conn).await?;
-        let write_end = ranges
-            .iter()
-            .map(NormalizedWriteRange::end)
-            .max()
-            .unwrap_or(metadata.size);
-        let new_size = std::cmp::max(metadata.size, write_end);
-
-        if metadata.storage_kind == STORAGE_INLINE
-            && new_size <= self.inline_threshold as u64
-            && dense_after_inline_write_batch(metadata.size, new_size, &ranges)
-        {
-            let mut inline_data = metadata.inline_data.unwrap_or_default();
-            inline_data.resize(metadata.size as usize, 0);
-            inline_data.resize(new_size as usize, 0);
-            for range in &ranges {
-                let start = range.offset as usize;
-                inline_data[start..start + range.data.len()].copy_from_slice(&range.data);
-            }
-
-            conn.execute("DELETE FROM fs_data WHERE ino = ?", (self.ino,))
-                .await?;
-            let mut sets = vec!["size = ?", "data_inline = ?", "storage_kind = ?"];
-            let mut values: Vec<Value> = vec![
-                Value::Integer(new_size as i64),
-                Value::Blob(inline_data),
-                Value::Integer(STORAGE_INLINE),
-            ];
-            let (time_sets, time_values) = write_commit_time_sets(preserve_times, explicit_times)?;
-            sets.extend(time_sets);
-            values.extend(time_values);
-            values.push(Value::Integer(self.ino));
-            let sql = format!("UPDATE fs_inode SET {} WHERE ino = ?", sets.join(", "));
-            conn.execute(&sql, values).await?;
-            return Ok(());
-        }
-
-        let mut chunked_ranges = Vec::new();
-        if metadata.storage_kind == STORAGE_INLINE {
-            let mut inline_data = metadata.inline_data.unwrap_or_default();
-            inline_data.resize(metadata.size as usize, 0);
-            conn.execute("DELETE FROM fs_data WHERE ino = ?", (self.ino,))
-                .await?;
-            if !inline_data.is_empty() {
-                chunked_ranges.push(NormalizedWriteRange {
-                    offset: 0,
-                    data: inline_data,
-                });
-            }
-        } else {
-            conn.execute(
-                "UPDATE fs_inode SET data_inline = NULL, storage_kind = ? WHERE ino = ?",
-                (STORAGE_CHUNKED, self.ino),
-            )
-            .await?;
-        }
-
-        chunked_ranges.extend(ranges);
-        self.write_ranges_chunked_with_conn(conn, &chunked_ranges)
-            .await?;
-
-        let mut sets = vec!["size = ?", "data_inline = NULL", "storage_kind = ?"];
-        let mut values: Vec<Value> = vec![
-            Value::Integer(new_size as i64),
-            Value::Integer(STORAGE_CHUNKED),
-        ];
-        let (time_sets, time_values) = write_commit_time_sets(preserve_times, explicit_times)?;
-        sets.extend(time_sets);
-        values.extend(time_values);
-        values.push(Value::Integer(self.ino));
-        let sql = format!("UPDATE fs_inode SET {} WHERE ino = ?", sets.join(", "));
-        conn.execute(&sql, values).await?;
-
-        Ok(())
-    }
-
-    async fn truncate_inode_with_conn(&self, conn: &Connection, new_size: u64) -> Result<()> {
-        let metadata = self.file_storage_with_conn(conn).await?;
-
-        if metadata.storage_kind == STORAGE_INLINE {
-            if new_size <= self.inline_threshold as u64 {
-                let mut inline_data = metadata.inline_data.unwrap_or_default();
-                inline_data.resize(metadata.size as usize, 0);
-                inline_data.resize(new_size as usize, 0);
-                conn.execute("DELETE FROM fs_data WHERE ino = ?", (self.ino,))
-                    .await?;
-                let (now_secs, now_nsec) = current_timestamp()?;
-                conn.execute(
-                    "UPDATE fs_inode SET size = ?, data_inline = ?, storage_kind = ?, mtime = ?, ctime = ?, mtime_nsec = ?, ctime_nsec = ? WHERE ino = ?",
-                    (
-                        new_size as i64,
-                        Value::Blob(inline_data),
-                        STORAGE_INLINE,
-                        now_secs,
-                        now_secs,
-                        now_nsec,
-                        now_nsec,
-                        self.ino,
-                    ),
-                )
-                .await?;
-                return Ok(());
-            }
-
-            let mut inline_data = metadata.inline_data.unwrap_or_default();
-            inline_data.resize(metadata.size as usize, 0);
-            self.transition_inline_to_chunked_with_conn(conn, &inline_data)
-                .await?;
-            self.truncate_chunked_data_with_conn(conn, metadata.size, new_size)
-                .await?;
-            self.update_chunked_truncate_metadata(conn, new_size)
-                .await?;
-            return Ok(());
-        }
-
-        if new_size <= self.inline_threshold as u64 {
-            if let Some(inline_data) = self.read_dense_prefix_for_inline(conn, new_size).await? {
-                conn.execute("DELETE FROM fs_data WHERE ino = ?", (self.ino,))
-                    .await?;
-                let (now_secs, now_nsec) = current_timestamp()?;
-                conn.execute(
-                    "UPDATE fs_inode SET size = ?, data_inline = ?, storage_kind = ?, mtime = ?, ctime = ?, mtime_nsec = ?, ctime_nsec = ? WHERE ino = ?",
-                    (
-                        new_size as i64,
-                        Value::Blob(inline_data),
-                        STORAGE_INLINE,
-                        now_secs,
-                        now_secs,
-                        now_nsec,
-                        now_nsec,
-                        self.ino,
-                    ),
-                )
-                .await?;
-                return Ok(());
-            }
-        }
-
-        self.truncate_chunked_data_with_conn(conn, metadata.size, new_size)
-            .await?;
-        self.update_chunked_truncate_metadata(conn, new_size)
-            .await?;
-        Ok(())
-    }
-
-    async fn file_storage_with_conn(&self, conn: &Connection) -> Result<FileStorage> {
-        let mut stmt = conn
-            .prepare_cached("SELECT size, storage_kind, data_inline FROM fs_inode WHERE ino = ?")
-            .await?;
-        let mut rows = stmt.query((self.ino,)).await?;
-
-        if let Some(row) = rows.next().await? {
-            let size = row
-                .get_value(0)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0) as u64;
-            let storage_kind = row
-                .get_value(1)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(STORAGE_CHUNKED);
-            let inline_data = match row.get_value(2) {
-                Ok(Value::Blob(data)) => Some(data),
-                _ => None,
-            };
-            Ok(FileStorage {
-                size,
-                storage_kind,
-                inline_data,
-            })
-        } else {
-            Err(FsError::NotFound.into())
-        }
-    }
-
-    async fn transition_inline_to_chunked_with_conn(
-        &self,
-        conn: &Connection,
-        inline_data: &[u8],
-    ) -> Result<()> {
-        conn.execute("DELETE FROM fs_data WHERE ino = ?", (self.ino,))
-            .await?;
-
-        if !inline_data.is_empty() {
-            self.write_data_at_offset_with_conn(conn, 0, inline_data)
-                .await?;
-        }
-
-        conn.execute(
-            "UPDATE fs_inode SET data_inline = NULL, storage_kind = ? WHERE ino = ?",
-            (STORAGE_CHUNKED, self.ino),
-        )
-        .await?;
-
-        Ok(())
-    }
-
-    async fn read_dense_prefix_for_inline(
-        &self,
-        conn: &Connection,
-        new_size: u64,
-    ) -> Result<Option<Vec<u8>>> {
-        if new_size == 0 {
-            return Ok(Some(Vec::new()));
-        }
-
-        let chunk_size = self.chunk_size as u64;
-        let last_chunk = (new_size - 1) / chunk_size;
-        let mut inline_data = Vec::with_capacity(new_size as usize);
-
-        let mut stmt = conn
-            .prepare_cached("SELECT data FROM fs_data WHERE ino = ? AND chunk_index = ?")
-            .await?;
-        for chunk_idx in 0..=last_chunk {
-            stmt.reset()?;
-            let mut rows = stmt.query((self.ino, chunk_idx as i64)).await?;
-            let Some(row) = rows.next().await? else {
-                return Ok(None);
-            };
-            let chunk_data = match row.get_value(0) {
-                Ok(Value::Blob(data)) => data,
-                _ => return Ok(None),
-            };
-            let remaining = new_size as usize - inline_data.len();
-            let needed = std::cmp::min(self.chunk_size, remaining);
-            if chunk_data.len() < needed {
-                return Ok(None);
-            }
-            inline_data.extend_from_slice(&chunk_data[..needed]);
-        }
-
-        Ok(Some(inline_data))
-    }
-
-    async fn truncate_chunked_data_with_conn(
-        &self,
-        conn: &Connection,
-        current_size: u64,
-        new_size: u64,
-    ) -> Result<()> {
-        let chunk_size = self.chunk_size as u64;
-
-        if new_size == 0 {
-            conn.execute("DELETE FROM fs_data WHERE ino = ?", (self.ino,))
-                .await?;
-        } else if new_size < current_size {
-            let last_chunk_idx = (new_size - 1) / chunk_size;
-
-            conn.execute(
-                "DELETE FROM fs_data WHERE ino = ? AND chunk_index > ?",
-                (self.ino, last_chunk_idx as i64),
-            )
-            .await?;
-
-            let end_in_last_chunk = ((new_size - 1) % chunk_size + 1) as usize;
-            if end_in_last_chunk < chunk_size as usize {
-                let mut stmt = conn
-                    .prepare_cached("SELECT data FROM fs_data WHERE ino = ? AND chunk_index = ?")
-                    .await?;
-                let mut rows = stmt.query((self.ino, last_chunk_idx as i64)).await?;
-
-                if let Some(row) = rows.next().await? {
-                    if let Ok(Value::Blob(chunk_data)) = row.get_value(0) {
-                        if chunk_data.len() > end_in_last_chunk {
-                            conn.execute(
-                                "UPDATE fs_data SET data = ? WHERE ino = ? AND chunk_index = ?",
-                                (
-                                    &chunk_data[..end_in_last_chunk],
-                                    self.ino,
-                                    last_chunk_idx as i64,
-                                ),
-                            )
-                            .await?;
-                        }
-                    }
-                }
-            }
-        } else if new_size > current_size {
-            let last_existing_chunk = if current_size == 0 {
-                None
-            } else {
-                Some((current_size - 1) / chunk_size)
-            };
-            let last_new_chunk = (new_size - 1) / chunk_size;
-
-            if let Some(last_idx) = last_existing_chunk {
-                let mut stmt = conn
-                    .prepare_cached("SELECT data FROM fs_data WHERE ino = ? AND chunk_index = ?")
-                    .await?;
-                let mut rows = stmt.query((self.ino, last_idx as i64)).await?;
-
-                if let Some(row) = rows.next().await? {
-                    if let Ok(Value::Blob(chunk_data)) = row.get_value(0) {
-                        let current_chunk_len = chunk_data.len();
-                        let needed_len = if last_idx == last_new_chunk {
-                            ((new_size - 1) % chunk_size + 1) as usize
-                        } else {
-                            chunk_size as usize
-                        };
-
-                        if needed_len > current_chunk_len {
-                            let mut padded = chunk_data.clone();
-                            padded.resize(needed_len, 0);
-                            conn.execute(
-                                "UPDATE fs_data SET data = ? WHERE ino = ? AND chunk_index = ?",
-                                (&padded[..], self.ino, last_idx as i64),
-                            )
-                            .await?;
-                        }
-                    }
-                }
-            }
-
-            let start_new_chunk = last_existing_chunk.map(|i| i + 1).unwrap_or(0);
-            for chunk_idx in start_new_chunk..=last_new_chunk {
-                let chunk_len = if chunk_idx == last_new_chunk {
-                    ((new_size - 1) % chunk_size + 1) as usize
-                } else {
-                    chunk_size as usize
-                };
-                let zeros = vec![0u8; chunk_len];
-                conn.execute(
-                    "INSERT INTO fs_data (ino, chunk_index, data) VALUES (?, ?, ?)",
-                    (self.ino, chunk_idx as i64, &zeros[..]),
-                )
-                .await?;
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn update_chunked_truncate_metadata(
-        &self,
-        conn: &Connection,
-        new_size: u64,
-    ) -> Result<()> {
-        let (now_secs, now_nsec) = current_timestamp()?;
-        conn.execute(
-            "UPDATE fs_inode SET size = ?, data_inline = NULL, storage_kind = ?, mtime = ?, ctime = ?, mtime_nsec = ?, ctime_nsec = ? WHERE ino = ?",
-            (
-                new_size as i64,
-                STORAGE_CHUNKED,
-                now_secs,
-                now_secs,
-                now_nsec,
-                now_nsec,
-                self.ino,
-            ),
-        )
-        .await?;
-        Ok(())
-    }
-
-    /// Write data at a specific offset, handling chunk boundaries.
-    /// Uses a provided connection to allow reuse within a transaction.
-    async fn write_data_at_offset_with_conn(
-        &self,
-        conn: &Connection,
-        offset: u64,
-        data: &[u8],
-    ) -> Result<()> {
-        let ranges = [WriteRangeRef { offset, data }];
-        let ranges = normalize_write_ranges(&ranges)?;
-        self.write_ranges_chunked_with_conn(conn, &ranges).await
-    }
-
-    async fn write_ranges_chunked_with_conn(
-        &self,
-        conn: &Connection,
-        ranges: &[NormalizedWriteRange],
-    ) -> Result<()> {
-        let chunk_size = self.chunk_size as u64;
-
-        if ranges.is_empty() {
-            return Ok(());
-        }
-
-        let mut select_stmt = conn
-            .prepare_cached("SELECT data FROM fs_data WHERE ino = ? AND chunk_index = ?")
-            .await?;
-        let mut insert_stmt = conn
-            .prepare_cached(
-                "INSERT OR REPLACE INTO fs_data (ino, chunk_index, data) VALUES (?, ?, ?)",
-            )
-            .await?;
-
-        let mut chunks: BTreeMap<i64, Vec<u8>> = BTreeMap::new();
-
-        for range in ranges {
-            let mut written = 0usize;
-            while written < range.data.len() {
-                let current_offset = range.offset + written as u64;
-                let chunk_index = (current_offset / chunk_size) as i64;
-                let offset_in_chunk = (current_offset % chunk_size) as usize;
-
-                let remaining_in_chunk = self.chunk_size - offset_in_chunk;
-                let remaining_data = range.data.len() - written;
-                let to_write = std::cmp::min(remaining_in_chunk, remaining_data);
-                let write_slice = &range.data[written..written + to_write];
-
-                if offset_in_chunk == 0 && to_write == self.chunk_size {
-                    chunks.insert(chunk_index, write_slice.to_vec());
-                    written += to_write;
-                    continue;
-                }
-
-                if let std::collections::btree_map::Entry::Vacant(entry) = chunks.entry(chunk_index)
-                {
-                    let mut rows = select_stmt.query((self.ino, chunk_index)).await?;
-                    let chunk_data = if let Some(row) = rows.next().await? {
-                        row.get_value(0)
-                            .ok()
-                            .and_then(|v| {
-                                if let Value::Blob(b) = v {
-                                    Some(b)
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or_default()
-                    } else {
-                        Vec::new()
-                    };
-                    select_stmt.reset()?;
-                    entry.insert(chunk_data);
-                }
-
-                let chunk_data = chunks
-                    .get_mut(&chunk_index)
-                    .expect("chunk must be loaded before partial write");
-                if chunk_data.len() < offset_in_chunk + to_write {
-                    chunk_data.resize(offset_in_chunk + to_write, 0);
-                }
-                chunk_data[offset_in_chunk..offset_in_chunk + to_write]
-                    .copy_from_slice(write_slice);
-
-                written += to_write;
-            }
-        }
-
-        let chunks_written = chunks.len() as u64;
-        // Tier Three Axis H investigation: tried a multi-row VALUES batch
-        // with up to 32 rows per execute() but measured slower wall-time in
-        // 5-iter runs, suggesting libSQL doesn't share the
-        // prepared-statement cost reduction across different VALUES
-        // arities or that the per-execute setup cost dwarfed any saved
-        // round-trips on our workload sizes. Reverted to the cached
-        // single-row prepared statement.
-        for (chunk_index, chunk_data) in chunks {
-            insert_stmt
-                .execute((self.ino, chunk_index, Value::Blob(chunk_data)))
-                .await?;
-            insert_stmt.reset()?;
-        }
-
-        crate::profiling::record_chunk_write_chunks(chunks_written);
-        Ok(())
     }
 }
 
@@ -3131,21 +2427,7 @@ impl AgentFS {
 
     /// Get link count for an inode
     async fn get_link_count(&self, conn: &Connection, ino: i64) -> Result<u32> {
-        let mut stmt = conn
-            .prepare_cached("SELECT nlink FROM fs_inode WHERE ino = ?")
-            .await?;
-        let mut rows = stmt.query((ino,)).await?;
-
-        if let Some(row) = rows.next().await? {
-            let nlink = row
-                .get_value(0)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0);
-            Ok(nlink as u32)
-        } else {
-            Ok(0)
-        }
+        store::link_count(conn, ino).await
     }
 
     /// Get file attributes by inode using an existing connection
@@ -3154,92 +2436,12 @@ impl AgentFS {
             return Ok(Some(stats));
         }
 
-        let mut stmt = conn
-            .prepare_cached("SELECT ino, mode, nlink, uid, gid, size, atime, mtime, ctime, rdev, atime_nsec, mtime_nsec, ctime_nsec FROM fs_inode WHERE ino = ?")
-            .await?;
-        let mut rows = stmt.query((ino,)).await?;
-
-        if let Some(row) = rows.next().await? {
-            let stats = Self::build_stats_from_row(&row)?;
+        if let Some(stats) = store::getattr(conn, ino).await? {
             self.cache_attr(stats.clone());
             Ok(Some(stats))
         } else {
             Ok(None)
         }
-    }
-
-    /// Build a Stats object from a database row
-    ///
-    /// The row should contain columns in this order:
-    /// ino, mode, nlink, uid, gid, size, atime, mtime, ctime
-    fn build_stats_from_row(row: &turso::Row) -> Result<Stats> {
-        Ok(Stats {
-            ino: row
-                .get_value(0)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0),
-            mode: row
-                .get_value(1)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0) as u32,
-            nlink: row
-                .get_value(2)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(1) as u32,
-            uid: row
-                .get_value(3)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0) as u32,
-            gid: row
-                .get_value(4)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0) as u32,
-            size: row
-                .get_value(5)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0),
-            atime: row
-                .get_value(6)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0),
-            mtime: row
-                .get_value(7)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0),
-            ctime: row
-                .get_value(8)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0),
-            atime_nsec: row
-                .get_value(10)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0) as u32,
-            mtime_nsec: row
-                .get_value(11)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0) as u32,
-            ctime_nsec: row
-                .get_value(12)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0) as u32,
-            rdev: row
-                .get_value(9)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0) as u64,
-        })
     }
 
     /// Resolve a path to an inode number
@@ -3695,18 +2897,7 @@ impl AgentFS {
         };
 
         // Check if it's a symlink by querying the inode
-        let mut rows = conn
-            .query("SELECT mode FROM fs_inode WHERE ino = ?", (ino,))
-            .await?;
-
-        if let Some(row) = rows.next().await? {
-            let mode = row
-                .get_value(0)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0) as u32;
-
-            // Check if it's a symlink
+        if let Some(mode) = store::mode(conn, ino).await? {
             if (mode & S_IFMT) != S_IFLNK {
                 return Err(FsError::NotASymlink.into());
             }
@@ -3949,7 +3140,7 @@ impl FileSystem for AgentFS {
         let mut rows = stmt.query((child_ino,)).await?;
 
         if let Some(row) = rows.next().await? {
-            let mut stats = Self::build_stats_from_row(&row)?;
+            let mut stats = store::stats_from_row(&row)?;
             self.merge_pending_view(child_ino, Some(&mut stats));
             // Cache the lookup result
             self.cache_dentry(parent_ino, name, child_ino);
@@ -4017,18 +3208,7 @@ impl FileSystem for AgentFS {
         let conn = self.pool.get_connection().await?;
 
         // Check if the inode exists and is a symlink
-        let mut stmt = conn
-            .prepare_cached("SELECT mode FROM fs_inode WHERE ino = ?")
-            .await?;
-        let mut rows = stmt.query((ino,)).await?;
-
-        if let Some(row) = rows.next().await? {
-            let mode = row
-                .get_value(0)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0) as u32;
-
+        if let Some(mode) = store::mode(&conn, ino).await? {
             if (mode & S_IFMT) != S_IFLNK {
                 return Err(FsError::NotASymlink.into());
             }
@@ -4062,18 +3242,7 @@ impl FileSystem for AgentFS {
         let conn = self.pool.get_connection().await?;
 
         // Check if inode exists and is a directory
-        let mut stmt = conn
-            .prepare_cached("SELECT mode FROM fs_inode WHERE ino = ?")
-            .await?;
-        let mut rows = stmt.query((ino,)).await?;
-
-        if let Some(row) = rows.next().await? {
-            let mode = row
-                .get_value(0)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0) as u32;
-
+        if let Some(mode) = store::mode(&conn, ino).await? {
             if (mode & S_IFMT) != super::S_IFDIR {
                 return Err(FsError::NotADirectory.into());
             }
@@ -4113,18 +3282,7 @@ impl FileSystem for AgentFS {
         let conn = self.pool.get_connection().await?;
 
         // Check if inode exists and is a directory
-        let mut stmt = conn
-            .prepare_cached("SELECT mode FROM fs_inode WHERE ino = ?")
-            .await?;
-        let mut rows = stmt.query((ino,)).await?;
-
-        if let Some(row) = rows.next().await? {
-            let mode = row
-                .get_value(0)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0) as u32;
-
+        if let Some(mode) = store::mode(&conn, ino).await? {
             if (mode & S_IFMT) != super::S_IFDIR {
                 return Err(FsError::NotADirectory.into());
             }
@@ -4158,75 +3316,7 @@ impl FileSystem for AgentFS {
                 continue;
             }
 
-            let entry_ino = row
-                .get_value(1)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0);
-
-            let stats = Stats {
-                ino: entry_ino,
-                mode: row
-                    .get_value(2)
-                    .ok()
-                    .and_then(|v| v.as_integer().copied())
-                    .unwrap_or(0) as u32,
-                nlink: row
-                    .get_value(3)
-                    .ok()
-                    .and_then(|v| v.as_integer().copied())
-                    .unwrap_or(1) as u32,
-                uid: row
-                    .get_value(4)
-                    .ok()
-                    .and_then(|v| v.as_integer().copied())
-                    .unwrap_or(0) as u32,
-                gid: row
-                    .get_value(5)
-                    .ok()
-                    .and_then(|v| v.as_integer().copied())
-                    .unwrap_or(0) as u32,
-                size: row
-                    .get_value(6)
-                    .ok()
-                    .and_then(|v| v.as_integer().copied())
-                    .unwrap_or(0),
-                atime: row
-                    .get_value(7)
-                    .ok()
-                    .and_then(|v| v.as_integer().copied())
-                    .unwrap_or(0),
-                mtime: row
-                    .get_value(8)
-                    .ok()
-                    .and_then(|v| v.as_integer().copied())
-                    .unwrap_or(0),
-                ctime: row
-                    .get_value(9)
-                    .ok()
-                    .and_then(|v| v.as_integer().copied())
-                    .unwrap_or(0),
-                atime_nsec: row
-                    .get_value(11)
-                    .ok()
-                    .and_then(|v| v.as_integer().copied())
-                    .unwrap_or(0) as u32,
-                mtime_nsec: row
-                    .get_value(12)
-                    .ok()
-                    .and_then(|v| v.as_integer().copied())
-                    .unwrap_or(0) as u32,
-                ctime_nsec: row
-                    .get_value(13)
-                    .ok()
-                    .and_then(|v| v.as_integer().copied())
-                    .unwrap_or(0) as u32,
-                rdev: row
-                    .get_value(10)
-                    .ok()
-                    .and_then(|v| v.as_integer().copied())
-                    .unwrap_or(0) as u64,
-            };
+            let stats = store::stats_from_row_at(&row, 1)?;
 
             self.cache_attr(stats.clone());
             entries.push(DirEntry { name, stats });
@@ -5289,9 +4379,13 @@ impl FileSystem for AgentFS {
 
             if src_stats.is_directory() {
                 let mut ancestor_ino = newparent_ino;
+                let mut visited = HashSet::new();
                 while ancestor_ino != ROOT_INO {
                     if ancestor_ino == src_ino {
                         return Err(FsError::InvalidRename.into());
+                    }
+                    if !visited.insert(ancestor_ino) {
+                        return Err(FsError::InvalidPath.into());
                     }
 
                     let mut stmt = conn
@@ -5604,6 +4698,161 @@ mod tests {
         let (oldparent_ino, oldname) = parent_and_name_for_test(fs, from).await?;
         let (newparent_ino, newname) = parent_and_name_for_test(fs, to).await?;
         FileSystem::rename(fs, oldparent_ino, &oldname, newparent_ino, &newname).await
+    }
+
+    fn assert_normalized_ranges(actual: &[NormalizedWriteRange], expected: &[(u64, &[u8])]) {
+        assert_eq!(actual.len(), expected.len());
+        for (range, (offset, data)) in actual.iter().zip(expected.iter()) {
+            assert_eq!(range.offset, *offset);
+            assert_eq!(range.data, *data);
+        }
+    }
+
+    #[test]
+    fn store_characterization_range_normalization_merges_overlaps_in_order() -> Result<()> {
+        let ranges = [
+            WriteRangeRef {
+                offset: 4,
+                data: b"CCCC",
+            },
+            WriteRangeRef {
+                offset: 0,
+                data: b"aaaaaa",
+            },
+            WriteRangeRef {
+                offset: 2,
+                data: b"ZZ",
+            },
+            WriteRangeRef {
+                offset: 8,
+                data: b"!",
+            },
+            WriteRangeRef {
+                offset: 12,
+                data: b"",
+            },
+        ];
+
+        let normalized = normalize_write_ranges(&ranges)?;
+        assert_normalized_ranges(&normalized, &[(0, b"aaZZaaCC!")]);
+        Ok(())
+    }
+
+    #[test]
+    fn store_characterization_range_normalization_keeps_sparse_gaps() -> Result<()> {
+        let ranges = [
+            WriteRangeRef {
+                offset: 0,
+                data: b"ab",
+            },
+            WriteRangeRef {
+                offset: 5,
+                data: b"xy",
+            },
+        ];
+
+        let normalized = normalize_write_ranges(&ranges)?;
+        assert_normalized_ranges(&normalized, &[(0, b"ab"), (5, b"xy")]);
+        assert!(!dense_after_inline_write_batch(0, 7, &normalized));
+
+        let mut bridged_refs: Vec<_> = normalized
+            .iter()
+            .map(|range| WriteRangeRef {
+                offset: range.offset,
+                data: range.data.as_slice(),
+            })
+            .collect();
+        bridged_refs.push(WriteRangeRef {
+            offset: 2,
+            data: b"345",
+        });
+
+        let bridged = normalize_write_ranges(&bridged_refs)?;
+        assert_normalized_ranges(&bridged, &[(0, b"ab345xy")]);
+        assert!(dense_after_inline_write_batch(0, 7, &bridged));
+        Ok(())
+    }
+
+    #[test]
+    fn store_characterization_range_normalization_rejects_offset_overflow() {
+        let ranges = [WriteRangeRef {
+            offset: u64::MAX,
+            data: b"x",
+        }];
+
+        match normalize_write_ranges(&ranges) {
+            Ok(_) => panic!("overflowing write range should fail"),
+            Err(error) => assert!(matches!(error, Error::Internal(_))),
+        }
+    }
+
+    fn assert_corrupt_error(error: Error, expected_column: &str) {
+        match error {
+            Error::Fs(FsError::Corrupt(message)) => assert!(
+                message.contains(expected_column),
+                "corruption message {message:?} should mention {expected_column:?}"
+            ),
+            other => panic!("expected corrupt row error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn row_decode_corruption_returns_error() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        let (created, file) = fs
+            .create_file("/corrupt.txt", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        file.pwrite(0, b"hello").await?;
+        file.drain_writes().await?;
+
+        let conn = fs.pool.get_connection().await?;
+        conn.execute(
+            "UPDATE fs_inode SET mode = ? WHERE ino = ?",
+            (Value::Text("not-an-integer".to_string()), created.ino),
+        )
+        .await?;
+        fs.invalidate_attr(created.ino);
+
+        assert_corrupt_error(
+            FileSystem::getattr(&fs, created.ino).await.unwrap_err(),
+            "mode",
+        );
+        assert_corrupt_error(
+            FileSystem::lookup(&fs, ROOT_INO, "corrupt.txt")
+                .await
+                .unwrap_err(),
+            "mode",
+        );
+        assert_corrupt_error(
+            FileSystem::readdir_plus(&fs, ROOT_INO).await.unwrap_err(),
+            "mode",
+        );
+
+        let corrupt_dir = FileSystem::mkdir(&fs, ROOT_INO, "corrupt-dir", 0o755, 0, 0).await?;
+        conn.execute(
+            "UPDATE fs_inode SET mode = ? WHERE ino = ?",
+            (Value::Text("not-an-integer".to_string()), corrupt_dir.ino),
+        )
+        .await?;
+        fs.invalidate_attr(corrupt_dir.ino);
+        assert_corrupt_error(
+            FileSystem::readdir(&fs, corrupt_dir.ino).await.unwrap_err(),
+            "mode",
+        );
+
+        conn.execute(
+            "UPDATE fs_inode SET mode = ?, storage_kind = ? WHERE ino = ?",
+            (
+                (S_IFREG | 0o644) as i64,
+                Value::Text("not-an-integer".to_string()),
+                created.ino,
+            ),
+        )
+        .await?;
+        fs.invalidate_attr(created.ino);
+
+        assert_corrupt_error(file.pread(0, 5).await.unwrap_err(), "storage_kind");
+        Ok(())
     }
 
     #[tokio::test]
@@ -7870,6 +7119,39 @@ mod tests {
         assert!(fs.stat("/parent").await?.is_some());
         assert!(fs.stat("/parent/child").await?.is_some());
         assert!(fs.stat("/parent/child/parent").await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn trait_rename_corrupt_dentry_cycle_returns_invalid_path() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        fs.mkdir("/src", 0, 0).await?;
+        fs.mkdir("/cycle-a", 0, 0).await?;
+        fs.mkdir("/cycle-a/cycle-b", 0, 0).await?;
+
+        let cycle_a = fs.stat("/cycle-a").await?.unwrap().ino;
+        let cycle_b = fs.stat("/cycle-a/cycle-b").await?.unwrap().ino;
+        let conn = fs.pool.get_connection().await?;
+        conn.execute(
+            "UPDATE fs_dentry SET parent_ino = ? WHERE ino = ?",
+            (cycle_b, cycle_a),
+        )
+        .await?;
+        fs.invalidate_dentry(ROOT_INO, "cycle-a");
+        fs.invalidate_dentry(cycle_a, "cycle-b");
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            FileSystem::rename(&fs, ROOT_INO, "src", cycle_a, "moved"),
+        )
+        .await
+        .expect("corrupt dentry cycles must error instead of looping forever");
+
+        assert!(matches!(result, Err(Error::Fs(FsError::InvalidPath))));
+        assert!(
+            FileSystem::lookup(&fs, ROOT_INO, "src").await?.is_some(),
+            "failed guarded rename must preserve the source directory"
+        );
         Ok(())
     }
 
