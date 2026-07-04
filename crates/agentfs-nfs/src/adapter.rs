@@ -17,6 +17,7 @@ use crate::server::nfs::{
 use crate::server::vfs::{auth_unix, DirEntry, NFSFileSystem, ReadDirResult};
 use agentfs_core::error::Error as SdkError;
 use agentfs_core::fs::FsError;
+use agentfs_core::semantics::{AckDurability, Semantics};
 use agentfs_core::{
     FileSystem, Stats, TimeChange, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG,
     S_IFSOCK,
@@ -66,6 +67,8 @@ fn error_to_nfsstat(e: SdkError) -> nfsstat3 {
 pub(crate) struct AgentNFS {
     /// The underlying concurrency-safe filesystem.
     fs: Arc<dyn FileSystem>,
+    /// Shared semantics contract for durability and coherent attrs.
+    semantics: Semantics,
     /// Server-local generation number embedded in opaque file handles.
     fh_generation: u64,
     /// CREATE-returned file-handle tokens that retain open-time write authority.
@@ -80,6 +83,7 @@ impl AgentNFS {
             .unwrap_or_default();
         let seed = (now.as_secs() << 32) ^ u64::from(now.subsec_nanos());
         AgentNFS {
+            semantics: Semantics::new(fs.clone()),
             fs,
             fh_generation: seed,
             write_handle_tokens: StdMutex::new(HashMap::new()),
@@ -267,9 +271,9 @@ impl NFSFileSystem for AgentNFS {
     }
 
     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
-        let fs = self.fs.clone();
-        let stats = fs
-            .getattr(id_to_fs_ino(id))
+        let stats = self
+            .semantics
+            .stat_coherent(id_to_fs_ino(id))
             .await
             .map_err(error_to_nfsstat)?
             .ok_or(nfsstat3::NFS3ERR_NOENT)?;
@@ -327,8 +331,9 @@ impl NFSFileSystem for AgentNFS {
         }
 
         // Get updated stats
-        let stats = fs
-            .getattr(fs_ino)
+        let stats = self
+            .semantics
+            .stat_coherent(fs_ino)
             .await
             .map_err(error_to_nfsstat)?
             .ok_or(nfsstat3::NFS3ERR_NOENT)?;
@@ -360,23 +365,33 @@ impl NFSFileSystem for AgentNFS {
         Ok((data, eof))
     }
 
-    async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
+    async fn write(
+        &self,
+        id: fileid3,
+        offset: u64,
+        data: &[u8],
+        durability: AckDurability,
+    ) -> Result<(fattr3, AckDurability), nfsstat3> {
         let fs = self.fs.clone();
 
         let file = fs
             .open(id_to_fs_ino(id), O_RDWR)
             .await
             .map_err(error_to_nfsstat)?;
-        file.pwrite(offset, data).await.map_err(error_to_nfsstat)?;
-        // NFS WRITE replies are emitted as FILE_SYNC by the protocol handler.
-        // Drain and checkpoint the SDK write batcher before returning so the
-        // acknowledged bytes are durable even if the server is aborted
-        // immediately after the reply.
-        file.fsync().await.map_err(error_to_nfsstat)?;
+        let receipt = self
+            .semantics
+            .write(&file, offset, data, durability)
+            .await
+            .map_err(error_to_nfsstat)?;
 
-        let stats = file.fstat().await.map_err(error_to_nfsstat)?;
+        let stats = self
+            .semantics
+            .stat_coherent(id_to_fs_ino(id))
+            .await
+            .map_err(error_to_nfsstat)?
+            .ok_or(nfsstat3::NFS3ERR_NOENT)?;
 
-        Ok(self.stats_to_fattr(&stats))
+        Ok((self.stats_to_fattr(&stats), receipt.durability))
     }
 
     async fn create(
@@ -669,7 +684,11 @@ impl NFSFileSystem for AgentNFS {
     }
 
     async fn finalize(&self) -> anyhow::Result<()> {
-        self.fs.finalize().await.map_err(anyhow::Error::from)
+        self.semantics
+            .commit_barrier(None)
+            .await
+            .map_err(anyhow::Error::from)?;
+        self.semantics.finalize().await.map_err(anyhow::Error::from)
     }
 }
 

@@ -4,7 +4,7 @@ use super::nfs;
 use super::permissions;
 use super::rpc::*;
 use super::xdr::*;
-use agentfs_core::semantics::access;
+use agentfs_core::semantics::{access, AckDurability};
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use num_derive::{FromPrimitive, ToPrimitive};
 use num_traits::cast::FromPrimitive;
@@ -1203,7 +1203,7 @@ pub async fn nfsproc3_readdir(
 }
 
 #[allow(non_camel_case_types)]
-#[derive(Copy, Clone, Debug, Default, FromPrimitive, ToPrimitive)]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, FromPrimitive, ToPrimitive)]
 #[repr(u32)]
 pub enum stable_how {
     #[default]
@@ -1212,6 +1212,21 @@ pub enum stable_how {
     FILE_SYNC = 2,
 }
 XDREnumSerde!(stable_how);
+
+fn ack_durability_for_write_request(_stable: u32) -> AckDurability {
+    // D3's current NFS policy is FILE_SYNC-honest for every WRITE: even if a
+    // client asks for UNSTABLE, this server commits before acknowledging and
+    // reports FILE_SYNC. UNSTABLE+COMMIT can later opt in by changing this one
+    // mapping.
+    AckDurability::Committed
+}
+
+fn stable_how_for_ack_durability(durability: AckDurability) -> stable_how {
+    match durability {
+        AckDurability::Volatile => stable_how::UNSTABLE,
+        AckDurability::Committed => stable_how::FILE_SYNC,
+    }
+}
 
 #[allow(non_camel_case_types)]
 #[derive(Debug, Default)]
@@ -1336,8 +1351,13 @@ pub async fn nfsproc3_write(
         ctime: attr.ctime,
     });
 
-    match context.vfs.write(id, args.offset, &args.data).await {
-        Ok(mut fattr) => {
+    let requested_durability = ack_durability_for_write_request(args.stable);
+    match context
+        .vfs
+        .write(id, args.offset, &args.data, requested_durability)
+        .await
+    {
+        Ok((mut fattr, ack_durability)) => {
             // POSIX: Clear SUID/SGID bits when a non-root user writes to a file.
             let written_stats = permissions::stats(&fattr);
             let cleared_mode = permissions::without_killpriv(&written_stats, &creds, fattr.mode);
@@ -1357,7 +1377,7 @@ pub async fn nfsproc3_write(
                     after: nfs::post_op_attr::attributes(fattr),
                 },
                 count: args.count,
-                committed: stable_how::FILE_SYNC,
+                committed: stable_how_for_ack_durability(ack_durability),
                 verf: context.vfs.serverid(),
             };
             make_success_reply(xid).serialize(output)?;
@@ -2955,6 +2975,13 @@ mod tests {
         input
     }
 
+    fn serialize_getattr_args(file: nfs::nfs_fh3) -> Vec<u8> {
+        let mut input = Vec::new();
+        let mut cursor = Cursor::new(&mut input);
+        file.serialize(&mut cursor).expect("serialize GETATTR fh");
+        input
+    }
+
     fn serialize_setattr_size_args(file: nfs::nfs_fh3, size: u64) -> Vec<u8> {
         serialize_setattr_size_args_with_guard(file, size, sattrguard3::Void)
     }
@@ -3099,6 +3126,29 @@ mod tests {
         }
     }
 
+    async fn getattr_result(
+        context: &RPCContext,
+        file: nfs::nfs_fh3,
+    ) -> (nfs::nfsstat3, Option<nfs::fattr3>) {
+        let mut input = Cursor::new(serialize_getattr_args(file));
+        let mut output = Vec::new();
+        nfsproc3_getattr(4, &mut input, &mut output, context)
+            .await
+            .expect("GETATTR handler");
+
+        let mut cursor = Cursor::new(output);
+        parse_rpc_success(&mut cursor);
+        let status = parse_nfs_status(&mut cursor);
+        if matches!(status, nfs::nfsstat3::NFS3_OK) {
+            let mut attr = nfs::fattr3::default();
+            attr.deserialize(&mut cursor)
+                .expect("deserialize GETATTR fattr");
+            (status, Some(attr))
+        } else {
+            (status, None)
+        }
+    }
+
     async fn setattr_size_status(
         context: &RPCContext,
         file: nfs::nfs_fh3,
@@ -3130,6 +3180,27 @@ mod tests {
         let mut cursor = Cursor::new(output);
         parse_rpc_success(&mut cursor);
         parse_nfs_status(&mut cursor)
+    }
+
+    #[test]
+    fn write_reply_committed_field_derives_from_ack_durability() {
+        assert_eq!(
+            stable_how_for_ack_durability(AckDurability::Committed),
+            stable_how::FILE_SYNC
+        );
+        assert_eq!(
+            stable_how_for_ack_durability(AckDurability::Volatile),
+            stable_how::UNSTABLE
+        );
+        assert_eq!(
+            ack_durability_for_write_request(stable_how::FILE_SYNC as u32),
+            AckDurability::Committed
+        );
+        assert_eq!(
+            ack_durability_for_write_request(stable_how::UNSTABLE as u32),
+            AckDurability::Committed,
+            "current NFS policy commits every WRITE until COMMIT support opts in"
+        );
     }
 
     async fn read_file(fs: &agentfs_core::fs::AgentFS, name: &str, len: u64) -> Vec<u8> {
@@ -3179,6 +3250,61 @@ mod tests {
         assert_eq!(
             persisted, payload,
             "NFS FILE_SYNC reply must not be sent before bytes are durable"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_wcc_and_getattr_are_coherent_with_acknowledged_data() {
+        force_long_write_batcher_window();
+        let (context, _fs) = test_context().await;
+        let created_fh = create_readonly_file(&context).await;
+        let payload = b"coherent attrs after ack";
+
+        let (status, resok) = write_file_sync_result(&context, created_fh.clone(), payload).await;
+
+        assert!(matches!(status, nfs::nfsstat3::NFS3_OK));
+        let resok = resok.expect("WRITE should return success payload");
+        assert_eq!(resok.count, payload.len() as u32);
+        assert!(matches!(resok.committed, stable_how::FILE_SYNC));
+        let after = match resok.file_wcc.after {
+            nfs::post_op_attr::attributes(attr) => attr,
+            nfs::post_op_attr::Void => panic!("WRITE wcc omitted post-op attrs"),
+        };
+        assert_eq!(after.size, payload.len() as u64);
+        match resok.file_wcc.before {
+            nfs::pre_op_attr::attributes(before) => {
+                assert!(
+                    after.mtime.seconds > before.mtime.seconds
+                        || (after.mtime.seconds == before.mtime.seconds
+                            && after.mtime.nseconds >= before.mtime.nseconds),
+                    "WRITE wcc mtime must be non-decreasing"
+                );
+            }
+            nfs::pre_op_attr::Void => panic!("WRITE wcc omitted pre-op attrs"),
+        }
+
+        let (getattr_status, getattr_attr) = getattr_result(&context, created_fh.clone()).await;
+        assert!(matches!(getattr_status, nfs::nfsstat3::NFS3_OK));
+        let getattr_attr = getattr_attr.expect("GETATTR should return attrs");
+        assert_eq!(getattr_attr.size, payload.len() as u64);
+        assert!(
+            getattr_attr.mtime.seconds > after.mtime.seconds
+                || (getattr_attr.mtime.seconds == after.mtime.seconds
+                    && getattr_attr.mtime.nseconds >= after.mtime.nseconds),
+            "GETATTR mtime must not move backwards after WRITE wcc"
+        );
+
+        let truncated_size = 7;
+        let setattr_status =
+            setattr_size_status(&context, created_fh.clone(), truncated_size).await;
+        assert!(matches!(setattr_status, nfs::nfsstat3::NFS3_OK));
+        let (getattr_status, getattr_attr) = getattr_result(&context, created_fh).await;
+        assert!(matches!(getattr_status, nfs::nfsstat3::NFS3_OK));
+        assert_eq!(
+            getattr_attr
+                .expect("GETATTR after SETATTR should return attrs")
+                .size,
+            truncated_size
         );
     }
 

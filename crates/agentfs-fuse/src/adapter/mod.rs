@@ -24,6 +24,7 @@ use agentfs_core::error::Error as SdkError;
 use agentfs_core::fs::{
     KernelCachePolicy, WriteRange, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFSOCK,
 };
+use agentfs_core::semantics::Semantics;
 use agentfs_core::{BoxedFile, DirEntry, FileSystem, FsError, Stats, TimeChange};
 use parking_lot::Mutex;
 use std::{
@@ -162,6 +163,7 @@ impl MutationAudit {
 
 struct AgentFSFuse {
     fs: Arc<dyn FileSystem>,
+    semantics: Semantics,
     runtime: Runtime,
     /// Env-backed kernel cache safety configuration for this mount.
     cache_config: FuseKernelCacheConfig,
@@ -323,6 +325,9 @@ impl Filesystem for AgentFSFuse {
         tracing::debug!("FUSE::destroy");
         if let Err(e) = self.flush_all_pending() {
             tracing::warn!("FUSE::destroy failed to flush pending writes: {}", e);
+        }
+        if let Err(e) = self.commit_barrier(None) {
+            tracing::warn!("FUSE::destroy failed to commit pending writes: {}", e);
         }
         if let Err(e) = self.finalize_filesystem() {
             tracing::warn!("FUSE::destroy failed to finalize filesystem: {}", e);
@@ -1668,17 +1673,14 @@ impl Filesystem for AgentFSFuse {
         }
     }
 
-    /// Synchronizes file data to persistent storage using the file handle.
-    ///
-    /// This now uses the file handle's fsync which knows which layer(s) the
-    /// file exists in, avoiding errors when a file only exists in one layer.
+    /// Synchronizes file data through the shared inode commit barrier.
     fn fsync(&self, _req: &Request, ino: u64, fh: u64, _datasync: bool, reply: ReplyEmpty) {
         tracing::debug!("FUSE::fsync: fh={}", fh);
         let file = {
             let open_files = self.open_files.lock();
             open_files.get(&fh).map(|open_file| open_file.file.clone())
         };
-        let file = match file {
+        let _file = match file {
             Some(file) => file,
             None => match self.resolve_ino_file(ino, false) {
                 Ok(file) => file,
@@ -1694,7 +1696,7 @@ impl Filesystem for AgentFSFuse {
             return;
         }
 
-        let result = self.runtime.block_on(async move { file.fsync().await });
+        let result = self.commit_barrier(Some(ino));
 
         match result {
             Ok(()) => reply.ok(),
@@ -1860,6 +1862,9 @@ impl Drop for AgentFSFuse {
     fn drop(&mut self) {
         if let Err(e) = self.flush_all_pending() {
             tracing::warn!("FUSE drop failed to flush pending writes: {}", e);
+        }
+        if let Err(e) = self.commit_barrier(None) {
+            tracing::warn!("FUSE drop failed to commit pending writes: {}", e);
         }
         if let Err(e) = self.finalize_filesystem() {
             tracing::warn!("FUSE drop failed to finalize filesystem: {}", e);
@@ -2200,14 +2205,17 @@ impl AgentFSFuse {
         // Kept for emergency parity with pre-Tier-4 paths; not called on the
         // hot read path because the SDK overlay handles read-after-write
         // consistency without forcing a SQLite commit.
-        let fs = self.fs.clone();
         self.runtime
-            .block_on(async move { fs.drain_inode_writes(ino as i64).await })
+            .block_on(self.semantics.commit_barrier(Some(ino as i64)))
+    }
+
+    fn commit_barrier(&self, ino: Option<u64>) -> Result<(), SdkError> {
+        self.runtime
+            .block_on(self.semantics.commit_barrier(ino.map(|ino| ino as i64)))
     }
 
     fn finalize_filesystem(&self) -> Result<(), SdkError> {
-        let fs = self.fs.clone();
-        self.runtime.block_on(async move { fs.finalize().await })
+        self.runtime.block_on(self.semantics.finalize())
     }
 
     fn invalidate_inode_cache(&self, req: &Request, ino: u64) {
@@ -2557,6 +2565,7 @@ impl AgentFSFuse {
         let writeback_enabled = cache_config.writeback_cache_enabled;
         let uring = config.uring;
         Self {
+            semantics: Semantics::new(fs.clone()),
             fs,
             runtime,
             cache_config,

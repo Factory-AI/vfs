@@ -1,6 +1,7 @@
 use super::nfs;
 use super::nfs::*;
 pub(crate) use super::rpc::auth_unix;
+use agentfs_core::semantics::AckDurability;
 use async_trait::async_trait;
 use std::cmp::Ordering;
 use std::sync::OnceLock;
@@ -114,7 +115,13 @@ pub trait NFSFileSystem: Sync {
     /// Writes the contents of a file.
     /// Note that offset/count may go past the end of the file and that
     /// in that case, the file is extended.
-    async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3>;
+    async fn write(
+        &self,
+        id: fileid3,
+        offset: u64,
+        data: &[u8],
+        durability: AckDurability,
+    ) -> Result<(fattr3, AckDurability), nfsstat3>;
 
     /// Creates a file with the following attributes.
     /// The auth parameter contains the caller's credentials for ownership.

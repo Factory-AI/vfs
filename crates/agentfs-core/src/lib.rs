@@ -41,6 +41,7 @@ pub use kv::KvStore;
 pub use mounts::{get_mounts, Mount};
 pub use options::{agentfs_dir, AgentFSOptions, EncryptionConfig, SyncOptions};
 pub use schema::{SchemaVersion, AGENTFS_SCHEMA_VERSION, CURRENT};
+pub use semantics::{AckDurability, Semantics, WriteReceipt};
 pub use toolcalls::{ToolCall, ToolCallStats, ToolCallStatus, ToolCalls};
 
 /// The main AgentFS SDK struct
