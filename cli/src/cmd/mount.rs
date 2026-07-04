@@ -1,16 +1,13 @@
 use agentfs_core::{
     error::Error as SdkError, AgentFSOptions, FileSystem, HostFS, OverlayFS, PartialOriginPolicy,
 };
-use agentfs_nfs::{serve, NfsServeOptions};
-use anyhow::{Context, Result};
+use agentfs_mount::{mount_fs, Backend, MountHandle, MountOpts};
+use anyhow::Result;
 use std::{
     path::{Path, PathBuf},
-    process::Command,
     sync::Arc,
 };
 use turso::value::Value;
-
-use crate::mount::{mount_fs, MountOpts};
 
 #[cfg(target_os = "linux")]
 use agentfs_core::{get_mounts, Mount};
@@ -22,13 +19,8 @@ use std::{
 
 #[cfg(target_os = "linux")]
 use crate::cmd::init::open_agentfs;
-#[cfg(target_os = "linux")]
-use agentfs_fuse::FuseMountOptions;
 
-pub use crate::opts::MountBackend;
-
-/// Default NFS port to try (use a high port to avoid needing root)
-const DEFAULT_NFS_PORT: u32 = 11111;
+use crate::opts::MountBackend;
 
 /// Arguments for the mount command.
 #[derive(Debug, Clone)]
@@ -119,14 +111,17 @@ fn mount_fuse(args: MountArgs) -> Result<()> {
             .ino()
     };
 
-    let fuse_opts = FuseMountOptions {
+    let mount_opts = MountOpts {
         mountpoint: args.mountpoint.clone(),
+        backend: Backend::Fuse,
         auto_unmount: args.auto_unmount,
         allow_root: args.allow_root,
         allow_other: args.allow_other,
         fsname,
         uid: args.uid,
         gid: args.gid,
+        lazy_unmount: true,
+        timeout: std::time::Duration::from_secs(10),
     };
 
     let id_or_path = args.id_or_path.clone();
@@ -184,35 +179,15 @@ fn mount_fuse(args: MountArgs) -> Result<()> {
             }
         })?;
 
-        // Run the session on its own thread so termination signals can tear
-        // the mount down; the default disposition would kill the process
-        // without unmounting, stranding a dead mount table entry.
-        let mut session = agentfs_fuse::mount(fs, fuse_opts, rt)?;
-        let interrupted = crate::get_runtime().block_on(async {
-            tokio::select! {
-                result = crate::mount::shutdown_signal() => result.map(|_| true),
-                _ = async {
-                    loop {
-                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                        if session.is_finished() {
-                            break;
-                        }
-                    }
-                } => Ok(false),
-            }
-        })?;
-        if interrupted {
-            let _ = session.unmount();
-        }
-        session.join()
+        rt.block_on(run_mount_session(fs, mount_opts, foreground))
     };
 
     if foreground {
         mount()
     } else {
-        crate::daemon::daemonize(
+        agentfs_mount::daemon::daemonize(
             mount,
-            move || is_mounted(&mountpoint),
+            move || agentfs_mount::is_mountpoint(&mountpoint),
             std::time::Duration::from_secs(10),
         )
     }
@@ -294,146 +269,61 @@ async fn mount_nfs_backend(args: MountArgs) -> Result<()> {
         Arc::new(agentfs.fs) as Arc<dyn FileSystem>
     };
 
+    let mount_opts = MountOpts {
+        mountpoint: mountpoint.clone(),
+        backend: Backend::Nfs,
+        fsname,
+        uid: args.uid,
+        gid: args.gid,
+        allow_other: args.allow_other,
+        allow_root: args.allow_root,
+        auto_unmount: args.auto_unmount,
+        lazy_unmount: true,
+        timeout: std::time::Duration::from_secs(10),
+    };
+
     if args.foreground {
-        // Use the unified mount API for foreground mode
-        let mount_opts = MountOpts {
-            mountpoint: mountpoint.clone(),
-            backend: MountBackend::Nfs,
-            fsname,
-            uid: args.uid,
-            gid: args.gid,
-            allow_other: args.allow_other,
-            allow_root: args.allow_root,
-            auto_unmount: args.auto_unmount,
-            lazy_unmount: true,
-            timeout: std::time::Duration::from_secs(10),
-        };
-
-        let _mount_handle = mount_fs(fs, mount_opts).await?;
-
-        eprintln!("Mounted at {}", mountpoint.display());
-        eprintln!("Press Ctrl+C to unmount and exit.");
-        crate::mount::shutdown_signal().await?;
-
-        // Handle drops automatically when we exit this scope
+        run_mount_session(fs, mount_opts, true).await
     } else {
-        // Daemon mode: use manual NFS server setup for persistent background operation
-        let port = find_available_port(DEFAULT_NFS_PORT)?;
-
-        let shutdown = tokio_util::sync::CancellationToken::new();
-        let _server_handle = serve(
-            fs,
-            NfsServeOptions::new("127.0.0.1", port),
-            shutdown.clone(),
+        let ready_mountpoint = mountpoint.clone();
+        agentfs_mount::daemon::daemonize(
+            move || {
+                let rt = crate::get_runtime();
+                rt.block_on(run_mount_session(fs, mount_opts, false))
+            },
+            move || agentfs_mount::is_mountpoint(&ready_mountpoint),
+            std::time::Duration::from_secs(10),
         )
-        .await
-        .context("Failed to bind NFS server")?;
-
-        eprintln!("Starting NFS server on 127.0.0.1:{}", port);
-
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        nfs_mount(port, &mountpoint)?;
-
-        eprintln!("Mounted at {}", mountpoint.display());
-        eprintln!(
-            "Running in background. Use 'umount {}' to unmount.",
-            mountpoint.display()
-        );
-
-        // Block forever (server runs in background task)
-        std::future::pending::<()>().await;
     }
-
-    Ok(())
 }
 
-/// Find an available TCP port starting from the given port.
-fn find_available_port(start_port: u32) -> Result<u32> {
-    for port in start_port..start_port + 100 {
-        if std::net::TcpListener::bind(format!("127.0.0.1:{}", port)).is_ok() {
-            return Ok(port);
-        }
-    }
-    anyhow::bail!(
-        "Could not find an available port in range {}-{}",
-        start_port,
-        start_port + 100
-    );
-}
-
-/// Mount the NFS filesystem (Linux version).
-#[cfg(target_os = "linux")]
-fn nfs_mount(port: u32, mountpoint: &Path) -> Result<()> {
-    let output = Command::new("mount")
-        .args([
-            "-t",
-            "nfs",
-            "-o",
-            &format!(
-                "vers=3,tcp,port={},mountport={},nolock,soft,timeo=10,retrans=2",
-                port, port
-            ),
-            "127.0.0.1:/",
-            mountpoint.to_str().unwrap(),
-        ])
-        .output()
-        .context("Failed to execute mount command")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(
-            "Failed to mount NFS: {}. Make sure NFS client tools are installed (nfs-common on Debian/Ubuntu, nfs-utils on Fedora/RHEL) and you have permission to mount (try running with sudo).",
-            stderr.trim()
-        );
+async fn run_mount_session(
+    fs: Arc<dyn FileSystem>,
+    mount_opts: MountOpts,
+    foreground: bool,
+) -> Result<()> {
+    let handle = mount_fs(fs, mount_opts).await?;
+    if foreground {
+        eprintln!("Mounted at {}", handle.mountpoint().display());
+        eprintln!("Press Ctrl+C to unmount and exit.");
     }
 
-    Ok(())
+    let _interrupted = wait_for_mount_end(&handle).await?;
+    handle.unmount().await
 }
 
-/// Mount the NFS filesystem (macOS version).
-#[cfg(target_os = "macos")]
-fn nfs_mount(port: u32, mountpoint: &Path) -> Result<()> {
-    let output = Command::new("/sbin/mount_nfs")
-        .args([
-            "-o",
-            &format!(
-                "locallocks,vers=3,tcp,port={},mountport={},wsize=1048576,rsize=1048576,soft,timeo=10,retrans=2",
-                port, port
-            ),
-            "127.0.0.1:/",
-            mountpoint.to_str().unwrap(),
-        ])
-        .output()
-        .context("Failed to execute mount_nfs")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("Failed to mount NFS: {}", stderr.trim());
+async fn wait_for_mount_end(handle: &MountHandle) -> Result<bool> {
+    tokio::select! {
+        result = agentfs_mount::shutdown_signal() => result.map(|_| true).map_err(Into::into),
+        _ = async {
+            loop {
+                if handle.is_finished() || !agentfs_mount::is_mountpoint(handle.mountpoint()) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+        } => Ok(false),
     }
-
-    Ok(())
-}
-
-/// Check if a path is a mountpoint by comparing device IDs
-#[cfg(target_os = "linux")]
-fn is_mounted(path: &std::path::Path) -> bool {
-    let path_meta = match std::fs::metadata(path) {
-        Ok(m) => m,
-        Err(_) => return false,
-    };
-
-    let parent = match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => std::path::Path::new("/"),
-    };
-
-    let parent_meta = match std::fs::metadata(parent) {
-        Ok(m) => m,
-        Err(_) => return false,
-    };
-
-    // Different device IDs means it's a mountpoint
-    path_meta.dev() != parent_meta.dev()
 }
 
 /// List all currently mounted agentfs filesystems (Linux)

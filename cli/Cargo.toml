@@ -19,6 +19,7 @@ strict = []
 
 [dependencies]
 agentfs-core = { workspace = true }
+agentfs-mount = { workspace = true }
 agentfs-nfs = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
@@ -46,10 +47,6 @@ async-trait = { workspace = true }
 # Unix dependencies
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
-
-# Linux-only dependencies for FUSE functionality
-[target.'cfg(target_os = "linux")'.dependencies]
-agentfs-fuse = { workspace = true }
 
 # macOS dependencies for NFS functionality (no FUSE - uses nfsserve instead)
 [target.'cfg(target_os = "macos")'.dependencies]

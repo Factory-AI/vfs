@@ -208,9 +208,9 @@ async fn run_init_cmd(
     base: Option<PathBuf>,
     agent: AgentFS,
 ) -> AnyhowResult<()> {
-    use crate::cmd::supervise::{supervise_command, ChildOutcome};
-    use crate::mount::{mount_fs, MountOpts};
     use agentfs_core::{FileSystem, HostFS};
+    use agentfs_mount::supervise::{supervise_command, ChildOutcome};
+    use agentfs_mount::{mount_fs, MountOpts};
     use std::sync::Arc;
 
     let fs: Arc<dyn FileSystem> = if let Some(ref base_path) = base {
@@ -230,7 +230,7 @@ async fn run_init_cmd(
 
     let mount_opts = MountOpts {
         mountpoint: mountpoint.clone(),
-        backend,
+        backend: backend.into(),
         fsname: format!("agentfs:{}", id),
         uid: None,
         gid: None,
@@ -249,7 +249,7 @@ async fn run_init_cmd(
         .await
         .with_context(|| format!("Failed to execute: {}", cmd_str));
 
-    drop(mount_handle);
+    mount_handle.unmount().await?;
 
     let _ = std::fs::remove_dir_all(&mountpoint);
 

@@ -17,7 +17,7 @@ use std::process::Command;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
-use crate::cmd::supervise::{
+use agentfs_mount::supervise::{
     supervise_command, supervise_mounted_command, ChildOutcome, MountedCommandBackend,
     ShutdownFuture,
 };

@@ -9,7 +9,7 @@ use std::sync::{
 };
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use super::{wait_for_mount, MountBackend, MountHandle, MountHandleInner, MountOpts};
+use super::{wait_for_mount, Backend, MountHandle, MountHandleInner, MountOpts};
 
 /// FUSE unmount implementation using fusermount.
 pub(super) fn unmount_fuse(mountpoint: &Path, lazy: bool) -> Result<()> {
@@ -68,7 +68,7 @@ pub(super) fn mount_fuse(
 
     Ok(MountHandle {
         mountpoint,
-        backend: MountBackend::Fuse,
+        backend: Backend::Fuse,
         lazy_unmount,
         inner: MountHandleInner::Fuse {
             session: Some(fuse_session),

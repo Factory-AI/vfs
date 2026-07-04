@@ -39,6 +39,15 @@ impl std::fmt::Display for MountBackend {
     }
 }
 
+impl From<MountBackend> for agentfs_mount::Backend {
+    fn from(value: MountBackend) -> Self {
+        match value {
+            MountBackend::Fuse => agentfs_mount::Backend::Fuse,
+            MountBackend::Nfs => agentfs_mount::Backend::Nfs,
+        }
+    }
+}
+
 /// Partial-origin copy-up policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum PartialOriginMode {

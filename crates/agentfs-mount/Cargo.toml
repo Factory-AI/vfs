@@ -1,0 +1,22 @@
+[package]
+name = "agentfs-mount"
+version.workspace = true
+edition.workspace = true
+description = "Mount lifecycle and supervision for AgentFS"
+license.workspace = true
+
+[dependencies]
+agentfs-core = { workspace = true }
+agentfs-nfs = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+libc = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+agentfs-fuse = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,5 +1,11 @@
 [workspace]
-members = ["cli", "crates/agentfs-core", "crates/agentfs-fuse", "crates/agentfs-nfs"]
+members = [
+    "cli",
+    "crates/agentfs-core",
+    "crates/agentfs-fuse",
+    "crates/agentfs-nfs",
+    "crates/agentfs-mount",
+]
 resolver = "2"
 
 [workspace.package]
@@ -11,6 +17,7 @@ repository = "https://github.com/tursodatabase/agentfs"
 [workspace.dependencies]
 agentfs-core = { path = "crates/agentfs-core" }
 agentfs-fuse = { path = "crates/agentfs-fuse" }
+agentfs-mount = { path = "crates/agentfs-mount" }
 agentfs-nfs = { path = "crates/agentfs-nfs" }
 
 anyhow = "1.0"

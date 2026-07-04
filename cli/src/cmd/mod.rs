@@ -11,9 +11,6 @@ pub mod timeline;
 #[cfg(unix)]
 pub mod mount;
 
-#[cfg(unix)]
-pub(crate) mod supervise;
-
 mod run;
 
 // Standalone NFS server command (Unix only)
@@ -29,5 +26,7 @@ pub mod exec;
 pub mod clone;
 
 #[cfg(unix)]
-pub use mount::{mount, MountArgs, MountBackend};
+pub use crate::opts::MountBackend;
+#[cfg(unix)]
+pub use mount::{mount, MountArgs};
 pub use run::handle_run_command;

@@ -53,7 +53,7 @@ version = "0.6.4"
 dependencies = [
  "aegis",
  "agentfs-core",
- "agentfs-fuse",
+ "agentfs-mount",
  "agentfs-nfs",
  "anyhow",
  "async-trait",
@@ -116,6 +116,22 @@ dependencies = [
  "tracing",
  "turso",
  "zerocopy",
+]
+
+[[package]]
+name = "agentfs-mount"
+version = "0.6.4"
+dependencies = [
+ "agentfs-core",
+ "agentfs-fuse",
+ "agentfs-nfs",
+ "anyhow",
+ "async-trait",
+ "libc",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

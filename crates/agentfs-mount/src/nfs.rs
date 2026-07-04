@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use agentfs_nfs::{serve, NfsServeOptions};
 
-use super::{MountBackend, MountHandle, MountHandleInner, MountOpts};
+use super::{Backend, MountHandle, MountHandleInner, MountOpts};
 
 /// Default NFS port to try (use a high port to avoid needing root).
 const DEFAULT_NFS_PORT: u32 = 11111;
@@ -98,7 +98,7 @@ pub(super) async fn mount_nfs(
 
     Ok(MountHandle {
         mountpoint: opts.mountpoint,
-        backend: MountBackend::Nfs,
+        backend: Backend::Nfs,
         lazy_unmount: opts.lazy_unmount,
         inner: MountHandleInner::Nfs {
             server_handle: Some(server_handle),

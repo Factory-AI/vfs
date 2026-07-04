@@ -30,8 +30,9 @@ use anyhow::{bail, Context, Result};
 use sha1::{Digest, Sha1};
 
 use crate::cmd::init::open_agentfs;
-use crate::cmd::supervise::{set_parent_death_signal_std, supervise_command, ChildOutcome};
-use crate::mount::{mount_fs, MountBackend, MountOpts};
+use crate::opts::MountBackend;
+use agentfs_mount::supervise::{set_parent_death_signal_std, supervise_command, ChildOutcome};
+use agentfs_mount::{mount_fs, MountOpts};
 
 const S_IFDIR: u32 = 0o040000;
 const MODE_FILE: u32 = 0o100644;
@@ -75,7 +76,7 @@ pub async fn handle_clone_command(
 
     let mount_opts = MountOpts {
         mountpoint: mountpoint.clone(),
-        backend,
+        backend: backend.into(),
         fsname: format!("agentfs:{id_or_path}"),
         uid: None,
         gid: None,
@@ -89,7 +90,7 @@ pub async fn handle_clone_command(
 
     let result = tokio::select! {
         result = clone_into_mount(&agent, &mountpoint, &source, &repo_name, verify) => result,
-        signal = crate::mount::termination_signal() => {
+        signal = agentfs_mount::termination_signal() => {
             match signal {
                 Ok(signo) => Err(InterruptedSignal(signo).into()),
                 Err(error) => Err(error.into()),
@@ -97,7 +98,7 @@ pub async fn handle_clone_command(
         }
     };
 
-    drop(mount_handle);
+    mount_handle.unmount().await?;
     let _ = std::fs::remove_dir_all(&mountpoint);
 
     let summary = match result {

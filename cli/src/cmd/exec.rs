@@ -11,8 +11,9 @@ use std::sync::Arc;
 use turso::value::Value;
 
 use crate::cmd::init::open_agentfs;
-use crate::cmd::supervise::{supervise_command, ChildOutcome};
-use crate::mount::{mount_fs, MountBackend, MountOpts};
+use crate::opts::MountBackend;
+use agentfs_mount::supervise::{supervise_command, ChildOutcome};
+use agentfs_mount::{mount_fs, MountOpts};
 
 /// Handle the exec command.
 ///
@@ -84,7 +85,7 @@ pub async fn handle_exec_command(
 
     let mount_opts = MountOpts {
         mountpoint: mountpoint.clone(),
-        backend,
+        backend: backend.into(),
         fsname,
         uid: None,
         gid: None,
@@ -108,7 +109,7 @@ pub async fn handle_exec_command(
 
     // Unmount and remove the mountpoint even when the workload was
     // interrupted, so no dead mount table entry or temp directory survives.
-    drop(mount_handle);
+    mount_handle.unmount().await?;
     let _ = std::fs::remove_dir_all(&mountpoint);
 
     match outcome? {

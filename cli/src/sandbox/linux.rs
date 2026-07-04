@@ -49,7 +49,7 @@ static TERM_SIGNAL_COUNT: AtomicI32 = AtomicI32::new(0);
 /// harness to attribute counters to workload phases.
 static PROFILE_CHECKPOINT_PENDING: AtomicU64 = AtomicU64::new(0);
 
-use crate::mount::{is_mountpoint, mount_fs, MountBackend, MountHandle, MountOpts};
+use agentfs_mount::{is_mountpoint, mount_fs, Backend, MountHandle, MountOpts};
 
 /// Exit code returned when exec fails (standard shell convention for "command not found")
 const EXIT_COMMAND_NOT_FOUND: i32 = 127;
@@ -281,7 +281,7 @@ pub async fn run_cmd(
 
     let mount_opts = MountOpts {
         mountpoint: session.fuse_mountpoint.clone(),
-        backend: MountBackend::Fuse,
+        backend: Backend::Fuse,
         fsname: format!("agentfs:{}", session.run_id),
         uid: Some(uid),
         gid: Some(gid),
