@@ -161,8 +161,11 @@ impl AgentFS {
 
         // Initialize or migrate schema for existing databases before any
         // schema-owned callers read or write sidecar sections.
-        let conn = pool.get_connection().await?;
-        schema::ensure_current(&conn).await?;
+        let mut conn = pool.get_connection().await?;
+        if let Err(error) = schema::ensure_current(&conn).await {
+            conn.mark_unhealthy_if_fatal(&error);
+            return Err(error);
+        }
         drop(conn);
 
         let overlay_requested = options.base.is_some();
@@ -171,8 +174,11 @@ impl AgentFS {
         if let Some(base_path) = options.base {
             let canonical_base = std::fs::canonicalize(base_path)?;
             let base_path_str = canonical_base.to_string_lossy().to_string();
-            let conn = pool.get_connection().await?;
-            OverlayFS::init_schema(&conn, &base_path_str).await?;
+            let mut conn = pool.get_connection().await?;
+            if let Err(error) = OverlayFS::init_schema(&conn, &base_path_str).await {
+                conn.mark_unhealthy_if_fatal(&error);
+                return Err(error);
+            }
         }
 
         let db_path_for_fs = if sync_db.is_none() && db_path != ":memory:" {

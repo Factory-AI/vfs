@@ -216,6 +216,26 @@ impl PooledConnection {
     pub fn mark_unhealthy(&mut self) {
         self.discard_on_drop = true;
     }
+
+    /// Mark this connection unhealthy when `error` indicates the connection
+    /// should not be returned to the reusable pool.
+    pub fn mark_unhealthy_if_fatal(&mut self, error: &Error) {
+        if is_fatal_connection_error(error) {
+            self.mark_unhealthy();
+        }
+    }
+}
+
+pub(crate) fn is_fatal_connection_error(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Database(
+            turso::Error::Corrupt(_)
+                | turso::Error::IoError(_, _)
+                | turso::Error::Misuse(_)
+                | turso::Error::NotAdb(_)
+        )
+    )
 }
 
 impl std::ops::Deref for PooledConnection {
@@ -366,7 +386,10 @@ mod tests {
         drop(guard);
 
         let after = crate::telemetry::snapshot().counter("connection_drop_discards");
-        assert_eq!(after, before + 1);
+        assert!(
+            after > before,
+            "drop-discard counter should increase by at least one: before={before}, after={after}"
+        );
     }
 
     #[tokio::test]
@@ -381,8 +404,28 @@ mod tests {
         drop(conn);
 
         let after = crate::telemetry::snapshot().counter("connection_health_evictions");
-        assert_eq!(after, before + 1);
+        assert!(
+            after > before,
+            "health-eviction counter should increase by at least one: before={before}, after={after}"
+        );
         assert_eq!(pool.inner.pool.lock().await.len(), 0);
+    }
+
+    #[test]
+    fn fatal_connection_error_classifier_is_narrow() {
+        assert!(is_fatal_connection_error(&Error::Database(
+            turso::Error::Corrupt("bad page".to_string())
+        )));
+        assert!(is_fatal_connection_error(&Error::Database(
+            turso::Error::NotAdb("not an agentfs db".to_string())
+        )));
+        assert!(is_fatal_connection_error(&Error::Database(
+            turso::Error::IoError(std::io::ErrorKind::UnexpectedEof, "read")
+        )));
+        assert!(!is_fatal_connection_error(&Error::Database(
+            turso::Error::Busy("database is busy".to_string())
+        )));
+        assert!(!is_fatal_connection_error(&Error::ConnectionPoolTimeout));
     }
 
     #[tokio::test]

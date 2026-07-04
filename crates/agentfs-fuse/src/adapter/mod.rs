@@ -2127,6 +2127,7 @@ impl AgentFSFuse {
     /// guarantees no further ops for `ino` without a fresh LOOKUP, so the
     /// entry is dropped after moving any buffered tail into the batcher.
     fn drop_ino_file(&self, ino: u64) {
+        self.caches.prune_external_read_state(ino);
         let drain = {
             let mut ino_files = self.ino_files.lock();
             let Some(mut entry) = ino_files.remove(&ino) else {
@@ -2219,27 +2220,33 @@ impl AgentFSFuse {
     }
 
     fn invalidate_inode_cache(&self, req: &Request, ino: u64) {
-        if self
+        let invalidation = self
             .caches
-            .invalidate_inode(ino, NotifyPolicy::NotifyKernel)
-        {
+            .invalidate_inode(ino, NotifyPolicy::NotifyKernel);
+        if invalidation.dropped_keepcache {
             crate::telemetry::record_fuse_keepcache_eligibility_drop();
         }
-        self.notify_inval_inode(req, ino, 0, i64::MAX);
-        crate::telemetry::record_base_fast_inode_invalidation();
+        if invalidation.notify_kernel {
+            self.notify_inval_inode(req, ino, 0, i64::MAX);
+            crate::telemetry::record_base_fast_inode_invalidation();
+        }
         record_mutation_invalidation();
     }
 
     fn invalidate_entry_cache(&self, req: &Request, parent: u64, name: &OsStr) {
+        let mut notify_kernel = true;
         if let Some(name) = name.to_str() {
-            if self
-                .caches
-                .invalidate_entry(parent, name, NotifyPolicy::NotifyKernel)
-            {
+            let invalidation =
+                self.caches
+                    .invalidate_entry(parent, name, NotifyPolicy::NotifyKernel);
+            if invalidation.removed_negative {
                 crate::telemetry::record_negative_cache_invalidation();
             }
+            notify_kernel = invalidation.notify_kernel;
         }
-        self.notify_inval_entry(req, parent, name);
+        if notify_kernel {
+            self.notify_inval_entry(req, parent, name);
+        }
         record_mutation_invalidation();
     }
 
@@ -2255,13 +2262,16 @@ impl AgentFSFuse {
             self.invalidate_inode_cache(req, ino);
             return;
         }
-        if self
+        let invalidation = self
             .caches
-            .invalidate_inode(ino, NotifyPolicy::SuppressKernel)
-        {
+            .invalidate_inode(ino, NotifyPolicy::SuppressKernel);
+        if invalidation.dropped_keepcache {
             crate::telemetry::record_fuse_keepcache_eligibility_drop();
         }
-        crate::telemetry::record_base_fast_inode_invalidation();
+        if invalidation.notify_kernel {
+            self.notify_inval_inode(req, ino, 0, i64::MAX);
+            crate::telemetry::record_base_fast_inode_invalidation();
+        }
         record_mutation_invalidation();
     }
 
@@ -2290,11 +2300,14 @@ impl AgentFSFuse {
             return;
         }
         if let Some(name) = name.to_str() {
-            if self
-                .caches
-                .invalidate_entry(parent, name, NotifyPolicy::SuppressKernel)
-            {
+            let invalidation =
+                self.caches
+                    .invalidate_entry(parent, name, NotifyPolicy::SuppressKernel);
+            if invalidation.removed_negative {
                 crate::telemetry::record_negative_cache_invalidation();
+            }
+            if invalidation.notify_kernel {
+                self.notify_inval_entry(req, parent, OsStr::new(name));
             }
         }
         record_mutation_invalidation();

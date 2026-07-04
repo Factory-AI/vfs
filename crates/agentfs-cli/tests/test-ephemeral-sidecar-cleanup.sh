@@ -59,6 +59,26 @@ run_agentfs fs sidecar cat /hello.txt >/dev/null
 assert_no_sidecars "fs-cat"
 run_agentfs run --session sidecar-run -- sh -c 'printf run-data > run.txt && cat run.txt' >/dev/null
 assert_no_sidecars "run"
+GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null run_agentfs run --session sidecar-git -- sh -c '
+    set -eu
+    git init repo >/dev/null
+    cd repo
+    git config user.email agentfs@example.invalid
+    git config user.name AgentFS
+    mkdir -p src
+    for i in 1 2 3 4; do
+        printf "token %s\n" "$i" > "src/file$i.txt"
+    done
+    git add src
+    git commit -m initial >/dev/null
+    git status --short >/dev/null
+    git grep token >/dev/null
+    printf change >> src/file1.txt
+    git diff -- src/file1.txt >/dev/null
+    git checkout -- src/file1.txt
+    git fsck --no-dangling >/dev/null
+' >/dev/null
+assert_no_sidecars "run-git"
 run_agentfs mount sidecar "$MNT"
 
 mounted=0

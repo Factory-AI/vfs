@@ -14,10 +14,10 @@ use agentfs_core::telemetry::DEFAULT_PROFILE_ENABLED;
 
 use crate::config::DEFAULT_CLONE_TIMINGS_ENABLED;
 
-// Transitional M5 state: the runtime FUSE config has moved to the sealed
-// agentfs-fuse crate, while the pre-cli-split knob ledger still lives here.
-// Keep these defaults byte-for-byte aligned with agentfs_fuse::adapter::config
-// until m5-cli-thinning moves the ledger to its final crate.
+// The runtime FUSE config lives in the sealed agentfs-fuse crate while the
+// knob ledger lives at the CLI edge. Keep these defaults byte-for-byte aligned
+// with agentfs_fuse::adapter::config; the scan roots below cover every
+// workspace crate so undeclared runtime env reads cannot bypass the ledger.
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct DefaultToken(&'static str);
@@ -936,6 +936,9 @@ mod tests {
         for source_root in [
             root.join("crates/agentfs-cli/src"),
             root.join("crates/agentfs-core/src"),
+            root.join("crates/agentfs-fuse/src"),
+            root.join("crates/agentfs-mount/src"),
+            root.join("crates/agentfs-nfs/src"),
         ] {
             collect_runtime_env_mentions_from_path(&source_root, &mut tokens);
         }

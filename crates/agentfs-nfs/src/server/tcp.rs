@@ -185,22 +185,6 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
             transaction_tracker: Arc::new(TransactionTracker::new(DEFAULT_REPLY_CACHE_CAPACITY)),
         })
     }
-
-    /// Sets an optional NFS export name.
-    ///
-    /// - `export_name`: The desired export name without slashes.
-    ///
-    /// Example: Name `foo` results in the export path `/foo`.
-    /// Default path is `/` if not set.
-    pub fn with_export_name<S: AsRef<str>>(&mut self, export_name: S) {
-        self.export_name = Arc::new(format!(
-            "/{}",
-            export_name
-                .as_ref()
-                .trim_end_matches('/')
-                .trim_start_matches('/')
-        ))
-    }
 }
 
 #[async_trait]

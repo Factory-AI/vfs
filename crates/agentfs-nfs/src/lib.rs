@@ -24,8 +24,6 @@ pub struct NfsServeOptions {
     pub bind: String,
     /// TCP port to bind. Use `0` to request an ephemeral port.
     pub port: u32,
-    /// Optional export name. `None` exports the root path `/`.
-    pub export_name: Option<String>,
 }
 
 impl NfsServeOptions {
@@ -34,7 +32,6 @@ impl NfsServeOptions {
         Self {
             bind: bind.into(),
             port,
-            export_name: None,
         }
     }
 
@@ -91,13 +88,16 @@ impl ServerHandle {
     }
 
     /// Wait for the server task to stop and surface shutdown errors.
-    pub async fn join(mut self) -> anyhow::Result<()> {
-        let Some(task) = self.task.take() else {
+    pub async fn join(&mut self) -> anyhow::Result<()> {
+        let Some(task) = self.task.as_mut() else {
             return Ok(());
         };
-        task.await
+        let result = task
+            .await
             .map_err(|error| anyhow::anyhow!("NFS server task failed to join: {error}"))?
-            .map_err(anyhow::Error::from)
+            .map_err(anyhow::Error::from);
+        self.task.take();
+        result
     }
 }
 
@@ -107,6 +107,10 @@ impl Drop for ServerHandle {
         if let Some(task) = &self.task {
             if !task.is_finished() {
                 task.abort();
+            } else {
+                tracing::warn!(
+                    "dropping a finished NFS server task without joining; call ServerHandle::join to observe shutdown errors"
+                );
             }
         }
     }
@@ -119,17 +123,70 @@ pub async fn serve(
     shutdown: CancellationToken,
 ) -> anyhow::Result<ServerHandle> {
     let nfs = AgentNFS::new(fs);
-    let mut listener = NFSTcpListener::bind(&opts.bind_addr()?, nfs).await?;
-    if let Some(export_name) = opts.export_name {
-        listener.with_export_name(export_name);
-    }
+    let listener = NFSTcpListener::bind(&opts.bind_addr()?, nfs).await?;
     let local_addr = SocketAddr::new(listener.get_listen_ip(), listener.get_listen_port());
     let server_shutdown = shutdown.clone();
-    let task = tokio::spawn(async move { listener.handle_until_cancelled(server_shutdown).await });
+    let task = tokio::spawn(async move {
+        let result = listener.handle_until_cancelled(server_shutdown).await;
+        if let Err(error) = &result {
+            tracing::error!(%error, "NFS server task exited with error");
+        }
+        result
+    });
 
     Ok(ServerHandle {
         shutdown,
         task: Some(task),
         local_addr,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+    use std::time::Duration;
+
+    fn test_handle(task: JoinHandle<io::Result<()>>) -> ServerHandle {
+        ServerHandle {
+            shutdown: CancellationToken::new(),
+            task: Some(task),
+            local_addr: "127.0.0.1:0".parse().expect("valid socket addr"),
+        }
+    }
+
+    #[tokio::test]
+    async fn join_surfaces_server_task_error() {
+        let task = tokio::spawn(async { Err(io::Error::other("synthetic NFS serve failure")) });
+        let mut handle = test_handle(task);
+
+        let error = handle.join().await.expect_err("join should surface error");
+
+        assert!(
+            error.to_string().contains("synthetic NFS serve failure"),
+            "unexpected join error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn join_timeout_leaves_server_task_abortable() {
+        let task = tokio::spawn(async { std::future::pending::<io::Result<()>>().await });
+        let mut handle = test_handle(task);
+
+        let timed_out = tokio::time::timeout(Duration::from_millis(10), handle.join()).await;
+        assert!(timed_out.is_err(), "join should remain pending");
+        assert!(
+            !handle.is_finished(),
+            "timed out join must not detach or finish the task"
+        );
+
+        handle.abort();
+        let aborted = tokio::time::timeout(Duration::from_secs(1), handle.join())
+            .await
+            .expect("aborted task should join promptly");
+        assert!(
+            aborted.is_err(),
+            "aborted task should report a JoinError on the join path"
+        );
+    }
 }

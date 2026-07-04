@@ -174,7 +174,7 @@ impl NfsServerHandle {
     }
 
     /// Wait for the server task to stop and surface shutdown errors.
-    pub async fn join(self) -> Result<()> {
+    pub async fn join(mut self) -> Result<()> {
         self.inner.join().await
     }
 }
@@ -301,18 +301,36 @@ impl MountHandle {
                         remember_error(&mut first_error, error);
                     }
                 }
-                if let Some(handle) = server_handle.take() {
+                if let Some(mut handle) = server_handle.take() {
                     match tokio::time::timeout(DEFAULT_UNMOUNT_TIMEOUT, handle.join()).await {
                         Ok(Ok(())) => {}
                         Ok(Err(error)) => remember_error(&mut first_error, error),
-                        Err(_) => remember_error(
-                            &mut first_error,
-                            anyhow::anyhow!(
+                        Err(_) => {
+                            let timeout_error = anyhow::anyhow!(
                                 "NFS server did not stop gracefully for {} within {:?}",
                                 self.mountpoint.display(),
                                 DEFAULT_UNMOUNT_TIMEOUT
-                            ),
-                        ),
+                            );
+                            tracing::warn!(
+                                mountpoint = %self.mountpoint.display(),
+                                timeout = ?DEFAULT_UNMOUNT_TIMEOUT,
+                                "NFS server did not stop gracefully; aborting task"
+                            );
+                            handle.abort();
+                            match tokio::time::timeout(Duration::from_secs(1), handle.join()).await
+                            {
+                                Ok(Ok(())) => {}
+                                Ok(Err(error)) => tracing::warn!(
+                                    %error,
+                                    "NFS server task reported an error after abort"
+                                ),
+                                Err(_) => tracing::warn!(
+                                    mountpoint = %self.mountpoint.display(),
+                                    "NFS server task did not join after abort"
+                                ),
+                            }
+                            remember_error(&mut first_error, timeout_error);
+                        }
                     }
                 }
             }

@@ -92,6 +92,22 @@ pub(super) enum NotifyPolicy {
     SuppressKernel,
 }
 
+impl NotifyPolicy {
+    fn should_notify_kernel(self) -> bool {
+        matches!(self, Self::NotifyKernel)
+    }
+}
+
+pub(super) struct InodeInvalidation {
+    pub(super) dropped_keepcache: bool,
+    pub(super) notify_kernel: bool,
+}
+
+pub(super) struct EntryInvalidation {
+    pub(super) removed_negative: bool,
+    pub(super) notify_kernel: bool,
+}
+
 /// Reply-lock guard retained while a cacheable FUSE reply is emitted.
 pub(super) struct CacheReplyGuard<'a> {
     _guard: MutexGuard<'a, ()>,
@@ -145,16 +161,18 @@ impl AdapterCaches {
         Some(CacheReplyGuard { _guard: guard })
     }
 
-    pub(super) fn mutate(&self, _policy: NotifyPolicy, f: impl FnOnce(&Self)) {
+    pub(super) fn mutate(&self, policy: NotifyPolicy, f: impl FnOnce(&Self)) -> bool {
         let _reply = self.reply_lock.lock();
         self.epoch.fetch_add(1, Ordering::AcqRel);
         f(self);
+        policy.should_notify_kernel()
     }
 
-    pub(super) fn invalidate_inode(&self, ino: u64, policy: NotifyPolicy) -> bool {
+    pub(super) fn invalidate_inode(&self, ino: u64, policy: NotifyPolicy) -> InodeInvalidation {
         let mut dropped_keepcache = false;
-        self.mutate(policy, |caches| {
+        let notify_kernel = self.mutate(policy, |caches| {
             dropped_keepcache = caches.drop_keepcache_eligibility(ino);
+            caches.prune_external_read_state(ino);
             caches.attrs().lock().remove(&ino);
             caches
                 .entries()
@@ -164,17 +182,28 @@ impl AdapterCaches {
                 *dir_ino != ino && !entries.iter().any(|entry| entry.attr.ino == ino)
             });
         });
-        dropped_keepcache
+        InodeInvalidation {
+            dropped_keepcache,
+            notify_kernel,
+        }
     }
 
-    pub(super) fn invalidate_entry(&self, parent: u64, name: &str, policy: NotifyPolicy) -> bool {
+    pub(super) fn invalidate_entry(
+        &self,
+        parent: u64,
+        name: &str,
+        policy: NotifyPolicy,
+    ) -> EntryInvalidation {
         let mut removed_negative = false;
-        self.mutate(policy, |caches| {
+        let notify_kernel = self.mutate(policy, |caches| {
             let key = (parent, name.to_string());
             caches.entries().lock().remove(&key);
             removed_negative = caches.negative_entries().lock().remove(&key).is_some();
         });
-        removed_negative
+        EntryInvalidation {
+            removed_negative,
+            notify_kernel,
+        }
     }
 
     pub(super) fn dir_entries(&self) -> &Mutex<HashMap<u64, Arc<Vec<CachedDirEntry>>>> {
@@ -223,6 +252,11 @@ impl AdapterCaches {
         self.external_read_seen.lock().contains(&ino)
     }
 
+    pub(super) fn prune_external_read_state(&self, ino: u64) {
+        self.external_read_fingerprints.lock().remove(&ino);
+        self.external_read_seen.lock().remove(&ino);
+    }
+
     pub(super) fn external_read_drifted(
         &self,
         ino: u64,
@@ -230,11 +264,88 @@ impl AdapterCaches {
     ) -> bool {
         let mut fingerprints = self.external_read_fingerprints.lock();
         match fingerprints.get(&ino) {
-            Some(existing) => existing != &fingerprint,
+            Some(existing) if existing != &fingerprint => {
+                fingerprints.insert(ino, fingerprint);
+                true
+            }
+            Some(_) => false,
             None => {
                 fingerprints.insert(ino, fingerprint);
                 false
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stats_with_size(size: i64) -> Stats {
+        Stats {
+            ino: 42,
+            mode: libc::S_IFREG | 0o644,
+            nlink: 1,
+            uid: 1000,
+            gid: 1000,
+            size,
+            atime: 1,
+            mtime: 2,
+            ctime: 3,
+            atime_nsec: 4,
+            mtime_nsec: 5,
+            ctime_nsec: 6,
+            rdev: 0,
+        }
+    }
+
+    #[test]
+    fn notify_policy_controls_mutation_notify_flag() {
+        let caches = AdapterCaches::new(false);
+
+        assert!(caches.mutate(NotifyPolicy::NotifyKernel, |_| {}));
+        assert!(!caches.mutate(NotifyPolicy::SuppressKernel, |_| {}));
+    }
+
+    #[test]
+    fn external_read_drift_revalidates_after_one_error() {
+        let caches = AdapterCaches::new(false);
+        let ino = 7;
+        caches.mark_external_read_seen(ino);
+
+        let before = KeepCacheFingerprint::from_stats(&stats_with_size(5));
+        let after = KeepCacheFingerprint::from_stats(&stats_with_size(9));
+
+        assert!(
+            !caches.external_read_drifted(ino, before.clone()),
+            "first fingerprint records the baseline"
+        );
+        assert!(
+            caches.external_read_drifted(ino, after.clone()),
+            "changed fingerprint reports one drift error"
+        );
+        assert!(
+            !caches.external_read_drifted(ino, after),
+            "the changed fingerprint becomes the new validated baseline"
+        );
+    }
+
+    #[test]
+    fn prune_external_read_state_removes_seen_and_fingerprint() {
+        let caches = AdapterCaches::new(false);
+        let ino = 11;
+        let fingerprint = KeepCacheFingerprint::from_stats(&stats_with_size(5));
+
+        caches.mark_external_read_seen(ino);
+        caches.set_external_read_fingerprint(ino, fingerprint.clone());
+        assert!(caches.external_read_was_seen(ino));
+
+        caches.prune_external_read_state(ino);
+
+        assert!(!caches.external_read_was_seen(ino));
+        assert!(
+            !caches.external_read_drifted(ino, fingerprint),
+            "pruned fingerprint should behave like a fresh baseline"
+        );
     }
 }

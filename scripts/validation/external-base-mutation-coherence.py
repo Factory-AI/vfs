@@ -25,6 +25,7 @@ FINAL_UNMOUNT_SETTLE_TIMEOUT = 0.5
 STALE_BYTES = b"before-base-content\n"
 FRESH_BYTES = b"after-base-content-with-new-size\n"
 MOUNTINFO_ESCAPE_RE = re.compile(r"\\([0-7]{3})")
+EIO_MARKERS = ("Input/output error", "EIO")
 
 
 def tail_text(text: str) -> str:
@@ -78,6 +79,17 @@ def run_checked(argv: list[str], cwd: Path, env: dict[str, str], timeout: float)
         capture_output=True,
         timeout=timeout,
     )
+
+
+def is_eio_failure(proc: subprocess.CompletedProcess[Any]) -> bool:
+    if proc.returncode == 0:
+        return False
+    stderr = proc.stderr
+    if isinstance(stderr, bytes):
+        stderr_text = stderr.decode("utf-8", "replace")
+    else:
+        stderr_text = stderr or ""
+    return any(marker in stderr_text for marker in EIO_MARKERS)
 
 
 def decode_mountinfo_field(value: str) -> str:
@@ -443,7 +455,7 @@ def run_leg(
         counters = parse_profile_summary(mount_output)
         stale = read_after.returncode == 0 and read_after.stdout == STALE_BYTES
         fresh = read_after.returncode == 0 and read_after.stdout == FRESH_BYTES
-        drift_error = read_after.returncode != 0 or stat_after.returncode != 0
+        drift_error = is_eio_failure(read_after) or is_eio_failure(stat_after)
         stat_size = stat_after.stdout.strip().split(" ")[0] if stat_after.returncode == 0 else None
         stat_fresh = stat_size == str(len(FRESH_BYTES))
         noopen_ok = True
@@ -475,6 +487,7 @@ def run_leg(
             "stale": stale,
             "fresh": fresh,
             "drift_error": drift_error,
+            "drift_errno": "EIO" if drift_error else None,
             "stat_fresh": stat_fresh,
             "noopen_ok": noopen_ok,
             "fuse_op_open_count": counters.get("fuse_op_open_count"),
@@ -536,6 +549,12 @@ def main() -> int:
     Path(output).write_text(json.dumps(report, indent=2))
 
     for run in runs:
+        if run.get("interrupted") or run.get("phase") == "interrupted" or run.get("run_phase") == "interrupted":
+            print(
+                f"INTERRUPTED {run['label']:15s} "
+                f"duration={run.get('duration_seconds')} interrupt={run.get('interrupt')!r}"
+            )
+            continue
         status = "PASS" if run.get("passed") else "FAIL"
         print(
             f"{status} {run['label']:15s} stale={run.get('stale')} "
