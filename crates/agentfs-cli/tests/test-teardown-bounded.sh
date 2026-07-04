@@ -221,6 +221,44 @@ git fsck --strict --no-progress
     ) >"$JOINER_LOG" 2>&1
 }
 
+verify_session_after_teardown() {
+    leg="$1"
+    verify_log="$LOGDIR/verify-after-term.log"
+    integrity_log="$LOGDIR/integrity-after-term.json"
+
+    HOME="$TEST_HOME" \
+    XDG_CACHE_HOME="$TEST_HOME/.cache" \
+    XDG_CONFIG_HOME="$TEST_HOME/.config" \
+    "$AGENTFS_BIN" integrity "$DELTA_DB" --json >"$integrity_log" 2>&1 ||
+        {
+            dump_failure_context "$leg integrity check failed after SIGTERM teardown"
+            sed 's/^/  /' "$integrity_log"
+            return 1
+        }
+
+    (
+        cd "$WORKDIR"
+        HOME="$TEST_HOME" \
+        XDG_CACHE_HOME="$TEST_HOME/.cache" \
+        XDG_CONFIG_HOME="$TEST_HOME/.config" \
+        CARGO_HOME="$CARGO_HOME_FOR_TEST" \
+        RUSTUP_HOME="$RUSTUP_HOME_FOR_TEST" \
+        RUSTUP_TOOLCHAIN="$RUSTUP_TOOLCHAIN_FOR_TEST" \
+        AGENTFS_FUSE_URING="$leg" \
+        "$AGENTFS_BIN" run --session "$SESSION_ID" \
+            /bin/bash -c '
+set -euo pipefail
+test "$(cat bounded/payload.txt)" = "bounded teardown payload"
+git -C bounded/repo fsck --strict --no-progress
+test -z "$(git -C bounded/repo status --porcelain)"
+'
+    ) >"$verify_log" 2>&1 || {
+        dump_failure_context "$leg remount verification failed after SIGTERM teardown"
+        sed 's/^/  /' "$verify_log"
+        return 1
+    }
+}
+
 wait_for_owner_exit() {
     start_ms="$(date +%s%3N)"
     deadline_ms=$((start_ms + TEARDOWN_TIMEOUT * 1000))
@@ -318,6 +356,17 @@ run_leg() {
 
     if ! assert_no_session_residue; then
         dump_failure_context "$label session left mount or process residue after ${elapsed_ms}ms teardown"
+        cleanup_current
+        return 1
+    fi
+
+    if ! verify_session_after_teardown "$leg"; then
+        cleanup_current
+        return 1
+    fi
+
+    if ! assert_no_session_residue; then
+        dump_failure_context "$label verification remount left residue"
         cleanup_current
         return 1
     fi

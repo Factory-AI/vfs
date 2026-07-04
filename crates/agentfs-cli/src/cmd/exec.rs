@@ -12,7 +12,7 @@ use turso::value::Value;
 
 use crate::cmd::init::open_agentfs;
 use crate::opts::MountBackend;
-use agentfs_mount::supervise::{supervise_command, ChildOutcome};
+use agentfs_mount::supervise::{exit_code_for_status, run_supervised};
 use agentfs_mount::{mount_fs, MountOpts};
 
 /// Handle the exec command.
@@ -103,26 +103,16 @@ pub async fn handle_exec_command(
 
     let mut child = tokio::process::Command::new(&command);
     child.args(&args).current_dir(&mountpoint);
-    let outcome = supervise_command(child)
+    let status = run_supervised(mount_handle, child)
         .await
         .with_context(|| format!("Failed to execute: {}", command.display()));
 
-    // Unmount and remove the mountpoint even when the workload was
-    // interrupted, so no dead mount table entry or temp directory survives.
-    mount_handle.unmount().await?;
     let _ = std::fs::remove_dir_all(&mountpoint);
 
-    match outcome? {
-        ChildOutcome::Exited(status) => {
-            if !status.success() {
-                crate::profiling::emit_cli_report();
-                std::process::exit(status.code().unwrap_or(1));
-            }
-            Ok(())
-        }
-        ChildOutcome::Interrupted(signo) => {
-            crate::profiling::emit_cli_report();
-            std::process::exit(128 + signo);
-        }
+    let status = status?;
+    if !status.success() {
+        crate::profiling::emit_cli_report();
+        std::process::exit(exit_code_for_status(status));
     }
+    Ok(())
 }

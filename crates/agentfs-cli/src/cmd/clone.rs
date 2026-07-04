@@ -31,7 +31,10 @@ use sha1::{Digest, Sha1};
 
 use crate::cmd::init::open_agentfs;
 use crate::opts::MountBackend;
-use agentfs_mount::supervise::{set_parent_death_signal_std, supervise_command, ChildOutcome};
+use agentfs_mount::supervise::{
+    run_supervised_task, set_parent_death_signal_std, supervise_command, ChildOutcome,
+    SupervisedTaskOutcome,
+};
 use agentfs_mount::{mount_fs, MountOpts};
 
 const S_IFDIR: u32 = 0o040000;
@@ -88,21 +91,19 @@ pub async fn handle_clone_command(
     };
     let mount_handle = mount_fs(fs, mount_opts).await?;
 
-    let result = tokio::select! {
-        result = clone_into_mount(&agent, &mountpoint, &source, &repo_name, verify) => result,
-        signal = agentfs_mount::termination_signal() => {
-            match signal {
-                Ok(signo) => Err(InterruptedSignal(signo).into()),
-                Err(error) => Err(error.into()),
-            }
-        }
-    };
-
-    mount_handle.unmount().await?;
+    let result = run_supervised_task(
+        mount_handle,
+        clone_into_mount(&agent, &mountpoint, &source, &repo_name, verify),
+    )
+    .await;
     let _ = std::fs::remove_dir_all(&mountpoint);
 
     let summary = match result {
-        Ok(summary) => summary,
+        Ok(SupervisedTaskOutcome::Completed(summary)) => summary,
+        Ok(SupervisedTaskOutcome::Interrupted(signo)) => {
+            crate::profiling::emit_cli_report();
+            std::process::exit(128 + signo);
+        }
         Err(error) => {
             if let Some(interrupted) = error.downcast_ref::<InterruptedSignal>() {
                 crate::profiling::emit_cli_report();

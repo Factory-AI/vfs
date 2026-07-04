@@ -4,14 +4,13 @@
 //! process group when requested, and interrupted workloads get a bounded
 //! TERM-then-KILL teardown before the mount is unmounted.
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(test)]
 use anyhow::Context;
 use anyhow::Result;
-#[cfg(any(target_os = "macos", test))]
 use std::future::Future;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(test)]
 use std::path::Path;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(test)]
 use std::pin::Pin;
 use std::process::ExitStatus;
 use std::time::Duration;
@@ -21,6 +20,12 @@ use crate::MountHandle;
 /// Outcome of a supervised command.
 pub enum ChildOutcome {
     Exited(ExitStatus),
+    Interrupted(i32),
+}
+
+/// Outcome of supervised async work that is not itself a child process.
+pub enum SupervisedTaskOutcome<T> {
+    Completed(T),
     Interrupted(i32),
 }
 
@@ -72,10 +77,48 @@ pub async fn run_supervised_with_opts(
     status
 }
 
-/// Supervise a command without owning a mount.
+/// Run arbitrary async work with a mounted filesystem and always unmount afterward.
 ///
-/// This compatibility helper is used by existing CLI command owners until all
-/// of them move to [`run_supervised`].
+/// This covers mount-owning flows whose lifetime is not represented by one
+/// child process, such as `agentfs clone`'s mount plus bulk-import pipeline.
+pub async fn run_supervised_task<T, F>(
+    handle: MountHandle,
+    task: F,
+) -> Result<SupervisedTaskOutcome<T>>
+where
+    F: Future<Output = Result<T>>,
+{
+    let outcome = tokio::select! {
+        result = task => result.map(SupervisedTaskOutcome::Completed),
+        signal = crate::termination_signal() => {
+            signal
+                .map(SupervisedTaskOutcome::Interrupted)
+                .map_err(anyhow::Error::from)
+        },
+    };
+
+    let unmount = handle.unmount().await;
+    unmount?;
+    outcome
+}
+
+/// Wait for a foreground mount to end, then unmount through the shared path.
+pub async fn supervise_mount(handle: MountHandle) -> Result<()> {
+    tokio::select! {
+        result = crate::shutdown_signal() => result.map_err(anyhow::Error::from),
+        _ = async {
+            loop {
+                if handle.is_finished() || !crate::is_mountpoint(handle.mountpoint()) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        } => Ok(()),
+    }?;
+    handle.unmount().await
+}
+
+/// Supervise a command without owning a mount.
 pub async fn supervise_command(mut command: tokio::process::Command) -> Result<ChildOutcome> {
     let opts = SuperviseOpts::default();
     configure_supervised_command(&mut command, opts);
@@ -92,15 +135,123 @@ pub async fn supervise_command(mut command: tokio::process::Command) -> Result<C
         signal = crate::termination_signal() => signal?,
     };
 
-    terminate_child(&mut child, opts.kill_process_group, libc::SIGTERM);
+    terminate_child(&mut child, opts.kill_process_group, signo);
     wait_or_kill(&mut child, opts).await?;
     Ok(ChildOutcome::Interrupted(signo))
 }
 
-#[cfg(any(target_os = "macos", test))]
+/// Hooks for supervising a forked child.
+#[cfg(unix)]
+#[derive(Default)]
+pub struct SuperviseHooks {
+    profile_checkpoint: Option<Box<dyn FnMut() + Send + 'static>>,
+}
+
+#[cfg(unix)]
+impl SuperviseHooks {
+    pub fn with_profile_checkpoint(hook: impl FnMut() + Send + 'static) -> Self {
+        Self {
+            profile_checkpoint: Some(Box::new(hook)),
+        }
+    }
+}
+
+/// Run an already-forked child with a mounted filesystem and always unmount afterward.
+#[cfg(unix)]
+pub async fn run_supervised_pid_with_hooks(
+    handle: MountHandle,
+    pid: libc::pid_t,
+    opts: SuperviseOpts,
+    hooks: SuperviseHooks,
+) -> Result<ExitStatus> {
+    let status = supervise_pid_with_hooks(pid, opts, hooks).await;
+    let unmount = handle.unmount().await;
+    unmount?;
+    status
+}
+
+/// Run an already-forked child with default supervision and a mounted filesystem.
+#[cfg(unix)]
+pub async fn run_supervised_pid(handle: MountHandle, pid: libc::pid_t) -> Result<ExitStatus> {
+    run_supervised_pid_with_hooks(
+        handle,
+        pid,
+        SuperviseOpts::default(),
+        SuperviseHooks::default(),
+    )
+    .await
+}
+
+/// Supervise an already-forked child without owning a mount.
+#[cfg(unix)]
+pub async fn supervise_pid_with_hooks(
+    pid: libc::pid_t,
+    opts: SuperviseOpts,
+    mut hooks: SuperviseHooks,
+) -> Result<ExitStatus> {
+    use tokio::signal::unix::{signal, Signal, SignalKind};
+
+    let mut term = signal(SignalKind::terminate())?;
+    let mut int = signal(SignalKind::interrupt())?;
+    let mut hup = signal(SignalKind::hangup())?;
+    let mut usr1 = if hooks.profile_checkpoint.is_some() {
+        Some(signal(SignalKind::user_defined1())?)
+    } else {
+        None
+    };
+
+    loop {
+        if let Some(status) = try_wait_pid(pid)? {
+            return Ok(status);
+        }
+
+        tokio::select! {
+            _ = term.recv() => return terminate_pid_and_wait(pid, opts, libc::SIGTERM).await,
+            _ = int.recv() => return terminate_pid_and_wait(pid, opts, libc::SIGINT).await,
+            _ = hup.recv() => return terminate_pid_and_wait(pid, opts, libc::SIGHUP).await,
+            _ = recv_optional_signal(&mut usr1) => {
+                if let Some(checkpoint) = hooks.profile_checkpoint.as_mut() {
+                    checkpoint();
+                }
+            },
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {},
+        }
+    }
+
+    async fn recv_optional_signal(signal: &mut Option<Signal>) {
+        match signal {
+            Some(signal) => {
+                let _ = signal.recv().await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    }
+}
+
+/// Prepare a child created by a command-specific `fork()` for shared supervision.
+#[cfg(unix)]
+pub fn prepare_forked_child(kill_process_group: bool) -> std::io::Result<()> {
+    supervised_child_pre_exec(kill_process_group)
+}
+
+/// Convert a child status to the process exit code used by shell-like commands.
+#[cfg(unix)]
+pub fn exit_code_for_status(status: ExitStatus) -> i32 {
+    signal_from_status(&status)
+        .map(|signal| 128 + signal)
+        .or_else(|| status.code())
+        .unwrap_or(1)
+}
+
+#[cfg(not(unix))]
+pub fn exit_code_for_status(status: ExitStatus) -> i32 {
+    status.code().unwrap_or(1)
+}
+
+#[cfg(test)]
 pub type ShutdownFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(test)]
 pub trait MountedCommandBackend {
     fn mountpoint(&self) -> &Path;
     fn unmount(&mut self) -> Result<()>;
@@ -108,7 +259,7 @@ pub trait MountedCommandBackend {
     fn remove_mountpoint(&mut self) -> Result<()>;
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(test)]
 pub async fn supervise_mounted_command<B>(
     command: tokio::process::Command,
     mut backend: B,
@@ -122,7 +273,7 @@ where
     outcome
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(test)]
 async fn cleanup_mounted_backend<B>(backend: &mut B) -> Result<()>
 where
     B: MountedCommandBackend,
@@ -166,7 +317,7 @@ async fn wait_for_supervised_child(
         signal = crate::termination_signal() => signal?,
     };
 
-    terminate_child(child, opts.kill_process_group, libc::SIGTERM);
+    terminate_child(child, opts.kill_process_group, signo);
     let status = wait_or_kill(child, opts).await?;
     if let Some(signal) = signal_from_status(&status) {
         tracing_signal_teardown(signo, signal);
@@ -187,11 +338,61 @@ async fn wait_or_kill(
     }
 }
 
+#[cfg(unix)]
+async fn terminate_pid_and_wait(
+    pid: libc::pid_t,
+    opts: SuperviseOpts,
+    signal: i32,
+) -> Result<ExitStatus> {
+    terminate_pid(pid, opts.kill_process_group, signal);
+    match tokio::time::timeout(opts.term_grace, wait_for_pid_exit(pid)).await {
+        Ok(status) => status,
+        Err(_) => {
+            terminate_pid(pid, opts.kill_process_group, libc::SIGKILL);
+            wait_for_pid_exit(pid).await
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_pid_exit(pid: libc::pid_t) -> Result<ExitStatus> {
+    loop {
+        if let Some(status) = try_wait_pid(pid)? {
+            return Ok(status);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[cfg(unix)]
+fn try_wait_pid(pid: libc::pid_t) -> Result<Option<ExitStatus>> {
+    use std::os::unix::process::ExitStatusExt;
+
+    let mut status: libc::c_int = 0;
+    let rc = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+    if rc == pid {
+        return Ok(Some(ExitStatus::from_raw(status)));
+    }
+    if rc == 0 {
+        return Ok(None);
+    }
+
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EINTR) {
+        return Ok(None);
+    }
+    Err(error.into())
+}
+
 fn terminate_child(child: &mut tokio::process::Child, kill_process_group: bool, signal: i32) {
     let Some(pid) = child.id() else {
         return;
     };
-    let pid = pid as i32;
+    terminate_pid(pid as i32, kill_process_group, signal);
+}
+
+#[cfg(unix)]
+fn terminate_pid(pid: libc::pid_t, kill_process_group: bool, signal: i32) {
     let rc = if kill_process_group {
         unsafe { libc::killpg(pid, signal) }
     } else {

@@ -1,7 +1,7 @@
 use agentfs_core::{
     error::Error as SdkError, AgentFSOptions, FileSystem, HostFS, OverlayFS, PartialOriginPolicy,
 };
-use agentfs_mount::{mount_fs, Backend, MountHandle, MountOpts};
+use agentfs_mount::{mount_fs, Backend, MountOpts};
 use anyhow::Result;
 use std::{
     path::{Path, PathBuf},
@@ -308,22 +308,7 @@ async fn run_mount_session(
         eprintln!("Press Ctrl+C to unmount and exit.");
     }
 
-    let _interrupted = wait_for_mount_end(&handle).await?;
-    handle.unmount().await
-}
-
-async fn wait_for_mount_end(handle: &MountHandle) -> Result<bool> {
-    tokio::select! {
-        result = agentfs_mount::shutdown_signal() => result.map(|_| true).map_err(Into::into),
-        _ = async {
-            loop {
-                if handle.is_finished() || !agentfs_mount::is_mountpoint(handle.mountpoint()) {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            }
-        } => Ok(false),
-    }
+    agentfs_mount::supervise::supervise_mount(handle).await
 }
 
 /// List all currently mounted agentfs filesystems (Linux)

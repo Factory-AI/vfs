@@ -209,7 +209,7 @@ async fn run_init_cmd(
     agent: AgentFS,
 ) -> AnyhowResult<()> {
     use agentfs_core::{FileSystem, HostFS};
-    use agentfs_mount::supervise::{supervise_command, ChildOutcome};
+    use agentfs_mount::supervise::{exit_code_for_status, run_supervised};
     use agentfs_mount::{mount_fs, MountOpts};
     use std::sync::Arc;
 
@@ -245,25 +245,16 @@ async fn run_init_cmd(
 
     let mut command = tokio::process::Command::new("sh");
     command.arg("-c").arg(&cmd_str).current_dir(&mountpoint);
-    let outcome = supervise_command(command)
+    let status = run_supervised(mount_handle, command)
         .await
         .with_context(|| format!("Failed to execute: {}", cmd_str));
 
-    mount_handle.unmount().await?;
-
     let _ = std::fs::remove_dir_all(&mountpoint);
 
-    match outcome? {
-        ChildOutcome::Exited(status) => {
-            if !status.success() {
-                crate::profiling::emit_cli_report();
-                std::process::exit(status.code().unwrap_or(1));
-            }
-        }
-        ChildOutcome::Interrupted(signo) => {
-            crate::profiling::emit_cli_report();
-            std::process::exit(128 + signo);
-        }
+    let status = status?;
+    if !status.success() {
+        crate::profiling::emit_cli_report();
+        std::process::exit(exit_code_for_status(status));
     }
 
     Ok(())

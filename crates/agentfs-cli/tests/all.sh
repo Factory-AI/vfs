@@ -90,6 +90,7 @@ run_test "profile-error-summary" "$DIR/test-profile-error-summary.sh"
 run_test "ephemeral-sidecar-cleanup" "$DIR/test-ephemeral-sidecar-cleanup.sh"
 run_test "teardown-bounded" "$DIR/test-teardown-bounded.sh"
 run_test "fuse-sigint-panic-census" "$DIR/test-fuse-sigint-panic-census.sh"
+run_test "sigkill-recovery" "$DIR/test-sigkill-recovery.sh"
 run_test "signal-teardown" env \
     SIGNAL_TEARDOWN_SIGNAL_DELAY="${SIGNAL_TEARDOWN_SIGNAL_DELAY:-8s}" \
     "$DIR/test-signal-teardown.sh"

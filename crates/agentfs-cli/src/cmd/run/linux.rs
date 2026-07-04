@@ -29,25 +29,8 @@ use std::{
     os::unix::fs::MetadataExt,
     os::unix::io::AsRawFd,
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicI32, AtomicU64, Ordering},
-        Arc,
-    },
+    sync::Arc,
 };
-
-/// Global child PID for signal forwarding.
-/// Set by the parent before installing signal handlers.
-static CHILD_PID: AtomicI32 = AtomicI32::new(0);
-
-/// Counter for termination signals received.
-/// First signal forwards to child, second signal sends SIGKILL.
-static TERM_SIGNAL_COUNT: AtomicI32 = AtomicI32::new(0);
-
-/// Count of pending profiling checkpoint requests (SIGUSR1).
-/// Incremented in the async-signal-safe handler; drained in the wait loop where
-/// it is safe to serialize and emit a profile summary. Used by the benchmark
-/// harness to attribute counters to workload phases.
-static PROFILE_CHECKPOINT_PENDING: AtomicU64 = AtomicU64::new(0);
 
 use agentfs_mount::{is_mountpoint, mount_fs, Backend, MountHandle, MountOpts};
 
@@ -77,111 +60,6 @@ const DEFAULT_ALLOWED_DIRS: &[&str] = &[
 /// Field index for mount point in /proc/self/mountinfo.
 /// Format: ID PARENT_ID MAJOR:MINOR ROOT MOUNT_POINT OPTIONS ...
 const MOUNTINFO_MOUNT_POINT_FIELD: usize = 4;
-
-/// Signal handler that forwards signals to the child process.
-///
-/// When the parent receives SIGTERM or SIGINT, this handler forwards
-/// the signal to the child process so it can shut down gracefully.
-/// On the second signal, SIGKILL is sent to force termination (handles
-/// cases where the child ignores SIGTERM, like interactive bash).
-///
-/// SAFETY: This is a signal handler. It must only use async-signal-safe functions.
-/// kill() and atomic operations are async-signal-safe.
-extern "C" fn forward_signal_to_child(sig: libc::c_int) {
-    let pid = CHILD_PID.load(Ordering::SeqCst);
-    if pid > 0 {
-        // Increment signal counter (fetch_add returns previous value)
-        let count = TERM_SIGNAL_COUNT.fetch_add(1, Ordering::SeqCst);
-
-        // SAFETY: kill() is async-signal-safe
-        unsafe {
-            if count == 0 {
-                // First signal: forward to child gracefully
-                libc::kill(pid, sig);
-            } else {
-                // Second+ signal: force kill the child
-                libc::kill(pid, libc::SIGKILL);
-            }
-        }
-    }
-}
-
-/// Signal handler that records a pending profiling checkpoint request.
-///
-/// The sandboxed workload sends SIGUSR1 at phase boundaries; we only flag the
-/// request here and let the wait loop emit the (async-signal-unsafe) summary.
-///
-/// SAFETY: This is a signal handler. It only performs an atomic increment, which
-/// is async-signal-safe.
-extern "C" fn request_profile_checkpoint(_sig: libc::c_int) {
-    PROFILE_CHECKPOINT_PENDING.fetch_add(1, Ordering::SeqCst);
-}
-
-/// Emit one profile checkpoint per pending SIGUSR1, draining the counter.
-///
-/// Called from the wait loop in normal (non-handler) context, where serializing
-/// and writing the profile summary is safe.
-fn drain_profile_checkpoints() {
-    let pending = PROFILE_CHECKPOINT_PENDING.swap(0, Ordering::SeqCst);
-    for _ in 0..pending {
-        crate::profiling::report_checkpoint();
-    }
-}
-
-/// Install signal handlers to forward SIGTERM and SIGINT to the child process.
-///
-/// This ensures that when the parent receives a termination signal, it forwards
-/// it to the child and waits for it to exit before cleaning up.
-fn install_signal_handlers() {
-    // Reset the signal counter for fresh signal handling
-    TERM_SIGNAL_COUNT.store(0, Ordering::SeqCst);
-    PROFILE_CHECKPOINT_PENDING.store(0, Ordering::SeqCst);
-
-    // SAFETY: sigaction() and sigprocmask() with valid signal numbers are safe.
-    // SA_RESTART ensures most syscalls restart after the handler returns.
-    unsafe {
-        // Ensure SIGTERM and SIGINT are not blocked (tokio might block them in worker threads)
-        let mut sigset: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut sigset);
-        libc::sigaddset(&mut sigset, libc::SIGTERM);
-        libc::sigaddset(&mut sigset, libc::SIGINT);
-        libc::pthread_sigmask(libc::SIG_UNBLOCK, &sigset, std::ptr::null_mut());
-
-        let mut sa: libc::sigaction = std::mem::zeroed();
-        libc::sigemptyset(&mut sa.sa_mask);
-        sa.sa_sigaction = forward_signal_to_child as *const () as usize;
-        sa.sa_flags = libc::SA_RESTART;
-
-        if libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut()) != 0 {
-            panic!(
-                "failed to install SIGTERM handler: {}",
-                std::io::Error::last_os_error()
-            );
-        }
-        if libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut()) != 0 {
-            panic!(
-                "failed to install SIGINT handler: {}",
-                std::io::Error::last_os_error()
-            );
-        }
-
-        // SIGUSR1 requests a profiling checkpoint. Install it WITHOUT SA_RESTART
-        // so the blocking waitpid in the wait loop returns EINTR, giving us a
-        // safe point to emit the (async-signal-unsafe) profile summary.
-        libc::sigaddset(&mut sigset, libc::SIGUSR1);
-        libc::pthread_sigmask(libc::SIG_UNBLOCK, &sigset, std::ptr::null_mut());
-        let mut usr_sa: libc::sigaction = std::mem::zeroed();
-        libc::sigemptyset(&mut usr_sa.sa_mask);
-        usr_sa.sa_sigaction = request_profile_checkpoint as *const () as usize;
-        usr_sa.sa_flags = 0;
-        if libc::sigaction(libc::SIGUSR1, &usr_sa, std::ptr::null_mut()) != 0 {
-            panic!(
-                "failed to install SIGUSR1 handler: {}",
-                std::io::Error::last_os_error()
-            );
-        }
-    }
-}
 
 /// Run a command in an overlay sandbox.
 #[allow(clippy::too_many_arguments)]
@@ -219,7 +97,8 @@ pub async fn run(
             command,
             args,
             &session.run_id,
-        );
+        )
+        .await;
     }
 
     print_welcome_banner(&cwd, &allowed_paths, &session.run_id, encryption.is_some());
@@ -358,8 +237,9 @@ pub async fn run(
             eprintln!("Warning: Failed to write proc file: {}", e);
         }
 
-        // Keep cwd_fd alive - it's needed by HostFS in the FUSE thread
-        run_parent(child_pid, cwd_fd, mount_handle, &session.run_id);
+        // Keep cwd_fd alive - it's needed by HostFS in the FUSE thread.
+        let exit_code = run_parent(child_pid, cwd_fd, mount_handle, &session.run_id).await?;
+        std::process::exit(exit_code);
     }
 }
 
@@ -367,7 +247,7 @@ pub async fn run(
 ///
 /// This is used when joining an existing session that already has a FUSE mount active.
 /// We don't need to start a new FUSE server, just run the command in the existing mount.
-fn run_in_existing_session(
+async fn run_in_existing_session(
     cwd: &Path,
     fuse_mountpoint: &Path,
     allowed_paths: &[PathBuf],
@@ -436,13 +316,15 @@ fn run_in_existing_session(
             eprintln!("Warning: Failed to write proc file: {}", e);
         }
 
-        // Store child PID and install signal handlers before waiting
-        CHILD_PID.store(child_pid, Ordering::SeqCst);
-        install_signal_handlers();
-
-        // Wait for child to exit (don't unmount or cleanup - the original session owns that)
-        // Retry on EINTR (signal interruption)
-        let exit_code = wait_for_child(child_pid);
+        let status = agentfs_mount::supervise::supervise_pid_with_hooks(
+            child_pid,
+            agentfs_mount::supervise::SuperviseOpts::default(),
+            agentfs_mount::supervise::SuperviseHooks::with_profile_checkpoint(
+                crate::profiling::report_checkpoint,
+            ),
+        )
+        .await?;
+        let exit_code = agentfs_mount::supervise::exit_code_for_status(status);
 
         // Clean up proc file
         crate::cmd::ps::remove_proc_file(session_id);
@@ -636,6 +518,10 @@ fn run_child(
     pipe_from_parent: libc::c_int,
     pipe_to_parent: libc::c_int,
 ) -> ! {
+    if let Err(error) = agentfs_mount::supervise::prepare_forked_child(true) {
+        child_exit(&format!("Failed to prepare supervised child: {error}"));
+    }
+
     // Step 1: Create new user + mount namespaces for unprivileged isolation.
     // User namespace gives us CAP_SYS_ADMIN within the namespace to manipulate mounts.
     // SAFETY: unshare() with valid flags is safe; we handle the error case.
@@ -936,33 +822,30 @@ fn unescape_mountinfo(s: &str) -> String {
 }
 
 /// Parent process: wait for child to exit, then clean up.
-///
-/// The MountHandle automatically unmounts when dropped. We explicitly drop it
-/// before calling exit() to ensure cleanup happens.
-fn run_parent(
+async fn run_parent(
     child_pid: i32,
     cwd_fd: std::fs::File,
     mount_handle: MountHandle,
     session_id: &str,
-) -> ! {
-    // Store child PID and install signal handlers before waiting
-    CHILD_PID.store(child_pid, Ordering::SeqCst);
-    install_signal_handlers();
-
-    // Wait for child process to exit, retrying on EINTR (signal interruption)
-    let exit_code = wait_for_child(child_pid);
-
-    // Clean up proc file
-    crate::cmd::ps::remove_proc_file(session_id);
-
+) -> Result<i32> {
     // Get mountpoint before dropping handle
     let fuse_mountpoint = mount_handle.mountpoint().to_path_buf();
 
     // Release the underlying directory fd (was kept alive for HostFS)
     drop(cwd_fd);
 
-    // Drop the mount handle to unmount (this also moves away from mountpoint)
-    drop(mount_handle);
+    let status = agentfs_mount::supervise::run_supervised_pid_with_hooks(
+        mount_handle,
+        child_pid,
+        agentfs_mount::supervise::SuperviseOpts::default(),
+        agentfs_mount::supervise::SuperviseHooks::with_profile_checkpoint(
+            crate::profiling::report_checkpoint,
+        ),
+    )
+    .await;
+
+    // Clean up proc file
+    crate::cmd::ps::remove_proc_file(session_id);
 
     // Clean up the FUSE mountpoint directory (but keep the delta database)
     if let Err(e) = std::fs::remove_dir_all(&fuse_mountpoint) {
@@ -989,7 +872,7 @@ fn run_parent(
 
     crate::profiling::emit_cli_report();
 
-    std::process::exit(exit_code);
+    Ok(agentfs_mount::supervise::exit_code_for_status(status?))
 }
 
 /// Execute the command, replacing the current process.
@@ -1059,41 +942,5 @@ fn setup_env_vars(session_id: &str) {
             "/dev/null".to_string()
         };
         std::env::set_var("GIT_SSH_COMMAND", format!("ssh -F {}", config_path));
-    }
-}
-
-/// Wait for a child process to exit, retrying on EINTR.
-///
-/// Returns the exit code of the child process, or 1 if waitpid fails.
-fn wait_for_child(child_pid: libc::pid_t) -> i32 {
-    let mut status: libc::c_int = 0;
-    loop {
-        // SAFETY: waitpid with valid child pid is safe
-        let result = unsafe { libc::waitpid(child_pid, &mut status, 0) };
-        if result == -1 {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EINTR) {
-                // Interrupted by signal. Emit any pending profile checkpoints
-                // (SIGUSR1) here, in a context where it is safe to do so.
-                drain_profile_checkpoints();
-                // Interrupted by signal, retry
-                continue;
-            }
-            // Other error, return exit code 1
-            return 1;
-        }
-        break;
-    }
-    wait_status_to_exit_code(status)
-}
-
-/// Extract exit code from wait status.
-fn wait_status_to_exit_code(status: libc::c_int) -> i32 {
-    if libc::WIFEXITED(status) {
-        libc::WEXITSTATUS(status)
-    } else if libc::WIFSIGNALED(status) {
-        128 + libc::WTERMSIG(status)
-    } else {
-        1
     }
 }

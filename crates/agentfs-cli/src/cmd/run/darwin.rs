@@ -15,10 +15,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use agentfs_mount::supervise::{
-    supervise_command, supervise_mounted_command, ChildOutcome, MountedCommandBackend,
-    ShutdownFuture,
+    exit_code_for_status, run_supervised, supervise_command, ChildOutcome,
 };
-use agentfs_mount::{mount_fs, Backend, MountHandle, MountOpts};
+use agentfs_mount::{mount_fs, Backend, MountOpts};
 
 /// Configuration for the macOS sandbox profile.
 #[derive(Debug, Clone)]
@@ -195,15 +194,18 @@ pub async fn run(
 
     print_welcome_banner(&session, encrypted);
 
-    let mount_backend = DarwinNfsRunMount {
-        mountpoint: session.mountpoint.clone(),
-        mount_handle: Some(mount_handle),
-    };
     let command_display = command.display().to_string();
     let child_command = command_in_mount(&session, command, args);
-    let outcome = supervise_mounted_command(child_command, mount_backend)
+    let status = run_supervised(mount_handle, child_command)
         .await
         .with_context(|| format!("Darwin/NFS run supervision failed for {command_display}"));
+    if let Err(e) = std::fs::remove_dir(&session.mountpoint) {
+        eprintln!(
+            "Warning: Failed to clean up mountpoint {}: {}",
+            session.mountpoint.display(),
+            e
+        );
+    }
 
     // Print session info for the user
     eprintln!();
@@ -216,46 +218,7 @@ pub async fn run(
     eprintln!("  agentfs diff {}", session.session_id);
 
     crate::profiling::emit_cli_report();
-    std::process::exit(exit_code_for_outcome(outcome?));
-}
-
-struct DarwinNfsRunMount {
-    mountpoint: PathBuf,
-    mount_handle: Option<MountHandle>,
-}
-
-impl MountedCommandBackend for DarwinNfsRunMount {
-    fn mountpoint(&self) -> &Path {
-        &self.mountpoint
-    }
-
-    fn unmount(&mut self) -> Result<()> {
-        Ok(())
-    }
-
-    fn shutdown_server(&mut self) -> ShutdownFuture<'_> {
-        let mount_handle = self.mount_handle.take();
-        Box::pin(async move {
-            if let Some(handle) = mount_handle {
-                handle
-                    .unmount()
-                    .await
-                    .context("NFS mount shutdown failed")?;
-            }
-            Ok(())
-        })
-    }
-
-    fn remove_mountpoint(&mut self) -> Result<()> {
-        if let Err(e) = std::fs::remove_dir(&self.mountpoint) {
-            eprintln!(
-                "Warning: Failed to clean up mountpoint {}: {}",
-                self.mountpoint.display(),
-                e
-            );
-        }
-        Ok(())
-    }
+    std::process::exit(exit_code_for_status(status?));
 }
 
 fn exit_code_for_outcome(outcome: ChildOutcome) -> i32 {
