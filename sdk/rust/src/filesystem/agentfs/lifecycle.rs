@@ -13,6 +13,10 @@ use turso::Connection;
 /// deletion.
 #[async_trait]
 pub trait ReapHook: Send + Sync {
+    fn dedup_key(&self) -> Option<&'static str> {
+        None
+    }
+
     async fn on_reap(&self, conn: &Connection, ino: i64) -> Result<()>;
 }
 
@@ -34,8 +38,18 @@ impl Lifecycle {
         self.open_inodes.defer_reap_if_open(ino)
     }
 
-    pub fn register_reap_hook(&self, hook: Arc<dyn ReapHook>) {
-        self.reap_hooks.lock().unwrap().push(hook);
+    pub fn register_reap_hook(&self, hook: Arc<dyn ReapHook>) -> bool {
+        let mut hooks = self.reap_hooks.lock().unwrap();
+        if let Some(key) = hook.dedup_key() {
+            if hooks
+                .iter()
+                .any(|registered| registered.dedup_key() == Some(key))
+            {
+                return false;
+            }
+        }
+        hooks.push(hook);
+        true
     }
 
     /// Sweep POSIX orphans a crash stranded: nlink = 0 rows are files that
@@ -76,11 +90,21 @@ impl Lifecycle {
     /// handles existed (POSIX unlink-while-open). Runs opportunistically at
     /// namespace mutations and at finalize; crash recovery is covered by the
     /// mount sweep.
-    pub(crate) async fn process_deferred_reaps(&self, pool: &ConnectionPool) -> Result<Vec<i64>> {
+    pub(crate) async fn process_deferred_reaps<F>(
+        &self,
+        pool: &ConnectionPool,
+        before_reap: F,
+    ) -> Result<Vec<i64>>
+    where
+        F: Fn(i64),
+    {
         if !self.open_inodes.has_pending_reaps() {
             return Ok(Vec::new());
         }
         let inos = self.open_inodes.take_reap_queue();
+        for ino in &inos {
+            before_reap(*ino);
+        }
         let conn = pool.get_connection().await?;
         let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
         let result: Result<Vec<i64>> = async {
@@ -130,6 +154,11 @@ impl Lifecycle {
 
     fn hooks_snapshot(&self) -> Vec<Arc<dyn ReapHook>> {
         self.reap_hooks.lock().unwrap().iter().cloned().collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reap_hook_count(&self) -> usize {
+        self.reap_hooks.lock().unwrap().len()
     }
 
     async fn nlink_zero_inos(&self, conn: &Connection) -> Result<Vec<i64>> {

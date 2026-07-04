@@ -276,8 +276,13 @@ impl AgentFS {
         self.core_config.partial_origin
     }
 
-    pub fn register_reap_hook(&self, hook: Arc<dyn ReapHook>) {
-        self.lifecycle.register_reap_hook(hook);
+    pub fn register_reap_hook(&self, hook: Arc<dyn ReapHook>) -> bool {
+        self.lifecycle.register_reap_hook(hook)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reap_hook_count(&self) -> usize {
+        self.lifecycle.reap_hook_count()
     }
 
     /// Get a database connection from the pool
@@ -587,9 +592,13 @@ impl AgentFS {
     /// namespace mutations and at finalize; a crash is covered by the
     /// nlink=0 sweep at mount.
     pub async fn process_deferred_reaps(&self) -> Result<()> {
-        let reaped = self.lifecycle.process_deferred_reaps(&self.pool).await?;
+        let reaped = self
+            .lifecycle
+            .process_deferred_reaps(&self.pool, |ino| {
+                self.discard_pending_before_reap(ino);
+            })
+            .await?;
         for ino in reaped {
-            self.discard_pending_after_reap(ino);
             self.invalidate_attr(ino);
         }
         Ok(())
@@ -599,7 +608,7 @@ impl AgentFS {
         self.lifecycle.reap_inode_with_conn(conn, ino).await
     }
 
-    fn discard_pending_after_reap(&self, ino: i64) {
+    fn discard_pending_before_reap(&self, ino: i64) {
         if let Some(drain) = &self.write_drain {
             drain.discard_pending(ino);
         }

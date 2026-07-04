@@ -52,6 +52,10 @@ was copied into `.agents/benchmarks/restructure-baseline/medians.json`.
   files for the active `medians.json`. The directory name is historical: it
   disambiguates the post-M3 raw iterations from the archived M1 raw iterations,
   and there is intentionally no sibling `medians-post-m3.json` file.
+- `bin/agentfs`: prebuilt baseline-code sentinel binary from commit
+  `2b811f03493e861e5a7786592d25ac73b39e1aba`, used when ambient drift requires
+  a direct candidate-vs-baseline rerun.
+- `bin/agentfs.sha256`: SHA-256 checksum for the cached sentinel binary.
 - `medians-m1.json`: archived M1 aggregate retained for auditability.
 - `medians.json.iterations/`: archived M1 warmup and measured iteration JSON
   files retained for auditability.

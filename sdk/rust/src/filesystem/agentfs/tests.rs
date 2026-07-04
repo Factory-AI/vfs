@@ -1808,6 +1808,22 @@
         }
     }
 
+    struct PendingStateReapHook {
+        batcher: Arc<AgentFSWriteBatcher>,
+        saw_pending: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl ReapHook for PendingStateReapHook {
+        async fn on_reap(&self, _conn: &Connection, ino: i64) -> Result<()> {
+            self.saw_pending.store(
+                self.batcher.has_pending(ino),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            Ok(())
+        }
+    }
+
     async fn count_probe_rows(fs: &AgentFS, ino: i64) -> Result<i64> {
         let conn = fs.pool.get_connection().await?;
         let mut rows = conn
@@ -1861,6 +1877,49 @@
 
         fs.process_deferred_reaps().await?;
         assert_eq!(count_probe_rows(&fs, ino).await?, 1);
+        assert_eq!(count_rows(&fs, "fs_inode", ino).await?, 0);
+        assert_eq!(count_rows(&fs, "fs_data", ino).await?, 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deferred_reap_discards_pending_before_reap_hooks() -> Result<()> {
+        let (fs, _dir) = create_test_fs_with_config(test_config_with_long_batch_window()).await?;
+        let (stats, file) = fs
+            .create_file("/pending-reap.bin", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        let ino = stats.ino;
+        file.pwrite(0, b"pending reap").await?;
+
+        let batcher = fs
+            .write_batcher
+            .as_ref()
+            .expect("long-window test config enables the batcher")
+            .clone();
+        assert!(
+            batcher.has_pending(ino),
+            "test setup requires a pending write before the file is reaped"
+        );
+
+        let hook = Arc::new(PendingStateReapHook {
+            batcher: Arc::clone(&batcher),
+            saw_pending: std::sync::atomic::AtomicBool::new(true),
+        });
+        fs.register_reap_hook(hook.clone());
+
+        FileSystem::unlink(&fs, ROOT_INO, "pending-reap.bin").await?;
+        drop(file);
+        fs.process_deferred_reaps().await?;
+
+        assert!(
+            !hook.saw_pending.load(std::sync::atomic::Ordering::SeqCst),
+            "pending writes must be discarded before reap hooks run in the reap transaction"
+        );
+        assert!(
+            !batcher.has_pending(ino),
+            "pending writes for a reaped inode must not survive the reap"
+        );
         assert_eq!(count_rows(&fs, "fs_inode", ino).await?, 0);
         assert_eq!(count_rows(&fs, "fs_data", ino).await?, 0);
 
@@ -3156,6 +3215,71 @@
         assert!(
             cached_attr(&fs, created.ino).is_none(),
             "a cache fill captured before a racing drain must be skipped"
+        );
+
+        let current = FileSystem::getattr(&fs, created.ino)
+            .await?
+            .expect("file should still exist");
+        assert_eq!(current.size, 7);
+        assert_eq!(file.pread(0, 16).await?, b"pending");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retired_generations_prune_without_cache_fill_aba() -> Result<()> {
+        let (fs, _dir) = create_test_fs_with_config(test_config_with_long_batch_window()).await?;
+        let (created, file) = fs
+            .create_file("/pruned-generation.txt", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+
+        file.pwrite(0, b"pending").await?;
+
+        let conn = fs.pool.get_connection().await?;
+        let generation = fs.pending_generation(created.ino);
+        let mut stale_stats = store::getattr(&conn, created.ino)
+            .await?
+            .expect("file should exist");
+        self::AgentFS::merge_pending_view(&fs, created.ino, Some(&mut stale_stats));
+        drop(conn);
+
+        file.drain_writes().await?;
+        let batcher = fs
+            .write_batcher
+            .as_ref()
+            .expect("long-window test config enables the batcher");
+        assert!(
+            batcher.retired_generation_contains(created.ino),
+            "draining a pending entry should retire its generation before pruning"
+        );
+
+        for idx in 0..(batcher::MAX_RETIRED_GENERATIONS + 8) {
+            let path = format!("/retired-{idx}.txt");
+            let (stats, _file) = fs.create_file(&path, DEFAULT_FILE_MODE, 0, 0).await?;
+            batcher
+                .enqueue_for_test(
+                    stats.ino,
+                    vec![WriteRange {
+                        offset: 0,
+                        data: vec![b'x'],
+                    }],
+                )
+                .await?;
+            batcher.discard_pending(stats.ino);
+        }
+
+        assert!(
+            batcher.retired_generation_count() <= batcher::MAX_RETIRED_GENERATIONS,
+            "retired generations must stay bounded under inode churn"
+        );
+        assert!(
+            !batcher.retired_generation_contains(created.ino),
+            "the oldest retired generation should have been pruned by the sweep"
+        );
+
+        fs.cache_attr_if_pending_generation(stale_stats, generation);
+        assert!(
+            cached_attr(&fs, created.ino).is_none(),
+            "a cache fill that observed the pre-drain generation must still be skipped after pruning"
         );
 
         let current = FileSystem::getattr(&fs, created.ino)

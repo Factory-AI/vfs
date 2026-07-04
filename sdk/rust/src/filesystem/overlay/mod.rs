@@ -96,6 +96,10 @@ struct OverlaySidecarReapHook;
 
 #[async_trait]
 impl ReapHook for OverlaySidecarReapHook {
+    fn dedup_key(&self) -> Option<&'static str> {
+        Some("overlay-sidecar")
+    }
+
     async fn on_reap(&self, conn: &Connection, ino: i64) -> Result<()> {
         conn.execute("DELETE FROM fs_origin WHERE delta_ino = ?", (ino,))
             .await?;

@@ -23,6 +23,27 @@ This file records the orchestrator-approved rebaseline for
 | Build command | `cargo +nightly build --release --workspace --bins` |
 | Benchmark command | `python3 scripts/validation/git-workload-benchmark-multi.py --label misc-a-rebaseline-run3 --iterations 5 --warmup 1 --agentfs-bin "$PWD/target/release/agentfs" --output /tmp/vfs-val/misc-a-bench-rebaseline/run3.json --keep-iterations --source .agents/benchmarks/fixtures/codex --read-files 64 --read-bytes 4096 --edit-files 8` |
 
+## Cached sentinel binary
+
+`bin/agentfs` is a prebuilt baseline-code sentinel binary for future BENCH
+features that need an ambient-drift check. It was built from the same recorded
+baseline commit, `2b811f03493e861e5a7786592d25ac73b39e1aba`, with:
+
+```bash
+git worktree add --detach /tmp/vfs-restructure-baseline-bin.<tmp> 2b811f03493e861e5a7786592d25ac73b39e1aba
+CARGO_TARGET_DIR=/home/ain3sh/factory/vfs/target \
+  cargo +nightly build --release --workspace --bins \
+  --manifest-path /tmp/vfs-restructure-baseline-bin.<tmp>/Cargo.toml
+install -m 0755 /home/ain3sh/factory/vfs/target/release/agentfs \
+  /home/ain3sh/factory/vfs/.agents/benchmarks/restructure-baseline/bin/agentfs
+```
+
+The cached binary reports `agentfs v0.6.4-107-g2b811f0`. Its SHA-256 is:
+
+```text
+3062585011a5a58da5b92781b808c58856be81125ee073b972513c4e4a3c0e53  .agents/benchmarks/restructure-baseline/bin/agentfs
+```
+
 ## Load and hygiene checks
 
 All benchmark runs were serialized. Before each run, the worker checked load,

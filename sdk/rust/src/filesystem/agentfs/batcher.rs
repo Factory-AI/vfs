@@ -17,6 +17,11 @@ use super::store::{self, normalize_write_ranges, NormalizedWriteRange, WriteRang
 
 pub(super) type Invalidate = Arc<dyn Fn(i64) + Send + Sync + 'static>;
 
+#[cfg(test)]
+pub(super) const MAX_RETIRED_GENERATIONS: usize = 64;
+#[cfg(not(test))]
+const MAX_RETIRED_GENERATIONS: usize = 16 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct PendingGeneration(u64);
 
@@ -246,8 +251,8 @@ impl PendingInodeWrites {
         }
     }
 
-    fn bump_generation(&mut self) {
-        self.generation = self.generation.wrapping_add(1);
+    fn bump_generation(&mut self, generation: u64) {
+        self.generation = generation;
     }
 
     /// True when nothing is left to commit for this inode (no data ranges and
@@ -273,13 +278,27 @@ impl PendingInodeWrites {
     }
 }
 
+#[derive(Clone, Copy)]
+struct RetiredGeneration {
+    generation: u64,
+    retired_at: u64,
+}
+
 #[derive(Default)]
 struct AgentFSWriteBatcherState {
     pending: HashMap<i64, PendingInodeWrites>,
     /// Monotonic per-inode version for the pending overlay. Cache fills that
     /// read SQLite before a concurrent drain must compare the generation they
     /// observed with the current one before inserting attrs.
-    retired_generations: HashMap<i64, u64>,
+    retired_generations: HashMap<i64, RetiredGeneration>,
+    /// Global monotonic generation watermark. When an old retired generation
+    /// is pruned, absent inodes report this watermark instead of resetting to
+    /// zero. That makes pruning ABA-safe: a cache fill that observed a
+    /// pending generation can never compare equal after the entry is drained
+    /// and swept from `retired_generations`.
+    last_generation: u64,
+    /// Logical retirement epoch used only to bound `retired_generations`.
+    retired_generation_epoch: u64,
     /// Running sum of `pending_bytes` across every inode in `pending`. Kept in
     /// lock-step with the map so the enqueue path can enforce a global memory
     /// cap in O(1) instead of summing the map on every write. Every site that
@@ -300,31 +319,63 @@ impl AgentFSWriteBatcherState {
             self.pending
                 .get(&ino)
                 .map(|entry| entry.generation)
-                .or_else(|| self.retired_generations.get(&ino).copied())
-                .unwrap_or(0),
+                .or_else(|| {
+                    self.retired_generations
+                        .get(&ino)
+                        .map(|retired| retired.generation)
+                })
+                .unwrap_or(self.last_generation),
         )
     }
 
     fn bump_generation(&mut self, ino: i64) {
+        let generation = self.next_generation();
         if let Some(entry) = self.pending.get_mut(&ino) {
-            entry.bump_generation();
+            entry.bump_generation(generation);
         } else {
-            let next = self
-                .retired_generations
-                .get(&ino)
-                .copied()
-                .unwrap_or(0)
-                .wrapping_add(1);
-            self.retired_generations.insert(ino, next);
+            self.retire_generation(ino, generation);
         }
     }
 
-    fn next_generation_for_new_entry(&self, ino: i64) -> u64 {
+    fn next_generation(&mut self) -> u64 {
+        self.last_generation = self
+            .last_generation
+            .checked_add(1)
+            .expect("AgentFS write batcher generation counter exhausted");
+        self.last_generation
+    }
+
+    fn retire_generation(&mut self, ino: i64, generation: u64) {
+        self.retired_generation_epoch = self
+            .retired_generation_epoch
+            .checked_add(1)
+            .expect("AgentFS write batcher retired-generation epoch exhausted");
+        self.retired_generations.insert(
+            ino,
+            RetiredGeneration {
+                generation,
+                retired_at: self.retired_generation_epoch,
+            },
+        );
+        self.prune_retired_generations();
+    }
+
+    fn prune_retired_generations(&mut self) {
+        let len = self.retired_generations.len();
+        if len <= MAX_RETIRED_GENERATIONS {
+            return;
+        }
+
+        let drop_count = len - MAX_RETIRED_GENERATIONS;
+        let mut epochs: Vec<u64> = self
+            .retired_generations
+            .values()
+            .map(|retired| retired.retired_at)
+            .collect();
+        epochs.sort_unstable();
+        let cutoff = epochs[drop_count - 1];
         self.retired_generations
-            .get(&ino)
-            .copied()
-            .unwrap_or(0)
-            .wrapping_add(1)
+            .retain(|_, retired| retired.retired_at > cutoff);
     }
 
     #[cfg(debug_assertions)]
@@ -424,13 +475,13 @@ impl AgentFSWriteBatcher {
         {
             let mut state = self.state.write();
             drain_now = {
-                let new_entry_generation = state.next_generation_for_new_entry(ino);
+                let generation = state.next_generation();
                 let entry = state
                     .pending
                     .entry(ino)
-                    .or_insert_with(|| PendingInodeWrites::new(new_entry_generation));
+                    .or_insert_with(|| PendingInodeWrites::new(generation));
                 entry.push_ranges(ranges, byte_count)?;
-                entry.bump_generation();
+                entry.bump_generation(generation);
                 crate::profiling::record_agentfs_batcher_enqueue();
                 crate::profiling::record_agentfs_batcher_pending_bytes(entry.pending_bytes as u64);
 
@@ -860,7 +911,7 @@ impl AgentFSWriteBatcher {
     fn remove_committed_prefix(&self, committed: &[(i64, usize)]) {
         let mut state = self.state.write();
         for &(ino, count) in committed {
-            let (removed_bytes, empty, generation) = {
+            let (removed_bytes, empty, should_bump) = {
                 let Some(entry) = state.pending.get_mut(&ino) else {
                     continue;
                 };
@@ -870,14 +921,22 @@ impl AgentFSWriteBatcher {
                 // An entry with stashed explicit times but no ranges is NOT
                 // drained yet — keep it so a later drain commits the times.
                 let empty = entry.is_drained();
-                if removed_bytes > 0 || empty {
-                    entry.bump_generation();
+                (removed_bytes, empty, removed_bytes > 0 || empty)
+            };
+            let generation = if should_bump {
+                let generation = state.next_generation();
+                if let Some(entry) = state.pending.get_mut(&ino) {
+                    entry.bump_generation(generation);
                 }
-                (removed_bytes, empty, entry.generation)
+                Some(generation)
+            } else {
+                None
             };
             state.total_pending_bytes = state.total_pending_bytes.saturating_sub(removed_bytes);
             if empty {
-                state.retired_generations.insert(ino, generation);
+                if let Some(generation) = generation {
+                    state.retire_generation(ino, generation);
+                }
                 state.pending.remove(&ino);
             }
         }
@@ -899,7 +958,7 @@ impl AgentFSWriteBatcher {
                 if let Some(b) = state.pending.remove(ino) {
                     state.total_pending_bytes =
                         state.total_pending_bytes.saturating_sub(b.pending_bytes);
-                    state.retired_generations.insert(*ino, b.generation);
+                    state.retire_generation(*ino, b.generation);
                 }
             }
             state.debug_assert_total();
@@ -1033,15 +1092,17 @@ impl AgentFSWriteBatcher {
         }
         {
             let mut state = self.state.write();
-            let new_entry_generation = state.next_generation_for_new_entry(ino);
+            let generation = state.next_generation();
             state
                 .pending
                 .entry(ino)
-                .or_insert_with(|| PendingInodeWrites::new(new_entry_generation))
+                .or_insert_with(|| PendingInodeWrites::new(generation))
                 .pending_times
                 .get_or_insert_with(PendingTimeChange::default)
                 .apply(&change);
-            state.bump_generation(ino);
+            if let Some(entry) = state.pending.get_mut(&ino) {
+                entry.bump_generation(generation);
+            }
         }
         (self.invalidate)(ino);
         // A times-only entry still needs a scheduled drain to commit it.
@@ -1096,6 +1157,10 @@ impl AgentFSWriteBatcher {
     /// drain first.
     pub(super) fn truncate_pending(&self, ino: i64, new_size: u64) {
         let mut state = self.state.write();
+        if !state.pending.contains_key(&ino) {
+            return;
+        }
+        let generation = state.next_generation();
         let (old_bytes, new_bytes, now_empty, generation) = {
             let Some(batch) = state.pending.get_mut(&ino) else {
                 return;
@@ -1115,7 +1180,7 @@ impl AgentFSWriteBatcher {
                 !range.data.is_empty()
             });
             batch.pending_bytes = new_bytes;
-            batch.bump_generation();
+            batch.bump_generation(generation);
             (
                 old_bytes,
                 new_bytes,
@@ -1128,7 +1193,7 @@ impl AgentFSWriteBatcher {
             .saturating_sub(old_bytes)
             .saturating_add(new_bytes);
         if now_empty {
-            state.retired_generations.insert(ino, generation);
+            state.retire_generation(ino, generation);
             state.pending.remove(&ino);
         }
         state.debug_assert_total();
@@ -1143,9 +1208,8 @@ impl AgentFSWriteBatcher {
             state.total_pending_bytes = state
                 .total_pending_bytes
                 .saturating_sub(batch.pending_bytes);
-            state
-                .retired_generations
-                .insert(ino, batch.generation.wrapping_add(1));
+            let generation = state.next_generation();
+            state.retire_generation(ino, generation);
         }
         state.debug_assert_total();
     }
@@ -1153,6 +1217,16 @@ impl AgentFSWriteBatcher {
     #[cfg(test)]
     pub(super) fn total_pending_bytes(&self) -> usize {
         self.state.read().total_pending_bytes
+    }
+
+    #[cfg(test)]
+    pub(super) fn retired_generation_count(&self) -> usize {
+        self.state.read().retired_generations.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn retired_generation_contains(&self, ino: i64) -> bool {
+        self.state.read().retired_generations.contains_key(&ino)
     }
 }
 

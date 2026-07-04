@@ -974,7 +974,7 @@ impl FileSystem for AgentFS {
         // `.git/config.lock` during a clone). The transaction also makes the
         // dentry/nlink/inode removal atomic.
         let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
-        let result: Result<(i64, bool)> = async {
+        let result: Result<i64> = async {
             // Look up the child inode
             let ino = self
                 .lookup_child(&conn, parent_ino, name)
@@ -1020,25 +1020,17 @@ impl FileSystem for AgentFS {
             let link_count = self.get_link_count(&conn, ino).await?;
             let removed = link_count == 0 && !self.lifecycle.defer_reap_if_open(ino);
             if removed {
+                self.discard_pending_before_reap(ino);
                 self.reap_inode_with_conn(&conn, ino).await?;
             }
 
-            Ok((ino, removed))
+            Ok(ino)
         }
         .await;
 
         match result {
-            Ok((ino, removed)) => {
+            Ok(ino) => {
                 txn.commit().await?;
-                if removed {
-                    // Tier Four: discard any pending writes the batcher might
-                    // still hold for this inode. The drains tolerate a deleted
-                    // inode (NotFound is skipped, never inserted as orphan
-                    // `fs_data` rows), so dropping the moot ranges after the
-                    // commit keeps the overlay clean without risking data loss
-                    // on a rolled-back unlink.
-                    self.discard_pending_after_reap(ino);
-                }
                 self.invalidate_dentry(parent_ino, name);
                 self.invalidate_parent_attr(parent_ino);
                 self.invalidate_attr(ino);
@@ -1259,9 +1251,8 @@ impl FileSystem for AgentFS {
 
         let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
 
-        let result: Result<(Option<i64>, Option<i64>)> = async {
+        let result: Result<Option<i64>> = async {
             let mut replaced_dst_ino = None;
-            let mut reaped_dst_ino = None;
 
             if src_stats.is_directory() {
                 let mut ancestor_ino = newparent_ino;
@@ -1349,9 +1340,9 @@ impl FileSystem for AgentFS {
                 let link_count = self.get_link_count(&conn, dst_ino).await?;
                 if link_count == 0
                     && !self.lifecycle.defer_reap_if_open(dst_ino)
-                    && self.reap_inode_with_conn(&conn, dst_ino).await?
                 {
-                    reaped_dst_ino = Some(dst_ino);
+                    self.discard_pending_before_reap(dst_ino);
+                    self.reap_inode_with_conn(&conn, dst_ino).await?;
                 }
             }
 
@@ -1404,20 +1395,13 @@ impl FileSystem for AgentFS {
                 stmt.execute((now_secs, now_secs, now_nsec, now_nsec, newparent_ino)).await?;
             }
 
-            Ok((replaced_dst_ino, reaped_dst_ino))
+            Ok(replaced_dst_ino)
         }
         .await;
 
         match result {
-            Ok((replaced_dst_ino, reaped_dst_ino)) => {
+            Ok(replaced_dst_ino) => {
                 txn.commit().await?;
-                if let Some(dst_ino) = reaped_dst_ino {
-                    // Tier Four: see public `rename` for rationale — drop
-                    // pending batched writes for the deleted inode so a
-                    // subsequent batched drain doesn't INSERT into a
-                    // missing fs_inode row.
-                    self.discard_pending_after_reap(dst_ino);
-                }
 
                 // Invalidate cache for source and destination
                 self.invalidate_dentry(oldparent_ino, oldname);

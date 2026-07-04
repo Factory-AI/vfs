@@ -1015,6 +1015,31 @@
     }
 
     #[tokio::test]
+    async fn overlay_sidecar_reap_hook_registers_once() -> Result<()> {
+        let base_dir = tempdir()?;
+        let delta_dir = tempdir()?;
+        let db_path = delta_dir.path().join("delta.db");
+        let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+        assert_eq!(delta.reap_hook_count(), 0);
+
+        assert!(
+            delta.register_reap_hook(OverlayFS::sidecar_reap_hook()),
+            "first constructor-time sidecar hook registration should be accepted"
+        );
+        assert_eq!(delta.reap_hook_count(), 1);
+
+        let base = Arc::new(HostFS::new(base_dir.path())?);
+        let overlay = OverlayFS::new(base, delta);
+        assert_eq!(
+            overlay.delta().reap_hook_count(),
+            1,
+            "OverlayFS construction must not duplicate a pre-registered sidecar hook"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_overlay_partial_origin_hardlink_survives_source_unlink() -> Result<()> {
         let base_dir = tempdir()?;
         let delta_dir = tempdir()?;
