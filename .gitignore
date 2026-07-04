@@ -4,7 +4,8 @@
 __MACOSX/
 .AppleDouble
 .LSOverride
-Icon[]
+Icon[
+]
 
 # Thumbnails
 ._*
@@ -27,6 +28,8 @@ Temporary Items
 
 .agentfs
 target/
+/cli/tests/syscall/*.o
+/cli/tests/syscall/test-syscalls
 
 # Python bytecode cache
 __pycache__/

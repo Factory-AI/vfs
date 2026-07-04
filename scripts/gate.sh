@@ -31,13 +31,13 @@ run_cargo clippy --workspace --all-targets -- -D warnings
 run_cargo test --workspace
 run_cargo build --release --workspace --bins
 
-printf '\n==> cli/tests/all.sh\n'
+printf '\n==> crates/agentfs-cli/tests/all.sh\n'
 AGENTFS_GATE_STRICT=1 \
 CORRUPTION_TORTURE_WORKERS="${CORRUPTION_TORTURE_WORKERS:-4}" \
 CORRUPTION_TORTURE_ITERATIONS="${CORRUPTION_TORTURE_ITERATIONS:-3}" \
 CORRUPTION_TORTURE_TIMEOUT="${CORRUPTION_TORTURE_TIMEOUT:-120}" \
 CORRUPTION_TORTURE_TEARDOWN_TIMEOUT="${CORRUPTION_TORTURE_TEARDOWN_TIMEOUT:-10}" \
-timeout "$SHELL_TIMEOUT" cli/tests/all.sh
+timeout "$SHELL_TIMEOUT" crates/agentfs-cli/tests/all.sh
 
 run python3 scripts/validation/phase8-validation.py \
     --smoke \

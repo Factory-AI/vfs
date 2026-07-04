@@ -822,7 +822,7 @@ mod tests {
         let config = FuseConfig::from_env();
         let cache = config.kernel_cache();
 
-        eprintln!(
+        println!(
             "invalid AGENTFS_FUSE_READDIRPLUS kept default {:?}",
             cache.readdirplus_mode
         );
@@ -841,7 +841,7 @@ mod tests {
         let DispatchMode::Parallel { workers, .. } = config.dispatch_mode else {
             panic!("25% workers should resolve to parallel dispatch");
         };
-        eprintln!(
+        println!(
             "parsed DispatchMode::Parallel workers={workers}; cache writeback={}",
             cache.writeback_cache_enabled
         );

@@ -10,9 +10,10 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+REPO_ROOT="$(cd "$CLI_DIR/../.." && pwd)"
 TEST_FILE="$SCRIPT_DIR/hello.txt"
 ITERATIONS="${1:-100000}"
-AGENTFS="$CLI_DIR/target/release/agentfs"
+AGENTFS="$REPO_ROOT/target/release/agentfs"
 
 # Build benchmarks if needed
 make -C "$SCRIPT_DIR" -s

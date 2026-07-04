@@ -65,7 +65,7 @@ AgentFS harness command from TESTING.md:
 
 ```bash
 scripts/validation/posix/run-pjdfstest.sh \
-  --agentfs-bin "$PWD/cli/target/debug/agentfs" \
+  --agentfs-bin "$PWD/target/debug/agentfs" \
   --pjdfstest-dir /path/to/pjdfstest \
   --profile phase45-ci
 ```

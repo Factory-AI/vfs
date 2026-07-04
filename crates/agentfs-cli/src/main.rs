@@ -1,6 +1,7 @@
-use agentfs::{
+use agentfs_cli::{
     cmd::{self, completions::handle_completions},
     get_runtime,
+    logging::default_env_filter,
     opts::{Args, Command, FsCommand, PruneCommand, ServeCommand, SyncCommand},
 };
 use clap::{CommandFactory, Parser};
@@ -23,7 +24,7 @@ fn parse_encryption(key: Option<String>, cipher: Option<String>) -> Option<(Stri
 }
 
 fn partial_origin_policy(
-    mode: Option<agentfs::opts::PartialOriginMode>,
+    mode: Option<agentfs_cli::opts::PartialOriginMode>,
     threshold_bytes: Option<u64>,
 ) -> Option<agentfs_core::PartialOriginPolicy> {
     match (mode, threshold_bytes) {
@@ -48,23 +49,20 @@ fn exit_with_error(message: impl std::fmt::Display) -> ! {
 }
 
 fn exit_with_code(code: i32) -> ! {
-    agentfs::profiling::emit_cli_report();
+    agentfs_cli::profiling::emit_cli_report();
     std::process::exit(code);
 }
 
 fn main() {
     let _ = tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer())
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "agentfs=info".into()),
-        )
+        .with(default_env_filter())
         .try_init();
 
     reset_sigpipe();
 
     CompleteEnv::with_factory(Args::command).complete();
-    let _profile_report = agentfs::profiling::install_cli_sink();
+    let _profile_report = agentfs_cli::profiling::install_cli_sink();
     let args = match Args::try_parse() {
         Ok(args) => args,
         Err(error) => {
@@ -483,7 +481,7 @@ fn default_shell() -> std::path::PathBuf {
 #[cfg(test)]
 mod partial_origin {
     use super::partial_origin_policy;
-    use agentfs::opts::{Args, Command, PartialOriginMode};
+    use agentfs_cli::opts::{Args, Command, PartialOriginMode};
     use clap::Parser;
 
     #[test]

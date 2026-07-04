@@ -10,23 +10,113 @@
 use agentfs_core::{
     AgentFS, AgentFSOptions, EncryptionConfig, FileSystem, HostFS, OverlayFS, PartialOriginPolicy,
 };
-use agentfs_nfs::{serve, NfsServeOptions, ServerHandle};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
-use tokio_util::sync::CancellationToken;
 
 use agentfs_mount::supervise::{
     supervise_command, supervise_mounted_command, ChildOutcome, MountedCommandBackend,
     ShutdownFuture,
 };
+use agentfs_mount::{mount_fs, Backend, MountHandle, MountOpts};
 
-#[cfg(target_os = "macos")]
-use crate::sandbox::darwin::{generate_sandbox_profile, SandboxConfig};
+/// Configuration for the macOS sandbox profile.
+#[derive(Debug, Clone)]
+struct SandboxConfig {
+    /// The NFS mountpoint (primary read/write location).
+    mountpoint: PathBuf,
+    /// Additional paths to allow read/write access.
+    allow_paths: Vec<PathBuf>,
+    /// Whether to allow network access.
+    allow_network: bool,
+    /// Session ID for log filtering.
+    session_id: String,
+}
 
-/// Default NFS port to try (use a high port to avoid needing root)
-const DEFAULT_NFS_PORT: u32 = 11111;
+/// Generate a sandbox-exec profile for AgentFS.
+///
+/// The profile allows most operations but restricts file writes to the NFS
+/// mountpoint, temp directories, and explicitly allowed paths.
+fn generate_sandbox_profile(config: &SandboxConfig) -> String {
+    let mut profile = Vec::new();
+    let log_tag = format!("agentfs-{}", config.session_id);
+
+    profile.push("(version 1)".to_string());
+    profile.push(format!(
+        r#"(deny default (with message "agentfs-{}: write denied"))"#,
+        config.session_id
+    ));
+    profile.push(format!("; Log tag: {}", log_tag));
+
+    profile.push("; Allow most operations".to_string());
+    profile.push("(allow process*)".to_string());
+    profile.push("(allow signal)".to_string());
+    profile.push("(allow mach*)".to_string());
+    profile.push("(allow sysctl*)".to_string());
+    profile.push("(allow system*)".to_string());
+    profile.push("(allow ipc*)".to_string());
+    profile.push("(allow pseudo-tty)".to_string());
+
+    profile.push("; Allow all file reads".to_string());
+    profile.push("(allow file-read*)".to_string());
+
+    profile.push("; Writable paths".to_string());
+    let mountpoint_str = config.mountpoint.to_string_lossy();
+    profile.push(format!(
+        r#"(allow file-write* (subpath "{}"))"#,
+        mountpoint_str
+    ));
+
+    if let Some(parent) = config.mountpoint.parent() {
+        let run_dir_str = parent.to_string_lossy();
+        profile.push(format!(
+            r#"(allow file-write* (subpath "{}"))"#,
+            run_dir_str
+        ));
+    }
+
+    profile.push(r#"(allow file-write* (subpath "/private/tmp"))"#.to_string());
+    profile.push(r#"(allow file-write* (subpath "/tmp"))"#.to_string());
+    profile.push(r#"(allow file-write* (subpath "/var/tmp"))"#.to_string());
+    profile.push(r#"(allow file-write* (subpath "/private/var/folders"))"#.to_string());
+    profile.push(r#"(allow file-write* (subpath "/dev"))"#.to_string());
+    profile.push(r#"(allow file-ioctl (subpath "/dev"))"#.to_string());
+
+    for path in &config.allow_paths {
+        let path_str = path.to_string_lossy();
+        profile.push(format!(r#"(allow file-write* (subpath "{}"))"#, path_str));
+    }
+
+    profile.push("; Network".to_string());
+    if config.allow_network {
+        profile.push("(allow network*)".to_string());
+    } else {
+        profile.push(r#"(allow network* (remote ip "localhost:*"))"#.to_string());
+        profile.push(r#"(allow network* (local ip "localhost:*"))"#.to_string());
+    }
+
+    profile.push("; Security and Keychain".to_string());
+    profile.push(r#"(allow file-write* (subpath "/private/var/db/mds"))"#.to_string());
+    profile.push(
+        r#"(allow file-write* (regex #"^/private/var/folders/[^/]+/[^/]+/C/mds/"))"#.to_string(),
+    );
+    profile
+        .push(r#"(allow file-write* (regex #"^/private/var/folders/[^/]+/[^/]+/T/"))"#.to_string());
+    if let Some(home) = dirs::home_dir() {
+        let home_str = home.to_string_lossy();
+        profile.push(format!(
+            r#"(allow file-write* (subpath "{}/Library"))"#,
+            home_str
+        ));
+    }
+    profile.push(r#"(allow file-write* (subpath "/Library/Preferences"))"#.to_string());
+    profile.push(r#"(allow file-write* (subpath "/Library/Keychains"))"#.to_string());
+    profile.push("(allow authorization-right-obtain)".to_string());
+    profile.push("(allow user-preference-write)".to_string());
+    profile.push("(allow user-preference-read)".to_string());
+
+    profile.join("\n")
+}
 
 /// Run the command in a Darwin sandbox.
 #[allow(clippy::too_many_arguments)]
@@ -55,7 +145,7 @@ pub async fn run(
             std::process::exit(exit_code_for_outcome(outcome));
         } else {
             eprintln!("Cleaning up stale NFS mount...");
-            if let Err(e) = unmount(&session.mountpoint) {
+            if let Err(e) = agentfs_mount::unmount(&session.mountpoint, Backend::Nfs, true) {
                 eprintln!("Warning: Failed to unmount stale mount: {}", e);
             }
         }
@@ -97,30 +187,17 @@ pub async fn run(
 
     let fs: Arc<dyn FileSystem> = Arc::new(overlay);
 
-    // Find an available port
-    let port = find_available_port(DEFAULT_NFS_PORT)?;
-
-    // Start NFS server in background
-    let shutdown = CancellationToken::new();
-    let server_handle = serve(
-        fs,
-        NfsServeOptions::new("127.0.0.1", port),
-        shutdown.clone(),
-    )
-    .await
-    .context("Failed to bind NFS server")?;
-
-    // Give the server a moment to start
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-    // Mount the NFS filesystem
-    mount_nfs(port, &session.mountpoint)?;
+    let mut mount_opts = MountOpts::new(session.mountpoint.clone(), Backend::Nfs);
+    mount_opts.fsname = format!("agentfs:{}", session.session_id);
+    mount_opts.lazy_unmount = true;
+    mount_opts.timeout = std::time::Duration::from_secs(10);
+    let mount_handle = mount_fs(fs, mount_opts).await?;
 
     print_welcome_banner(&session, encrypted);
 
     let mount_backend = DarwinNfsRunMount {
         mountpoint: session.mountpoint.clone(),
-        server_handle: Some(server_handle),
+        mount_handle: Some(mount_handle),
     };
     let command_display = command.display().to_string();
     let child_command = command_in_mount(&session, command, args);
@@ -144,7 +221,7 @@ pub async fn run(
 
 struct DarwinNfsRunMount {
     mountpoint: PathBuf,
-    server_handle: Option<ServerHandle>,
+    mount_handle: Option<MountHandle>,
 }
 
 impl MountedCommandBackend for DarwinNfsRunMount {
@@ -153,15 +230,17 @@ impl MountedCommandBackend for DarwinNfsRunMount {
     }
 
     fn unmount(&mut self) -> Result<()> {
-        unmount(&self.mountpoint)
+        Ok(())
     }
 
     fn shutdown_server(&mut self) -> ShutdownFuture<'_> {
-        let server_handle = self.server_handle.take();
+        let mount_handle = self.mount_handle.take();
         Box::pin(async move {
-            if let Some(handle) = server_handle {
-                handle.cancel();
-                handle.join().await.context("NFS server shutdown failed")?;
+            if let Some(handle) = mount_handle {
+                handle
+                    .unmount()
+                    .await
+                    .context("NFS mount shutdown failed")?;
             }
             Ok(())
         })
@@ -189,7 +268,7 @@ fn exit_code_for_outcome(outcome: ChildOutcome) -> i32 {
 /// Print the welcome banner showing sandbox configuration (macOS).
 #[cfg(target_os = "macos")]
 fn print_welcome_banner(session: &RunSession, encrypted: bool) {
-    use crate::sandbox::group_paths_by_parent;
+    use super::group_paths_by_parent;
 
     eprintln!("Welcome to AgentFS!");
     eprintln!();
@@ -315,44 +394,6 @@ fn is_mount_healthy(mountpoint: &Path) -> bool {
     std::fs::read_dir(mountpoint).is_ok()
 }
 
-/// Find an available TCP port starting from the given port.
-fn find_available_port(start_port: u32) -> Result<u32> {
-    for port in start_port..start_port + 100 {
-        if std::net::TcpListener::bind(format!("127.0.0.1:{}", port)).is_ok() {
-            return Ok(port);
-        }
-    }
-    anyhow::bail!(
-        "Could not find an available port in range {}-{}",
-        start_port,
-        start_port + 100
-    );
-}
-
-/// Mount the NFS filesystem (macOS version).
-#[cfg(target_os = "macos")]
-fn mount_nfs(port: u32, mountpoint: &Path) -> Result<()> {
-    let output = Command::new("/sbin/mount_nfs")
-        .args([
-            "-o",
-            &format!(
-                "locallocks,vers=3,tcp,port={},mountport={},wsize=1048576,rsize=1048576,soft,timeo=100,retrans=5",
-                port, port
-            ),
-            "127.0.0.1:/",
-            mountpoint.to_str().unwrap(),
-        ])
-        .output()
-        .context("Failed to execute mount_nfs")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("Failed to mount NFS: {}", stderr.trim());
-    }
-
-    Ok(())
-}
-
 /// Run a command with the working directory set to the mounted filesystem (macOS).
 ///
 /// On macOS, the command is wrapped with sandbox-exec using a Sandbox profile
@@ -401,32 +442,4 @@ async fn run_command_in_mount(
     supervise_command(child_command)
         .await
         .with_context(|| format!("Failed to execute command: {command_display}"))
-}
-
-/// Unmount the NFS filesystem (macOS version).
-#[cfg(target_os = "macos")]
-fn unmount(mountpoint: &Path) -> Result<()> {
-    let output = Command::new("/sbin/umount")
-        .arg(mountpoint)
-        .output()
-        .context("Failed to execute umount")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // Try force unmount
-        let output2 = Command::new("/sbin/umount")
-            .arg("-f")
-            .arg(mountpoint)
-            .output()?;
-
-        if !output2.status.success() {
-            anyhow::bail!(
-                "Failed to unmount: {}. You may need to manually unmount with: umount -f {}",
-                stderr.trim(),
-                mountpoint.display()
-            );
-        }
-    }
-
-    Ok(())
 }

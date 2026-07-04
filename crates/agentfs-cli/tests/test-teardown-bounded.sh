@@ -12,6 +12,7 @@ echo -n "TEST bounded FUSE teardown on SIGTERM... "
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(cd "$DIR/.." && pwd)"
+REPO_ROOT="$(cd "$CLI_DIR/../.." && pwd)"
 CARGO_MANIFEST="$CLI_DIR/Cargo.toml"
 AGENTFS_BIN="${AGENTFS_BIN:-}"
 TEARDOWN_TIMEOUT="${TEARDOWN_TIMEOUT:-10}"
@@ -81,7 +82,7 @@ if [ -z "$AGENTFS_BIN" ]; then
             echo "FAILED: failed to build agentfs CLI"
             exit 1
         }
-    AGENTFS_BIN="$CLI_DIR/target/debug/agentfs"
+    AGENTFS_BIN="$REPO_ROOT/target/debug/agentfs"
 fi
 
 if [ ! -x "$AGENTFS_BIN" ]; then

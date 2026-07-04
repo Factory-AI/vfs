@@ -122,6 +122,78 @@ impl Default for MountOpts {
 /// Alias for the architecture-level mount specification.
 pub type MountSpec = MountOpts;
 
+/// Options for serving AgentFS over NFS without mounting it locally.
+#[derive(Debug, Clone)]
+pub struct NfsServerOptions {
+    /// IP address or hostname to bind.
+    pub bind: String,
+    /// TCP port to bind. Use `0` to request an ephemeral port.
+    pub port: u32,
+}
+
+impl NfsServerOptions {
+    /// Create NFS server options for the given bind host and port.
+    pub fn new(bind: impl Into<String>, port: u32) -> Self {
+        Self {
+            bind: bind.into(),
+            port,
+        }
+    }
+}
+
+impl Default for NfsServerOptions {
+    fn default() -> Self {
+        Self::new("127.0.0.1", 0)
+    }
+}
+
+/// Handle for a standalone NFS server owned by the mount lifecycle crate.
+pub struct NfsServerHandle {
+    inner: agentfs_nfs::ServerHandle,
+}
+
+impl NfsServerHandle {
+    /// Listening address chosen by the OS.
+    pub fn local_addr(&self) -> std::net::SocketAddr {
+        self.inner.local_addr()
+    }
+
+    /// Listening TCP port chosen by the OS.
+    pub fn local_port(&self) -> u16 {
+        self.inner.local_port()
+    }
+
+    /// Request cooperative server shutdown.
+    pub fn cancel(&self) {
+        self.inner.cancel();
+    }
+
+    /// Whether the background server task has finished.
+    pub fn is_finished(&self) -> bool {
+        self.inner.is_finished()
+    }
+
+    /// Wait for the server task to stop and surface shutdown errors.
+    pub async fn join(self) -> Result<()> {
+        self.inner.join().await
+    }
+}
+
+/// Serve a filesystem over NFS through the mount lifecycle crate's sealed edge.
+pub async fn serve_nfs(
+    fs: Arc<dyn agentfs_core::FileSystem>,
+    opts: NfsServerOptions,
+) -> Result<NfsServerHandle> {
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let inner = agentfs_nfs::serve(
+        fs,
+        agentfs_nfs::NfsServeOptions::new(opts.bind, opts.port),
+        shutdown,
+    )
+    .await?;
+    Ok(NfsServerHandle { inner })
+}
+
 /// A mounted filesystem handle.
 ///
 /// This handle represents an active mount. Prefer calling [`MountHandle::unmount`]
@@ -260,40 +332,40 @@ impl MountHandle {
             MountHandleInner::Fuse { session } => {
                 if let Some(session) = session.as_mut() {
                     if let Err(error) = session.unmount() {
-                        eprintln!(
-                            "Warning: Failed to request FUSE session unmount at {}: {}",
-                            self.mountpoint.display(),
-                            error
+                        tracing::warn!(
+                            mountpoint = %self.mountpoint.display(),
+                            %error,
+                            "failed to request FUSE session unmount"
                         );
                     }
                 }
                 if is_mountpoint(&self.mountpoint) {
                     if let Err(error) = unmount(&self.mountpoint, self.backend, self.lazy_unmount) {
-                        eprintln!(
-                            "Warning: Failed to unmount FUSE filesystem at {}: {}",
-                            self.mountpoint.display(),
-                            error
+                        tracing::warn!(
+                            mountpoint = %self.mountpoint.display(),
+                            %error,
+                            "failed to unmount FUSE filesystem"
                         );
                     }
                 }
                 if let Some(session) = session.take() {
                     if let Err(error) = session.join() {
-                        eprintln!("Warning: FUSE session exited with error: {error}");
+                        tracing::warn!(%error, "FUSE session exited with error");
                     }
                 }
                 if is_mountpoint(&self.mountpoint) {
                     if let Err(error) = unmount(&self.mountpoint, self.backend, self.lazy_unmount) {
-                        eprintln!(
-                            "Warning: Failed final FUSE unmount at {}: {}",
-                            self.mountpoint.display(),
-                            error
+                        tracing::warn!(
+                            mountpoint = %self.mountpoint.display(),
+                            %error,
+                            "failed final FUSE unmount"
                         );
                     }
                 }
                 if is_mountpoint(&self.mountpoint) {
-                    eprintln!(
-                        "Warning: FUSE mountpoint {} is still mounted after teardown",
-                        self.mountpoint.display()
+                    tracing::warn!(
+                        mountpoint = %self.mountpoint.display(),
+                        "FUSE mountpoint is still mounted after teardown"
                     );
                 }
             }
@@ -304,10 +376,10 @@ impl MountHandle {
 
                 if is_mountpoint(&self.mountpoint) {
                     if let Err(error) = unmount(&self.mountpoint, self.backend, self.lazy_unmount) {
-                        eprintln!(
-                            "Warning: Failed to unmount NFS filesystem at {}: {}",
-                            self.mountpoint.display(),
-                            error
+                        tracing::warn!(
+                            mountpoint = %self.mountpoint.display(),
+                            %error,
+                            "failed to unmount NFS filesystem"
                         );
                     }
                 }
@@ -318,10 +390,10 @@ impl MountHandle {
                         std::thread::sleep(Duration::from_millis(10));
                     }
                     if !handle.is_finished() {
-                        eprintln!(
-                            "Warning: NFS server did not stop gracefully for {} within {:?}; aborting task",
-                            self.mountpoint.display(),
-                            DEFAULT_UNMOUNT_TIMEOUT
+                        tracing::warn!(
+                            mountpoint = %self.mountpoint.display(),
+                            timeout = ?DEFAULT_UNMOUNT_TIMEOUT,
+                            "NFS server did not stop gracefully; aborting task"
                         );
                         handle.abort();
                     }

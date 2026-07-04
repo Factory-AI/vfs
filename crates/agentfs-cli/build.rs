@@ -1,20 +1,25 @@
+use std::path::Path;
 use std::process::Command;
 
 fn main() {
-    // Sandbox uses libunwind-ptrace which depends on liblzma and gcc_s.
-    #[cfg(target_os = "linux")]
-    {
-        println!("cargo:rustc-link-lib=lzma");
-        // libgcc_s provides _Unwind_RaiseException and other exception handling symbols
-        println!("cargo:rustc-link-lib=dylib=gcc_s");
-    }
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("agentfs-cli should live under crates/agentfs-cli");
 
     // Capture git version from tags for --version flag
     // Rerun if git HEAD changes (new commits or tags)
-    println!("cargo:rerun-if-changed=../.git/HEAD");
-    println!("cargo:rerun-if-changed=../.git/refs/tags");
+    println!(
+        "cargo:rerun-if-changed={}",
+        repo_root.join(".git/HEAD").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        repo_root.join(".git/refs/tags").display()
+    );
 
     let version = Command::new("git")
+        .current_dir(repo_root)
         .args(["describe", "--tags", "--always", "--dirty"])
         .output()
         .ok()

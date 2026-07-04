@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "cli",
+    "crates/agentfs-cli",
     "crates/agentfs-core",
     "crates/agentfs-fuse",
     "crates/agentfs-nfs",
@@ -16,6 +16,7 @@ repository = "https://github.com/tursodatabase/agentfs"
 
 [workspace.dependencies]
 agentfs-core = { path = "crates/agentfs-core" }
+agentfs-cli = { path = "crates/agentfs-cli" }
 agentfs-fuse = { path = "crates/agentfs-fuse" }
 agentfs-mount = { path = "crates/agentfs-mount" }
 agentfs-nfs = { path = "crates/agentfs-nfs" }

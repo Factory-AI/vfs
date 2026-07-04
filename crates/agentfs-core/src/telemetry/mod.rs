@@ -664,21 +664,7 @@ pub const fn passthrough_fallback_read_path() -> &'static str {
     "hostfs"
 }
 
-/// Report sinks receive serialized profile payloads.
-pub trait Sink {
-    fn emit(&self, payload: &str);
-}
-
-#[derive(Debug, Default)]
-pub struct StderrSink;
-
-impl Sink for StderrSink {
-    fn emit(&self, payload: &str) {
-        eprintln!("{payload}");
-    }
-}
-
-fn summary_payload(event: &str, source: &str, snapshot: &ProfileSnapshot) -> String {
+pub fn summary_payload(event: &str, source: &str, snapshot: &ProfileSnapshot) -> String {
     serde_json::json!({
         "event": event,
         "source": source,
@@ -690,64 +676,34 @@ fn summary_payload(event: &str, source: &str, snapshot: &ProfileSnapshot) -> Str
     .to_string()
 }
 
-fn emit_summary_to(source: &str, sink: &dyn Sink) {
+/// Return the process summary payload at most once.
+pub fn take_summary_payload(event: &str, source: &str) -> Option<String> {
     if !is_enabled() {
-        return;
+        return None;
     }
 
-    let snapshot = snapshot();
-    sink.emit(&summary_payload(
-        "agentfs_profile_summary",
-        source,
-        &snapshot,
-    ));
-}
-
-/// Emit the process summary at most once from the installed CLI sink.
-pub fn report_summary(source: &str) {
     if SUMMARY_EMITTED
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
-        emit_summary_to(source, &StderrSink);
+        Some(summary_payload(event, source, &snapshot()))
+    } else {
+        None
     }
 }
 
-/// Emit a cumulative profile checkpoint tagged with a monotonic sequence number.
-pub fn report_checkpoint() {
+/// Return a cumulative profile checkpoint payload tagged with a sequence number.
+pub fn checkpoint_payload(event: &str) -> Option<String> {
     if !is_enabled() {
-        return;
+        return None;
     }
 
     let seq = CHECKPOINT_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
-    let snapshot = snapshot();
-    StderrSink.emit(&summary_payload(
-        "agentfs_profile_summary",
+    Some(summary_payload(
+        event,
         &format!("phase-checkpoint-{seq}"),
-        &snapshot,
-    ));
-}
-
-/// Drop guard installed by binaries that want a single process summary.
-#[derive(Debug)]
-pub struct ProfileReportGuard {
-    source: &'static str,
-}
-
-impl ProfileReportGuard {
-    pub fn new(source: &'static str) -> Self {
-        Self { source }
-    }
-
-    pub fn emit_now(&self) {
-        report_summary(self.source);
-    }
-}
-
-impl Drop for ProfileReportGuard {
-    fn drop(&mut self) {
-        self.emit_now();
-    }
+        &snapshot(),
+    ))
 }
 
 #[cfg(test)]
@@ -809,13 +765,13 @@ mod tests {
         );
         let snapshot = ProfileSnapshot { sections };
         let value: Value = serde_json::from_str(&summary_payload(
-            "agentfs_profile_summary",
+            "unit_profile_summary",
             "unit-test",
             &snapshot,
         ))
         .expect("summary json should parse");
 
-        assert_eq!(value["event"], "agentfs_profile_summary");
+        assert_eq!(value["event"], "unit_profile_summary");
         assert_eq!(value["source"], "unit-test");
         assert_eq!(value["sections"]["core"]["connection_create"], 1);
         assert_eq!(value["counters"]["connection_create"], 1);
@@ -827,7 +783,7 @@ mod tests {
         let snapshot = snapshot();
         assert!(snapshot.counter("connection_create") >= 1);
         // No report guard is constructed here. The validation harness runs this
-        // test with --nocapture and asserts no `agentfs_profile_summary` line is
+        // test with --nocapture and asserts no CLI profile summary line is
         // printed by SDK-only usage.
     }
 }

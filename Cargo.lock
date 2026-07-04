@@ -48,15 +48,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "agentfs"
+name = "agentfs-cli"
 version = "0.6.4"
 dependencies = [
- "aegis",
  "agentfs-core",
  "agentfs-mount",
- "agentfs-nfs",
  "anyhow",
- "async-trait",
  "base64",
  "chrono",
  "clap",
@@ -70,7 +67,6 @@ dependencies = [
  "sha1",
  "tempfile",
  "tokio",
- "tokio-util",
  "tracing",
  "tracing-subscriber",
  "turso",

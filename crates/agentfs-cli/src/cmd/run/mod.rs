@@ -1,17 +1,52 @@
-//! Sandbox implementations for running commands in isolated environments.
+//! Run command - common entry point.
 //!
-//! This module provides platform-specific sandbox approaches:
-//! - `linux`: FUSE + namespace-based sandbox with copy-on-write filesystem
-//! - `darwin`: Kernel-enforced sandbox using sandbox-exec
+//! Dispatches to platform-specific implementations:
+//! - Linux: FUSE + namespace sandbox
+//! - Darwin: NFS + sandbox-exec
 
+use agentfs_core::PartialOriginPolicy;
+use anyhow::Result;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+#[cfg(target_os = "macos")]
+mod darwin;
 #[cfg(target_os = "linux")]
-pub mod linux;
+mod linux;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+mod not_supported;
 
 #[cfg(target_os = "macos")]
-pub mod darwin;
+use darwin as sys;
+#[cfg(target_os = "linux")]
+use linux as sys;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+use not_supported as sys;
+
+/// Handle the `run` command, dispatching to the platform-specific implementation.
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_run_command(
+    allow: Vec<PathBuf>,
+    no_default_allows: bool,
+    session: Option<String>,
+    system: bool,
+    encryption: Option<(String, String)>,
+    partial_origin_policy: Option<PartialOriginPolicy>,
+    command: PathBuf,
+    args: Vec<String>,
+) -> Result<()> {
+    sys::run(
+        allow,
+        no_default_allows,
+        session,
+        system,
+        encryption,
+        partial_origin_policy,
+        command,
+        args,
+    )
+    .await
+}
 
 /// Group paths by parent directory and format using brace expansion.
 ///
@@ -22,7 +57,7 @@ pub mod darwin;
 /// - /home/user/.npm
 ///
 /// Returns: `["/home/user/{.claude, .claude.json, .codex, .npm}"]`
-pub fn group_paths_by_parent(paths: &[PathBuf]) -> Vec<String> {
+fn group_paths_by_parent(paths: &[PathBuf]) -> Vec<String> {
     let mut groups: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
 
     for path in paths {

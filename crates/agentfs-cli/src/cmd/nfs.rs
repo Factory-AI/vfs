@@ -5,12 +5,11 @@
 //! it as their root filesystem.
 
 use agentfs_core::{agentfs_dir, AgentFSOptions, FileSystem, HostFS, OverlayFS};
-use agentfs_nfs::{serve, NfsServeOptions};
+use agentfs_mount::{serve_nfs, NfsServerOptions};
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::signal;
-use tokio_util::sync::CancellationToken;
 
 use crate::cmd::init::open_agentfs;
 
@@ -47,14 +46,9 @@ pub async fn handle_nfs_command(id_or_path: String, bind: String, port: u32) -> 
     };
 
     // Bind NFS server
-    let shutdown = CancellationToken::new();
-    let server_handle = serve(
-        fs,
-        NfsServeOptions::new(bind.clone(), port),
-        shutdown.clone(),
-    )
-    .await
-    .with_context(|| format!("Failed to bind NFS server to {bind}:{port}"))?;
+    let server_handle = serve_nfs(fs, NfsServerOptions::new(bind.clone(), port))
+        .await
+        .with_context(|| format!("Failed to bind NFS server to {bind}:{port}"))?;
     let listen_addr = server_handle.local_addr();
     let listen_port = u32::from(server_handle.local_port());
 
@@ -82,7 +76,7 @@ pub async fn handle_nfs_command(id_or_path: String, bind: String, port: u32) -> 
     eprintln!();
     eprintln!("Shutting down...");
 
-    shutdown.cancel();
+    server_handle.cancel();
     server_handle
         .join()
         .await

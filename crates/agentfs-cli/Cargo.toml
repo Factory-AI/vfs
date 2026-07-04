@@ -1,12 +1,13 @@
 [package]
-name = "agentfs"
+name = "agentfs-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "Command-line interface for AgentFS"
 
 [lib]
-name = "agentfs"
+name = "agentfs_cli"
 path = "src/lib.rs"
 
 [[bin]]
@@ -20,7 +21,6 @@ strict = []
 [dependencies]
 agentfs-core = { workspace = true }
 agentfs-mount = { workspace = true }
-agentfs-nfs = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
@@ -39,18 +39,11 @@ chrono = { workspace = true }
 # MCP Server support
 base64 = { workspace = true }
 
-# NFS server for userspace filesystem (used by `agentfs run` and `agentfs nfs`)
 uuid = { workspace = true }
-tokio-util = { workspace = true }
-async-trait = { workspace = true }
 
 # Unix dependencies
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
-
-# macOS dependencies for NFS functionality (no FUSE - uses nfsserve instead)
-[target.'cfg(target_os = "macos")'.dependencies]
-aegis = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

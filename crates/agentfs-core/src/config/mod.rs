@@ -29,7 +29,7 @@ mod tests {
             "AGENTFS_PROFILE",
             "AGENTFS_DRAIN_ON_SETATTR",
         ];
-        eprintln!(
+        println!(
             "covered runtime bool knobs: {}",
             covered_runtime_bool_knobs.join(", ")
         );
@@ -86,8 +86,8 @@ mod tests {
                 SourceKind::Sdk,
             ),
             SourceRoot::new(
-                "cli/src",
-                repo_root.join("cli").join("src"),
+                "crates/agentfs-cli/src",
+                repo_root.join("crates").join("agentfs-cli").join("src"),
                 SourceKind::Cli,
             ),
             SourceRoot::new(
@@ -252,7 +252,7 @@ mod tests {
             None => std::env::remove_var(key),
         }
 
-        eprintln!(
+        println!(
             "legacy partial-origin env ignored; resolved policy is {:?}",
             config.partial_origin.mode
         );

@@ -200,7 +200,7 @@ fn terminate_child(child: &mut tokio::process::Child, kill_process_group: bool, 
     if rc != 0 {
         let error = std::io::Error::last_os_error();
         if error.raw_os_error() != Some(libc::ESRCH) {
-            eprintln!("Warning: failed to signal supervised child {pid}: {error}");
+            tracing::warn!(pid, %error, "failed to signal supervised child");
         }
     }
 }

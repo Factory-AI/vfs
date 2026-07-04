@@ -12,6 +12,7 @@ echo -n "TEST signal teardown for clone/init/exec/mount... "
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(cd "$DIR/.." && pwd)"
+REPO_ROOT="$(cd "$CLI_DIR/../.." && pwd)"
 CARGO_MANIFEST="$CLI_DIR/Cargo.toml"
 AGENTFS_BIN="${AGENTFS_BIN:-}"
 SIGNAL_DELAY="${SIGNAL_TEARDOWN_SIGNAL_DELAY:-3s}"
@@ -51,7 +52,7 @@ if [ -z "$AGENTFS_BIN" ]; then
             echo "FAILED: failed to build agentfs CLI"
             exit 1
         }
-    AGENTFS_BIN="$CLI_DIR/target/debug/agentfs"
+    AGENTFS_BIN="$REPO_ROOT/target/debug/agentfs"
 fi
 
 if [ ! -x "$AGENTFS_BIN" ]; then
