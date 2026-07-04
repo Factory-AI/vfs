@@ -321,7 +321,7 @@ impl FileSystem for AgentFS {
                 FROM fs_dentry d
                 JOIN fs_inode i ON d.ino = i.ino
                 WHERE d.parent_ino = ? AND d.name > ?
-                ORDER BY d.name
+                ORDER BY d.parent_ino, d.name
                 LIMIT ?",
             )
             .await?
@@ -331,7 +331,7 @@ impl FileSystem for AgentFS {
                 FROM fs_dentry d
                 JOIN fs_inode i ON d.ino = i.ino
                 WHERE d.parent_ino = ?
-                ORDER BY d.name
+                ORDER BY d.parent_ino, d.name
                 LIMIT ?",
             )
             .await?

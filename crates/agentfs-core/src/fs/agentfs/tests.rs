@@ -75,6 +75,16 @@
         Ok(count)
     }
 
+    async fn index_exists(conn: &Connection, index_name: &str) -> Result<bool> {
+        let mut rows = conn
+            .query(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?",
+                (index_name,),
+            )
+            .await?;
+        Ok(rows.next().await?.is_some())
+    }
+
     fn cached_attr(fs: &AgentFS, ino: i64) -> Option<Stats> {
         fs.attr_cache.get(ino)
     }
@@ -298,6 +308,114 @@
 
         assert!(page_count > 1, "test must exercise multiple pages");
         assert_eq!(seen, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn readdir_plus_after_query_plan_uses_bounded_dentry_indexes() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        for index in 0..16 {
+            let name = format!("entry-{index:04}");
+            FileSystem::create_file(&fs, ROOT_INO, &name, DEFAULT_FILE_MODE, 0, 0).await?;
+        }
+        let cookie_ino = FileSystem::lookup(&fs, ROOT_INO, "entry-0007")
+            .await?
+            .expect("cookie entry exists")
+            .ino;
+
+        let conn = fs.pool.get_connection().await?;
+        let mut rows = conn
+            .query(
+                "EXPLAIN QUERY PLAN SELECT name FROM fs_dentry WHERE parent_ino = ? AND ino = ?",
+                (ROOT_INO, cookie_ino),
+            )
+            .await?;
+        let mut cookie_plan = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let detail: String = row.get(3)?;
+            cookie_plan.push(detail);
+        }
+        println!("PLAN cookie lookup: {cookie_plan:?}");
+        assert!(
+            cookie_plan
+                .iter()
+                .any(|detail| detail.contains("idx_fs_dentry_parent_ino")
+                    && detail.contains("parent_ino=? AND ino=?")),
+            "cookie lookup must use the parent+ino index, got {cookie_plan:?}"
+        );
+
+        let mut rows = conn
+            .query(
+                "EXPLAIN QUERY PLAN SELECT d.name, i.ino, i.mode, i.nlink, i.uid, i.gid, i.size, i.atime, i.mtime, i.ctime, i.rdev, i.atime_nsec, i.mtime_nsec, i.ctime_nsec
+                FROM fs_dentry d
+                JOIN fs_inode i ON d.ino = i.ino
+                WHERE d.parent_ino = ? AND d.name > ?
+                ORDER BY d.parent_ino, d.name
+                LIMIT ?",
+                (ROOT_INO, "entry-0007".to_string(), 8_i64),
+            )
+            .await?;
+        let mut page_plan = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let detail: String = row.get(3)?;
+            page_plan.push(detail);
+        }
+        println!("PLAN bounded page: {page_plan:?}");
+        assert!(
+            page_plan
+                .iter()
+                .any(|detail| detail.contains("parent_ino=? AND name>?")),
+            "page query must range-seek by parent+name, got {page_plan:?}"
+        );
+        assert!(
+            !page_plan.iter().any(|detail| detail.contains("USE SORTER")),
+            "page query must not sort the full remaining directory, got {page_plan:?}"
+        );
+
+        let mut rows = conn
+            .query(
+                "EXPLAIN QUERY PLAN SELECT d.name, i.ino, i.mode, i.nlink, i.uid, i.gid, i.size, i.atime, i.mtime, i.ctime, i.rdev, i.atime_nsec, i.mtime_nsec, i.ctime_nsec
+                FROM fs_dentry d
+                JOIN fs_inode i ON d.ino = i.ino
+                WHERE d.parent_ino = ?
+                ORDER BY d.parent_ino, d.name
+                LIMIT ?",
+                (ROOT_INO, 8_i64),
+            )
+            .await?;
+        let mut first_page_plan = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let detail: String = row.get(3)?;
+            first_page_plan.push(detail);
+        }
+        println!("PLAN first page: {first_page_plan:?}");
+        assert!(
+            first_page_plan
+                .iter()
+                .any(|detail| detail.contains("parent_ino=?")),
+            "first page query must seek by parent, got {first_page_plan:?}"
+        );
+        assert!(
+            !first_page_plan
+                .iter()
+                .any(|detail| detail.contains("USE SORTER")),
+            "first page query must not sort the full directory, got {first_page_plan:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ensure_current_restores_readdir_cookie_index_for_current_databases() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        let conn = fs.pool.get_connection().await?;
+        conn.execute("DROP INDEX idx_fs_dentry_parent_ino", ())
+            .await?;
+        assert!(!index_exists(&conn, "idx_fs_dentry_parent_ino").await?);
+
+        schema::ensure_current(&conn).await?;
+
+        assert!(index_exists(&conn, "idx_fs_dentry_parent_ino").await?);
         Ok(())
     }
 

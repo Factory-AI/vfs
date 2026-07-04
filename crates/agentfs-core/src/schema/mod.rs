@@ -163,6 +163,7 @@ pub mod ddl {
             UNIQUE(parent_ino, name)
         )",
         "CREATE INDEX IF NOT EXISTS idx_fs_dentry_parent ON fs_dentry(parent_ino, name)",
+        "CREATE INDEX IF NOT EXISTS idx_fs_dentry_parent_ino ON fs_dentry(parent_ino, ino)",
         "CREATE TABLE IF NOT EXISTS fs_data (
             ino INTEGER NOT NULL,
             chunk_index INTEGER NOT NULL,
@@ -383,6 +384,7 @@ pub async fn ensure_current(conn: &Connection) -> Result<()> {
 
     if raw_user_version == CURRENT.user_version() {
         validate_current_schema(conn).await?;
+        ensure_current_indexes(conn).await?;
         return Ok(());
     }
 
@@ -558,6 +560,23 @@ async fn execute_current_ddl(conn: &Connection) -> Result<()> {
     for sql in ddl::create_all(CURRENT) {
         conn.execute(*sql, ()).await?;
     }
+    Ok(())
+}
+
+async fn ensure_current_indexes(conn: &Connection) -> Result<()> {
+    // Indexes are not represented in the column-based current-schema sniffing
+    // used for legacy DB compatibility, so make newly added planner indexes
+    // idempotently present when opening an already-current database.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_fs_dentry_parent ON fs_dentry(parent_ino, name)",
+        (),
+    )
+    .await?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_fs_dentry_parent_ino ON fs_dentry(parent_ino, ino)",
+        (),
+    )
+    .await?;
     Ok(())
 }
 
