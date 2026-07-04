@@ -10,6 +10,15 @@ impl EnvReader {
         Self
     }
 
+    /// Read an optional string environment value.
+    ///
+    /// Non-Unicode values behave like an unset variable, matching the legacy
+    /// `std::env::var(...).ok()` behavior at call sites that use ambient
+    /// credentials or OS context rather than runtime boolean knobs.
+    pub fn string(self, name: &str) -> Option<String> {
+        std::env::var(name).ok()
+    }
+
     /// Parse the shared boolean grammar:
     /// true = {1,true,yes,on}, false = {0,false,no,off}.
     pub fn parse_bool(value: &str) -> Option<bool> {

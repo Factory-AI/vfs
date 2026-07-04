@@ -383,14 +383,6 @@ const ACTIVE_COMMON_KNOBS: &[Knob] = &[
         "Encryption cipher paired with AGENTFS_KEY or --key.",
         "opts clap env binding",
     ),
-    Knob::product(
-        "TURSO_DB_AUTH_TOKEN",
-        "env",
-        DefaultValue::Literal("unset"),
-        CLI_OWNER,
-        "Cloud sync authentication token when sync options do not supply one explicitly.",
-        "cmd::init sync option construction",
-    ),
     Knob::sunset(
         "AGENTFS_CLONE_TIMINGS",
         "env",
@@ -398,7 +390,7 @@ const ACTIVE_COMMON_KNOBS: &[Knob] = &[
         CLI_OWNER,
         "Ad hoc clone timing printout for local performance investigations.",
         "Remove after telemetry registry exposes clone timing through the single report sink.",
-        "m3-telemetry-registry",
+        "config::clone_timings_enabled",
     ),
     Knob::product(
         "AGENTFS_PROFILE",
@@ -775,7 +767,11 @@ mod tests {
     fn ignored_env_token(name: &str) -> bool {
         matches!(
             name,
-            "AGENTFS_VERSION" | "AGENTFS_SCHEMA_VERSION" | "AGENTFS_SANDBOX" | "AGENTFS_SESSION"
+            "AGENTFS_VERSION"
+                | "AGENTFS_SCHEMA_VERSION"
+                | "AGENTFS_SANDBOX"
+                | "AGENTFS_SESSION"
+                | "TURSO_DB_AUTH_TOKEN"
         ) || name.starts_with("AGENTFS_TEST_")
             || name.ends_with('_')
     }

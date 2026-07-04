@@ -139,7 +139,7 @@ async fn clone_into_mount(
     repo_name: &str,
     verify: bool,
 ) -> Result<CloneSummary> {
-    let timings = std::env::var("AGENTFS_CLONE_TIMINGS").is_ok_and(|v| v == "1");
+    let timings = crate::config::clone_timings_enabled();
     let mut stage_start = std::time::Instant::now();
     let mut stage = |name: &str| {
         if timings {

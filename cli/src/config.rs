@@ -2,6 +2,10 @@
 
 use agentfs_sdk::{CoreConfig, EnvReader};
 
+const CLONE_TIMINGS_ENV: &str = "AGENTFS_CLONE_TIMINGS";
+const SHELL_ENV: &str = "SHELL";
+const TURSO_AUTH_TOKEN_ENV: &str = "TURSO_DB_AUTH_TOKEN";
+
 #[cfg(target_os = "linux")]
 const FUSE_WRITEBACK_ENV: &str = "AGENTFS_FUSE_WRITEBACK";
 
@@ -14,4 +18,18 @@ pub(crate) fn core_config_from_env() -> CoreConfig {
     }
 
     config
+}
+
+pub(crate) fn clone_timings_enabled() -> bool {
+    EnvReader::new()
+        .string(CLONE_TIMINGS_ENV)
+        .is_some_and(|value| value == "1")
+}
+
+pub(crate) fn current_shell_path() -> Option<String> {
+    EnvReader::new().string(SHELL_ENV)
+}
+
+pub(crate) fn turso_db_auth_token() -> Option<String> {
+    EnvReader::new().string(TURSO_AUTH_TOKEN_ENV)
 }

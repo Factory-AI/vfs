@@ -23,9 +23,7 @@ pub async fn open_agentfs(options: AgentFSOptions) -> Result<AgentFS, agentfs_sd
     }
     // CLI handles env var fallback for auth token
     if options.sync.auth_token.is_none() {
-        if let Ok(auth_token) = std::env::var("TURSO_DB_AUTH_TOKEN") {
-            options.sync.auth_token = Some(auth_token);
-        }
+        options.sync.auth_token = crate::config::turso_db_auth_token();
     }
     AgentFS::open(options).await
 }
@@ -33,7 +31,7 @@ pub async fn open_agentfs(options: AgentFSOptions) -> Result<AgentFS, agentfs_sd
 pub fn build_sync_options(sync_cmd_options: &SyncCommandOptions) -> SyncOptions {
     let mut sync = SyncOptions {
         remote_url: sync_cmd_options.sync_remote_url.clone(),
-        auth_token: std::env::var("TURSO_DB_AUTH_TOKEN").ok(),
+        auth_token: crate::config::turso_db_auth_token(),
         partial_sync: None,
     };
 

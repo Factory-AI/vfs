@@ -32,7 +32,7 @@ impl fmt::Display for Shell {
 impl Shell {
     /// Detect the current shell from the `SHELL` environment variable
     fn detect() -> Option<Shell> {
-        let shell_path = std::env::var("SHELL").ok()?;
+        let shell_path = crate::config::current_shell_path()?;
         let shell_name = shell_path.rsplit('/').next()?;
         match shell_name {
             "bash" => Some(Shell::Bash),
