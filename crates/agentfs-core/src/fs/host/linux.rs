@@ -467,7 +467,11 @@ impl FileSystem for HostFS {
             let mut stats = stat_to_stats(&stat);
             stats.ino = child_ino;
 
-            result.push(DirEntry { name, stats });
+            result.push(DirEntry {
+                name,
+                cookie: stats.ino,
+                stats,
+            });
         }
 
         result.sort_by(|a, b| a.name.cmp(&b.name));

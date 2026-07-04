@@ -147,9 +147,9 @@ pub fn setattr_allowed(
     Ok(())
 }
 
-/// Mode bits to clear when a non-privileged caller writes file contents.
-pub fn killpriv_mask(stats: &Stats, creds: &Credentials) -> u32 {
-    if is_root(creds) || !stats.is_file() {
+/// Mode bits to clear when file contents, size, or ownership change.
+pub fn killpriv_mask(stats: &Stats, _creds: &Credentials) -> u32 {
+    if !stats.is_file() {
         return 0;
     }
     stats.mode & KILLPRIV_BITS
@@ -286,12 +286,36 @@ mod tests {
                 search: false,
             },
             Case {
+                name: "auxiliary group execute only directory",
+                stats: stats(S_IFDIR | 0o010, 3000, 2000),
+                creds: creds(1000, 1000, &[2000]),
+                read: false,
+                write: false,
+                search: true,
+            },
+            Case {
+                name: "primary group write without execute directory",
+                stats: stats(S_IFDIR | 0o020, 3000, 2000),
+                creds: creds(1000, 2000, &[]),
+                read: false,
+                write: true,
+                search: false,
+            },
+            Case {
                 name: "other write only",
                 stats: stats(S_IFREG | 0o002, 2000, 2000),
                 creds: creds(1000, 1000, &[]),
                 read: false,
                 write: true,
                 search: false,
+            },
+            Case {
+                name: "other execute only file",
+                stats: stats(S_IFREG | 0o001, 2000, 2000),
+                creds: creds(1000, 1000, &[]),
+                read: false,
+                write: false,
+                search: true,
             },
             Case {
                 name: "root reads and writes mode zero file",
@@ -343,7 +367,16 @@ mod tests {
 
         let privileged = stats(S_IFREG | 0o6755, 20, 20);
         assert_eq!(killpriv_mask(&privileged, &creds(1000, 1000, &[])), 0o6000);
-        assert_eq!(killpriv_mask(&privileged, &creds(0, 0, &[])), 0);
+        assert_eq!(
+            killpriv_mask(&privileged, &creds(0, 0, &[])),
+            0o6000,
+            "root chown/truncate follows Linux killpriv behavior for NFS SETATTR"
+        );
+        assert_eq!(
+            killpriv_mask(&stats(S_IFDIR | 0o6755, 20, 20), &creds(0, 0, &[])),
+            0,
+            "killpriv only applies to regular files"
+        );
     }
 
     #[test]

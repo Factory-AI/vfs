@@ -1000,7 +1000,7 @@ pub async fn nfsproc3_readdirplus(
                 let entry = entryplus3 {
                     fileid: entry.fileid,
                     name: entry.name,
-                    cookie: entry.fileid,
+                    cookie: entry.cookie,
                     name_attributes: nfs::post_op_attr::attributes(obj_attr),
                     name_handle: handle,
                 };
@@ -1147,7 +1147,7 @@ pub async fn nfsproc3_readdir(
                 let entry = entry3 {
                     fileid: entry.fileid,
                     name: entry.name,
-                    cookie: entry.fileid,
+                    cookie: entry.cookie,
                 };
                 // write the entry into a buffer first
                 let mut write_buf: Vec<u8> = Vec::new();
@@ -1360,7 +1360,7 @@ pub async fn nfsproc3_write(
         .await
     {
         Ok((mut fattr, ack_durability)) => {
-            // POSIX: Clear SUID/SGID bits when a non-root user writes to a file.
+            // POSIX: Clear SUID/SGID bits when file contents change.
             let written_stats = permissions::stats(&fattr);
             let cleared_mode = permissions::without_killpriv(&written_stats, &creds, fattr.mode);
             if cleared_mode != fattr.mode {
@@ -1718,7 +1718,7 @@ pub async fn nfsproc3_setattr(
         args.new_attribute.mode = nfs::set_mode3::mode(mode);
     }
 
-    // POSIX: writes/truncates and non-root owner/group changes clear SUID/SGID
+    // POSIX: writes/truncates and owner/group changes clear SUID/SGID
     // unless this SETATTR also supplies an explicit mode.
     if (original_change.size || original_change.uid.is_some() || original_change.gid.is_some())
         && original_change.mode.is_none()
@@ -3300,6 +3300,86 @@ mod tests {
             );
             assert_eq!(unique, expected, "pagination skipped or reordered entries");
         }
+    }
+
+    #[tokio::test]
+    async fn readdir_cookies_are_unique_for_hardlinks() {
+        let (context, _fs) = test_context().await;
+        let (fileid, _) = context
+            .vfs
+            .create(
+                1,
+                &b"entry-0000".to_vec().into(),
+                nfs::sattr3::default(),
+                &context.auth,
+            )
+            .await
+            .expect("create original hardlink target");
+        context
+            .vfs
+            .link(fileid, 1, &b"entry-0001".to_vec().into())
+            .await
+            .expect("create second hardlink");
+        context
+            .vfs
+            .create(
+                1,
+                &b"entry-0002".to_vec().into(),
+                nfs::sattr3::default(),
+                &context.auth,
+            )
+            .await
+            .expect("create trailing entry");
+
+        let first = context.vfs.readdir(1, 0, 2).await.expect("first page");
+        assert_eq!(first.entries.len(), 2);
+        assert_eq!(
+            first.entries[0].fileid, first.entries[1].fileid,
+            "test must page across two hardlinks to one inode"
+        );
+        assert_ne!(
+            first.entries[0].cookie, first.entries[1].cookie,
+            "NFS cookies must identify dentries, not just fileids"
+        );
+
+        let second = context
+            .vfs
+            .readdir(1, first.entries[1].cookie, 2)
+            .await
+            .expect("second page");
+        assert_eq!(
+            second
+                .entries
+                .iter()
+                .map(|entry| entry.name.to_vec())
+                .collect::<Vec<_>>(),
+            vec![b"entry-0002".to_vec()],
+            "resuming after the second hardlink must not duplicate or skip entries"
+        );
+        assert!(second.end);
+    }
+
+    #[tokio::test]
+    async fn readdir_returns_bad_cookie_when_resume_dentry_is_deleted() {
+        let (context, _fs) = test_context().await;
+        create_numbered_files(&context, 2).await;
+
+        let first = context.vfs.readdir(1, 0, 1).await.expect("first page");
+        assert_eq!(first.entries.len(), 1);
+        let stale_cookie = first.entries[0].cookie;
+        let stale_name = first.entries[0].name.clone();
+        context
+            .vfs
+            .remove(1, &stale_name)
+            .await
+            .expect("remove resume dentry");
+
+        let err = context
+            .vfs
+            .readdir(1, stale_cookie, 1)
+            .await
+            .expect_err("stale cookie should be rejected");
+        assert!(matches!(err, nfs::nfsstat3::NFS3ERR_BAD_COOKIE));
     }
 
     #[tokio::test]

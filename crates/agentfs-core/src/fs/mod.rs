@@ -62,6 +62,9 @@ pub enum FsError {
     #[error("Filename too long")]
     NameTooLong,
 
+    #[error("Bad directory cookie")]
+    BadCookie,
+
     #[error("Filesystem metadata is corrupt: {0}")]
     Corrupt(String),
 }
@@ -84,6 +87,7 @@ impl FsError {
             FsError::InvalidRename => libc::EINVAL,
             FsError::CrossDevice => libc::EXDEV,
             FsError::NameTooLong => libc::ENAMETOOLONG,
+            FsError::BadCookie => libc::EINVAL,
             FsError::Corrupt(_) => libc::EIO,
         }
     }
@@ -151,6 +155,8 @@ pub struct DirEntry {
     pub name: String,
     /// Full statistics for this entry
     pub stats: Stats,
+    /// Opaque directory cookie for resuming after this entry.
+    pub cookie: i64,
 }
 
 /// A cookie-addressed directory page.
@@ -297,10 +303,11 @@ pub trait FileSystem: Send + Sync {
 
     /// List a bounded page of directory entries after `start_after`.
     ///
-    /// `start_after` is the inode cookie returned with the previous entry. A
+    /// `start_after` is the opaque cookie returned with the previous entry. A
     /// zero cookie starts at the beginning. Implementations with an ordered
     /// directory index should override this method so callers do not need to
-    /// enumerate all prior entries for every page.
+    /// enumerate all prior entries for every page. A positive cookie that is
+    /// no longer present is [`FsError::BadCookie`].
     async fn readdir_plus_after(
         &self,
         ino: i64,
@@ -314,9 +321,9 @@ pub trait FileSystem: Send + Sync {
         let start = if start_after > 0 {
             entries
                 .iter()
-                .position(|entry| entry.stats.ino == start_after)
+                .position(|entry| entry.cookie == start_after)
                 .map(|index| index + 1)
-                .unwrap_or(entries.len())
+                .ok_or(FsError::BadCookie)?
         } else {
             0
         };

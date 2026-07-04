@@ -234,7 +234,7 @@ impl FileSystem for AgentFS {
             return Ok(None);
         }
 
-        let mut stmt = conn.prepare_cached("SELECT d.name, i.ino, i.mode, i.nlink, i.uid, i.gid, i.size, i.atime, i.mtime, i.ctime, i.rdev, i.atime_nsec, i.mtime_nsec, i.ctime_nsec
+        let mut stmt = conn.prepare_cached("SELECT d.id, d.name, i.ino, i.mode, i.nlink, i.uid, i.gid, i.size, i.atime, i.mtime, i.ctime, i.rdev, i.atime_nsec, i.mtime_nsec, i.ctime_nsec
             FROM fs_dentry d
             JOIN fs_inode i ON d.ino = i.ino
             WHERE d.parent_ino = ?
@@ -244,8 +244,9 @@ impl FileSystem for AgentFS {
 
         let mut entries = Vec::new();
         while let Some(row) = rows.next().await? {
+            let cookie = row.get::<i64>(0)?;
             let name = row
-                .get_value(0)
+                .get_value(1)
                 .ok()
                 .and_then(|v| {
                     if let Value::Text(s) = v {
@@ -260,10 +261,14 @@ impl FileSystem for AgentFS {
                 continue;
             }
 
-            let stats = store::stats_from_row_at(&row, 1)?;
+            let stats = store::stats_from_row_at(&row, 2)?;
 
             self.cache_attr(stats.clone());
-            entries.push(DirEntry { name, stats });
+            entries.push(DirEntry {
+                name,
+                stats,
+                cookie,
+            });
         }
 
         Ok(Some(entries))
@@ -290,9 +295,9 @@ impl FileSystem for AgentFS {
 
         let start_after_name = if start_after > 0 {
             let mut stmt = conn
-                .prepare_cached("SELECT name FROM fs_dentry WHERE parent_ino = ? AND ino = ?")
+                .prepare_cached("SELECT name FROM fs_dentry WHERE id = ? AND parent_ino = ?")
                 .await?;
-            let mut rows = stmt.query((ino, start_after)).await?;
+            let mut rows = stmt.query((start_after, ino)).await?;
             match rows.next().await? {
                 Some(row) => Some(
                     row.get_value(0)
@@ -303,12 +308,7 @@ impl FileSystem for AgentFS {
                         })
                         .unwrap_or_default(),
                 ),
-                None => {
-                    return Ok(Some(DirEntryPage {
-                        entries: Vec::new(),
-                        end: true,
-                    }));
-                }
+                None => return Err(FsError::BadCookie.into()),
             }
         } else {
             None
@@ -317,7 +317,7 @@ impl FileSystem for AgentFS {
         let fetch_limit = max_entries.saturating_add(1).min(i64::MAX as usize) as i64;
         let mut stmt = if start_after_name.is_some() {
             conn.prepare_cached(
-                "SELECT d.name, i.ino, i.mode, i.nlink, i.uid, i.gid, i.size, i.atime, i.mtime, i.ctime, i.rdev, i.atime_nsec, i.mtime_nsec, i.ctime_nsec
+                "SELECT d.id, d.name, i.ino, i.mode, i.nlink, i.uid, i.gid, i.size, i.atime, i.mtime, i.ctime, i.rdev, i.atime_nsec, i.mtime_nsec, i.ctime_nsec
                 FROM fs_dentry d
                 JOIN fs_inode i ON d.ino = i.ino
                 WHERE d.parent_ino = ? AND d.name > ?
@@ -327,7 +327,7 @@ impl FileSystem for AgentFS {
             .await?
         } else {
             conn.prepare_cached(
-                "SELECT d.name, i.ino, i.mode, i.nlink, i.uid, i.gid, i.size, i.atime, i.mtime, i.ctime, i.rdev, i.atime_nsec, i.mtime_nsec, i.ctime_nsec
+                "SELECT d.id, d.name, i.ino, i.mode, i.nlink, i.uid, i.gid, i.size, i.atime, i.mtime, i.ctime, i.rdev, i.atime_nsec, i.mtime_nsec, i.ctime_nsec
                 FROM fs_dentry d
                 JOIN fs_inode i ON d.ino = i.ino
                 WHERE d.parent_ino = ?
@@ -345,8 +345,9 @@ impl FileSystem for AgentFS {
 
         let mut entries = Vec::new();
         while let Some(row) = rows.next().await? {
+            let cookie = row.get::<i64>(0)?;
             let name = row
-                .get_value(0)
+                .get_value(1)
                 .ok()
                 .and_then(|v| {
                     if let Value::Text(s) = v {
@@ -361,10 +362,14 @@ impl FileSystem for AgentFS {
                 continue;
             }
 
-            let stats = store::stats_from_row_at(&row, 1)?;
+            let stats = store::stats_from_row_at(&row, 2)?;
 
             self.cache_attr(stats.clone());
-            entries.push(DirEntry { name, stats });
+            entries.push(DirEntry {
+                name,
+                stats,
+                cookie,
+            });
         }
 
         let end = entries.len() <= max_entries;

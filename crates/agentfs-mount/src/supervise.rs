@@ -194,6 +194,7 @@ pub async fn supervise_pid_with_hooks(
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
     let mut hup = signal(SignalKind::hangup())?;
+    let mut child = signal(SignalKind::child())?;
     let mut usr1 = if hooks.profile_checkpoint.is_some() {
         Some(signal(SignalKind::user_defined1())?)
     } else {
@@ -209,12 +210,12 @@ pub async fn supervise_pid_with_hooks(
             _ = term.recv() => return terminate_pid_and_wait(pid, opts, libc::SIGTERM).await,
             _ = int.recv() => return terminate_pid_and_wait(pid, opts, libc::SIGINT).await,
             _ = hup.recv() => return terminate_pid_and_wait(pid, opts, libc::SIGHUP).await,
+            _ = child.recv() => {},
             _ = recv_optional_signal(&mut usr1) => {
                 if let Some(checkpoint) = hooks.profile_checkpoint.as_mut() {
                     checkpoint();
                 }
             },
-            _ = tokio::time::sleep(Duration::from_millis(20)) => {},
         }
     }
 
@@ -322,7 +323,7 @@ async fn wait_for_supervised_child(
     if let Some(signal) = signal_from_status(&status) {
         tracing_signal_teardown(signo, signal);
     }
-    Ok(status)
+    Ok(interrupted_status(signo))
 }
 
 async fn wait_or_kill(
@@ -345,23 +346,35 @@ async fn terminate_pid_and_wait(
     signal: i32,
 ) -> Result<ExitStatus> {
     terminate_pid(pid, opts.kill_process_group, signal);
-    match tokio::time::timeout(opts.term_grace, wait_for_pid_exit(pid)).await {
+    let status = match tokio::time::timeout(opts.term_grace, wait_for_pid_exit(pid)).await {
         Ok(status) => status,
         Err(_) => {
             terminate_pid(pid, opts.kill_process_group, libc::SIGKILL);
             wait_for_pid_exit(pid).await
         }
+    }?;
+    if let Some(child_signal) = signal_from_status(&status) {
+        tracing_signal_teardown(signal, child_signal);
     }
+    Ok(interrupted_status(signal))
 }
 
 #[cfg(unix)]
 async fn wait_for_pid_exit(pid: libc::pid_t) -> Result<ExitStatus> {
+    let mut child = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())?;
     loop {
         if let Some(status) = try_wait_pid(pid)? {
             return Ok(status);
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        let _ = child.recv().await;
     }
+}
+
+#[cfg(unix)]
+fn interrupted_status(signal: i32) -> ExitStatus {
+    use std::os::unix::process::ExitStatusExt;
+
+    ExitStatus::from_raw(signal)
 }
 
 #[cfg(unix)]
@@ -612,6 +625,16 @@ mod tests {
         assert!(
             !process_exists(grandchild_pid),
             "grandchild process {grandchild_pid} survived process-group teardown"
+        );
+    }
+
+    #[test]
+    fn parent_signal_status_preserves_interrupted_exit_code() {
+        let status = interrupted_status(libc::SIGTERM);
+        assert_eq!(
+            exit_code_for_status(status),
+            128 + libc::SIGTERM,
+            "parent-directed teardown reports the parent signal even if the child handles TERM"
         );
     }
 

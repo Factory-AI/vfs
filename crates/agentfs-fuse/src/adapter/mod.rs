@@ -2944,14 +2944,46 @@ mod tests {
             (
                 "fuse other denied",
                 stats_with_owner(21, S_IFREG | 0o600, 1000, 1000),
-                other,
+                other.clone(),
                 false,
                 false,
                 false,
             ),
             (
+                "fuse auxiliary group execute directory",
+                stats_with_owner(22, S_IFDIR | 0o010, 1000, 2000),
+                access::Credentials {
+                    uid: 3000,
+                    gid: 3000,
+                    groups: smallvec![2000],
+                },
+                false,
+                false,
+                true,
+            ),
+            (
+                "fuse primary group write without search directory",
+                stats_with_owner(23, S_IFDIR | 0o020, 1000, 2000),
+                access::Credentials {
+                    uid: 3000,
+                    gid: 2000,
+                    groups: smallvec![],
+                },
+                false,
+                true,
+                false,
+            ),
+            (
+                "fuse other execute-only file",
+                stats_with_owner(24, S_IFREG | 0o001, 1000, 1000),
+                other,
+                false,
+                false,
+                true,
+            ),
+            (
                 "fuse root directory search",
-                stats_with_owner(22, S_IFDIR, 1000, 1000),
+                stats_with_owner(25, S_IFDIR, 1000, 1000),
                 root,
                 true,
                 true,
@@ -3008,10 +3040,12 @@ mod tests {
                 DirEntry {
                     name: "file.txt".to_string(),
                     stats: child,
+                    cookie: 1,
                 },
                 DirEntry {
                     name: "link".to_string(),
                     stats: symlink,
+                    cookie: 2,
                 },
             ],
         );

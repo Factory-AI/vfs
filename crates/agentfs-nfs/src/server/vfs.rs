@@ -9,6 +9,7 @@ use std::time::SystemTime;
 #[derive(Default, Debug)]
 pub struct DirEntrySimple {
     pub fileid: fileid3,
+    pub cookie: cookie3,
     pub name: filename3,
 }
 #[derive(Default, Debug)]
@@ -20,6 +21,7 @@ pub struct ReadDirSimpleResult {
 #[derive(Default, Debug)]
 pub struct DirEntry {
     pub fileid: fileid3,
+    pub cookie: cookie3,
     pub name: filename3,
     pub attr: fattr3,
 }
@@ -36,6 +38,7 @@ impl ReadDirSimpleResult {
             .iter()
             .map(|e| DirEntrySimple {
                 fileid: e.fileid,
+                cookie: e.cookie,
                 name: e.name.clone(),
             })
             .collect();
@@ -186,11 +189,11 @@ pub trait NFSFileSystem: Sync {
 
     /// Returns the contents of a directory with pagination.
     /// Directory listing should be deterministic.
-    /// Up to max_entries may be returned, and start_after is used
-    /// to determine where to start returning entries from.
+    /// Up to max_entries may be returned, and start_after is the opaque cookie
+    /// returned on the prior page's last entry.
     ///
-    /// For instance if the directory has entry with ids [1,6,2,11,8,9]
-    /// and start_after=6, readdir should returning 2,11,8,...
+    /// For instance if the directory returns cookies [1,6,2,11,8,9]
+    /// and start_after=6, readdir should return 2,11,8,...
     //
     async fn readdir(
         &self,

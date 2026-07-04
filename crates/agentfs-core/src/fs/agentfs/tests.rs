@@ -298,7 +298,7 @@
                 assert!(!page.entries.is_empty(), "non-final page must progress");
             }
             if let Some(last) = page.entries.last() {
-                cookie = last.stats.ino;
+                cookie = last.cookie;
             }
             seen.extend(page.entries.into_iter().map(|entry| entry.name));
             if page.end {
@@ -312,22 +312,98 @@
     }
 
     #[tokio::test]
+    async fn readdir_plus_after_uses_unique_dentry_cookies_for_hardlinks() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        let original =
+            FileSystem::create_file(&fs, ROOT_INO, "entry-0000", DEFAULT_FILE_MODE, 0, 0)
+                .await?
+                .0;
+        FileSystem::link(&fs, original.ino, ROOT_INO, "entry-0001").await?;
+        FileSystem::create_file(&fs, ROOT_INO, "entry-0002", DEFAULT_FILE_MODE, 0, 0).await?;
+
+        let first = FileSystem::readdir_plus_after(&fs, ROOT_INO, 0, 2)
+            .await?
+            .expect("root directory exists");
+        assert_eq!(
+            first
+                .entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["entry-0000", "entry-0001"]
+        );
+        assert_eq!(
+            first.entries[0].stats.ino, first.entries[1].stats.ino,
+            "test must place two hardlinks to the same inode on one page"
+        );
+        assert_ne!(
+            first.entries[0].cookie, first.entries[1].cookie,
+            "hardlinked dentries need distinct cookies even when fileid/inode matches"
+        );
+
+        let second = FileSystem::readdir_plus_after(
+            &fs,
+            ROOT_INO,
+            first.entries.last().expect("first page entry").cookie,
+            2,
+        )
+        .await?
+        .expect("root directory exists");
+        assert_eq!(
+            second
+                .entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["entry-0002"],
+            "resuming after a hardlink page boundary must not duplicate or skip entries"
+        );
+        assert!(second.end);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn readdir_plus_after_rejects_deleted_cookie() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        FileSystem::create_file(&fs, ROOT_INO, "entry-0000", DEFAULT_FILE_MODE, 0, 0).await?;
+        FileSystem::create_file(&fs, ROOT_INO, "entry-0001", DEFAULT_FILE_MODE, 0, 0).await?;
+
+        let first = FileSystem::readdir_plus_after(&fs, ROOT_INO, 0, 1)
+            .await?
+            .expect("root directory exists");
+        let stale_cookie = first.entries[0].cookie;
+        FileSystem::unlink(&fs, ROOT_INO, "entry-0000").await?;
+
+        let err = FileSystem::readdir_plus_after(&fs, ROOT_INO, stale_cookie, 1)
+            .await
+            .expect_err("deleted directory cookie should be rejected");
+        assert!(
+            matches!(err, crate::error::Error::Fs(FsError::BadCookie)),
+            "expected BadCookie, got {err:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn readdir_plus_after_query_plan_uses_bounded_dentry_indexes() -> Result<()> {
         let (fs, _dir) = create_test_fs().await?;
         for index in 0..16 {
             let name = format!("entry-{index:04}");
             FileSystem::create_file(&fs, ROOT_INO, &name, DEFAULT_FILE_MODE, 0, 0).await?;
         }
-        let cookie_ino = FileSystem::lookup(&fs, ROOT_INO, "entry-0007")
+        let cookie = FileSystem::readdir_plus_after(&fs, ROOT_INO, 0, 8)
             .await?
-            .expect("cookie entry exists")
-            .ino;
+            .expect("root directory exists")
+            .entries
+            .pop()
+            .expect("eighth entry exists")
+            .cookie;
 
         let conn = fs.pool.get_connection().await?;
         let mut rows = conn
             .query(
-                "EXPLAIN QUERY PLAN SELECT name FROM fs_dentry WHERE parent_ino = ? AND ino = ?",
-                (ROOT_INO, cookie_ino),
+                "EXPLAIN QUERY PLAN SELECT name FROM fs_dentry WHERE id = ? AND parent_ino = ?",
+                (cookie, ROOT_INO),
             )
             .await?;
         let mut cookie_plan = Vec::new();
@@ -339,14 +415,14 @@
         assert!(
             cookie_plan
                 .iter()
-                .any(|detail| detail.contains("idx_fs_dentry_parent_ino")
-                    && detail.contains("parent_ino=? AND ino=?")),
-            "cookie lookup must use the parent+ino index, got {cookie_plan:?}"
+                .any(|detail| detail.contains("INTEGER PRIMARY KEY")
+                    || detail.contains("rowid=?")),
+            "cookie lookup must use the dentry primary key, got {cookie_plan:?}"
         );
 
         let mut rows = conn
             .query(
-                "EXPLAIN QUERY PLAN SELECT d.name, i.ino, i.mode, i.nlink, i.uid, i.gid, i.size, i.atime, i.mtime, i.ctime, i.rdev, i.atime_nsec, i.mtime_nsec, i.ctime_nsec
+                "EXPLAIN QUERY PLAN SELECT d.id, d.name, i.ino, i.mode, i.nlink, i.uid, i.gid, i.size, i.atime, i.mtime, i.ctime, i.rdev, i.atime_nsec, i.mtime_nsec, i.ctime_nsec
                 FROM fs_dentry d
                 JOIN fs_inode i ON d.ino = i.ino
                 WHERE d.parent_ino = ? AND d.name > ?
@@ -374,7 +450,7 @@
 
         let mut rows = conn
             .query(
-                "EXPLAIN QUERY PLAN SELECT d.name, i.ino, i.mode, i.nlink, i.uid, i.gid, i.size, i.atime, i.mtime, i.ctime, i.rdev, i.atime_nsec, i.mtime_nsec, i.ctime_nsec
+                "EXPLAIN QUERY PLAN SELECT d.id, d.name, i.ino, i.mode, i.nlink, i.uid, i.gid, i.size, i.atime, i.mtime, i.ctime, i.rdev, i.atime_nsec, i.mtime_nsec, i.ctime_nsec
                 FROM fs_dentry d
                 JOIN fs_inode i ON d.ino = i.ino
                 WHERE d.parent_ino = ?

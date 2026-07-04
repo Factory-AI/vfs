@@ -318,6 +318,9 @@ impl FileSystem for OverlayFS {
 
         let mut result: Vec<_> = entries_map.into_values().collect();
         result.sort_by(|a, b| a.name.cmp(&b.name));
+        for (index, entry) in result.iter_mut().enumerate() {
+            entry.cookie = (index + 1) as i64;
+        }
         Ok(Some(result))
     }
 

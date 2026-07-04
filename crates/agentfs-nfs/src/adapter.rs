@@ -51,6 +51,7 @@ fn error_to_nfsstat(e: SdkError) -> nfsstat3 {
             FsError::NotADirectory => nfsstat3::NFS3ERR_NOTDIR,
             FsError::IsADirectory => nfsstat3::NFS3ERR_ISDIR,
             FsError::NameTooLong => nfsstat3::NFS3ERR_NAMETOOLONG,
+            FsError::BadCookie => nfsstat3::NFS3ERR_BAD_COOKIE,
             FsError::RootOperation => nfsstat3::NFS3ERR_ACCES,
             _ => nfsstat3::NFS3ERR_IO,
         },
@@ -628,6 +629,7 @@ impl NFSFileSystem for AgentNFS {
 
             result.entries.push(DirEntry {
                 fileid: ino,
+                cookie: entry.cookie as fileid3,
                 name: entry.name.as_bytes().into(),
                 attr: self.stats_to_fattr(&entry.stats),
             });

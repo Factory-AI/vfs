@@ -12,7 +12,7 @@ use super::mount_handlers;
 
 use super::nfs;
 use super::nfs_handlers;
-use super::transaction_tracker::TransactionLookup;
+use super::transaction_tracker::{TransactionKey, TransactionLookup};
 
 use super::portmap;
 use super::portmap_handlers;
@@ -45,7 +45,17 @@ async fn handle_rpc(
 
         let mut client_verifier = Vec::new();
         call.verf.serialize(&mut client_verifier)?;
-        let transaction = context.transaction_tracker.begin(xid, client_verifier);
+        let mut procedure_args = Vec::new();
+        input.read_to_end(&mut procedure_args)?;
+        let transaction_key = TransactionKey::new(
+            xid,
+            call.prog,
+            call.vers,
+            call.proc,
+            client_verifier,
+            &procedure_args,
+        );
+        let transaction = context.transaction_tracker.begin(transaction_key);
         let transaction_guard = match transaction {
             TransactionLookup::New(guard) => guard,
             TransactionLookup::InProgress => {
@@ -75,13 +85,28 @@ async fn handle_rpc(
         }
 
         let mut handler_output = Vec::new();
+        let mut args_cursor = Cursor::new(procedure_args.as_slice());
         let res = {
             if call.prog == nfs::PROGRAM {
-                nfs_handlers::handle_nfs(xid, call, input, &mut handler_output, &context).await
+                nfs_handlers::handle_nfs(xid, call, &mut args_cursor, &mut handler_output, &context)
+                    .await
             } else if call.prog == portmap::PROGRAM {
-                portmap_handlers::handle_portmap(xid, call, input, &mut handler_output, &context)
+                portmap_handlers::handle_portmap(
+                    xid,
+                    call,
+                    &mut args_cursor,
+                    &mut handler_output,
+                    &context,
+                )
             } else if call.prog == mount::PROGRAM {
-                mount_handlers::handle_mount(xid, call, input, &mut handler_output, &context).await
+                mount_handlers::handle_mount(
+                    xid,
+                    call,
+                    &mut args_cursor,
+                    &mut handler_output,
+                    &context,
+                )
+                .await
             } else if call.prog == NFS_ACL_PROGRAM
                 || call.prog == NFS_ID_MAP_PROGRAM
                 || call.prog == NFS_METADATA_PROGRAM
@@ -319,6 +344,25 @@ mod tests {
         msg
     }
 
+    fn serialize_getattr_call(xid: u32, fh: nfs::nfs_fh3, verf: opaque_auth) -> Vec<u8> {
+        let mut msg = Vec::new();
+        rpc_msg {
+            xid,
+            body: rpc_body::CALL(call_body {
+                rpcvers: 2,
+                prog: nfs::PROGRAM,
+                vers: nfs::VERSION,
+                proc: 1,
+                cred: opaque_auth::default(),
+                verf,
+            }),
+        }
+        .serialize(&mut msg)
+        .expect("serialize RPC header");
+        fh.serialize(&mut msg).expect("serialize GETATTR fh");
+        msg
+    }
+
     async fn run_rpc(payload: &[u8], context: RPCContext) -> Vec<u8> {
         let mut input = Cursor::new(payload.to_vec());
         let mut output = Vec::new();
@@ -421,6 +465,87 @@ mod tests {
         ));
         println!(
             "replayed=true reconnect=true first_port=40001 second_port=50002 xid={xid} verifier=stable-client-verifier side_effect_count=1"
+        );
+    }
+
+    #[tokio::test]
+    async fn drc_key_separates_cross_procedure_xid_collisions() {
+        let (context, _fs) = test_context().await;
+        let xid = 4300;
+        let verifier = verifier(b"shared-auth-none-verifier");
+        let create = serialize_guarded_create_call(
+            xid,
+            context.vfs.id_to_fh(1),
+            b"drc-cross-proc",
+            verifier.clone(),
+        );
+        let getattr = serialize_getattr_call(xid, context.vfs.id_to_fh(1), verifier);
+
+        let create_reply = run_rpc(&create, context.clone()).await;
+        assert!(matches!(
+            parse_nfs_status(&create_reply, xid),
+            nfs::nfsstat3::NFS3_OK
+        ));
+
+        let getattr_reply = run_rpc(&getattr, context.clone()).await;
+        assert_ne!(
+            create_reply, getattr_reply,
+            "same xid/verifier across different procedures must not replay cached bytes"
+        );
+        assert!(matches!(
+            parse_nfs_status(&getattr_reply, xid),
+            nfs::nfsstat3::NFS3_OK
+        ));
+        println!(
+            "replayed=false collision=cross-procedure xid={xid} key_fields=prog,vers,proc,args_digest"
+        );
+    }
+
+    #[tokio::test]
+    async fn drc_key_separates_same_procedure_argument_collisions() {
+        let (context, fs) = test_context().await;
+        let xid = 4400;
+        let verifier = verifier(b"shared-auth-none-verifier");
+        let first_name = b"drc-create-a";
+        let second_name = b"drc-create-b";
+        let first = serialize_guarded_create_call(
+            xid,
+            context.vfs.id_to_fh(1),
+            first_name,
+            verifier.clone(),
+        );
+        let second =
+            serialize_guarded_create_call(xid, context.vfs.id_to_fh(1), second_name, verifier);
+
+        let first_reply = run_rpc(&first, context.clone()).await;
+        assert!(matches!(
+            parse_nfs_status(&first_reply, xid),
+            nfs::nfsstat3::NFS3_OK
+        ));
+
+        let second_reply = run_rpc(&second, context.clone()).await;
+        assert_ne!(
+            first_reply, second_reply,
+            "same xid/verifier/procedure with different args must not replay cached bytes"
+        );
+        assert!(matches!(
+            parse_nfs_status(&second_reply, xid),
+            nfs::nfsstat3::NFS3_OK
+        ));
+        assert!(
+            FileSystem::lookup(&fs, 1, std::str::from_utf8(first_name).unwrap())
+                .await
+                .expect("lookup first file")
+                .is_some()
+        );
+        assert!(
+            FileSystem::lookup(&fs, 1, std::str::from_utf8(second_name).unwrap())
+                .await
+                .expect("lookup second file")
+                .is_some()
+        );
+        println!(
+            "replayed=false collision=same-procedure-different-args xid={xid} key_fields=args_digest"
         );
     }
 }
