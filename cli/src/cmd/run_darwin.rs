@@ -7,8 +7,6 @@
 //! Sandboxing is enforced using macOS sandbox-exec with dynamically generated
 //! profiles that restrict file writes to the NFS mountpoint and allowed paths.
 
-#![cfg(unix)]
-
 use agentfs_sdk::{
     AgentFS, AgentFSOptions, EncryptionConfig, FileSystem, HostFS, OverlayFS, PartialOriginPolicy,
 };

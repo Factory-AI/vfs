@@ -633,9 +633,9 @@ def resolve_agentfs_bin(agentfs_bin: Optional[str], repo_root: Path) -> str:
     # measuring (debug is unoptimized and can be 10x slower), AND release tends
     # to be rebuilt more often than debug during active development, so we are
     # more likely to pick up recent source changes. Debug-first ordering bit us
-    # in Tier One (see RCA in the notes file): a stale debug binary missing the
-    # `fuse-modern` feature kept returning ENOSYS while the just-built release
-    # binary worked fine.
+    # in Tier One (see RCA in the notes file): a stale debug binary from the
+    # pre-ABI-collapse workspace kept returning ENOSYS while the just-built
+    # release binary worked fine.
     for candidate_path in (
         repo_root / "cli" / "target" / "release" / "agentfs",
         repo_root / "cli" / "target" / "debug" / "agentfs",

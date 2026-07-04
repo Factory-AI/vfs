@@ -389,7 +389,10 @@ impl AgentFS {
                 Builder::new_local(&db_path).build().await?
             };
             let pool = if db_path == ":memory:" {
-                connection_pool::ConnectionPool::new_single_connection(db)
+                connection_pool::ConnectionPool::with_options(
+                    db,
+                    filesystem::agentfs::memory_connection_pool_options(),
+                )
             } else {
                 connection_pool::ConnectionPool::with_options(
                     db,
@@ -486,7 +489,10 @@ impl AgentFS {
     pub async fn new(db_path: &str) -> Result<Self> {
         let db = Builder::new_local(db_path).build().await?;
         let pool = if db_path == ":memory:" {
-            connection_pool::ConnectionPool::new_single_connection(db)
+            connection_pool::ConnectionPool::with_options(
+                db,
+                filesystem::agentfs::memory_connection_pool_options(),
+            )
         } else {
             connection_pool::ConnectionPool::with_options(
                 db,

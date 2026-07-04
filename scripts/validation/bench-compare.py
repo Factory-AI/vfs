@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Compare two median-of-5 git workload benchmark JSON files."""
+"""Compare two median-of-5 git workload benchmark JSON files.
+
+Exit status is part of the contract: 0 means every phase is within band, 1
+means at least one phase is red, and 2 means either input is malformed. The
+baseline and candidate phase sets must match exactly; a phase-set change is a
+format error so harness changes force an explicit rebaseline decision.
+"""
 
 from __future__ import annotations
 
@@ -212,7 +218,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         description=(
             "Compare two git-workload-benchmark-multi.py aggregate JSON files "
             "using the VFS perf contract."
-        )
+        ),
+        epilog=(
+            "Exit codes: 0 = all phases within band; 1 = one or more red phases; "
+            "2 = malformed input, including mismatched phase sets. Phase sets "
+            "are strict by design so adding or removing a benchmark phase forces "
+            "a deliberate rebaseline."
+        ),
     )
     parser.add_argument("baseline_json", type=Path, help="M1 baseline aggregate JSON")
     parser.add_argument("candidate_json", type=Path, help="candidate aggregate JSON")

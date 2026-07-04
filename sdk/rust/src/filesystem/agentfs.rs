@@ -41,6 +41,7 @@ const FILE_BACKED_SETUP_SQL: &[&str] = &[
     WAL_MODE_SQL,
     BASELINE_SYNCHRONOUS_SQL,
 ];
+const MEMORY_SETUP_SQL: &[&str] = &[TEMP_STORE_MEMORY_SQL];
 const ATTR_CACHE_MAX_SIZE: usize = 10000;
 
 /// Production connection-pool options for local file-backed AgentFS databases.
@@ -49,6 +50,11 @@ pub(crate) fn file_backed_connection_pool_options() -> ConnectionPoolOptions {
         max_connections: FILE_BACKED_MAX_CONNECTIONS,
         ..ConnectionPoolOptions::default().with_setup_sql(FILE_BACKED_SETUP_SQL.iter().copied())
     }
+}
+
+/// Production connection-pool options for local in-memory AgentFS databases.
+pub(crate) fn memory_connection_pool_options() -> ConnectionPoolOptions {
+    ConnectionPoolOptions::single_connection().with_setup_sql(MEMORY_SETUP_SQL.iter().copied())
 }
 
 async fn checkpoint_wal(conn: &Connection) -> Result<()> {
@@ -5654,6 +5660,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_file_follows_terminal_symlink() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+
+        let (_, file) = fs
+            .create_file("/target.txt", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        file.pwrite(0, b"target contents").await?;
+        file.fsync().await?;
+        FileSystem::symlink(&fs, ROOT_INO, "target.link", "target.txt", 0, 0).await?;
+
+        let link = FileSystem::lookup(&fs, ROOT_INO, "target.link")
+            .await?
+            .unwrap();
+        assert!(link.is_symlink());
+        assert_eq!(
+            fs.read_file("/target.link").await?.unwrap(),
+            b"target contents"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn import_entries_builds_tree_with_correct_content_and_stats() -> Result<()> {
         let (fs, _dir) = create_test_fs().await?;
 
@@ -6716,6 +6745,16 @@ mod tests {
             .setup_sql
             .iter()
             .any(|sql| sql == "PRAGMA synchronous = OFF"));
+    }
+
+    #[tokio::test]
+    async fn test_memory_agentfs_connections_use_temp_store_memory() -> Result<()> {
+        let agentfs = crate::AgentFS::open(crate::AgentFSOptions::ephemeral()).await?;
+
+        let conn = agentfs.get_connection().await?;
+        assert_eq!(read_pragma_i64(&conn, "PRAGMA temp_store").await, 2);
+
+        Ok(())
     }
 
     #[tokio::test]

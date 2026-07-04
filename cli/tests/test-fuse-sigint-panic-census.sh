@@ -297,8 +297,6 @@ run_cycle() {
     CURRENT_MNT=""
 
     if [ "$cycle_leg" = "1" ] &&
-        [ -r /sys/module/fuse/parameters/enable_uring ] &&
-        [ "$(cat /sys/module/fuse/parameters/enable_uring)" = "Y" ] &&
         ! awk '/advertising FUSE_OVER_IO_URING/ { found = 1 } END { exit found ? 0 : 1 }' "$log"; then
         echo
         echo "mount log for $cycle_label cycle $cycle_index:"
@@ -319,13 +317,23 @@ run_cycle() {
 }
 
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/agentfs-panic-census.XXXXXX")"
+RUN_URING_LEG=1
+URING_CYCLES_RUN=0
+LEGACY_CYCLES_RUN=0
 
-if [ -r /sys/module/fuse/parameters/enable_uring ] &&
-    [ "$(cat /sys/module/fuse/parameters/enable_uring)" != "Y" ]; then
-    skip "FUSE-over-io_uring disabled by kernel parameter"
+if [ ! -r /sys/module/fuse/parameters/enable_uring ]; then
+    echo "SKIP: uring leg requires readable /sys/module/fuse/parameters/enable_uring"
+    RUN_URING_LEG=0
+elif [ "$(cat /sys/module/fuse/parameters/enable_uring)" != "Y" ]; then
+    echo "SKIP: uring leg requires FUSE-over-io_uring enabled by kernel parameter"
+    RUN_URING_LEG=0
 fi
 
 for run_leg in 1 0; do
+    if [ "$run_leg" = "1" ] && [ "$RUN_URING_LEG" -ne 1 ]; then
+        continue
+    fi
+
     case "$run_leg" in
         1) run_label="uring" ;;
         0) run_label="legacy" ;;
@@ -333,6 +341,10 @@ for run_leg in 1 0; do
     run_i=1
     while [ "$run_i" -le "$CYCLES" ]; do
         run_cycle "$run_leg" "$run_label" "$run_i"
+        case "$run_leg" in
+            1) URING_CYCLES_RUN=$((URING_CYCLES_RUN + 1)) ;;
+            0) LEGACY_CYCLES_RUN=$((LEGACY_CYCLES_RUN + 1)) ;;
+        esac
         run_i=$((run_i + 1))
     done
 done
@@ -344,4 +356,5 @@ if [ -s "$PANIC_LINES" ]; then
     fail "panic census found Rust panic output"
 fi
 
-printf "OK (cycles_per_leg=%s panic_lines=0)\n" "$CYCLES"
+printf "OK (uring_cycles=%s legacy_cycles=%s panic_lines=0)\n" \
+    "$URING_CYCLES_RUN" "$LEGACY_CYCLES_RUN"
