@@ -456,7 +456,8 @@ impl FileSystem for OverlayFS {
                     .await?
                     .ok_or(FsError::NotFound)?;
                 self.refresh_overlay_mapping(ino, Layer::Base, current.ino, &info.path);
-                return self.base.open(current.ino, flags).await;
+                let base_file = self.base.open(current.ino, flags).await?;
+                return Ok(mount_visible_file(base_file, ino));
             }
             Layer::Base => {
                 let base_stats = self

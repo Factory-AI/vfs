@@ -1444,6 +1444,10 @@ impl FileSystem for AgentFS {
         AgentFS::finalize(self).await
     }
 
+    fn register_reap_hook(&self, hook: Arc<dyn ReapHook>) -> bool {
+        AgentFS::register_reap_hook(self, hook)
+    }
+
     // `forget` deliberately uses the default no-op trait impl: a FORGET only
     // drops the kernel's reference to the inode. Pending batched writes stay
     // readable through the Tier-4 overlay and are committed by the batcher

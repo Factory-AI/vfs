@@ -17,7 +17,7 @@ use turso::{Connection, Value};
 
 use super::{
     agentfs::{AgentFS, ReapHook},
-    FileSystem, Stats,
+    BoxedFile, File, FileSystem, Stats, WriteRange,
 };
 
 use maps::{InodeInfo, Layer, OverlayMaps};
@@ -90,6 +90,52 @@ pub(super) fn current_timestamp() -> Result<(i64, i64)> {
 
 pub(super) fn is_write_open(flags: i32) -> bool {
     (flags & libc::O_ACCMODE) != libc::O_RDONLY || (flags & libc::O_TRUNC) != 0
+}
+
+pub(super) fn mount_visible_file(inner: BoxedFile, overlay_ino: i64) -> BoxedFile {
+    Arc::new(MountVisibleFile { inner, overlay_ino })
+}
+
+struct MountVisibleFile {
+    inner: BoxedFile,
+    overlay_ino: i64,
+}
+
+#[async_trait]
+impl File for MountVisibleFile {
+    async fn pread(&self, offset: u64, size: u64) -> Result<Vec<u8>> {
+        self.inner.pread(offset, size).await
+    }
+
+    async fn pwrite(&self, offset: u64, data: &[u8]) -> Result<()> {
+        self.inner.pwrite(offset, data).await
+    }
+
+    async fn pwrite_ranges(&self, ranges: Vec<WriteRange>) -> Result<()> {
+        self.inner.pwrite_ranges(ranges).await
+    }
+
+    async fn pwrite_ranges_batched(&self, ranges: Vec<WriteRange>) -> Result<()> {
+        self.inner.pwrite_ranges_batched(ranges).await
+    }
+
+    async fn drain_writes(&self) -> Result<()> {
+        self.inner.drain_writes().await
+    }
+
+    async fn truncate(&self, size: u64) -> Result<()> {
+        self.inner.truncate(size).await
+    }
+
+    async fn fsync(&self) -> Result<()> {
+        self.inner.fsync().await
+    }
+
+    async fn fstat(&self) -> Result<Stats> {
+        let mut stats = self.inner.fstat().await?;
+        stats.ino = self.overlay_ino;
+        Ok(stats)
+    }
 }
 
 struct OverlaySidecarReapHook;

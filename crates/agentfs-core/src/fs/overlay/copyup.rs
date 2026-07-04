@@ -414,7 +414,7 @@ impl OverlayFS {
                     .await?
                 {
                     crate::telemetry::record_base_fast_open_passthrough_succeeded();
-                    return Ok(base_file);
+                    return Ok(mount_visible_file(base_file, overlay_ino));
                 }
                 crate::telemetry::record_base_fast_open_passthrough_fallback();
             }

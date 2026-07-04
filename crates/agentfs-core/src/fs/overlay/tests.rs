@@ -2,7 +2,7 @@
     use crate::fs::HostFS;
     use crate::fs::{FsError, TimeChange};
     use crate::DEFAULT_FILE_MODE;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use tempfile::tempdir;
 
     async fn create_test_overlay() -> Result<(OverlayFS, tempfile::TempDir, tempfile::TempDir)> {
@@ -114,6 +114,21 @@
             0,
             "read-only open of a base file should not copy file bytes into delta"
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn base_fast_path_fstat_reports_overlay_identity() -> Result<()> {
+        let (overlay, base_dir, _delta_dir) = create_test_overlay().await?;
+
+        let stats = overlay.lookup(ROOT_INO, "base.txt").await?.unwrap();
+        let host_ino = std::fs::metadata(base_dir.path().join("base.txt"))?.ino() as i64;
+        let file = overlay.open(stats.ino, libc::O_RDONLY).await?;
+
+        let fstat = file.fstat().await?;
+        assert_eq!(fstat.ino, stats.ino);
+        assert_ne!(fstat.ino, host_ino);
 
         Ok(())
     }

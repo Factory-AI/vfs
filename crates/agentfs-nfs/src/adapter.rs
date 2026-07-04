@@ -4,11 +4,8 @@
 //! FileSystem trait, enabling systems to mount AgentFS via NFS without requiring
 //! FUSE or other system extensions.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-
-use libc::{O_RDONLY, O_RDWR};
 
 use crate::server::nfs::{
     fattr3, fileid3, filename3, ftype3, nfs_fh3, nfspath3, nfsstat3, nfstime3, sattr3, set_atime,
@@ -17,7 +14,7 @@ use crate::server::nfs::{
 use crate::server::vfs::{auth_unix, DirEntry, NFSFileSystem, ReadDirResult};
 use agentfs_core::error::Error as SdkError;
 use agentfs_core::fs::FsError;
-use agentfs_core::semantics::{AckDurability, Semantics};
+use agentfs_core::semantics::{AckDurability, Authority, Semantics};
 use agentfs_core::{
     FileSystem, Stats, TimeChange, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG,
     S_IFSOCK,
@@ -30,7 +27,6 @@ const ROOT_INO: fileid3 = 1;
 const WRITE_HANDLE_MAGIC: &[u8; 8] = b"AFSWRIT\0";
 const PLAIN_HANDLE_LEN: usize = 16;
 const WRITE_HANDLE_LEN: usize = 32;
-const MAX_WRITE_HANDLE_TOKENS: usize = 16384;
 
 /// Convert a fileid3 to a filesystem inode number.
 fn id_to_fs_ino(id: fileid3) -> i64 {
@@ -71,8 +67,6 @@ pub(crate) struct AgentNFS {
     semantics: Semantics,
     /// Server-local generation number embedded in opaque file handles.
     fh_generation: u64,
-    /// CREATE-returned file-handle tokens that retain open-time write authority.
-    write_handle_tokens: StdMutex<HashMap<u64, fileid3>>,
 }
 
 impl AgentNFS {
@@ -86,7 +80,6 @@ impl AgentNFS {
             semantics: Semantics::new(fs.clone()),
             fs,
             fh_generation: seed,
-            write_handle_tokens: StdMutex::new(HashMap::new()),
         }
     }
 
@@ -189,18 +182,13 @@ impl NFSFileSystem for AgentNFS {
     }
 
     fn id_to_write_fh(&self, id: fileid3) -> nfs_fh3 {
-        let mut tokens = self.write_handle_tokens.lock().unwrap();
-        if tokens.len() >= MAX_WRITE_HANDLE_TOKENS {
-            if let Some(oldest) = tokens.keys().next().copied() {
-                tokens.remove(&oldest);
-            }
-        }
         let mut token = random_write_handle_token();
-        while tokens.contains_key(&token) {
+        while !self
+            .semantics
+            .try_grant_write_authority_with_token(id_to_fs_ino(id), token)
+        {
             token = random_write_handle_token();
         }
-        tokens.insert(token, id);
-        drop(tokens);
 
         let mut ret = Vec::with_capacity(WRITE_HANDLE_LEN);
         ret.extend_from_slice(&self.fh_generation.to_le_bytes());
@@ -210,6 +198,19 @@ impl NFSFileSystem for AgentNFS {
         nfs_fh3 { data: ret }
     }
 
+    fn id_to_readdirplus_fh(&self, id: fileid3) -> nfs_fh3 {
+        if let Some(token) = self.semantics.authority_token_for_ino(id_to_fs_ino(id)) {
+            let mut ret = Vec::with_capacity(WRITE_HANDLE_LEN);
+            ret.extend_from_slice(&self.fh_generation.to_le_bytes());
+            ret.extend_from_slice(&id.to_le_bytes());
+            ret.extend_from_slice(WRITE_HANDLE_MAGIC);
+            ret.extend_from_slice(&token.to_le_bytes());
+            nfs_fh3 { data: ret }
+        } else {
+            self.encode_plain_fh(id)
+        }
+    }
+
     fn fh_has_write_authority(&self, fh: &nfs_fh3, id: fileid3) -> bool {
         let Ok((handle_id, Some(token))) = self.parse_fh(fh) else {
             return false;
@@ -217,12 +218,7 @@ impl NFSFileSystem for AgentNFS {
         if handle_id != id {
             return false;
         }
-        self.write_handle_tokens
-            .lock()
-            .unwrap()
-            .get(&token)
-            .copied()
-            == Some(id)
+        self.semantics.has_write_authority(id_to_fs_ino(id), token)
     }
 
     fn fh_to_id(&self, fh: &nfs_fh3) -> Result<fileid3, nfsstat3> {
@@ -309,8 +305,16 @@ impl NFSFileSystem for AgentNFS {
 
         // Handle size change (truncate)
         if let set_size3::size(size) = setattr.size {
-            let file = fs.open(fs_ino, O_RDWR).await.map_err(error_to_nfsstat)?;
-            file.truncate(size).await.map_err(error_to_nfsstat)?;
+            let handle = self
+                .semantics
+                .open_cached(fs_ino, Authority::Write)
+                .await
+                .map_err(error_to_nfsstat)?;
+            handle
+                .file()
+                .truncate(size)
+                .await
+                .map_err(error_to_nfsstat)?;
         }
 
         // Handle atime/mtime changes (utimensat)
@@ -347,19 +351,19 @@ impl NFSFileSystem for AgentNFS {
         offset: u64,
         count: u32,
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
-        let fs = self.fs.clone();
-
-        let file = fs
-            .open(id_to_fs_ino(id), O_RDONLY)
+        let handle = self
+            .semantics
+            .open_cached(id_to_fs_ino(id), Authority::Read)
             .await
             .map_err(|_| nfsstat3::NFS3ERR_NOENT)?;
-        let data = file
+        let data = handle
+            .file()
             .pread(offset, count as u64)
             .await
             .map_err(error_to_nfsstat)?;
 
         // Check if we've reached EOF
-        let stats = file.fstat().await.map_err(error_to_nfsstat)?;
+        let stats = handle.file().fstat().await.map_err(error_to_nfsstat)?;
 
         let eof = offset + data.len() as u64 >= stats.size as u64;
         Ok((data, eof))
@@ -372,15 +376,14 @@ impl NFSFileSystem for AgentNFS {
         data: &[u8],
         durability: AckDurability,
     ) -> Result<(fattr3, AckDurability), nfsstat3> {
-        let fs = self.fs.clone();
-
-        let file = fs
-            .open(id_to_fs_ino(id), O_RDWR)
+        let handle = self
+            .semantics
+            .open_cached(id_to_fs_ino(id), Authority::Write)
             .await
             .map_err(error_to_nfsstat)?;
         let receipt = self
             .semantics
-            .write(&file, offset, data, durability)
+            .write_handle(&handle, offset, data, durability)
             .await
             .map_err(error_to_nfsstat)?;
 
@@ -548,6 +551,7 @@ impl NFSFileSystem for AgentNFS {
                 .await
                 .map_err(error_to_nfsstat)?;
         }
+        self.semantics.invalidate_handles(stats.ino);
 
         Ok(())
     }
@@ -566,9 +570,18 @@ impl NFSFileSystem for AgentNFS {
 
         let fs = self.fs.clone();
 
+        let replaced_ino = fs
+            .lookup(to_dir_fs_ino, to_name)
+            .await
+            .map_err(error_to_nfsstat)?
+            .map(|stats| stats.ino);
+
         fs.rename(from_dir_fs_ino, from_name, to_dir_fs_ino, to_name)
             .await
             .map_err(error_to_nfsstat)?;
+        if let Some(ino) = replaced_ino {
+            self.semantics.invalidate_handles(ino);
+        }
 
         Ok(())
     }
@@ -753,5 +766,72 @@ mod tests {
         forged_token_fh.data[24..32].copy_from_slice(&token.wrapping_add(1).to_le_bytes());
         assert!(matches!(nfs.fh_to_id(&forged_token_fh), Ok(7)));
         assert!(!nfs.fh_has_write_authority(&forged_token_fh, 7));
+    }
+
+    #[tokio::test]
+    async fn readdirplus_handle_reuses_live_create_write_authority() {
+        let nfs = test_nfs().await;
+        let write_fh = nfs.id_to_write_fh(7);
+        assert!(nfs.fh_has_write_authority(&write_fh, 7));
+
+        let readdirplus_fh = nfs.id_to_readdirplus_fh(7);
+        assert!(nfs.fh_has_write_authority(&readdirplus_fh, 7));
+    }
+
+    #[tokio::test]
+    async fn remove_and_rename_over_invalidate_write_authority() {
+        let nfs = test_nfs().await;
+        let auth = auth_unix {
+            stamp: 0,
+            machinename: b"test".to_vec(),
+            uid: 1000,
+            gid: 1000,
+            gids: Vec::new(),
+        };
+
+        let (victim, _) = nfs
+            .create(1, &b"victim.txt".to_vec().into(), sattr3::default(), &auth)
+            .await
+            .expect("victim create succeeds");
+        let victim_fh = nfs.id_to_write_fh(victim);
+        assert!(nfs.fh_has_write_authority(&victim_fh, victim));
+
+        nfs.remove(1, &b"victim.txt".to_vec().into())
+            .await
+            .expect("remove succeeds");
+        assert!(!nfs.fh_has_write_authority(&victim_fh, victim));
+
+        let (replaced, _) = nfs
+            .create(
+                1,
+                &b"replaced.txt".to_vec().into(),
+                sattr3::default(),
+                &auth,
+            )
+            .await
+            .expect("replaced create succeeds");
+        let replaced_fh = nfs.id_to_write_fh(replaced);
+        let (incoming, _) = nfs
+            .create(
+                1,
+                &b"incoming.txt".to_vec().into(),
+                sattr3::default(),
+                &auth,
+            )
+            .await
+            .expect("incoming create succeeds");
+        let incoming_fh = nfs.id_to_write_fh(incoming);
+
+        nfs.rename(
+            1,
+            &b"incoming.txt".to_vec().into(),
+            1,
+            &b"replaced.txt".to_vec().into(),
+        )
+        .await
+        .expect("rename-over succeeds");
+
+        assert!(!nfs.fh_has_write_authority(&replaced_fh, replaced));
+        assert!(nfs.fh_has_write_authority(&incoming_fh, incoming));
     }
 }

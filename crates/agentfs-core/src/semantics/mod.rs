@@ -6,8 +6,10 @@
 
 pub mod access;
 mod durability;
+mod handles;
 
 pub use durability::{AckDurability, Semantics, WriteReceipt};
+pub use handles::{Authority, Handle, HandleTable};
 
 #[cfg(test)]
 mod tests {

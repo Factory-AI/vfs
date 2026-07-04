@@ -414,6 +414,15 @@ pub trait FileSystem: Send + Sync {
         self.drain_all().await
     }
 
+    /// Register a hook that runs when this filesystem reaps an inode.
+    ///
+    /// Filesystems without an AgentFS lifecycle return `false`; callers should
+    /// still invalidate adapter-local state around explicit unlink/rename
+    /// operations when they need immediate semantics over wrapper inode spaces.
+    fn register_reap_hook(&self, _hook: Arc<dyn agentfs::ReapHook>) -> bool {
+        false
+    }
+
     /// Retain an existing lookup reference without resolving a name again.
     ///
     /// FUSE positive LOOKUP cache hits still create kernel lookup references.

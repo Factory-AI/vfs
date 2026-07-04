@@ -993,7 +993,8 @@ pub async fn nfsproc3_readdirplus(
             dirversion.serialize(&mut counting_output)?;
             for entry in result.entries {
                 let obj_attr = entry.attr;
-                let handle = nfs::post_op_fh3::handle(context.vfs.id_to_fh(entry.fileid));
+                let handle =
+                    nfs::post_op_fh3::handle(context.vfs.id_to_readdirplus_fh(entry.fileid));
 
                 let entry = entryplus3 {
                     fileid: entry.fileid,
@@ -2975,6 +2976,21 @@ mod tests {
         input
     }
 
+    fn serialize_readdirplus_args(root_fh: nfs::nfs_fh3) -> Vec<u8> {
+        let mut input = Vec::new();
+        let mut cursor = Cursor::new(&mut input);
+        READDIRPLUS3args {
+            dir: root_fh,
+            cookie: 0,
+            cookieverf: nfs::cookieverf3::default(),
+            dircount: 8192,
+            maxcount: 8192,
+        }
+        .serialize(&mut cursor)
+        .expect("serialize READDIRPLUS args");
+        input
+    }
+
     fn serialize_getattr_args(file: nfs::nfs_fh3) -> Vec<u8> {
         let mut input = Vec::new();
         let mut cursor = Cursor::new(&mut input);
@@ -3123,6 +3139,47 @@ mod tests {
             (status, Some(resok))
         } else {
             (status, None)
+        }
+    }
+
+    async fn readdirplus_handle_for_name(context: &RPCContext, name: &[u8]) -> nfs::nfs_fh3 {
+        let mut input = Cursor::new(serialize_readdirplus_args(context.vfs.id_to_fh(1)));
+        let mut output = Vec::new();
+        nfsproc3_readdirplus(5, &mut input, &mut output, context)
+            .await
+            .expect("READDIRPLUS handler");
+
+        let mut cursor = Cursor::new(output);
+        parse_rpc_success(&mut cursor);
+        let status = parse_nfs_status(&mut cursor);
+        assert!(matches!(status, nfs::nfsstat3::NFS3_OK));
+        let mut dir_attr = nfs::post_op_attr::Void;
+        dir_attr
+            .deserialize(&mut cursor)
+            .expect("deserialize READDIRPLUS dir attrs");
+        let mut cookieverf = nfs::cookieverf3::default();
+        cookieverf
+            .deserialize(&mut cursor)
+            .expect("deserialize READDIRPLUS cookie verifier");
+
+        loop {
+            let mut has_entry = false;
+            has_entry
+                .deserialize(&mut cursor)
+                .expect("deserialize READDIRPLUS entry presence");
+            if !has_entry {
+                panic!("READDIRPLUS did not return requested entry {name:?}");
+            }
+            let mut entry = entryplus3::default();
+            entry
+                .deserialize(&mut cursor)
+                .expect("deserialize READDIRPLUS entry");
+            if entry.name.as_slice() == name {
+                return match entry.name_handle {
+                    nfs::post_op_fh3::handle(fh) => fh,
+                    nfs::post_op_fh3::Void => panic!("READDIRPLUS entry omitted file handle"),
+                };
+            }
         }
     }
 
@@ -3316,6 +3373,28 @@ mod tests {
         let status = write_status(&context, created_fh, b"data").await;
 
         assert!(matches!(status, nfs::nfsstat3::NFS3_OK));
+        assert_eq!(read_file(&fs, "loose-object", 4).await, b"data");
+    }
+
+    #[tokio::test]
+    async fn readdirplus_refreshed_handle_can_write_after_readonly_final_mode() {
+        let (context, fs) = test_context().await;
+        let created_fh = create_readonly_file(&context).await;
+        let created_id = context
+            .vfs
+            .fh_to_id(&created_fh)
+            .expect("created handle resolves");
+
+        let readdirplus_fh = readdirplus_handle_for_name(&context, b"loose-object").await;
+
+        assert!(context
+            .vfs
+            .fh_has_write_authority(&readdirplus_fh, created_id));
+        let status = write_status(&context, readdirplus_fh.clone(), b"data").await;
+        assert!(matches!(status, nfs::nfsstat3::NFS3_OK));
+        let (getattr_status, getattr_attr) = getattr_result(&context, readdirplus_fh).await;
+        assert!(matches!(getattr_status, nfs::nfsstat3::NFS3_OK));
+        assert_eq!(getattr_attr.expect("attrs").mode, 0o444);
         assert_eq!(read_file(&fs, "loose-object", 4).await, b"data");
     }
 

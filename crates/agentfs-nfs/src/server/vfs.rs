@@ -277,6 +277,15 @@ pub trait NFSFileSystem: Sync {
         self.id_to_fh(id)
     }
 
+    /// Converts the fileid to a handle suitable for READDIRPLUS.
+    ///
+    /// Implementations with live CREATE write-authority tokens can override
+    /// this to keep a client-side node refresh from downgrading the handle to
+    /// a plain mode-bit-gated handle.
+    fn id_to_readdirplus_fh(&self, id: fileid3) -> nfs_fh3 {
+        self.id_to_fh(id)
+    }
+
     /// Returns whether this exact opaque file handle carries write authority
     /// captured at CREATE time for the resolved fileid.
     fn fh_has_write_authority(&self, _fh: &nfs_fh3, _id: fileid3) -> bool {

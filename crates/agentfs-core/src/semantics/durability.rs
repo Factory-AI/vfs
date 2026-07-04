@@ -4,6 +4,7 @@
 //! volatile or committed. The facade then owns the mechanical contract for
 //! turning that declaration into filesystem work.
 
+use super::handles::{Authority, Handle, HandleTable};
 use crate::error::Result;
 use crate::fs::{BoxedFile, FileSystem, Stats};
 use std::sync::Arc;
@@ -28,12 +29,18 @@ pub struct WriteReceipt {
 #[derive(Clone)]
 pub struct Semantics {
     fs: Arc<dyn FileSystem>,
+    handles: HandleTable,
 }
 
 impl Semantics {
     /// Create a semantics facade over the canonical filesystem implementation.
     pub fn new(fs: Arc<dyn FileSystem>) -> Self {
-        Self { fs }
+        Self::new_with_handle_table(fs, HandleTable::default())
+    }
+
+    pub fn new_with_handle_table(fs: Arc<dyn FileSystem>, handles: HandleTable) -> Self {
+        fs.register_reap_hook(Arc::new(handles.clone()));
+        Self { fs, handles }
     }
 
     /// Return coherent attributes for `ino`.
@@ -63,6 +70,43 @@ impl Semantics {
             count: data.len(),
             durability,
         })
+    }
+
+    /// Write bytes through a semantics-owned cached handle.
+    pub async fn write_handle(
+        &self,
+        handle: &Handle,
+        offset: u64,
+        data: &[u8],
+        durability: AckDurability,
+    ) -> Result<WriteReceipt> {
+        self.write(handle.file(), offset, data, durability).await
+    }
+
+    /// Return a cached open handle for `ino` with the requested authority.
+    pub async fn open_cached(&self, ino: i64, authority: Authority) -> Result<Handle> {
+        self.handles.open_cached(&self.fs, ino, authority).await
+    }
+
+    /// Insert a caller-generated write-authority token.
+    pub fn try_grant_write_authority_with_token(&self, ino: i64, token: u64) -> bool {
+        self.handles
+            .try_grant_write_authority_with_token(ino, token)
+    }
+
+    /// Check and refresh write authority carried by a token.
+    pub fn has_write_authority(&self, ino: i64, token: u64) -> bool {
+        self.handles.has_write_authority(ino, token)
+    }
+
+    /// Return a live token for READDIRPLUS, if this inode has write authority.
+    pub fn authority_token_for_ino(&self, ino: i64) -> Option<u64> {
+        self.handles.authority_token_for_ino(ino)
+    }
+
+    /// Invalidate all cached handles and write-authority tokens for an inode.
+    pub fn invalidate_handles(&self, ino: i64) {
+        self.handles.invalidate_ino(ino);
     }
 
     /// Commit pending writes for one inode or for the whole filesystem.
