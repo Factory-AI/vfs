@@ -13,8 +13,8 @@ use turso::transaction::{Transaction, TransactionBehavior};
 use turso::{Connection, Value};
 
 use super::{
-    agentfs::AgentFS, BoxedFile, DirEntry, File, FileSystem, FilesystemStats, FsError, Stats,
-    TimeChange, WriteRange,
+    agentfs::{AgentFS, ReapHook},
+    BoxedFile, DirEntry, File, FileSystem, FilesystemStats, FsError, Stats, TimeChange, WriteRange,
 };
 
 /// Root inode number (matches FUSE convention)
@@ -84,6 +84,21 @@ fn current_timestamp() -> Result<(i64, i64)> {
 
 fn is_write_open(flags: i32) -> bool {
     (flags & libc::O_ACCMODE) != libc::O_RDONLY || (flags & libc::O_TRUNC) != 0
+}
+
+struct OverlaySidecarReapHook;
+
+#[async_trait]
+impl ReapHook for OverlaySidecarReapHook {
+    async fn on_reap(&self, conn: &Connection, ino: i64) -> Result<()> {
+        conn.execute("DELETE FROM fs_origin WHERE delta_ino = ?", (ino,))
+            .await?;
+        conn.execute("DELETE FROM fs_chunk_override WHERE delta_ino = ?", (ino,))
+            .await?;
+        conn.execute("DELETE FROM fs_partial_origin WHERE delta_ino = ?", (ino,))
+            .await?;
+        Ok(())
+    }
 }
 
 fn parent_path_for_whiteout(path: &str) -> String {
@@ -198,6 +213,8 @@ impl OverlayFS {
         delta: AgentFS,
         partial_origin_policy: PartialOriginPolicy,
     ) -> Self {
+        delta.register_reap_hook(Self::sidecar_reap_hook());
+
         let mut inode_map = HashMap::new();
         let mut reverse_map = HashMap::new();
         let mut path_map = HashMap::new();
@@ -226,6 +243,10 @@ impl OverlayFS {
             origin_map: RwLock::new(HashMap::new()),
             partial_origin_policy,
         }
+    }
+
+    pub(crate) fn sidecar_reap_hook() -> Arc<dyn ReapHook> {
+        Arc::new(OverlaySidecarReapHook)
     }
 
     /// Initialize the overlay filesystem schema
@@ -3367,6 +3388,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn overlay_reap_hook_cleans_sidecars() -> Result<()> {
+        let base_dir = tempdir()?;
+        let delta_dir = tempdir()?;
+        let db_path = delta_dir.path().join("delta.db");
+        let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+        let chunk_size = delta.chunk_size();
+        std::fs::write(
+            base_dir.path().join("src.bin"),
+            patterned_bytes(chunk_size + 17, 0xd1),
+        )?;
+        std::fs::write(
+            base_dir.path().join("dst.bin"),
+            patterned_bytes(chunk_size + 19, 0xe1),
+        )?;
+
+        let base = Arc::new(HostFS::new(base_dir.path())?);
+        let overlay = OverlayFS::new_with_partial_origin(base, delta, true);
+        overlay.init(base_dir.path().to_str().unwrap()).await?;
+
+        for (name, byte) in [("src.bin", b'S'), ("dst.bin", b'D')] {
+            let stats = overlay.lookup(ROOT_INO, name).await?.unwrap();
+            let file = overlay.open(stats.ino, libc::O_RDWR).await?;
+            file.pwrite(3, &[byte]).await?;
+            file.fsync().await?;
+            drop(file);
+        }
+        assert_eq!(
+            scalar_i64(&overlay, "SELECT COUNT(*) FROM fs_partial_origin").await?,
+            2,
+            "both partially copied files should have sidecar metadata before rename-replace"
+        );
+
+        overlay
+            .rename(ROOT_INO, "src.bin", ROOT_INO, "dst.bin")
+            .await?;
+        assert_no_orphan_sidecars(&overlay, "rename-replace").await?;
+
+        let (deferred, deferred_file) = FileSystem::create_file(
+            overlay.delta(),
+            ROOT_INO,
+            "manual-deferred.bin",
+            DEFAULT_FILE_MODE,
+            0,
+            0,
+        )
+        .await?;
+        deferred_file.pwrite(0, b"manual").await?;
+        deferred_file.drain_writes().await?;
+        insert_manual_sidecars(overlay.delta(), deferred.ino).await?;
+        FileSystem::unlink(overlay.delta(), ROOT_INO, "manual-deferred.bin").await?;
+        assert_eq!(deferred_file.fstat().await?.nlink, 0);
+        drop(deferred_file);
+        overlay.delta().process_deferred_reaps().await?;
+        assert_no_orphan_sidecars(&overlay, "deferred-reap").await?;
+
+        let crash_dir = tempdir()?;
+        let crash_db = crash_dir.path().join("crash.db");
+        let crash_db_path = crash_db.to_string_lossy().into_owned();
+        {
+            let agent = crate::AgentFS::open(
+                crate::AgentFSOptions::with_path(crash_db_path.clone()).with_base(base_dir.path()),
+            )
+            .await?;
+            let (stats, file) = FileSystem::create_file(
+                &agent.fs,
+                ROOT_INO,
+                "manual-crash.bin",
+                DEFAULT_FILE_MODE,
+                0,
+                0,
+            )
+            .await?;
+            file.pwrite(0, b"crash").await?;
+            file.drain_writes().await?;
+            insert_manual_sidecars(&agent.fs, stats.ino).await?;
+            FileSystem::unlink(&agent.fs, ROOT_INO, "manual-crash.bin").await?;
+            std::mem::forget(file);
+        }
+
+        let reopened_agent = crate::AgentFS::open(
+            crate::AgentFSOptions::with_path(crash_db_path).with_base(base_dir.path()),
+        )
+        .await?;
+        let reopened_base = Arc::new(HostFS::new(base_dir.path())?);
+        let reopened = OverlayFS::new_with_partial_origin(reopened_base, reopened_agent.fs, true);
+        reopened.load().await?;
+        assert_no_orphan_sidecars(&reopened, "crash-sweep").await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_overlay_partial_origin_hardlink_survives_source_unlink() -> Result<()> {
         let base_dir = tempdir()?;
         let delta_dir = tempdir()?;
@@ -5084,6 +5197,60 @@ mod tests {
             .ok()
             .and_then(|v| v.as_integer().copied())
             .unwrap_or(0))
+    }
+
+    async fn insert_manual_sidecars(delta: &AgentFS, ino: i64) -> Result<()> {
+        let conn = delta.get_connection().await?;
+        conn.execute(
+            "INSERT OR REPLACE INTO fs_origin (delta_ino, base_ino) VALUES (?, ?)",
+            (ino, 9_001_i64),
+        )
+        .await?;
+        conn.execute(
+            "INSERT OR REPLACE INTO fs_partial_origin \
+             (delta_ino, base_ino, base_path, base_size, created_at) \
+             VALUES (?, ?, ?, ?, ?)",
+            (ino, 9_001_i64, format!("/manual-{ino}"), 0_i64, 0_i64),
+        )
+        .await?;
+        conn.execute(
+            "INSERT OR REPLACE INTO fs_chunk_override (delta_ino, chunk_index) VALUES (?, ?)",
+            (ino, 0_i64),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn assert_no_orphan_sidecars(overlay: &OverlayFS, context: &str) -> Result<()> {
+        let probes = [
+            (
+                "fs_origin",
+                "SELECT COUNT(*) FROM fs_origin s \
+                 LEFT JOIN fs_inode i ON i.ino = s.delta_ino \
+                 WHERE i.ino IS NULL",
+            ),
+            (
+                "fs_partial_origin",
+                "SELECT COUNT(*) FROM fs_partial_origin s \
+                 LEFT JOIN fs_inode i ON i.ino = s.delta_ino \
+                 WHERE i.ino IS NULL",
+            ),
+            (
+                "fs_chunk_override",
+                "SELECT COUNT(*) FROM fs_chunk_override s \
+                 LEFT JOIN fs_inode i ON i.ino = s.delta_ino \
+                 WHERE i.ino IS NULL",
+            ),
+        ];
+
+        for (table, sql) in probes {
+            assert_eq!(
+                scalar_i64(overlay, sql).await?,
+                0,
+                "{context} should not leave orphan rows in {table}"
+            );
+        }
+        Ok(())
     }
 
     fn patterned_bytes(len: usize, seed: u8) -> Vec<u8> {

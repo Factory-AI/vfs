@@ -26,6 +26,7 @@ use error::{Error, Result};
 use std::{
     collections::{HashSet, VecDeque},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 use turso::{Builder, EncryptionOpts, Value};
 
@@ -407,6 +408,8 @@ impl AgentFS {
         schema::check_schema_version(&conn).await?;
         drop(conn);
 
+        let overlay_requested = options.base.is_some();
+
         // Initialize overlay schema if base is provided
         if let Some(base_path) = options.base {
             let canonical_base = std::fs::canonicalize(base_path)?;
@@ -421,7 +424,8 @@ impl AgentFS {
             None
         };
 
-        Self::open_with_pool_and_path(pool, sync_db, db_path_for_fs, core_config).await
+        let reap_hooks = Self::overlay_reap_hooks_for_pool(&pool, overlay_requested).await?;
+        Self::open_with_pool_and_path(pool, sync_db, db_path_for_fs, core_config, reap_hooks).await
     }
 
     /// Open an AgentFS instance from a connection pool
@@ -438,8 +442,15 @@ impl AgentFS {
         sync_db: Option<turso::sync::Database>,
         core_config: CoreConfig,
     ) -> Result<Self> {
+        let reap_hooks = Self::overlay_reap_hooks_for_pool(&pool, false).await?;
         let kv = KvStore::from_pool(pool.clone()).await?;
-        let fs = filesystem::AgentFS::from_pool_with_config(pool.clone(), core_config).await?;
+        let fs = filesystem::AgentFS::from_pool_with_path_config_and_reap_hooks(
+            pool.clone(),
+            None,
+            core_config,
+            reap_hooks,
+        )
+        .await?;
         let tools = ToolCalls::from_pool(pool.clone()).await?;
 
         Ok(Self {
@@ -456,11 +467,16 @@ impl AgentFS {
         sync_db: Option<turso::sync::Database>,
         db_path: Option<PathBuf>,
         core_config: CoreConfig,
+        reap_hooks: Vec<Arc<dyn filesystem::agentfs::ReapHook>>,
     ) -> Result<Self> {
         let kv = KvStore::from_pool(pool.clone()).await?;
-        let fs =
-            filesystem::AgentFS::from_pool_with_path_and_config(pool.clone(), db_path, core_config)
-                .await?;
+        let fs = filesystem::AgentFS::from_pool_with_path_config_and_reap_hooks(
+            pool.clone(),
+            db_path,
+            core_config,
+            reap_hooks,
+        )
+        .await?;
         let tools = ToolCalls::from_pool(pool.clone()).await?;
 
         Ok(Self {
@@ -470,6 +486,38 @@ impl AgentFS {
             fs,
             tools,
         })
+    }
+
+    async fn overlay_reap_hooks_for_pool(
+        pool: &connection_pool::ConnectionPool,
+        force_overlay_hook: bool,
+    ) -> Result<Vec<Arc<dyn filesystem::agentfs::ReapHook>>> {
+        if force_overlay_hook || Self::overlay_config_exists(pool).await? {
+            Ok(vec![filesystem::OverlayFS::sidecar_reap_hook()])
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    async fn overlay_config_exists(pool: &connection_pool::ConnectionPool) -> Result<bool> {
+        let conn = pool.get_connection().await?;
+        let mut rows = conn
+            .query(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'fs_overlay_config'",
+                (),
+            )
+            .await?;
+        if rows.next().await?.is_none() {
+            return Ok(false);
+        }
+
+        let mut rows = conn
+            .query(
+                "SELECT 1 FROM fs_overlay_config WHERE key = 'base_path' LIMIT 1",
+                (),
+            )
+            .await?;
+        Ok(rows.next().await?.is_some())
     }
 
     /// Open an AgentFS instance from a sync database
