@@ -15,9 +15,9 @@ use crate::nfsserve::nfs::{
     set_gid3, set_mode3, set_mtime, set_size3, set_uid3, specdata3,
 };
 use crate::nfsserve::vfs::{auth_unix, DirEntry, NFSFileSystem, ReadDirResult};
-use agentfs_sdk::error::Error as SdkError;
-use agentfs_sdk::filesystem::FsError;
-use agentfs_sdk::{
+use agentfs_core::error::Error as SdkError;
+use agentfs_core::fs::FsError;
+use agentfs_core::{
     FileSystem, Stats, TimeChange, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG,
     S_IFSOCK,
 };
@@ -677,7 +677,7 @@ impl NFSFileSystem for AgentNFS {
 mod tests {
     use super::*;
     use crate::nfsserve::vfs::NFSFileSystem;
-    use agentfs_sdk::{AgentFS, AgentFSOptions};
+    use agentfs_core::{AgentFS, AgentFSOptions};
     use std::sync::Arc;
 
     async fn test_nfs() -> AgentNFS {

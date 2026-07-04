@@ -4,7 +4,7 @@
 //! - Linux: FUSE + namespace sandbox
 //! - Darwin: NFS + sandbox-exec
 
-use agentfs_sdk::PartialOriginPolicy;
+use agentfs_core::PartialOriginPolicy;
 use anyhow::Result;
 use std::path::PathBuf;
 

@@ -1,4 +1,4 @@
-use agentfs_sdk::AgentFSOptions;
+use agentfs_core::AgentFSOptions;
 
 use crate::cmd::init::open_agentfs;
 

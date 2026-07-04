@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use agentfs_sdk::{
+use agentfs_core::{
     agentfs_dir, AgentFS, AgentFSOptions, EncryptionConfig, OverlayFS, PartialBootstrapStrategy,
     PartialSyncOpts, SyncOptions,
 };
@@ -16,7 +16,7 @@ pub struct EncryptionOptions {
     pub cipher: String,
 }
 
-pub async fn open_agentfs(options: AgentFSOptions) -> Result<AgentFS, agentfs_sdk::error::Error> {
+pub async fn open_agentfs(options: AgentFSOptions) -> Result<AgentFS, agentfs_core::error::Error> {
     let mut options = options;
     if options.core_config.is_none() {
         options = options.with_core_config(crate::config::core_config_from_env());
@@ -210,7 +210,7 @@ async fn run_init_cmd(
 ) -> AnyhowResult<()> {
     use crate::cmd::supervise::{supervise_command, ChildOutcome};
     use crate::mount::{mount_fs, MountOpts};
-    use agentfs_sdk::{FileSystem, HostFS};
+    use agentfs_core::{FileSystem, HostFS};
     use std::sync::Arc;
 
     let fs: Arc<dyn FileSystem> = if let Some(ref base_path) = base {

@@ -4,7 +4,7 @@
 //! filesystem to a temporary directory, runs a command with that as the
 //! working directory, and automatically unmounts when done.
 
-use agentfs_sdk::{AgentFSOptions, EncryptionConfig, FileSystem, HostFS, OverlayFS};
+use agentfs_core::{AgentFSOptions, EncryptionConfig, FileSystem, HostFS, OverlayFS};
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::sync::Arc;

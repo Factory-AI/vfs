@@ -16,7 +16,7 @@
 //! bypassing the FUSE mount entirely.
 
 use super::group_paths_by_parent;
-use agentfs_sdk::{
+use agentfs_core::{
     AgentFS, AgentFSOptions, EncryptionConfig, HostFS, OverlayFS, PartialOriginPolicy,
 };
 use anyhow::{bail, Context, Result};

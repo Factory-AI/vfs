@@ -1,6 +1,6 @@
 //! CLI-owned runtime config assembly.
 
-use agentfs_sdk::{CoreConfig, EnvReader};
+use agentfs_core::{CoreConfig, EnvReader};
 
 const CLONE_TIMINGS_ENV: &str = "AGENTFS_CLONE_TIMINGS";
 const SHELL_ENV: &str = "SHELL";

@@ -11,15 +11,15 @@ Every active runtime knob is declared here with an architecture class. Defaults 
 | `AGENTFS_KEY` | env or --key | product-config | `unset` | agentfs CLI edge | Hex-encoded local encryption key for CLI commands that open a database. | n/a | opts clap env binding |
 | `AGENTFS_CIPHER` | env or --cipher | product-config | `unset` | agentfs CLI edge | Encryption cipher paired with AGENTFS_KEY or --key. | n/a | opts clap env binding |
 | `AGENTFS_CLONE_TIMINGS` | env | sunset | `false` | agentfs CLI edge | Ad hoc clone timing printout for local performance investigations. | Remove after telemetry registry exposes clone timing through the single report sink. | config::clone_timings_enabled |
-| `AGENTFS_PROFILE` | env | product-config | `false` | agentfs-sdk config | Enables profiling counters and summaries. | n/a | VAL-CONF-011 and VAL-CONF-014 |
-| `AGENTFS_OVERLAY_READS` | env | sunset | `true` | agentfs-sdk config | Tier-4 pending-write read overlay rollback path. | Remove after PendingView/stat coherence and overlay read gates are green for N=2 consecutive milestones. | VAL-CORE-006 and phase8 smoke |
-| `AGENTFS_KEEPCACHE_DELTA` | env | product-config | `true` | agentfs-sdk config | Allows DB-backed delta files to participate in keep-cache eligibility. | n/a | VAL-FUSE-014 |
-| `AGENTFS_BATCH_MS` | env | product-config | `5` | agentfs-sdk config | Write batcher timer window in milliseconds. | n/a | sdk write-batcher tests |
-| `AGENTFS_BATCH_BYTES` | env | product-config | `4194304` | agentfs-sdk config | Per-inode pending-byte drain trigger. | n/a | sdk write-batcher tests |
-| `AGENTFS_BATCH_GLOBAL_BYTES` | env | product-config | `67108864` | agentfs-sdk config | Global pending-byte cap across inodes. | n/a | sdk write-batcher tests |
-| `AGENTFS_BATCH_TXN_INODES` | env | product-config | `1024` | agentfs-sdk config | Maximum inodes drained or imported per transaction. | n/a | sdk write-batcher and import tests |
-| `AGENTFS_BATCH_TXN_BYTES` | env | product-config | `33554432` | agentfs-sdk config | Maximum bytes drained or imported per transaction. | n/a | sdk write-batcher and import tests |
-| `AGENTFS_DRAIN_ON_SETATTR` | env | sunset | `true` | agentfs-sdk config | Compatibility path that drains pending writes before setattr operations. | Remove after PendingView/stat coherence and setattr tests are green for N=2 consecutive milestones. | VAL-CORE-006 and VAL-NFS-016 |
+| `AGENTFS_PROFILE` | env | product-config | `false` | agentfs-core config | Enables profiling counters and summaries. | n/a | VAL-CONF-011 and VAL-CONF-014 |
+| `AGENTFS_OVERLAY_READS` | env | sunset | `true` | agentfs-core config | Tier-4 pending-write read overlay rollback path. | Remove after PendingView/stat coherence and overlay read gates are green for N=2 consecutive milestones. | VAL-CORE-006 and phase8 smoke |
+| `AGENTFS_KEEPCACHE_DELTA` | env | product-config | `true` | agentfs-core config | Allows DB-backed delta files to participate in keep-cache eligibility. | n/a | VAL-FUSE-014 |
+| `AGENTFS_BATCH_MS` | env | product-config | `5` | agentfs-core config | Write batcher timer window in milliseconds. | n/a | sdk write-batcher tests |
+| `AGENTFS_BATCH_BYTES` | env | product-config | `4194304` | agentfs-core config | Per-inode pending-byte drain trigger. | n/a | sdk write-batcher tests |
+| `AGENTFS_BATCH_GLOBAL_BYTES` | env | product-config | `67108864` | agentfs-core config | Global pending-byte cap across inodes. | n/a | sdk write-batcher tests |
+| `AGENTFS_BATCH_TXN_INODES` | env | product-config | `1024` | agentfs-core config | Maximum inodes drained or imported per transaction. | n/a | sdk write-batcher and import tests |
+| `AGENTFS_BATCH_TXN_BYTES` | env | product-config | `33554432` | agentfs-core config | Maximum bytes drained or imported per transaction. | n/a | sdk write-batcher and import tests |
+| `AGENTFS_DRAIN_ON_SETATTR` | env | sunset | `true` | agentfs-core config | Compatibility path that drains pending writes before setattr operations. | Remove after PendingView/stat coherence and setattr tests are green for N=2 consecutive milestones. | VAL-CORE-006 and VAL-NFS-016 |
 | `--partial-origin` | cli flag | product-config | `off` | agentfs CLI edge | First-class partial-origin copy-up policy: off, on, or auto. | n/a | partial_origin::legacy_env_does_not_override_cli_off |
 | `--partial-origin-threshold-bytes` | cli flag | product-config | `1048576` | agentfs CLI edge | Size threshold used by --partial-origin auto. | n/a | opts partial-origin parse tests |
 | `AGENTFS_FUSE_WORKERS` | env | product-config | `auto` | agentfs FUSE config | FUSE request dispatch mode. auto sizes from CPU and memory budgets; serial disables kernel-cache acceleration for safety. | n/a | fuse_config::tests::workers_config_feeds_dispatch_and_cache_policy |
@@ -51,4 +51,4 @@ Every active runtime knob is declared here with an architecture class. Defaults 
 
 | Name | Surface | Class | Default | Owner | Description | Removal criteria | Gate |
 |---|---|---|---|---|---|---|---|
-| `AGENTFS_OVERLAY_PARTIAL_ORIGIN` | deleted env compat | sunset | `removed` | agentfs-sdk config | Removed legacy env compatibility path superseded by --partial-origin. | Already removed in M3. Do not reintroduce; use --partial-origin or --partial-origin-threshold-bytes. | partial_origin::legacy_env_does_not_override_cli_off |
+| `AGENTFS_OVERLAY_PARTIAL_ORIGIN` | deleted env compat | sunset | `removed` | agentfs-core config | Removed legacy env compatibility path superseded by --partial-origin. | Already removed in M3. Do not reintroduce; use --partial-origin or --partial-origin-threshold-bytes. | partial_origin::legacy_env_does_not_override_cli_off |

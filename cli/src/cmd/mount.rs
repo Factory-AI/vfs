@@ -1,4 +1,4 @@
-use agentfs_sdk::{
+use agentfs_core::{
     error::Error as SdkError, AgentFSOptions, FileSystem, HostFS, OverlayFS, PartialOriginPolicy,
 };
 use anyhow::{Context, Result};
@@ -14,7 +14,7 @@ use crate::nfs::AgentNFS;
 use crate::nfsserve::tcp::NFSTcp;
 
 #[cfg(target_os = "linux")]
-use agentfs_sdk::{get_mounts, Mount};
+use agentfs_core::{get_mounts, Mount};
 #[cfg(target_os = "linux")]
 use std::{
     io::{self, Write},
@@ -225,7 +225,7 @@ async fn ensure_schema_current_for_mount_precheck(
 ) -> std::result::Result<(), SdkError> {
     let db = turso::Builder::new_local(db_path).build().await?;
     let conn = db.connect()?;
-    agentfs_sdk::schema::ensure_current(&conn).await
+    agentfs_core::schema::ensure_current(&conn).await
 }
 
 /// Mount the agent filesystem using NFS over localhost.

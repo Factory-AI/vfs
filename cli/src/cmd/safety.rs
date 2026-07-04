@@ -1,6 +1,6 @@
 //! Production safety commands for local AgentFS databases.
 
-use agentfs_sdk::{schema::integrity, AgentFSOptions};
+use agentfs_core::{schema::integrity, AgentFSOptions};
 use anyhow::{Context, Result as AnyhowResult};
 use std::collections::BTreeMap;
 use std::fs;
@@ -941,7 +941,7 @@ fn value_i64(value: Value) -> AnyhowResult<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentfs_sdk::{AgentFS, AgentFSOptions};
+    use agentfs_core::{AgentFS, AgentFSOptions};
     use serde_json::Value as JsonValue;
 
     async fn write_agent_file(agent: &AgentFS, path: &str, data: &[u8]) {

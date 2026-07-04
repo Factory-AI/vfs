@@ -1,5 +1,5 @@
 use crate::cmd::completions::Shell;
-use agentfs_sdk::agentfs_dir;
+use agentfs_core::agentfs_dir;
 use clap::{Parser, Subcommand};
 use clap_complete::{
     engine::ValueCompleter, ArgValueCompleter, CompletionCandidate, PathCompleter,
@@ -50,12 +50,12 @@ pub enum PartialOriginMode {
     Auto,
 }
 
-impl From<PartialOriginMode> for agentfs_sdk::PartialOriginMode {
+impl From<PartialOriginMode> for agentfs_core::PartialOriginMode {
     fn from(value: PartialOriginMode) -> Self {
         match value {
-            PartialOriginMode::Off => agentfs_sdk::PartialOriginMode::Off,
-            PartialOriginMode::On => agentfs_sdk::PartialOriginMode::On,
-            PartialOriginMode::Auto => agentfs_sdk::PartialOriginMode::Auto,
+            PartialOriginMode::Off => agentfs_core::PartialOriginMode::Off,
+            PartialOriginMode::On => agentfs_core::PartialOriginMode::On,
+            PartialOriginMode::Auto => agentfs_core::PartialOriginMode::Auto,
         }
     }
 }

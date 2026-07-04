@@ -25,18 +25,18 @@ fn parse_encryption(key: Option<String>, cipher: Option<String>) -> Option<(Stri
 fn partial_origin_policy(
     mode: Option<agentfs::opts::PartialOriginMode>,
     threshold_bytes: Option<u64>,
-) -> Option<agentfs_sdk::PartialOriginPolicy> {
+) -> Option<agentfs_core::PartialOriginPolicy> {
     match (mode, threshold_bytes) {
         (None, None) => None,
         (Some(mode), threshold_bytes) => {
-            let mut policy = agentfs_sdk::PartialOriginPolicy::new(mode.into());
+            let mut policy = agentfs_core::PartialOriginPolicy::new(mode.into());
             if let Some(threshold_bytes) = threshold_bytes {
                 policy = policy.with_threshold_bytes(threshold_bytes);
             }
             Some(policy)
         }
         (None, Some(threshold_bytes)) => Some(
-            agentfs_sdk::PartialOriginPolicy::new(agentfs_sdk::PartialOriginMode::Auto)
+            agentfs_core::PartialOriginPolicy::new(agentfs_core::PartialOriginMode::Auto)
                 .with_threshold_bytes(threshold_bytes),
         ),
     }
@@ -525,6 +525,6 @@ mod partial_origin {
             policy.mode
         );
         assert_eq!(mode, Some(PartialOriginMode::Off));
-        assert_eq!(policy.mode, agentfs_sdk::PartialOriginMode::Off);
+        assert_eq!(policy.mode, agentfs_core::PartialOriginMode::Off);
     }
 }

@@ -6,7 +6,7 @@
 //! `git clone --no-checkout` through a temporary mount (pack files are a few
 //! large sequential writes), then streams the worktree content out of the
 //! object database: a producer thread parses `git ls-tree` + `git cat-file
-//! --batch` output while an [`agentfs_sdk::ImportSession`] consumer bulk
+//! --batch` output while an [`agentfs_core::ImportSession`] consumer bulk
 //! imports each chunk (large multi-inode transactions), so blob decoding
 //! overlaps SQLite writes instead of buffering every blob in memory first.
 //! Finally it fabricates a git index whose cached stat data matches exactly
@@ -25,7 +25,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use agentfs_sdk::{AgentFSOptions, FileSystem, ImportEntry, ImportOptions, ImportedEntry};
+use agentfs_core::{AgentFSOptions, FileSystem, ImportEntry, ImportOptions, ImportedEntry};
 use anyhow::{bail, Context, Result};
 use sha1::{Digest, Sha1};
 
@@ -134,7 +134,7 @@ struct CloneSummary {
 }
 
 async fn clone_into_mount(
-    agent: &agentfs_sdk::filesystem::AgentFS,
+    agent: &agentfs_core::fs::AgentFS,
     mountpoint: &Path,
     source: &str,
     repo_name: &str,

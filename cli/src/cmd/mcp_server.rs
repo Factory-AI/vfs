@@ -1,5 +1,5 @@
-use agentfs_sdk::filesystem::FileSystem;
-use agentfs_sdk::{AgentFS, AgentFSOptions, Stats};
+use agentfs_core::fs::FileSystem;
+use agentfs_core::{AgentFS, AgentFSOptions, Stats};
 
 const ROOT_INO: i64 = 1;
 const S_IFREG: u32 = 0o100000;
@@ -992,7 +992,7 @@ impl From<Stats> for StatsResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentfs_sdk::{error::Error as SdkError, FsError};
+    use agentfs_core::{error::Error as SdkError, FsError};
     use tempfile::tempdir;
 
     async fn create_test_server() -> Result<(McpServer, tempfile::TempDir)> {

@@ -211,7 +211,7 @@ pub fn unmount(mountpoint: &Path, backend: MountBackend, lazy: bool) -> Result<(
 /// The filesystem must be wrapped in `Arc<dyn FileSystem>`.
 #[cfg(target_os = "linux")]
 pub async fn mount_fs(
-    fs: Arc<dyn agentfs_sdk::FileSystem>,
+    fs: Arc<dyn agentfs_core::FileSystem>,
     opts: MountOpts,
 ) -> Result<MountHandle> {
     match opts.backend {
@@ -223,7 +223,7 @@ pub async fn mount_fs(
 /// Mount a filesystem with the given options (macOS version).
 #[cfg(target_os = "macos")]
 pub async fn mount_fs(
-    fs: Arc<dyn agentfs_sdk::FileSystem>,
+    fs: Arc<dyn agentfs_core::FileSystem>,
     opts: MountOpts,
 ) -> Result<MountHandle> {
     match opts.backend {

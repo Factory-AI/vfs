@@ -7,7 +7,7 @@
 use std::env::VarError;
 use std::time::Duration;
 
-use agentfs_sdk::EnvReader;
+use agentfs_core::EnvReader;
 
 /// The max size of write requests plus header slack used by the FUSE session
 /// request buffer. Dispatch auto-sizing must account for one buffer per

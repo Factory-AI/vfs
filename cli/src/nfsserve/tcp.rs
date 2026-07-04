@@ -285,7 +285,7 @@ mod tests {
     use crate::nfsserve::rpc::{self, accept_body, accepted_reply, reply_body, rpc_body, rpc_msg};
     use crate::nfsserve::vfs::NFSFileSystem;
     use crate::nfsserve::xdr::XDR;
-    use agentfs_sdk::{AgentFS as AgentSdk, AgentFSOptions, FileSystem, DEFAULT_FILE_MODE};
+    use agentfs_core::{AgentFS as AgentSdk, AgentFSOptions, FileSystem, DEFAULT_FILE_MODE};
     use std::io::Cursor;
     use tokio::io::AsyncReadExt;
 

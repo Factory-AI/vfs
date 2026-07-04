@@ -38,7 +38,7 @@ pub(super) fn unmount_fuse(mountpoint: &Path, lazy: bool) -> Result<()> {
 
 /// Internal FUSE mount implementation.
 pub(super) fn mount_fuse(
-    fs: Arc<dyn agentfs_sdk::FileSystem>,
+    fs: Arc<dyn agentfs_core::FileSystem>,
     opts: MountOpts,
 ) -> Result<MountHandle> {
     use crate::fuse::FuseMountOptions;
@@ -57,7 +57,7 @@ pub(super) fn mount_fuse(
     let timeout = opts.timeout;
     let lazy_unmount = opts.lazy_unmount;
 
-    let fs_arc: Arc<dyn agentfs_sdk::FileSystem> = Arc::new(ReadWriteLaneFsAdapter::new(fs));
+    let fs_arc: Arc<dyn agentfs_core::FileSystem> = Arc::new(ReadWriteLaneFsAdapter::new(fs));
 
     let rt = crate::get_runtime();
     let fuse_session = crate::fuse::spawn_mount(fs_arc, fuse_opts, rt)?;
@@ -79,7 +79,7 @@ pub(super) fn mount_fuse(
 /// Adapter that admits read operations concurrently while serializing
 /// mutations before they reach the backend filesystem.
 struct ReadWriteLaneFsAdapter {
-    inner: Arc<dyn agentfs_sdk::FileSystem>,
+    inner: Arc<dyn agentfs_core::FileSystem>,
     lanes: RwLock<()>,
     active_reads: AtomicU64,
 }
@@ -102,7 +102,7 @@ impl Drop for ReadLaneGuard<'_> {
 }
 
 impl ReadWriteLaneFsAdapter {
-    fn new(inner: Arc<dyn agentfs_sdk::FileSystem>) -> Self {
+    fn new(inner: Arc<dyn agentfs_core::FileSystem>) -> Self {
         Self {
             inner,
             lanes: RwLock::new(()),
@@ -141,12 +141,12 @@ impl ReadWriteLaneFsAdapter {
 }
 
 #[async_trait::async_trait]
-impl agentfs_sdk::FileSystem for ReadWriteLaneFsAdapter {
+impl agentfs_core::FileSystem for ReadWriteLaneFsAdapter {
     async fn lookup(
         &self,
         parent_ino: i64,
         name: &str,
-    ) -> std::result::Result<Option<agentfs_sdk::Stats>, agentfs_sdk::error::Error> {
+    ) -> std::result::Result<Option<agentfs_core::Stats>, agentfs_core::error::Error> {
         let _lane = self.lock_read_fs().await;
         self.inner.lookup(parent_ino, name).await
     }
@@ -154,7 +154,7 @@ impl agentfs_sdk::FileSystem for ReadWriteLaneFsAdapter {
     async fn getattr(
         &self,
         ino: i64,
-    ) -> std::result::Result<Option<agentfs_sdk::Stats>, agentfs_sdk::error::Error> {
+    ) -> std::result::Result<Option<agentfs_core::Stats>, agentfs_core::error::Error> {
         let _lane = self.lock_read_fs().await;
         self.inner.getattr(ino).await
     }
@@ -162,7 +162,7 @@ impl agentfs_sdk::FileSystem for ReadWriteLaneFsAdapter {
     async fn readlink(
         &self,
         ino: i64,
-    ) -> std::result::Result<Option<String>, agentfs_sdk::error::Error> {
+    ) -> std::result::Result<Option<String>, agentfs_core::error::Error> {
         let _lane = self.lock_read_fs().await;
         self.inner.readlink(ino).await
     }
@@ -170,7 +170,7 @@ impl agentfs_sdk::FileSystem for ReadWriteLaneFsAdapter {
     async fn readdir(
         &self,
         ino: i64,
-    ) -> std::result::Result<Option<Vec<String>>, agentfs_sdk::error::Error> {
+    ) -> std::result::Result<Option<Vec<String>>, agentfs_core::error::Error> {
         let _lane = self.lock_read_fs().await;
         self.inner.readdir(ino).await
     }
@@ -178,7 +178,7 @@ impl agentfs_sdk::FileSystem for ReadWriteLaneFsAdapter {
     async fn readdir_plus(
         &self,
         ino: i64,
-    ) -> std::result::Result<Option<Vec<agentfs_sdk::DirEntry>>, agentfs_sdk::error::Error> {
+    ) -> std::result::Result<Option<Vec<agentfs_core::DirEntry>>, agentfs_core::error::Error> {
         let _lane = self.lock_read_fs().await;
         self.inner.readdir_plus(ino).await
     }
@@ -187,7 +187,7 @@ impl agentfs_sdk::FileSystem for ReadWriteLaneFsAdapter {
         &self,
         ino: i64,
         mode: u32,
-    ) -> std::result::Result<(), agentfs_sdk::error::Error> {
+    ) -> std::result::Result<(), agentfs_core::error::Error> {
         let _lane = self.lock_write_fs().await;
         self.inner.chmod(ino, mode).await
     }
@@ -197,7 +197,7 @@ impl agentfs_sdk::FileSystem for ReadWriteLaneFsAdapter {
         ino: i64,
         uid: Option<u32>,
         gid: Option<u32>,
-    ) -> std::result::Result<(), agentfs_sdk::error::Error> {
+    ) -> std::result::Result<(), agentfs_core::error::Error> {
         let _lane = self.lock_write_fs().await;
         self.inner.chown(ino, uid, gid).await
     }
@@ -205,9 +205,9 @@ impl agentfs_sdk::FileSystem for ReadWriteLaneFsAdapter {
     async fn utimens(
         &self,
         ino: i64,
-        atime: agentfs_sdk::TimeChange,
-        mtime: agentfs_sdk::TimeChange,
-    ) -> std::result::Result<(), agentfs_sdk::error::Error> {
+        atime: agentfs_core::TimeChange,
+        mtime: agentfs_core::TimeChange,
+    ) -> std::result::Result<(), agentfs_core::error::Error> {
         let _lane = self.lock_write_fs().await;
         self.inner.utimens(ino, atime, mtime).await
     }
@@ -216,7 +216,7 @@ impl agentfs_sdk::FileSystem for ReadWriteLaneFsAdapter {
         &self,
         ino: i64,
         flags: i32,
-    ) -> std::result::Result<agentfs_sdk::BoxedFile, agentfs_sdk::error::Error> {
+    ) -> std::result::Result<agentfs_core::BoxedFile, agentfs_core::error::Error> {
         match classify_open(flags) {
             FuseFsOperationClass::PureRead => {
                 let _lane = self.lock_read_fs().await;
@@ -233,7 +233,7 @@ impl agentfs_sdk::FileSystem for ReadWriteLaneFsAdapter {
         &self,
         ino: i64,
         flags: i32,
-    ) -> std::result::Result<Option<agentfs_sdk::Stats>, agentfs_sdk::error::Error> {
+    ) -> std::result::Result<Option<agentfs_core::Stats>, agentfs_core::error::Error> {
         match classify_open(flags) {
             FuseFsOperationClass::PureRead => {
                 let _lane = self.lock_read_fs().await;
@@ -257,7 +257,7 @@ impl agentfs_sdk::FileSystem for ReadWriteLaneFsAdapter {
         mode: u32,
         uid: u32,
         gid: u32,
-    ) -> std::result::Result<agentfs_sdk::Stats, agentfs_sdk::error::Error> {
+    ) -> std::result::Result<agentfs_core::Stats, agentfs_core::error::Error> {
         let _lane = self.lock_write_fs().await;
         self.inner.mkdir(parent_ino, name, mode, uid, gid).await
     }
@@ -269,8 +269,10 @@ impl agentfs_sdk::FileSystem for ReadWriteLaneFsAdapter {
         mode: u32,
         uid: u32,
         gid: u32,
-    ) -> std::result::Result<(agentfs_sdk::Stats, agentfs_sdk::BoxedFile), agentfs_sdk::error::Error>
-    {
+    ) -> std::result::Result<
+        (agentfs_core::Stats, agentfs_core::BoxedFile),
+        agentfs_core::error::Error,
+    > {
         let _lane = self.lock_write_fs().await;
         self.inner
             .create_file(parent_ino, name, mode, uid, gid)
@@ -285,7 +287,7 @@ impl agentfs_sdk::FileSystem for ReadWriteLaneFsAdapter {
         rdev: u64,
         uid: u32,
         gid: u32,
-    ) -> std::result::Result<agentfs_sdk::Stats, agentfs_sdk::error::Error> {
+    ) -> std::result::Result<agentfs_core::Stats, agentfs_core::error::Error> {
         let _lane = self.lock_write_fs().await;
         self.inner
             .mknod(parent_ino, name, mode, rdev, uid, gid)
@@ -299,7 +301,7 @@ impl agentfs_sdk::FileSystem for ReadWriteLaneFsAdapter {
         target: &str,
         uid: u32,
         gid: u32,
-    ) -> std::result::Result<agentfs_sdk::Stats, agentfs_sdk::error::Error> {
+    ) -> std::result::Result<agentfs_core::Stats, agentfs_core::error::Error> {
         let _lane = self.lock_write_fs().await;
         self.inner.symlink(parent_ino, name, target, uid, gid).await
     }
@@ -308,7 +310,7 @@ impl agentfs_sdk::FileSystem for ReadWriteLaneFsAdapter {
         &self,
         parent_ino: i64,
         name: &str,
-    ) -> std::result::Result<(), agentfs_sdk::error::Error> {
+    ) -> std::result::Result<(), agentfs_core::error::Error> {
         let _lane = self.lock_write_fs().await;
         self.inner.unlink(parent_ino, name).await
     }
@@ -317,7 +319,7 @@ impl agentfs_sdk::FileSystem for ReadWriteLaneFsAdapter {
         &self,
         parent_ino: i64,
         name: &str,
-    ) -> std::result::Result<(), agentfs_sdk::error::Error> {
+    ) -> std::result::Result<(), agentfs_core::error::Error> {
         let _lane = self.lock_write_fs().await;
         self.inner.rmdir(parent_ino, name).await
     }
@@ -327,7 +329,7 @@ impl agentfs_sdk::FileSystem for ReadWriteLaneFsAdapter {
         ino: i64,
         newparent_ino: i64,
         newname: &str,
-    ) -> std::result::Result<agentfs_sdk::Stats, agentfs_sdk::error::Error> {
+    ) -> std::result::Result<agentfs_core::Stats, agentfs_core::error::Error> {
         let _lane = self.lock_write_fs().await;
         self.inner.link(ino, newparent_ino, newname).await
     }
@@ -338,7 +340,7 @@ impl agentfs_sdk::FileSystem for ReadWriteLaneFsAdapter {
         oldname: &str,
         newparent_ino: i64,
         newname: &str,
-    ) -> std::result::Result<(), agentfs_sdk::error::Error> {
+    ) -> std::result::Result<(), agentfs_core::error::Error> {
         let _lane = self.lock_write_fs().await;
         self.inner
             .rename(oldparent_ino, oldname, newparent_ino, newname)
@@ -347,7 +349,7 @@ impl agentfs_sdk::FileSystem for ReadWriteLaneFsAdapter {
 
     async fn statfs(
         &self,
-    ) -> std::result::Result<agentfs_sdk::FilesystemStats, agentfs_sdk::error::Error> {
+    ) -> std::result::Result<agentfs_core::FilesystemStats, agentfs_core::error::Error> {
         let _lane = self.lock_read_fs().await;
         self.inner.statfs().await
     }
@@ -355,17 +357,17 @@ impl agentfs_sdk::FileSystem for ReadWriteLaneFsAdapter {
     async fn drain_inode_writes(
         &self,
         ino: i64,
-    ) -> std::result::Result<(), agentfs_sdk::error::Error> {
+    ) -> std::result::Result<(), agentfs_core::error::Error> {
         let _lane = self.lock_write_fs().await;
         self.inner.drain_inode_writes(ino).await
     }
 
-    async fn drain_all(&self) -> std::result::Result<(), agentfs_sdk::error::Error> {
+    async fn drain_all(&self) -> std::result::Result<(), agentfs_core::error::Error> {
         let _lane = self.lock_write_fs().await;
         self.inner.drain_all().await
     }
 
-    async fn finalize(&self) -> std::result::Result<(), agentfs_sdk::error::Error> {
+    async fn finalize(&self) -> std::result::Result<(), agentfs_core::error::Error> {
         let _lane = self.lock_write_fs().await;
         self.inner.finalize().await
     }
@@ -374,7 +376,7 @@ impl agentfs_sdk::FileSystem for ReadWriteLaneFsAdapter {
         &self,
         ino: i64,
         nlookup: u64,
-    ) -> std::result::Result<(), agentfs_sdk::error::Error> {
+    ) -> std::result::Result<(), agentfs_core::error::Error> {
         let _lane = self.lock_read_fs().await;
         self.inner.retain_lookup(ino, nlookup).await
     }

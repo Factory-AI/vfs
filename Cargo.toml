@@ -1,5 +1,5 @@
 [workspace]
-members = ["cli", "sdk/rust"]
+members = ["cli", "crates/agentfs-core"]
 resolver = "2"
 
 [workspace.package]
@@ -9,7 +9,7 @@ license = "MIT"
 repository = "https://github.com/tursodatabase/agentfs"
 
 [workspace.dependencies]
-agentfs-sdk = { path = "sdk/rust" }
+agentfs-core = { path = "crates/agentfs-core" }
 
 anyhow = "1.0"
 async-trait = "0.1"

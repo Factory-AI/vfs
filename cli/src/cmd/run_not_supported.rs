@@ -2,7 +2,7 @@
 //!
 //! The `run` command is supported on Linux and macOS.
 
-use agentfs_sdk::PartialOriginPolicy;
+use agentfs_core::PartialOriginPolicy;
 use anyhow::{bail, Result};
 use std::path::PathBuf;
 

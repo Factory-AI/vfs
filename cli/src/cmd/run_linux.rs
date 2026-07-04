@@ -2,7 +2,7 @@
 //!
 //! Runs commands through the FUSE+namespace sandbox.
 
-use agentfs_sdk::PartialOriginPolicy;
+use agentfs_core::PartialOriginPolicy;
 use anyhow::Result;
 use std::path::PathBuf;
 

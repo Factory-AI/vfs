@@ -4,13 +4,13 @@
 //! typed SDK/core config, the typed FUSE adapter config, CLI env-backed
 //! options, and the first-class partial-origin CLI policy flags.
 
-use agentfs_sdk::{
+use agentfs_core::{
     CoreConfig, DEFAULT_PARTIAL_ORIGIN_THRESHOLD_BYTES, DEFAULT_WRITE_BATCH_BYTES,
     DEFAULT_WRITE_BATCH_GLOBAL_BYTES, DEFAULT_WRITE_BATCH_MS, DEFAULT_WRITE_BATCH_TXN_BYTES,
     DEFAULT_WRITE_BATCH_TXN_INODES,
 };
 
-use agentfs_sdk::profiling::DEFAULT_PROFILE_ENABLED;
+use agentfs_core::telemetry::DEFAULT_PROFILE_ENABLED;
 
 use crate::config::DEFAULT_CLONE_TIMINGS_ENABLED;
 
@@ -189,11 +189,11 @@ fn render_bool(value: bool) -> &'static str {
     }
 }
 
-fn partial_origin_mode_as_str(mode: agentfs_sdk::PartialOriginMode) -> &'static str {
+fn partial_origin_mode_as_str(mode: agentfs_core::PartialOriginMode) -> &'static str {
     match mode {
-        agentfs_sdk::PartialOriginMode::Off => "off",
-        agentfs_sdk::PartialOriginMode::On => "on",
-        agentfs_sdk::PartialOriginMode::Auto => "auto",
+        agentfs_core::PartialOriginMode::Off => "off",
+        agentfs_core::PartialOriginMode::On => "on",
+        agentfs_core::PartialOriginMode::Auto => "auto",
     }
 }
 
@@ -273,7 +273,7 @@ impl Knob {
     }
 }
 
-const CORE_OWNER: &str = "agentfs-sdk config";
+const CORE_OWNER: &str = "agentfs-core config";
 const FUSE_OWNER: &str = "agentfs FUSE config";
 const CLI_OWNER: &str = "agentfs CLI edge";
 #[cfg(test)]
@@ -871,7 +871,7 @@ mod tests {
     fn collect_runtime_env_mentions() -> BTreeSet<&'static str> {
         let root = repo_root();
         let mut tokens = BTreeSet::new();
-        for source_root in [root.join("cli/src"), root.join("sdk/rust/src")] {
+        for source_root in [root.join("cli/src"), root.join("crates/agentfs-core/src")] {
             collect_runtime_env_mentions_from_path(&source_root, &mut tokens);
         }
         tokens

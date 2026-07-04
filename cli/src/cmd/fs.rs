@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use agentfs_sdk::{AgentFSOptions, EncryptionConfig};
+use agentfs_core::{AgentFSOptions, EncryptionConfig};
 use anyhow::{Context, Result as AnyhowResult};
 use turso::Value;
 
@@ -276,7 +276,7 @@ pub async fn diff_filesystem(id_or_path: String) -> AnyhowResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use agentfs_sdk::{AgentFS, AgentFSOptions, EncryptionConfig};
+    use agentfs_core::{AgentFS, AgentFSOptions, EncryptionConfig};
     use tempfile::NamedTempFile;
 
     use crate::cmd::fs::{cat_filesystem, ls_filesystem, write_filesystem};
@@ -467,7 +467,7 @@ f d/e/3.md
     }
 
     async fn write_file(
-        fs: &agentfs_sdk::filesystem::AgentFS,
+        fs: &agentfs_core::fs::AgentFS,
         path: &str,
         data: &[u8],
         uid: u32,

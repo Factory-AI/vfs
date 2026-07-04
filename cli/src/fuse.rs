@@ -9,11 +9,9 @@ use crate::fuser::{
     ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen,
     ReplyStatfs, ReplyWrite, Request,
 };
-use agentfs_sdk::error::Error as SdkError;
-use agentfs_sdk::filesystem::{
-    WriteRange, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFSOCK,
-};
-use agentfs_sdk::{BoxedFile, DirEntry, FileSystem, FsError, Stats, TimeChange};
+use agentfs_core::error::Error as SdkError;
+use agentfs_core::fs::{WriteRange, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFSOCK};
+use agentfs_core::{BoxedFile, DirEntry, FileSystem, FsError, Stats, TimeChange};
 use parking_lot::Mutex;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -3077,8 +3075,8 @@ mod tests {
     use super::{
         build_cached_readdir_entries, fuse_write_open, readdir_start, OpenFile, WriteBuffer,
     };
-    use agentfs_sdk::filesystem::{DirEntry, Stats, WriteRange, S_IFDIR, S_IFLNK, S_IFREG};
-    use agentfs_sdk::{BoxedFile, File};
+    use agentfs_core::fs::{DirEntry, Stats, WriteRange, S_IFDIR, S_IFLNK, S_IFREG};
+    use agentfs_core::{BoxedFile, File};
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
@@ -3102,30 +3100,30 @@ mod tests {
 
     #[async_trait::async_trait]
     impl File for RecordingFile {
-        async fn pread(&self, _offset: u64, _size: u64) -> agentfs_sdk::error::Result<Vec<u8>> {
+        async fn pread(&self, _offset: u64, _size: u64) -> agentfs_core::error::Result<Vec<u8>> {
             Ok(Vec::new())
         }
 
-        async fn pwrite(&self, _offset: u64, _data: &[u8]) -> agentfs_sdk::error::Result<()> {
+        async fn pwrite(&self, _offset: u64, _data: &[u8]) -> agentfs_core::error::Result<()> {
             self.pwrite_calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
 
-        async fn pwrite_ranges(&self, ranges: Vec<WriteRange>) -> agentfs_sdk::error::Result<()> {
+        async fn pwrite_ranges(&self, ranges: Vec<WriteRange>) -> agentfs_core::error::Result<()> {
             self.pwrite_ranges_calls.fetch_add(1, Ordering::SeqCst);
             *self.ranges.lock().unwrap() = ranges;
             Ok(())
         }
 
-        async fn truncate(&self, _size: u64) -> agentfs_sdk::error::Result<()> {
+        async fn truncate(&self, _size: u64) -> agentfs_core::error::Result<()> {
             Ok(())
         }
 
-        async fn fsync(&self) -> agentfs_sdk::error::Result<()> {
+        async fn fsync(&self) -> agentfs_core::error::Result<()> {
             Ok(())
         }
 
-        async fn fstat(&self) -> agentfs_sdk::error::Result<Stats> {
+        async fn fstat(&self) -> agentfs_core::error::Result<Stats> {
             Ok(stats(1, S_IFREG | 0o644))
         }
     }

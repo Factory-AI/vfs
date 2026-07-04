@@ -7,7 +7,7 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
-pub use agentfs_sdk::profiling::{
+pub use agentfs_core::telemetry::{
     is_enabled, record_base_fast_inode_invalidation, record_base_fast_open_eligible,
     record_base_fast_open_keep_cache, record_base_fast_open_passthrough_attempted,
     record_base_fast_open_passthrough_fallback, record_base_fast_open_passthrough_succeeded,
@@ -16,7 +16,7 @@ pub use agentfs_sdk::profiling::{
     ProfileReportGuard, ProfileSnapshot, TimerGuard,
 };
 
-agentfs_sdk::profiling::define_counters! {
+agentfs_core::telemetry::define_counters! {
     pub(crate) static FUSE_COUNTERS: FuseCounters = "fuse" {
         fuse_callback_count: Counter,
         fuse_lookup_count: Counter,
@@ -81,7 +81,7 @@ agentfs_sdk::profiling::define_counters! {
     }
 }
 
-agentfs_sdk::profiling::define_counters! {
+agentfs_core::telemetry::define_counters! {
     pub(crate) static CONFIG_COUNTERS: ConfigCounters = "config" {
         fuse_workers_configured: Gauge,
         fuse_readdirplus_mode: Gauge,
@@ -97,8 +97,8 @@ static REGISTERED: OnceLock<()> = OnceLock::new();
 
 pub fn register_sections() {
     REGISTERED.get_or_init(|| {
-        agentfs_sdk::profiling::Registry::register(&FUSE_COUNTERS);
-        agentfs_sdk::profiling::Registry::register(&CONFIG_COUNTERS);
+        agentfs_core::telemetry::Registry::register(&FUSE_COUNTERS);
+        agentfs_core::telemetry::Registry::register(&CONFIG_COUNTERS);
     });
 }
 
@@ -109,12 +109,12 @@ pub fn install_cli_sink() -> ProfileReportGuard {
 
 pub fn emit_cli_report() {
     register_sections();
-    agentfs_sdk::profiling::report_summary("cli");
+    agentfs_core::telemetry::report_summary("cli");
 }
 
 pub fn snapshot() -> ProfileSnapshot {
     register_sections();
-    agentfs_sdk::profiling::snapshot()
+    agentfs_core::telemetry::snapshot()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

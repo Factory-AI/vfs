@@ -18,7 +18,7 @@ default = []
 strict = []
 
 [dependencies]
-agentfs-sdk = { workspace = true }
+agentfs-core = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }

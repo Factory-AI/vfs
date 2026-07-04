@@ -2,7 +2,7 @@
 //!
 //! Migrates an agentfs SQLite database to the current schema version.
 
-use agentfs_sdk::{
+use agentfs_core::{
     config::{DEFAULT_CHUNK_SIZE, DEFAULT_INLINE_THRESHOLD},
     schema, AgentFSOptions, SchemaVersion,
 };

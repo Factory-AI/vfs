@@ -1,0 +1,36 @@
+[package]
+name = "agentfs-core"
+version.workspace = true
+edition.workspace = true
+description = "AgentFS SDK for Rust"
+license.workspace = true
+
+[dependencies]
+turso = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+libc = { workspace = true }
+thiserror = { workspace = true }
+lru = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+aegis = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+proptest = { workspace = true }
+criterion = { workspace = true }
+rand = { workspace = true }
+
+[[bench]]
+name = "overlayfs"
+harness = false
+
+[[bench]]
+name = "workload"
+harness = false
+

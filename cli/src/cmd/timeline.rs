@@ -1,4 +1,4 @@
-use agentfs_sdk::{toolcalls::ToolCall, AgentFSOptions, ToolCalls};
+use agentfs_core::{toolcalls::ToolCall, AgentFSOptions, ToolCalls};
 use anyhow::{Context, Result as AnyhowResult};
 use chrono::TimeZone;
 use std::io::Write;
@@ -136,7 +136,7 @@ fn format_json(stdout: &mut impl Write, calls: &[ToolCall]) -> AnyhowResult<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentfs_sdk::{AgentFS, AgentFSOptions};
+    use agentfs_core::{AgentFS, AgentFSOptions};
     use tempfile::NamedTempFile;
 
     async fn create_test_agentfs() -> (AgentFS, String, NamedTempFile) {

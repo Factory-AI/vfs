@@ -52,7 +52,7 @@ name = "agentfs"
 version = "0.6.4"
 dependencies = [
  "aegis",
- "agentfs-sdk",
+ "agentfs-core",
  "anyhow",
  "async-trait",
  "base64",
@@ -86,7 +86,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agentfs-sdk"
+name = "agentfs-core"
 version = "0.6.4"
 dependencies = [
  "aegis",

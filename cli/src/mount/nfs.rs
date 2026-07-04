@@ -77,7 +77,7 @@ pub(super) fn unmount_nfs(mountpoint: &Path, lazy: bool) -> Result<()> {
 
 /// Internal NFS mount implementation.
 pub(super) async fn mount_nfs(
-    fs: Arc<dyn agentfs_sdk::FileSystem>,
+    fs: Arc<dyn agentfs_core::FileSystem>,
     opts: MountOpts,
 ) -> Result<MountHandle> {
     use tokio_util::sync::CancellationToken;

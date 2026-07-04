@@ -4,7 +4,7 @@
 //! filesystem over the network, allowing remote systems (like VMs) to mount
 //! it as their root filesystem.
 
-use agentfs_sdk::{agentfs_dir, AgentFSOptions, FileSystem, HostFS, OverlayFS};
+use agentfs_core::{agentfs_dir, AgentFSOptions, FileSystem, HostFS, OverlayFS};
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::sync::Arc;

@@ -2927,7 +2927,7 @@ mod tests {
     use crate::nfsserve::rpc::{accept_body, accepted_reply, reply_body, rpc_body, rpc_msg};
     use crate::nfsserve::transaction_tracker::TransactionTracker;
     use crate::nfsserve::vfs::NFSFileSystem;
-    use agentfs_sdk::{AgentFS as AgentSdk, AgentFSOptions, FileSystem};
+    use agentfs_core::{AgentFS as AgentSdk, AgentFSOptions, FileSystem};
     use std::io::Cursor;
     use std::path::Path;
     use std::sync::Arc;
@@ -2936,16 +2936,14 @@ mod tests {
     const TEST_UID: u32 = 1000;
     const TEST_GID: u32 = 1000;
 
-    async fn test_context() -> (RPCContext, agentfs_sdk::filesystem::AgentFS) {
+    async fn test_context() -> (RPCContext, agentfs_core::fs::AgentFS) {
         let agent = AgentSdk::open(AgentFSOptions::ephemeral())
             .await
             .expect("open ephemeral AgentFS");
         test_context_from_agent(agent).await
     }
 
-    async fn test_context_with_db_path(
-        db_path: &Path,
-    ) -> (RPCContext, agentfs_sdk::filesystem::AgentFS) {
+    async fn test_context_with_db_path(db_path: &Path) -> (RPCContext, agentfs_core::fs::AgentFS) {
         let agent = AgentSdk::open(AgentFSOptions::with_path(
             db_path.to_str().expect("test DB path is UTF-8"),
         ))
@@ -2954,9 +2952,7 @@ mod tests {
         test_context_from_agent(agent).await
     }
 
-    async fn test_context_from_agent(
-        agent: AgentSdk,
-    ) -> (RPCContext, agentfs_sdk::filesystem::AgentFS) {
+    async fn test_context_from_agent(agent: AgentSdk) -> (RPCContext, agentfs_core::fs::AgentFS) {
         agent
             .fs
             .chmod(1, 0o777)
@@ -3160,7 +3156,7 @@ mod tests {
         parse_nfs_status(&mut cursor)
     }
 
-    async fn read_file(fs: &agentfs_sdk::filesystem::AgentFS, name: &str, len: u64) -> Vec<u8> {
+    async fn read_file(fs: &agentfs_core::fs::AgentFS, name: &str, len: u64) -> Vec<u8> {
         let stats = fs
             .lookup(1, name)
             .await
