@@ -1,0 +1,35 @@
+.agents/benchmarks/restructure-baseline/medians-m1.json
+  s_da4de8884cb398::t_a01f4e353d8c88 1-288
+.agents/benchmarks/restructure-baseline/medians-post-m3.json.iterations/iter-00.json
+  s_da4de8884cb398::t_11ae7f9de0ca89 1-8674
+.agents/benchmarks/restructure-baseline/medians-post-m3.json.iterations/iter-01.json
+  s_da4de8884cb398::t_ca785a18c84f06 1-8686
+.agents/benchmarks/restructure-baseline/medians-post-m3.json.iterations/iter-02.json
+  s_da4de8884cb398::t_d3573cb8cf14bb 1-8674
+.agents/benchmarks/restructure-baseline/medians-post-m3.json.iterations/iter-03.json
+  s_da4de8884cb398::t_644959b691548b 1-8674
+.agents/benchmarks/restructure-baseline/medians-post-m3.json.iterations/iter-04.json
+  s_da4de8884cb398::t_f97248f96c195c 1-8680
+.agents/benchmarks/restructure-baseline/medians-post-m3.json.iterations/warmup-00.json
+  s_da4de8884cb398::t_1f7dad628eb130 1-8674
+.agents/benchmarks/restructure-baseline/medians.json
+  s_da4de8884cb398::t_3a4572726341ea 21-25,28,32-38,42-48,52-58,65-71,75-81,85-91,97-103,107-113,117-123,129-135,139-145,149-155,161-167,171-177,181-187,193-199,203-209,213-219,225-231,235-241,245-251,257-263,267-273,277-283
+.agents/benchmarks/restructure-baseline/provenance-post-m3.md
+  s_da4de8884cb398::t_db37ab128b60b8 1-61
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "654d5599f99d11490d8f7e966a958688788e3789",
+  "prompts": {},
+  "sessions": {
+    "s_da4de8884cb398": {
+      "agent_id": {
+        "tool": "droid",
+        "id": "aaac398f-de63-4186-b856-4cdf731a9517",
+        "model": "unknown"
+      },
+      "human_author": "factory-ain3sh <ainesh@factory.ai>"
+    }
+  }
+}
