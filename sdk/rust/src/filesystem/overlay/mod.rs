@@ -547,6 +547,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn overlay_partial_origin_store_characterization() -> Result<()> {
+        let base_dir = tempdir()?;
+        let delta_dir = tempdir()?;
+        let db_path = delta_dir.path().join("delta.db");
+        let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+        let chunk_size = delta.chunk_size();
+        let mut expected = patterned_bytes(chunk_size * 2 + 17, 0x2a);
+        std::fs::write(base_dir.path().join("large.bin"), &expected)?;
+
+        let base = Arc::new(HostFS::new(base_dir.path())?);
+        let overlay = OverlayFS::new_with_partial_origin(base, delta, true);
+        overlay.init(base_dir.path().to_str().unwrap()).await?;
+
+        let stats = overlay.lookup(ROOT_INO, "large.bin").await?.unwrap();
+        let file = overlay.open(stats.ino, libc::O_RDWR).await?;
+
+        let cross_chunk_offset = chunk_size as u64 - 2;
+        file.pwrite(cross_chunk_offset, b"STORE").await?;
+        expected[cross_chunk_offset as usize..cross_chunk_offset as usize + 5]
+            .copy_from_slice(b"STORE");
+
+        assert_eq!(
+            scalar_i64(&overlay, "SELECT COUNT(*) FROM fs_data").await?,
+            2,
+            "shared store write should materialize only the touched chunks"
+        );
+        assert_eq!(
+            scalar_i64(&overlay, "SELECT COUNT(*) FROM fs_chunk_override").await?,
+            2,
+            "shared store hook should mark exactly the touched chunks as overrides"
+        );
+        assert_eq!(
+            file.pread(chunk_size as u64 - 4, 10).await?,
+            expected[chunk_size - 4..chunk_size + 6],
+            "partial-origin reads should merge store-owned chunks with base fallback bytes"
+        );
+
+        file.truncate(chunk_size as u64 + 1).await?;
+        expected.truncate(chunk_size + 1);
+        assert_eq!(file.fstat().await?.size, (chunk_size + 1) as i64);
+        assert_eq!(
+            scalar_i64(&overlay, "SELECT COUNT(*) FROM fs_chunk_override").await?,
+            2,
+            "truncate within an overridden chunk should keep in-range override markers"
+        );
+        assert_eq!(
+            file.pread(chunk_size as u64 - 4, 8).await?,
+            expected[chunk_size - 4..],
+            "truncate through the shared store should preserve in-range override bytes"
+        );
+        assert_eq!(
+            std::fs::read(base_dir.path().join("large.bin"))?,
+            patterned_bytes(chunk_size * 2 + 17, 0x2a),
+            "partial-origin store writes and truncates must not mutate the base file"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_overlay_partial_origin_policy_off_uses_whole_copy_up() -> Result<()> {
         let base_dir = tempdir()?;
         let delta_dir = tempdir()?;

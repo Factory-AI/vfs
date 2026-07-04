@@ -1,3 +1,4 @@
+use super::super::agentfs::store::{self, ChunkWriteHooks, WriteRangeRef};
 use super::*;
 use crate::filesystem::{File, FsError, WriteRange};
 use std::sync::Arc;
@@ -21,6 +22,48 @@ pub(super) struct OverlayPartialFile {
     pub(super) overlay_ino: i64,
     pub(super) delta_ino: i64,
     pub(super) chunk_size: usize,
+}
+
+struct PartialOriginChunkHooks<'a> {
+    file: &'a OverlayPartialFile,
+}
+
+#[async_trait]
+impl ChunkWriteHooks for PartialOriginChunkHooks<'_> {
+    async fn seed_missing_chunk(
+        &self,
+        conn: &Connection,
+        ino: i64,
+        geometry: crate::config::Geometry,
+        chunk_index: i64,
+    ) -> Result<Option<Vec<u8>>> {
+        debug_assert_eq!(ino, self.file.delta_ino);
+        let chunk_index = u64::try_from(chunk_index)
+            .map_err(|_| Error::Internal("negative chunk index".to_string()))?;
+        let base_size = self.file.partial_base_size_with_conn(conn).await?;
+        let chunk_start = chunk_index
+            .checked_mul(geometry.chunk_size as u64)
+            .ok_or_else(|| Error::Internal("chunk offset overflow".to_string()))?;
+        if chunk_start >= base_size {
+            return Ok(None);
+        }
+
+        self.file.validate_current_origin().await?;
+        let readable = std::cmp::min(geometry.chunk_size as u64, base_size - chunk_start);
+        let mut chunk = self.file.base_file.pread(chunk_start, readable).await?;
+        chunk.resize(geometry.chunk_size, 0);
+        Ok(Some(chunk))
+    }
+
+    async fn chunk_written(&self, conn: &Connection, ino: i64, chunk_index: i64) -> Result<()> {
+        debug_assert_eq!(ino, self.file.delta_ino);
+        conn.execute(
+            "INSERT OR IGNORE INTO fs_chunk_override (delta_ino, chunk_index) VALUES (?, ?)",
+            (ino, chunk_index),
+        )
+        .await?;
+        Ok(())
+    }
 }
 
 impl OverlayFS {
@@ -179,68 +222,22 @@ impl File for OverlayPartialFile {
         }
         let conn = self.delta.get_connection().await?;
         let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+        let range_refs: Vec<_> = ranges
+            .iter()
+            .map(|range| WriteRangeRef {
+                offset: range.offset,
+                data: range.data.as_slice(),
+            })
+            .collect();
+        let hooks = PartialOriginChunkHooks { file: self };
 
         let result: Result<()> = async {
-            let mut new_size = self.delta_file_size_with_conn(&conn).await?;
-            for range in ranges {
-                if range.data.is_empty() {
-                    continue;
-                }
-                let write_end = range
-                    .offset
-                    .checked_add(range.data.len() as u64)
-                    .ok_or_else(|| Error::Internal("file write offset overflow".to_string()))?;
-                new_size = std::cmp::max(new_size, write_end);
-                let chunk_size = self.chunk_size as u64;
-                let mut written = 0usize;
-
-                while written < range.data.len() {
-                    let current_offset = range.offset + written as u64;
-                    let chunk_index = current_offset / chunk_size;
-                    let offset_in_chunk = (current_offset % chunk_size) as usize;
-                    let remaining_in_chunk = self.chunk_size - offset_in_chunk;
-                    let to_write = std::cmp::min(remaining_in_chunk, range.data.len() - written);
-
-                    let mut chunk = self
-                        .read_merged_chunk_with_conn(&conn, chunk_index)
-                        .await?;
-                    chunk[offset_in_chunk..offset_in_chunk + to_write]
-                        .copy_from_slice(&range.data[written..written + to_write]);
-
-                    conn.execute(
-                        "INSERT OR REPLACE INTO fs_data (ino, chunk_index, data) VALUES (?, ?, ?)",
-                        (
-                            self.delta_ino,
-                            chunk_index as i64,
-                            Value::Blob(chunk),
-                        ),
-                    )
-                    .await?;
-                    conn.execute(
-                        "INSERT OR IGNORE INTO fs_chunk_override (delta_ino, chunk_index) VALUES (?, ?)",
-                        (self.delta_ino, chunk_index as i64),
-                    )
-                    .await?;
-
-                    written += to_write;
-                }
-            }
-
-            let (now_secs, now_nsec) = current_timestamp()?;
-            conn.execute(
-                "UPDATE fs_inode
-                 SET size = ?, data_inline = NULL, storage_kind = ?, mtime = ?, ctime = ?,
-                     mtime_nsec = ?, ctime_nsec = ?
-                 WHERE ino = ?",
-                (
-                    new_size as i64,
-                    STORAGE_CHUNKED,
-                    now_secs,
-                    now_secs,
-                    now_nsec,
-                    now_nsec,
-                    self.delta_ino,
-                ),
+            store::write_ranges_with_chunk_hooks(
+                &conn,
+                self.delta_ino,
+                self.geometry(),
+                &range_refs,
+                &hooks,
             )
             .await?;
             Ok(())
@@ -263,48 +260,13 @@ impl File for OverlayPartialFile {
     async fn truncate(&self, size: u64) -> Result<()> {
         let conn = self.delta.get_connection().await?;
         let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+        let hooks = PartialOriginChunkHooks { file: self };
 
         let result: Result<()> = async {
-            let current_size = self.delta_file_size_with_conn(&conn).await?;
-            let chunk_size = self.chunk_size as u64;
-
-            if size == 0 {
-                conn.execute("DELETE FROM fs_data WHERE ino = ?", (self.delta_ino,))
-                    .await?;
-                conn.execute(
-                    "DELETE FROM fs_chunk_override WHERE delta_ino = ?",
-                    (self.delta_ino,),
-                )
+            store::truncate_with_chunk_hooks(&conn, self.delta_ino, self.geometry(), size, &hooks)
                 .await?;
-            } else if size < current_size {
-                let last_chunk = (size - 1) / chunk_size;
-                conn.execute(
-                    "DELETE FROM fs_data WHERE ino = ? AND chunk_index > ?",
-                    (self.delta_ino, last_chunk as i64),
-                )
+            self.prune_chunk_overrides_after_truncate(&conn, size)
                 .await?;
-                conn.execute(
-                    "DELETE FROM fs_chunk_override WHERE delta_ino = ? AND chunk_index > ?",
-                    (self.delta_ino, last_chunk as i64),
-                )
-                .await?;
-
-                let end_in_last_chunk = ((size - 1) % chunk_size + 1) as usize;
-                if self.chunk_is_override_with_conn(&conn, last_chunk).await? {
-                    let mut chunk = self
-                        .delta_chunk_with_conn(&conn, last_chunk)
-                        .await?
-                        .unwrap_or_default();
-                    if chunk.len() > end_in_last_chunk {
-                        chunk.truncate(end_in_last_chunk);
-                        conn.execute(
-                            "UPDATE fs_data SET data = ? WHERE ino = ? AND chunk_index = ?",
-                            (Value::Blob(chunk), self.delta_ino, last_chunk as i64),
-                        )
-                        .await?;
-                    }
-                }
-            }
 
             let origin_base_size = self.partial_base_size_with_conn(&conn).await?;
             if size < origin_base_size {
@@ -314,24 +276,6 @@ impl File for OverlayPartialFile {
                 )
                 .await?;
             }
-
-            let (now_secs, now_nsec) = current_timestamp()?;
-            conn.execute(
-                "UPDATE fs_inode
-                 SET size = ?, data_inline = NULL, storage_kind = ?, mtime = ?, ctime = ?,
-                     mtime_nsec = ?, ctime_nsec = ?
-                 WHERE ino = ?",
-                (
-                    size as i64,
-                    STORAGE_CHUNKED,
-                    now_secs,
-                    now_secs,
-                    now_nsec,
-                    now_nsec,
-                    self.delta_ino,
-                ),
-            )
-            .await?;
             Ok(())
         }
         .await;
@@ -363,6 +307,13 @@ impl File for OverlayPartialFile {
 }
 
 impl OverlayPartialFile {
+    fn geometry(&self) -> crate::config::Geometry {
+        crate::config::Geometry {
+            chunk_size: self.chunk_size,
+            inline_threshold: self.delta.inline_threshold(),
+        }
+    }
+
     async fn resolve_origin_base_stats(&self) -> Result<Option<Stats>> {
         let mut ino = ROOT_INO;
         if self.origin.base_path == "/" {
@@ -414,6 +365,29 @@ impl OverlayPartialFile {
         }
     }
 
+    async fn prune_chunk_overrides_after_truncate(
+        &self,
+        conn: &Connection,
+        size: u64,
+    ) -> Result<()> {
+        if size == 0 {
+            conn.execute(
+                "DELETE FROM fs_chunk_override WHERE delta_ino = ?",
+                (self.delta_ino,),
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let last_chunk = (size - 1) / self.chunk_size as u64;
+        conn.execute(
+            "DELETE FROM fs_chunk_override WHERE delta_ino = ? AND chunk_index > ?",
+            (self.delta_ino, last_chunk as i64),
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn partial_base_size_with_conn(&self, conn: &Connection) -> Result<u64> {
         let mut rows = conn
             .query(
@@ -446,37 +420,23 @@ impl OverlayPartialFile {
         Ok(rows.next().await?.is_some())
     }
 
-    async fn delta_chunk_with_conn(
-        &self,
-        conn: &Connection,
-        chunk_index: u64,
-    ) -> Result<Option<Vec<u8>>> {
-        let mut rows = conn
-            .query(
-                "SELECT data FROM fs_data WHERE ino = ? AND chunk_index = ?",
-                (self.delta_ino, chunk_index as i64),
-            )
-            .await?;
-        if let Some(row) = rows.next().await? {
-            match row.get_value(0) {
-                Ok(Value::Blob(data)) => Ok(Some(data)),
-                _ => Ok(Some(Vec::new())),
-            }
-        } else {
-            Ok(None)
-        }
-    }
-
     async fn read_merged_chunk_with_conn(
         &self,
         conn: &Connection,
         chunk_index: u64,
     ) -> Result<Vec<u8>> {
         if self.chunk_is_override_with_conn(conn, chunk_index).await? {
-            let mut chunk = self
-                .delta_chunk_with_conn(conn, chunk_index)
-                .await?
-                .unwrap_or_default();
+            let chunk_start = chunk_index
+                .checked_mul(self.chunk_size as u64)
+                .ok_or_else(|| Error::Internal("chunk offset overflow".to_string()))?;
+            let mut chunk = store::read(
+                conn,
+                self.delta_ino,
+                self.geometry(),
+                chunk_start,
+                self.chunk_size as u64,
+            )
+            .await?;
             chunk.resize(self.chunk_size, 0);
             return Ok(chunk);
         }

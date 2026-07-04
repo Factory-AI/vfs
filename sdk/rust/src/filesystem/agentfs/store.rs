@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use async_trait::async_trait;
 use turso::{Connection, Value};
 
 use crate::config::Geometry;
@@ -15,9 +16,22 @@ pub(super) struct FileStorage {
     inline_data: Option<Vec<u8>>,
 }
 
-pub(super) struct WriteRangeRef<'a> {
-    pub(super) offset: u64,
-    pub(super) data: &'a [u8],
+pub(in crate::filesystem) struct WriteRangeRef<'a> {
+    pub(in crate::filesystem) offset: u64,
+    pub(in crate::filesystem) data: &'a [u8],
+}
+
+#[async_trait]
+pub(in crate::filesystem) trait ChunkWriteHooks: Send + Sync {
+    async fn seed_missing_chunk(
+        &self,
+        conn: &Connection,
+        ino: i64,
+        geometry: Geometry,
+        chunk_index: i64,
+    ) -> Result<Option<Vec<u8>>>;
+
+    async fn chunk_written(&self, conn: &Connection, ino: i64, chunk_index: i64) -> Result<()>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -173,7 +187,7 @@ pub(super) async fn file_storage(conn: &Connection, ino: i64) -> Result<FileStor
 // AgentFSFile hot path uses `read_from_storage` after it has already fetched
 // metadata, avoiding a duplicate metadata query.
 #[allow(dead_code)]
-pub(super) async fn read(
+pub(in crate::filesystem) async fn read(
     conn: &Connection,
     ino: i64,
     geometry: Geometry,
@@ -300,6 +314,14 @@ async fn read_chunked(
 /// chmod/chown/utimens), leave mtime/ctime untouched instead of stamping
 /// the commit time. `explicit_times`: stashed setattr values folded into the
 /// inode UPDATE itself (see `write_commit_time_sets`).
+#[derive(Default)]
+struct WriteOptions<'a> {
+    preserve_times: bool,
+    explicit_times: Option<&'a PendingTimeChange>,
+    hooks: Option<&'a dyn ChunkWriteHooks>,
+    force_chunked: bool,
+}
+
 pub(super) async fn write_ranges(
     conn: &Connection,
     ino: i64,
@@ -307,6 +329,48 @@ pub(super) async fn write_ranges(
     ranges: &[WriteRangeRef<'_>],
     preserve_times: bool,
     explicit_times: Option<&PendingTimeChange>,
+) -> Result<()> {
+    write_ranges_inner(
+        conn,
+        ino,
+        geometry,
+        ranges,
+        WriteOptions {
+            preserve_times,
+            explicit_times,
+            ..WriteOptions::default()
+        },
+    )
+    .await
+}
+
+pub(in crate::filesystem) async fn write_ranges_with_chunk_hooks(
+    conn: &Connection,
+    ino: i64,
+    geometry: Geometry,
+    ranges: &[WriteRangeRef<'_>],
+    hooks: &dyn ChunkWriteHooks,
+) -> Result<()> {
+    write_ranges_inner(
+        conn,
+        ino,
+        geometry,
+        ranges,
+        WriteOptions {
+            hooks: Some(hooks),
+            force_chunked: true,
+            ..WriteOptions::default()
+        },
+    )
+    .await
+}
+
+async fn write_ranges_inner(
+    conn: &Connection,
+    ino: i64,
+    geometry: Geometry,
+    ranges: &[WriteRangeRef<'_>],
+    options: WriteOptions<'_>,
 ) -> Result<()> {
     let ranges = normalize_write_ranges(ranges)?;
     if ranges.is_empty() {
@@ -321,7 +385,8 @@ pub(super) async fn write_ranges(
         .unwrap_or(metadata.size);
     let new_size = std::cmp::max(metadata.size, write_end);
 
-    if metadata.storage_kind == STORAGE_INLINE
+    if !options.force_chunked
+        && metadata.storage_kind == STORAGE_INLINE
         && new_size <= geometry.inline_threshold as u64
         && dense_after_inline_write_batch(metadata.size, new_size, &ranges)
     {
@@ -341,7 +406,8 @@ pub(super) async fn write_ranges(
             Value::Blob(inline_data),
             Value::Integer(STORAGE_INLINE),
         ];
-        let (time_sets, time_values) = write_commit_time_sets(preserve_times, explicit_times)?;
+        let (time_sets, time_values) =
+            write_commit_time_sets(options.preserve_times, options.explicit_times)?;
         sets.extend(time_sets);
         values.extend(time_values);
         values.push(Value::Integer(ino));
@@ -371,14 +437,15 @@ pub(super) async fn write_ranges(
     }
 
     chunked_ranges.extend(ranges);
-    write_ranges_chunked(conn, ino, geometry, &chunked_ranges).await?;
+    write_ranges_chunked(conn, ino, geometry, &chunked_ranges, options.hooks).await?;
 
     let mut sets = vec!["size = ?", "data_inline = NULL", "storage_kind = ?"];
     let mut values: Vec<Value> = vec![
         Value::Integer(new_size as i64),
         Value::Integer(STORAGE_CHUNKED),
     ];
-    let (time_sets, time_values) = write_commit_time_sets(preserve_times, explicit_times)?;
+    let (time_sets, time_values) =
+        write_commit_time_sets(options.preserve_times, options.explicit_times)?;
     sets.extend(time_sets);
     values.extend(time_values);
     values.push(Value::Integer(ino));
@@ -394,10 +461,31 @@ pub(super) async fn truncate(
     geometry: Geometry,
     new_size: u64,
 ) -> Result<()> {
+    truncate_inner(conn, ino, geometry, new_size, false, None).await
+}
+
+pub(in crate::filesystem) async fn truncate_with_chunk_hooks(
+    conn: &Connection,
+    ino: i64,
+    geometry: Geometry,
+    new_size: u64,
+    hooks: &dyn ChunkWriteHooks,
+) -> Result<()> {
+    truncate_inner(conn, ino, geometry, new_size, true, Some(hooks)).await
+}
+
+async fn truncate_inner(
+    conn: &Connection,
+    ino: i64,
+    geometry: Geometry,
+    new_size: u64,
+    force_chunked: bool,
+    hooks: Option<&dyn ChunkWriteHooks>,
+) -> Result<()> {
     let metadata = file_storage(conn, ino).await?;
 
     if metadata.storage_kind == STORAGE_INLINE {
-        if new_size <= geometry.inline_threshold as u64 {
+        if !force_chunked && new_size <= geometry.inline_threshold as u64 {
             let mut inline_data = metadata.inline_data.unwrap_or_default();
             inline_data.resize(metadata.size as usize, 0);
             inline_data.resize(new_size as usize, 0);
@@ -423,13 +511,13 @@ pub(super) async fn truncate(
 
         let mut inline_data = metadata.inline_data.unwrap_or_default();
         inline_data.resize(metadata.size as usize, 0);
-        transition_inline_to_chunked(conn, ino, geometry, &inline_data).await?;
-        truncate_chunked_data(conn, ino, geometry, metadata.size, new_size).await?;
+        transition_inline_to_chunked(conn, ino, geometry, &inline_data, hooks).await?;
+        truncate_chunked_data(conn, ino, geometry, metadata.size, new_size, hooks).await?;
         update_chunked_truncate_metadata(conn, ino, new_size).await?;
         return Ok(());
     }
 
-    if new_size <= geometry.inline_threshold as u64 {
+    if !force_chunked && new_size <= geometry.inline_threshold as u64 {
         if let Some(inline_data) =
             read_dense_prefix_for_inline(conn, ino, geometry, new_size).await?
         {
@@ -454,7 +542,7 @@ pub(super) async fn truncate(
         }
     }
 
-    truncate_chunked_data(conn, ino, geometry, metadata.size, new_size).await?;
+    truncate_chunked_data(conn, ino, geometry, metadata.size, new_size, hooks).await?;
     update_chunked_truncate_metadata(conn, ino, new_size).await?;
     Ok(())
 }
@@ -464,12 +552,13 @@ async fn transition_inline_to_chunked(
     ino: i64,
     geometry: Geometry,
     inline_data: &[u8],
+    hooks: Option<&dyn ChunkWriteHooks>,
 ) -> Result<()> {
     conn.execute("DELETE FROM fs_data WHERE ino = ?", (ino,))
         .await?;
 
     if !inline_data.is_empty() {
-        write_data_at_offset(conn, ino, geometry, 0, inline_data).await?;
+        write_data_at_offset(conn, ino, geometry, 0, inline_data, hooks).await?;
     }
 
     conn.execute(
@@ -525,6 +614,7 @@ async fn truncate_chunked_data(
     geometry: Geometry,
     current_size: u64,
     new_size: u64,
+    hooks: Option<&dyn ChunkWriteHooks>,
 ) -> Result<()> {
     let chunk_size = geometry.chunk_size as u64;
 
@@ -555,6 +645,11 @@ async fn truncate_chunked_data(
                             (&chunk_data[..end_in_last_chunk], ino, last_chunk_idx as i64),
                         )
                         .await?;
+                        if let Some(hooks) = hooks {
+                            hooks
+                                .chunk_written(conn, ino, last_chunk_idx as i64)
+                                .await?;
+                        }
                     }
                 }
             }
@@ -590,6 +685,9 @@ async fn truncate_chunked_data(
                             (&padded[..], ino, last_idx as i64),
                         )
                         .await?;
+                        if let Some(hooks) = hooks {
+                            hooks.chunk_written(conn, ino, last_idx as i64).await?;
+                        }
                     }
                 }
             }
@@ -608,6 +706,9 @@ async fn truncate_chunked_data(
                 (ino, chunk_idx as i64, &zeros[..]),
             )
             .await?;
+            if let Some(hooks) = hooks {
+                hooks.chunk_written(conn, ino, chunk_idx as i64).await?;
+            }
         }
     }
 
@@ -642,10 +743,11 @@ async fn write_data_at_offset(
     geometry: Geometry,
     offset: u64,
     data: &[u8],
+    hooks: Option<&dyn ChunkWriteHooks>,
 ) -> Result<()> {
     let ranges = [WriteRangeRef { offset, data }];
     let ranges = normalize_write_ranges(&ranges)?;
-    write_ranges_chunked(conn, ino, geometry, &ranges).await
+    write_ranges_chunked(conn, ino, geometry, &ranges, hooks).await
 }
 
 async fn write_ranges_chunked(
@@ -653,6 +755,7 @@ async fn write_ranges_chunked(
     ino: i64,
     geometry: Geometry,
     ranges: &[NormalizedWriteRange],
+    hooks: Option<&dyn ChunkWriteHooks>,
 ) -> Result<()> {
     let chunk_size = geometry.chunk_size as u64;
 
@@ -689,17 +792,28 @@ async fn write_ranges_chunked(
 
             if let std::collections::btree_map::Entry::Vacant(entry) = chunks.entry(chunk_index) {
                 let mut rows = select_stmt.query((ino, chunk_index)).await?;
-                let chunk_data = if let Some(row) = rows.next().await? {
-                    match row.get_value(0) {
+                let existing_chunk = if let Some(row) = rows.next().await? {
+                    Some(match row.get_value(0) {
                         Ok(Value::Blob(data)) => data,
                         Ok(_) | Err(_) => {
                             return Err(corrupt_column("fs_data.data", "expected blob"))
                         }
-                    }
+                    })
+                } else {
+                    None
+                };
+                drop(rows);
+                select_stmt.reset()?;
+                let chunk_data = if let Some(existing_chunk) = existing_chunk {
+                    existing_chunk
+                } else if let Some(hooks) = hooks {
+                    hooks
+                        .seed_missing_chunk(conn, ino, geometry, chunk_index)
+                        .await?
+                        .unwrap_or_default()
                 } else {
                     Vec::new()
                 };
-                select_stmt.reset()?;
                 entry.insert(chunk_data);
             }
 
@@ -728,6 +842,9 @@ async fn write_ranges_chunked(
             .execute((ino, chunk_index, Value::Blob(chunk_data)))
             .await?;
         insert_stmt.reset()?;
+        if let Some(hooks) = hooks {
+            hooks.chunk_written(conn, ino, chunk_index).await?;
+        }
     }
 
     crate::profiling::record_chunk_write_chunks(chunks_written);

@@ -23,7 +23,7 @@ use crate::schema;
 
 mod batcher;
 mod lifecycle;
-mod store;
+pub(in crate::filesystem) mod store;
 use batcher::{
     AgentFSWriteBatcher, BatcherDrain, BatcherPendingView, Drain, EnqueueOutcome,
     PendingGeneration, PendingTimeChange, PendingView,
