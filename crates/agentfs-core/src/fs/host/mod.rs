@@ -1,3 +1,5 @@
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod common;
 #[cfg(target_os = "macos")]
 mod darwin;
 #[cfg(target_os = "linux")]
