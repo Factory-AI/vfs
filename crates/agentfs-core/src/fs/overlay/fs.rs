@@ -1,5 +1,7 @@
 use super::*;
-use crate::fs::{BoxedFile, DirEntry, FileSystem, FilesystemStats, FsError, Stats, TimeChange};
+use crate::fs::{
+    BoxedFile, DirEntry, FileSystem, FilesystemStats, FsError, KernelCachePolicy, Stats, TimeChange,
+};
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
 use tracing::trace;
@@ -114,15 +116,22 @@ impl FileSystem for OverlayFS {
             return Ok(None);
         }
 
-        let stats = match info.layer {
-            Layer::Delta => FileSystem::getattr(&self.delta, info.underlying_ino).await?,
-            Layer::Base => self.base.getattr(info.underlying_ino).await?,
-        };
-
-        Ok(stats.map(|mut s| {
-            s.ino = ino;
-            s
-        }))
+        match info.layer {
+            Layer::Delta => Ok(FileSystem::getattr(&self.delta, info.underlying_ino)
+                .await?
+                .map(|mut s| {
+                    s.ino = ino;
+                    s
+                })),
+            Layer::Base => {
+                let stats = self.resolve_base_path(&info.path).await?;
+                Ok(stats.map(|mut s| {
+                    self.refresh_overlay_mapping(ino, Layer::Base, s.ino, &info.path);
+                    s.ino = ino;
+                    s
+                }))
+            }
+        }
     }
 
     async fn readlink(&self, ino: i64) -> Result<Option<String>> {
@@ -405,15 +414,7 @@ impl FileSystem for OverlayFS {
 
         let info = self.get_inode_info(ino).ok_or(FsError::NotFound)?;
         match info.layer {
-            Layer::Base => {
-                if self.is_whiteout(&info.path) {
-                    return Ok(None);
-                }
-                let Some(stats) = self.base.getattr(info.underlying_ino).await? else {
-                    return Ok(None);
-                };
-                Ok(stats.is_file().then_some(stats))
-            }
+            Layer::Base => Ok(None),
             // Delta (DB-backed) files inherit the AgentFS keep-cache policy:
             // the adapter fingerprint guard revalidates per open.
             Layer::Delta => {
@@ -424,6 +425,15 @@ impl FileSystem for OverlayFS {
 
     fn delta_keep_cache_fast_path(&self) -> bool {
         self.delta.delta_keep_cache_fast_path()
+    }
+
+    fn kernel_cache_policy(&self, ino: i64) -> KernelCachePolicy {
+        match self.get_inode_info(ino) {
+            Some(info) if info.layer == Layer::Base && !self.is_whiteout(&info.path) => {
+                KernelCachePolicy::ExternalDrift
+            }
+            _ => KernelCachePolicy::Stable,
+        }
     }
 
     async fn open(&self, ino: i64, flags: i32) -> Result<BoxedFile> {
@@ -441,14 +451,19 @@ impl FileSystem for OverlayFS {
                     .await;
             }
             Layer::Base if !is_write_open(flags) => {
-                return self.base.open(info.underlying_ino, flags).await;
+                let current = self
+                    .resolve_base_path(&info.path)
+                    .await?
+                    .ok_or(FsError::NotFound)?;
+                self.refresh_overlay_mapping(ino, Layer::Base, current.ino, &info.path);
+                return self.base.open(current.ino, flags).await;
             }
             Layer::Base => {
                 let base_stats = self
-                    .base
-                    .getattr(info.underlying_ino)
+                    .resolve_base_path(&info.path)
                     .await?
                     .ok_or(FsError::NotFound)?;
+                self.refresh_overlay_mapping(ino, Layer::Base, base_stats.ino, &info.path);
                 if self.partial_origin_policy.permits(&base_stats) {
                     let delta_ino = self.partial_copy_up_and_update_mapping(ino, &info).await?;
                     return self.partial_file_for_delta(ino, delta_ino, flags).await;

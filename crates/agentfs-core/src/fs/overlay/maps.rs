@@ -106,6 +106,8 @@ impl OverlayMaps {
         let Some(info) = self.inode.get_mut(&overlay_ino) else {
             return;
         };
+        let old_layer = info.layer;
+        let old_underlying_ino = info.underlying_ino;
         let old_path = info.path.clone();
         let keeps_origin_reverse = info.layer == Layer::Base && new_layer == Layer::Delta;
         info.layer = new_layer;
@@ -113,6 +115,11 @@ impl OverlayMaps {
         info.path = new_path.to_string();
         info.has_extra_reverse |= keeps_origin_reverse;
 
+        if (old_layer, old_underlying_ino) != (new_layer, new_underlying_ino)
+            && !keeps_origin_reverse
+        {
+            self.reverse.remove(&(old_layer, old_underlying_ino));
+        }
         self.reverse
             .insert((new_layer, new_underlying_ino), overlay_ino);
         if self.path.get(&old_path).copied() == Some(overlay_ino) {

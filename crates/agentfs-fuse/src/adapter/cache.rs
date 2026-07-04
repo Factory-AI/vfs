@@ -107,6 +107,8 @@ pub(super) struct AdapterCaches {
     attr: Arc<Mutex<HashMap<u64, Stats>>>,
     entry: Arc<Mutex<HashMap<(u64, String), Stats>>>,
     negative_entry: Arc<Mutex<HashMap<(u64, String), ()>>>,
+    external_read_fingerprints: Arc<Mutex<HashMap<u64, KeepCacheFingerprint>>>,
+    external_read_seen: Arc<Mutex<HashSet<u64>>>,
     keepcache_drift: Arc<Mutex<KeepCacheDriftGuard>>,
     reply_lock: Arc<Mutex<()>>,
     epoch: AtomicU64,
@@ -119,6 +121,8 @@ impl AdapterCaches {
             attr: Arc::new(Mutex::new(HashMap::new())),
             entry: Arc::new(Mutex::new(HashMap::new())),
             negative_entry: Arc::new(Mutex::new(HashMap::new())),
+            external_read_fingerprints: Arc::new(Mutex::new(HashMap::new())),
+            external_read_seen: Arc::new(Mutex::new(HashSet::new())),
             keepcache_drift: Arc::new(Mutex::new(KeepCacheDriftGuard::new(keepcache_sticky_drop))),
             reply_lock: Arc::new(Mutex::new(())),
             epoch: AtomicU64::new(0),
@@ -199,5 +203,38 @@ impl AdapterCaches {
 
     pub(super) fn drop_keepcache_eligibility(&self, ino: u64) -> bool {
         self.keepcache_drift.lock().drop_eligibility(ino)
+    }
+
+    pub(super) fn set_external_read_fingerprint(
+        &self,
+        ino: u64,
+        fingerprint: KeepCacheFingerprint,
+    ) {
+        self.external_read_fingerprints
+            .lock()
+            .insert(ino, fingerprint);
+    }
+
+    pub(super) fn mark_external_read_seen(&self, ino: u64) {
+        self.external_read_seen.lock().insert(ino);
+    }
+
+    pub(super) fn external_read_was_seen(&self, ino: u64) -> bool {
+        self.external_read_seen.lock().contains(&ino)
+    }
+
+    pub(super) fn external_read_drifted(
+        &self,
+        ino: u64,
+        fingerprint: KeepCacheFingerprint,
+    ) -> bool {
+        let mut fingerprints = self.external_read_fingerprints.lock();
+        match fingerprints.get(&ino) {
+            Some(existing) => existing != &fingerprint,
+            None => {
+                fingerprints.insert(ino, fingerprint);
+                false
+            }
+        }
     }
 }

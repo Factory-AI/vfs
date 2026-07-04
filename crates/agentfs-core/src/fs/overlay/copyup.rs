@@ -2,7 +2,7 @@ use super::*;
 use crate::fs::{BoxedFile, FsError};
 
 impl OverlayFS {
-    async fn resolve_base_path(&self, path: &str) -> Result<Option<Stats>> {
+    pub(super) async fn resolve_base_path(&self, path: &str) -> Result<Option<Stats>> {
         let mut ino = ROOT_INO;
         if path == "/" {
             return self.base.getattr(ino).await;

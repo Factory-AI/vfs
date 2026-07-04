@@ -119,7 +119,7 @@
     }
 
     #[tokio::test]
-    async fn test_overlay_keep_cache_only_for_read_only_base_files() -> Result<()> {
+    async fn test_overlay_keep_cache_rejects_base_files() -> Result<()> {
         let (overlay, _base_dir, _delta_dir) = create_test_overlay().await?;
 
         let stats = overlay.lookup(ROOT_INO, "base.txt").await?.unwrap();
@@ -127,13 +127,8 @@
             .keep_cache_for_read_open(stats.ino, libc::O_RDONLY)
             .await?;
         assert!(
-            granted.is_some(),
-            "read-only base files are eligible for FOPEN_KEEP_CACHE"
-        );
-        assert_eq!(
-            granted.map(|s| s.size),
-            Some(stats.size),
-            "keep-cache grant must carry the stats it was decided on"
+            granted.is_none(),
+            "base files can drift outside the mount and must not get FOPEN_KEEP_CACHE"
         );
         assert!(
             overlay

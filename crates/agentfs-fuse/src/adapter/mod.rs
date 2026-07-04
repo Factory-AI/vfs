@@ -12,16 +12,18 @@ use self::write_buffer::{
 };
 use crate::transport::{
     consts::{
-        FOPEN_CACHE_DIR, FOPEN_KEEP_CACHE, FUSE_ASYNC_READ, FUSE_CACHE_SYMLINKS,
-        FUSE_DO_READDIRPLUS, FUSE_NO_OPENDIR_SUPPORT, FUSE_NO_OPEN_SUPPORT, FUSE_OVER_IO_URING,
-        FUSE_PARALLEL_DIROPS, FUSE_READDIRPLUS_AUTO, FUSE_WRITEBACK_CACHE,
+        FOPEN_CACHE_DIR, FOPEN_KEEP_CACHE, FUSE_ASYNC_READ, FUSE_AUTO_INVAL_DATA,
+        FUSE_CACHE_SYMLINKS, FUSE_DO_READDIRPLUS, FUSE_NO_OPENDIR_SUPPORT, FUSE_NO_OPEN_SUPPORT,
+        FUSE_OVER_IO_URING, FUSE_PARALLEL_DIROPS, FUSE_READDIRPLUS_AUTO, FUSE_WRITEBACK_CACHE,
     },
     fuse_forget_one, FileAttr, FileType, Filesystem, KernelConfig, MountOption, ReplyAttr,
     ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen,
     ReplyStatfs, ReplyWrite, Request,
 };
 use agentfs_core::error::Error as SdkError;
-use agentfs_core::fs::{WriteRange, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFSOCK};
+use agentfs_core::fs::{
+    KernelCachePolicy, WriteRange, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFSOCK,
+};
 use agentfs_core::{BoxedFile, DirEntry, FileSystem, FsError, Stats, TimeChange};
 use parking_lot::Mutex;
 use std::{
@@ -275,7 +277,8 @@ impl Filesystem for AgentFSFuse {
         // FUSE_NO_OPENDIR_SUPPORT skips the OPENDIR round trip, but granting
         // FOPEN_CACHE_DIR requires replying to OPENDIR; one round trip per
         // opendir(3) buys kernel-cached getdents for every warm re-listing.
-        let mut capabilities = FUSE_ASYNC_READ | FUSE_PARALLEL_DIROPS | FUSE_CACHE_SYMLINKS;
+        let mut capabilities =
+            FUSE_ASYNC_READ | FUSE_AUTO_INVAL_DATA | FUSE_PARALLEL_DIROPS | FUSE_CACHE_SYMLINKS;
         if !self.cache_dir_enabled {
             capabilities |= FUSE_NO_OPENDIR_SUPPORT;
         }
@@ -444,17 +447,32 @@ impl Filesystem for AgentFSFuse {
                         return;
                     }
                 };
-                if stable {
+                let external_drift = self.external_drift_sensitive(stats.ino as u64);
+                let drift_detected =
+                    external_drift && self.external_drift_detected(stats.ino as u64, &stats);
+                if drift_detected {
+                    reply.error(libc::EIO);
+                    crate::telemetry::record_base_fast_stale_rejection();
+                    return;
+                }
+                if external_drift {
+                    self.caches.set_external_read_fingerprint(
+                        stats.ino as u64,
+                        KeepCacheFingerprint::from_stats(&stats),
+                    );
+                }
+                if stable && !external_drift {
                     self.cache_entry(parent, name_str, &stats);
                 }
                 let attr = fillattr(&stats);
+                let cacheable = stable && !external_drift;
                 reply.entry_with_ttls(
-                    if stable {
+                    if cacheable {
                         &self.cache_config.entry_ttl
                     } else {
                         &Duration::ZERO
                     },
-                    if stable {
+                    if cacheable {
                         &self.cache_config.attr_ttl
                     } else {
                         &Duration::ZERO
@@ -524,11 +542,25 @@ impl Filesystem for AgentFSFuse {
 
         match result {
             Ok(Some(stats)) => {
-                if stable && self.attrs_cacheable() {
+                let external_drift = self.external_drift_sensitive(ino);
+                let drift_detected = external_drift && self.external_drift_detected(ino, &stats);
+                if drift_detected {
+                    reply.error(libc::EIO);
+                    crate::telemetry::record_base_fast_stale_rejection();
+                    return;
+                }
+                if external_drift {
+                    self.caches.set_external_read_fingerprint(
+                        ino,
+                        KeepCacheFingerprint::from_stats(&stats),
+                    );
+                }
+                let cacheable = stable && !external_drift;
+                if cacheable && self.attrs_cacheable() {
                     self.cache_attr(&stats);
                 }
                 reply.attr(
-                    if stable {
+                    if cacheable {
                         &self.cache_config.attr_ttl
                     } else {
                         &Duration::ZERO
@@ -776,16 +808,17 @@ impl Filesystem for AgentFSFuse {
         let cache_reply = self.caches.try_reply_guard(stable_epoch);
         let stable = stable && cache_reply.is_some();
         for (i, entry) in all_entries.iter().enumerate().skip(readdir_start(offset)) {
+            let entry_cacheable = stable && !self.external_drift_sensitive(entry.attr.ino);
             if reply.add_with_ttls(
                 entry.attr.ino,
                 (i + 1) as i64,
                 &entry.name,
-                if stable {
+                if entry_cacheable {
                     &self.cache_config.entry_ttl
                 } else {
                     &Duration::ZERO
                 },
-                if stable {
+                if entry_cacheable {
                     &self.cache_config.attr_ttl
                 } else {
                     &Duration::ZERO
@@ -1355,7 +1388,7 @@ impl Filesystem for AgentFSFuse {
     /// Reads data using the file handle.
     fn read(
         &self,
-        _req: &Request,
+        req: &Request,
         ino: u64,
         fh: u64,
         offset: i64,
@@ -1370,6 +1403,7 @@ impl Filesystem for AgentFSFuse {
             reply.error(libc::EINVAL);
             return;
         }
+        let external_drift_read = self.external_drift_sensitive(ino);
 
         let file = {
             let open_files = self.open_files.lock();
@@ -1397,7 +1431,17 @@ impl Filesystem for AgentFSFuse {
             .block_on(async move { file.pread(offset as u64, size as u64).await });
 
         match result {
-            Ok(data) => reply.data(&data),
+            Ok(data) => {
+                let notifier = external_drift_read.then(|| req.deferred_notifier().clone());
+                if external_drift_read {
+                    self.caches.mark_external_read_seen(ino);
+                }
+                reply.data(&data);
+                if let Some(notifier) = notifier {
+                    notifier.inval_inode(ino, -1, 0);
+                    crate::telemetry::record_base_fast_inode_invalidation();
+                }
+            }
             Err(e) => reply.error(error_to_errno(&e)),
         }
     }
@@ -1939,6 +1983,21 @@ impl AgentFSFuse {
         !self.cache_config.attr_ttl.is_zero()
     }
 
+    fn kernel_cache_policy(&self, ino: u64) -> KernelCachePolicy {
+        self.fs.kernel_cache_policy(ino as i64)
+    }
+
+    fn external_drift_sensitive(&self, ino: u64) -> bool {
+        self.kernel_cache_policy(ino).has_external_drift()
+    }
+
+    fn external_drift_detected(&self, ino: u64, stats: &Stats) -> bool {
+        self.caches.external_read_was_seen(ino)
+            && self
+                .caches
+                .external_read_drifted(ino, KeepCacheFingerprint::from_stats(stats))
+    }
+
     fn has_pending_write_for_inode(&self, ino: u64) -> bool {
         self.open_files
             .lock()
@@ -2320,7 +2379,7 @@ impl AgentFSFuse {
     }
 
     fn cache_attr(&self, stats: &Stats) {
-        if !self.attrs_cacheable() {
+        if !self.attrs_cacheable() || self.external_drift_sensitive(stats.ino as u64) {
             return;
         }
         self.caches
@@ -2330,7 +2389,7 @@ impl AgentFSFuse {
     }
 
     fn cache_entry(&self, parent: u64, name: &str, stats: &Stats) {
-        if !self.attrs_cacheable() {
+        if !self.attrs_cacheable() || self.external_drift_sensitive(stats.ino as u64) {
             return;
         }
         self.cache_attr(stats);
@@ -2375,8 +2434,9 @@ impl AgentFSFuse {
         &self,
         ino: u64,
     ) -> Result<(Arc<Vec<CachedDirEntry>>, bool, u64), SdkError> {
+        let dir_cacheable = self.attrs_cacheable() && !self.external_drift_sensitive(ino);
         let cache_epoch = self.cache_epoch();
-        let cached_entries = if self.attrs_cacheable() {
+        let cached_entries = if dir_cacheable {
             self.caches.dir_entries().lock().get(&ino).cloned()
         } else {
             None
@@ -2468,7 +2528,7 @@ impl AgentFSFuse {
         let cache_reply = self.caches.try_reply_guard(stable_epoch);
         stable = stable && cache_reply.is_some();
 
-        if stable && self.attrs_cacheable() {
+        if stable && dir_cacheable {
             for entry in &entries {
                 self.cache_entry(ino, &entry.name, &entry.stats);
             }
@@ -2476,7 +2536,7 @@ impl AgentFSFuse {
 
         let all_entries = build_cached_readdir_entries(&dir_stats, &parent_stats, entries);
         let entries = Arc::new(all_entries);
-        if stable && self.attrs_cacheable() {
+        if stable && dir_cacheable {
             self.caches
                 .dir_entries()
                 .lock()

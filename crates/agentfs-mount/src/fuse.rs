@@ -244,6 +244,10 @@ impl agentfs_core::FileSystem for ReadWriteLaneFsAdapter {
         self.inner.delta_keep_cache_fast_path()
     }
 
+    fn kernel_cache_policy(&self, ino: i64) -> agentfs_core::fs::KernelCachePolicy {
+        self.inner.kernel_cache_policy(ino)
+    }
+
     async fn mkdir(
         &self,
         parent_ino: i64,

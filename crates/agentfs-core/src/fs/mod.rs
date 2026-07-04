@@ -145,6 +145,24 @@ pub struct DirEntry {
     pub stats: Stats,
 }
 
+/// Kernel-cache coherence class for an inode.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum KernelCachePolicy {
+    /// Inode contents can only change through this filesystem implementation,
+    /// so adapter invalidations bound kernel-cache staleness.
+    Stable,
+    /// Inode contents may change outside this filesystem implementation.
+    /// Adapters must avoid long-lived kernel page, attr, and entry cache
+    /// grants that could present stale bytes as current.
+    ExternalDrift,
+}
+
+impl KernelCachePolicy {
+    pub fn has_external_drift(self) -> bool {
+        matches!(self, Self::ExternalDrift)
+    }
+}
+
 /// A byte range to write at a fixed file offset.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteRange {
@@ -293,6 +311,11 @@ pub trait FileSystem: Send + Sync {
     /// [`FileSystem::keep_cache_for_read_open`].
     fn delta_keep_cache_fast_path(&self) -> bool {
         false
+    }
+
+    /// Return the kernel-cache coherence class for an inode.
+    fn kernel_cache_policy(&self, _ino: i64) -> KernelCachePolicy {
+        KernelCachePolicy::Stable
     }
 
     /// Create a directory with the specified ownership.
