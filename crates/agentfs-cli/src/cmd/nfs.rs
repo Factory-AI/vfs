@@ -4,7 +4,7 @@
 //! filesystem over the network, allowing remote systems (like VMs) to mount
 //! it as their root filesystem.
 
-use agentfs_core::{agentfs_dir, AgentFSOptions, FileSystem, HostFS, OverlayFS};
+use agentfs_core::{agentfs_dir, AgentFSOptions, EncryptionConfig, FileSystem, HostFS, OverlayFS};
 use agentfs_mount::{serve_nfs, NfsServerOptions};
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -14,7 +14,12 @@ use tokio::signal;
 use crate::cmd::init::open_agentfs;
 
 /// Handle the `nfs` command - start a standalone NFS server.
-pub async fn handle_nfs_command(id_or_path: String, bind: String, port: u32) -> Result<()> {
+pub async fn handle_nfs_command(
+    id_or_path: String,
+    bind: String,
+    port: u32,
+    encryption: Option<(String, String)>,
+) -> Result<()> {
     // Resolve database path
     let db_path = resolve_db_path(&id_or_path)?;
 
@@ -23,8 +28,16 @@ pub async fn handle_nfs_command(id_or_path: String, bind: String, port: u32) -> 
         .to_str()
         .context("Database path contains non-UTF8 characters")?;
 
-    let options = AgentFSOptions::with_path(db_path_str);
-    let agentfs = open_agentfs(options).await?;
+    let mut options = AgentFSOptions::with_path(db_path_str);
+    if let Some((key, cipher)) = encryption {
+        options = options.with_encryption(EncryptionConfig {
+            hex_key: key,
+            cipher,
+        });
+    }
+    let agentfs = open_agentfs(options)
+        .await
+        .map_err(|err| super::migrate::open_error_with_guidance(err, &id_or_path))?;
 
     // Check if overlay is configured in the database
     let base_path = agentfs

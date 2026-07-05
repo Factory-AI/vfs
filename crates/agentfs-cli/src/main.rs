@@ -10,16 +10,15 @@ use tracing_subscriber::prelude::*;
 
 /// Parse and validate encryption key and cipher options.
 /// Both must be provided together or neither.
-fn parse_encryption(key: Option<String>, cipher: Option<String>) -> Option<(String, String)> {
+fn parse_encryption(
+    key: Option<String>,
+    cipher: Option<String>,
+) -> anyhow::Result<Option<(String, String)>> {
     match (key, cipher) {
-        (Some(key), Some(cipher)) => Some((key, cipher)),
-        (Some(_), None) => {
-            exit_with_error("--cipher is required when using --key");
-        }
-        (None, Some(_)) => {
-            exit_with_error("--key is required when using --cipher");
-        }
-        (None, None) => None,
+        (Some(key), Some(cipher)) => Ok(Some((key, cipher))),
+        (Some(_), None) => anyhow::bail!("--cipher is required when using --key"),
+        (None, Some(_)) => anyhow::bail!("--key is required when using --cipher"),
+        (None, None) => Ok(None),
     }
 }
 
@@ -72,6 +71,14 @@ fn main() {
         }
     };
 
+    // The one CLI error reporter (Display formatting, exit 1). Child-status
+    // passthrough inside run/exec/init -c is the only other sanctioned exit.
+    if let Err(e) = dispatch(args) {
+        exit_with_error(format_args!("{e:#}"));
+    }
+}
+
+fn dispatch(args: Args) -> anyhow::Result<()> {
     match args.command {
         Command::Init {
             id,
@@ -84,9 +91,9 @@ fn main() {
             sync,
         } => {
             let rt = get_runtime();
-            let encryption_opts = parse_encryption(key, cipher)
+            let encryption_opts = parse_encryption(key, cipher)?
                 .map(|(key, cipher)| cmd::init::EncryptionOptions { key, cipher });
-            if let Err(e) = rt.block_on(cmd::init::init_database(
+            rt.block_on(cmd::init::init_database(
                 id,
                 sync,
                 force,
@@ -94,42 +101,25 @@ fn main() {
                 encryption_opts,
                 command,
                 backend,
-            )) {
-                exit_with_error(e);
-            }
+            ))
         }
         Command::Sync {
             id_or_path,
             command,
-        } => match command {
-            SyncCommand::Pull => {
-                let rt = get_runtime();
-                if let Err(e) = rt.block_on(cmd::sync::handle_pull_command(id_or_path)) {
-                    exit_with_error(e);
+        } => {
+            let rt = get_runtime();
+            match command {
+                SyncCommand::Pull => rt.block_on(cmd::sync::handle_pull_command(id_or_path)),
+                SyncCommand::Push => rt.block_on(cmd::sync::handle_push_command(id_or_path)),
+                SyncCommand::Checkpoint => {
+                    rt.block_on(cmd::sync::handle_checkpoint_command(id_or_path))
                 }
-            }
-            SyncCommand::Push => {
-                let rt = get_runtime();
-                if let Err(e) = rt.block_on(cmd::sync::handle_push_command(id_or_path)) {
-                    exit_with_error(e);
-                }
-            }
-            SyncCommand::Checkpoint => {
-                let rt = get_runtime();
-                if let Err(e) = rt.block_on(cmd::sync::handle_checkpoint_command(id_or_path)) {
-                    exit_with_error(e);
-                }
-            }
-            SyncCommand::Stats => {
-                let rt = get_runtime();
-                if let Err(e) = rt.block_on(cmd::sync::handle_stats_command(
+                SyncCommand::Stats => rt.block_on(cmd::sync::handle_stats_command(
                     &mut std::io::stdout(),
                     id_or_path,
-                )) {
-                    exit_with_error(e);
-                }
+                )),
             }
-        },
+        }
         Command::Run {
             allow,
             no_default_allows,
@@ -142,7 +132,7 @@ fn main() {
             command,
             args,
         } => {
-            let encryption = parse_encryption(key, cipher)
+            let encryption = parse_encryption(key, cipher)?
                 .map(|(hex_key, cipher)| agentfs_core::EncryptionConfig { hex_key, cipher });
             let options = agentfs_cli::opts::RunOptions {
                 allow,
@@ -158,9 +148,7 @@ fn main() {
                 args,
             };
             // No runtime here: the Linux backend must fork before tokio starts.
-            if let Err(e) = cmd::handle_run_command(options) {
-                exit_with_error(format_args!("{e:?}"));
-            }
+            cmd::handle_run_command(options)
         }
         #[cfg(unix)]
         Command::Exec {
@@ -171,13 +159,11 @@ fn main() {
             key,
             cipher,
         } => {
-            let encryption = parse_encryption(key, cipher);
+            let encryption = parse_encryption(key, cipher)?;
             let rt = get_runtime();
-            if let Err(e) = rt.block_on(cmd::exec::handle_exec_command(
+            rt.block_on(cmd::exec::handle_exec_command(
                 id_or_path, command, args, backend, encryption,
-            )) {
-                exit_with_error(format_args!("{e:?}"));
-            }
+            ))
         }
         #[cfg(unix)]
         Command::Clone {
@@ -188,11 +174,9 @@ fn main() {
             verify,
         } => {
             let rt = get_runtime();
-            if let Err(e) = rt.block_on(cmd::clone::handle_clone_command(
+            rt.block_on(cmd::clone::handle_clone_command(
                 id_or_path, source, name, backend, verify,
-            )) {
-                exit_with_error(format_args!("{e:?}"));
-            }
+            ))
         }
         Command::Mount {
             id_or_path,
@@ -206,38 +190,34 @@ fn main() {
             backend,
             partial_origin,
             partial_origin_threshold_bytes,
+            key,
+            cipher,
         } => match (id_or_path, mountpoint) {
-            (Some(id_or_path), Some(mountpoint)) => {
-                if let Err(e) = cmd::mount(cmd::MountArgs {
-                    id_or_path,
-                    mountpoint,
-                    auto_unmount,
-                    allow_root,
-                    allow_other: system,
-                    foreground,
-                    uid,
-                    gid,
-                    backend,
-                    partial_origin_policy: partial_origin_policy(
-                        partial_origin,
-                        partial_origin_threshold_bytes,
-                    ),
-                }) {
-                    exit_with_error(e);
-                }
-            }
+            (Some(id_or_path), Some(mountpoint)) => cmd::mount(cmd::MountArgs {
+                id_or_path,
+                mountpoint,
+                auto_unmount,
+                allow_root,
+                allow_other: system,
+                foreground,
+                uid,
+                gid,
+                backend,
+                partial_origin_policy: partial_origin_policy(
+                    partial_origin,
+                    partial_origin_threshold_bytes,
+                ),
+                encryption: parse_encryption(key, cipher)?,
+            }),
             (None, None) => {
                 cmd::mount::list_mounts(&mut std::io::stdout());
+                Ok(())
             }
-            _ => {
-                exit_with_error("both ID_OR_PATH and MOUNTPOINT are required to mount");
-            }
+            _ => anyhow::bail!("both ID_OR_PATH and MOUNTPOINT are required to mount"),
         },
         Command::Diff { id_or_path } => {
             let rt = get_runtime();
-            if let Err(e) = rt.block_on(cmd::fs::diff_filesystem(id_or_path)) {
-                exit_with_error(e);
-            }
+            rt.block_on(cmd::fs::diff_filesystem(id_or_path))
         }
         Command::Timeline {
             id_or_path,
@@ -253,13 +233,11 @@ fn main() {
                 status,
                 format,
             };
-            if let Err(e) = rt.block_on(cmd::timeline::show_timeline(
+            rt.block_on(cmd::timeline::show_timeline(
                 &mut std::io::stdout(),
                 &id_or_path,
                 &options,
-            )) {
-                exit_with_error(e);
-            }
+            ))
         }
         Command::Fs {
             command,
@@ -267,39 +245,27 @@ fn main() {
             key,
             cipher,
         } => {
-            let encryption = parse_encryption(key, cipher);
+            let encryption = parse_encryption(key, cipher)?;
             let rt = get_runtime();
             match command {
-                FsCommand::Ls { fs_path } => {
-                    if let Err(e) = rt.block_on(cmd::fs::ls_filesystem(
-                        &mut std::io::stdout(),
-                        id_or_path,
-                        &fs_path,
-                        encryption.as_ref(),
-                    )) {
-                        exit_with_error(e);
-                    }
-                }
-                FsCommand::Cat { file_path } => {
-                    if let Err(e) = rt.block_on(cmd::fs::cat_filesystem(
-                        &mut std::io::stdout(),
-                        id_or_path,
-                        &file_path,
-                        encryption.as_ref(),
-                    )) {
-                        exit_with_error(e);
-                    }
-                }
-                FsCommand::Write { file_path, content } => {
-                    if let Err(e) = rt.block_on(cmd::fs::write_filesystem(
-                        id_or_path,
-                        &file_path,
-                        &content,
-                        encryption.as_ref(),
-                    )) {
-                        exit_with_error(e);
-                    }
-                }
+                FsCommand::Ls { fs_path } => rt.block_on(cmd::fs::ls_filesystem(
+                    &mut std::io::stdout(),
+                    id_or_path,
+                    &fs_path,
+                    encryption.as_ref(),
+                )),
+                FsCommand::Cat { file_path } => rt.block_on(cmd::fs::cat_filesystem(
+                    &mut std::io::stdout(),
+                    id_or_path,
+                    &file_path,
+                    encryption.as_ref(),
+                )),
+                FsCommand::Write { file_path, content } => rt.block_on(cmd::fs::write_filesystem(
+                    id_or_path,
+                    &file_path,
+                    &content,
+                    encryption.as_ref(),
+                )),
             }
         }
         Command::Completions { command } => handle_completions(command),
@@ -308,23 +274,24 @@ fn main() {
             id_or_path,
             bind,
             port,
+            key,
+            cipher,
         } => {
             eprintln!("Warning: `agentfs nfs` is deprecated, use `agentfs serve nfs` instead");
+            let encryption = parse_encryption(key, cipher)?;
             let rt = get_runtime();
-            if let Err(e) = rt.block_on(cmd::nfs::handle_nfs_command(id_or_path, bind, port)) {
-                exit_with_error(e);
-            }
+            rt.block_on(cmd::nfs::handle_nfs_command(
+                id_or_path, bind, port, encryption,
+            ))
         }
         Command::McpServer { id_or_path, tools } => {
             eprintln!(
                 "Warning: `agentfs mcp-server` is deprecated, use `agentfs serve mcp` instead"
             );
             let rt = get_runtime();
-            if let Err(e) = rt.block_on(cmd::mcp_server::handle_mcp_server_command(
+            rt.block_on(cmd::mcp_server::handle_mcp_server_command(
                 id_or_path, tools,
-            )) {
-                exit_with_error(e);
-            }
+            ))
         }
         Command::Serve { command } => match command {
             #[cfg(unix)]
@@ -332,32 +299,25 @@ fn main() {
                 id_or_path,
                 bind,
                 port,
+                key,
+                cipher,
             } => {
+                let encryption = parse_encryption(key, cipher)?;
                 let rt = get_runtime();
-                if let Err(e) = rt.block_on(cmd::nfs::handle_nfs_command(id_or_path, bind, port)) {
-                    exit_with_error(e);
-                }
+                rt.block_on(cmd::nfs::handle_nfs_command(
+                    id_or_path, bind, port, encryption,
+                ))
             }
             ServeCommand::Mcp { id_or_path, tools } => {
                 let rt = get_runtime();
-                if let Err(e) = rt.block_on(cmd::mcp_server::handle_mcp_server_command(
+                rt.block_on(cmd::mcp_server::handle_mcp_server_command(
                     id_or_path, tools,
-                )) {
-                    exit_with_error(e);
-                }
+                ))
             }
         },
-        Command::Ps => {
-            if let Err(e) = cmd::ps::list_ps(&mut std::io::stdout()) {
-                exit_with_error(e);
-            }
-        }
+        Command::Ps => cmd::ps::list_ps(&mut std::io::stdout()),
         Command::Prune { command } => match command {
-            PruneCommand::Mounts { force } => {
-                if let Err(e) = cmd::mount::prune_mounts(force) {
-                    exit_with_error(e);
-                }
-            }
+            PruneCommand::Mounts { force } => cmd::mount::prune_mounts(force),
         },
         Command::Integrity {
             id_or_path,
@@ -368,9 +328,9 @@ fn main() {
             key,
             cipher,
         } => {
-            let encryption = parse_encryption(key, cipher);
+            let encryption = parse_encryption(key, cipher)?;
             let rt = get_runtime();
-            if let Err(e) = rt.block_on(cmd::safety::handle_integrity_command(
+            rt.block_on(cmd::safety::handle_integrity_command(
                 &mut std::io::stdout(),
                 id_or_path,
                 json,
@@ -378,9 +338,7 @@ fn main() {
                 check_base,
                 checkpoint,
                 encryption.as_ref(),
-            )) {
-                exit_with_error(e);
-            }
+            ))
         }
         Command::Backup {
             id_or_path,
@@ -390,18 +348,16 @@ fn main() {
             key,
             cipher,
         } => {
-            let encryption = parse_encryption(key, cipher);
+            let encryption = parse_encryption(key, cipher)?;
             let rt = get_runtime();
-            if let Err(e) = rt.block_on(cmd::safety::handle_backup_command(
+            rt.block_on(cmd::safety::handle_backup_command(
                 &mut std::io::stdout(),
                 id_or_path,
                 target,
                 verify,
                 materialize,
                 encryption.as_ref(),
-            )) {
-                exit_with_error(e);
-            }
+            ))
         }
         Command::Materialize {
             id_or_path,
@@ -410,17 +366,15 @@ fn main() {
             key,
             cipher,
         } => {
-            let encryption = parse_encryption(key, cipher);
+            let encryption = parse_encryption(key, cipher)?;
             let rt = get_runtime();
-            if let Err(e) = rt.block_on(cmd::safety::handle_materialize_command(
+            rt.block_on(cmd::safety::handle_materialize_command(
                 &mut std::io::stdout(),
                 id_or_path,
                 output,
                 verify,
                 encryption.as_ref(),
-            )) {
-                exit_with_error(e);
-            }
+            ))
         }
         Command::Migrate {
             id_or_path,
@@ -431,9 +385,9 @@ fn main() {
             key,
             cipher,
         } => {
-            let encryption = parse_encryption(key, cipher);
+            let encryption = parse_encryption(key, cipher)?;
             let rt = get_runtime();
-            let result = if let Some(target) = copy {
+            if let Some(target) = copy {
                 rt.block_on(cmd::migrate::handle_migrate_copy_command(
                     &mut std::io::stdout(),
                     id_or_path,
@@ -449,9 +403,6 @@ fn main() {
                     dry_run,
                     encryption.as_ref(),
                 ))
-            };
-            if let Err(e) = result {
-                exit_with_error(e);
             }
         }
     }

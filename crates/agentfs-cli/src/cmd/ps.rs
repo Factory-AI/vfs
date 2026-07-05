@@ -65,8 +65,20 @@ pub fn remove_proc_file(session_id: &str) {
 }
 
 /// Check if a process is still running.
+///
+/// `kill(pid, 0)` probes liveness without signalling; EPERM still proves the
+/// pid exists. This works on every Unix (a /proc scan would be Linux-only).
+#[cfg(unix)]
 fn is_process_alive(pid: u32) -> bool {
-    PathBuf::from(format!("/proc/{}", pid)).exists()
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// `agentfs run` sessions only exist on Unix platforms, so nothing can be
+/// alive here.
+#[cfg(not(unix))]
+fn is_process_alive(_pid: u32) -> bool {
+    false
 }
 
 /// Information about a session with its processes.
@@ -180,6 +192,19 @@ fn truncate(s: &str, max_len: usize) -> String {
         s.to_string()
     } else {
         format!("{}...", &s[..max_len.saturating_sub(3)])
+    }
+}
+
+#[cfg(all(test, unix))]
+mod liveness {
+    #[test]
+    fn probe_distinguishes_live_and_reaped_pids() {
+        assert!(super::is_process_alive(std::process::id()));
+
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert!(!super::is_process_alive(pid));
     }
 }
 

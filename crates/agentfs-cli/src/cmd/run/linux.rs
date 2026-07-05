@@ -155,7 +155,7 @@ pub fn run(options: RunOptions) -> Result<()> {
     )) {
         Ok(handle) => handle,
         Err(e) => {
-            eprintln!("Error: {e:?}");
+            eprintln!("Error: {e:#}");
             abort_child(pipe_to_child[1], child_pid);
         }
     };
@@ -1095,7 +1095,7 @@ fn exec_command(command: PathBuf, args: Vec<String>, session_id: &str) -> ! {
 
     child_exit_with_code(
         &format!(
-            "Failed to execute {}: {}",
+            "Error: Failed to execute {}: {}",
             command.display(),
             std::io::Error::last_os_error()
         ),

@@ -1,5 +1,6 @@
 use agentfs_core::{
-    error::Error as SdkError, AgentFSOptions, FileSystem, HostFS, OverlayFS, PartialOriginPolicy,
+    error::Error as SdkError, AgentFSOptions, EncryptionConfig, FileSystem, HostFS, OverlayFS,
+    PartialOriginPolicy,
 };
 use agentfs_mount::{mount_fs, Backend, MountOpts};
 use anyhow::Result;
@@ -45,6 +46,21 @@ pub struct MountArgs {
     pub backend: MountBackend,
     /// Partial-origin policy for overlay copy-up.
     pub partial_origin_policy: Option<PartialOriginPolicy>,
+    /// Encryption key and cipher for encrypted databases.
+    pub encryption: Option<(String, String)>,
+}
+
+fn apply_encryption(
+    options: AgentFSOptions,
+    encryption: &Option<(String, String)>,
+) -> AgentFSOptions {
+    match encryption {
+        Some((key, cipher)) => options.with_encryption(EncryptionConfig {
+            hex_key: key.clone(),
+            cipher: cipher.clone(),
+        }),
+        None => options,
+    }
 }
 
 /// Mount the agent filesystem (Linux).
@@ -52,10 +68,7 @@ pub struct MountArgs {
 pub fn mount(args: MountArgs) -> Result<()> {
     match args.backend {
         MountBackend::Fuse => mount_fuse(args),
-        MountBackend::Nfs => {
-            let rt = crate::get_runtime();
-            rt.block_on(mount_nfs_backend(args))
-        }
+        MountBackend::Nfs => mount_nfs(args),
     }
 }
 
@@ -69,26 +82,58 @@ pub fn mount(args: MountArgs) -> Result<()> {
                  Use --backend nfs (default) or `agentfs nfs` instead."
             );
         }
-        MountBackend::Nfs => {
-            let rt = crate::get_runtime();
-            rt.block_on(mount_nfs_backend(args))
-        }
+        MountBackend::Nfs => mount_nfs(args),
+    }
+}
+
+/// Mount the agent filesystem via the NFS backend.
+///
+/// Deliberately synchronous: the non-foreground arm must fork before any
+/// tokio runtime exists (forking inside a live multi-threaded runtime can
+/// deadlock the child), so each arm creates its own runtime and the daemon
+/// child builds its runtime after the fork. Errors from the child still
+/// reach the user through the daemonize readiness pipe.
+fn mount_nfs(args: MountArgs) -> Result<()> {
+    if !args.mountpoint.exists() {
+        anyhow::bail!("Mountpoint does not exist: {}", args.mountpoint.display());
+    }
+    let mountpoint = std::fs::canonicalize(args.mountpoint.clone())?;
+
+    if args.foreground {
+        let rt = crate::get_runtime();
+        rt.block_on(mount_nfs_backend(args, mountpoint))
+    } else {
+        let ready_mountpoint = mountpoint.clone();
+        agentfs_mount::daemon::daemonize(
+            move || {
+                let rt = crate::get_runtime();
+                rt.block_on(mount_nfs_backend(args, mountpoint))
+            },
+            move || agentfs_mount::is_mountpoint(&ready_mountpoint),
+            std::time::Duration::from_secs(10),
+        )
     }
 }
 
 /// Mount the agent filesystem using FUSE (Linux only).
 #[cfg(target_os = "linux")]
 fn mount_fuse(args: MountArgs) -> Result<()> {
-    let opts = AgentFSOptions::resolve(&args.id_or_path)?;
+    let opts = apply_encryption(AgentFSOptions::resolve(&args.id_or_path)?, &args.encryption);
 
     // Check schema version before daemonizing. This allows us to show the error
     // message to the user directly, rather than having it appear in daemon logs.
     {
         let rt = crate::get_runtime();
         let db_path = opts.db_path()?;
-        let result = rt.block_on(require_schema_current_for_mount_precheck(&db_path));
-        if let Err(SdkError::SchemaVersionMismatch { found, expected }) = result {
-            exit_schema_version_mismatch(&found, &expected, &args.id_or_path);
+        let result = rt.block_on(require_schema_current_for_mount_precheck(
+            &db_path,
+            args.encryption.as_ref(),
+        ));
+        if let Err(err @ SdkError::SchemaVersionMismatch { .. }) = result {
+            return Err(super::migrate::open_error_with_guidance(
+                err,
+                &args.id_or_path,
+            ));
         }
     }
 
@@ -129,13 +174,9 @@ fn mount_fuse(args: MountArgs) -> Result<()> {
     let partial_origin_policy = args.partial_origin_policy;
     let mount = move || {
         let rt = crate::get_runtime();
-        let agentfs = match rt.block_on(open_agentfs(opts)) {
-            Ok(fs) => fs,
-            Err(SdkError::SchemaVersionMismatch { found, expected }) => {
-                exit_schema_version_mismatch(&found, &expected, &id_or_path);
-            }
-            Err(e) => return Err(e.into()),
-        };
+        let agentfs = rt
+            .block_on(open_agentfs(opts))
+            .map_err(|err| super::migrate::open_error_with_guidance(err, &id_or_path))?;
 
         // Check for overlay configuration
         let fs: Arc<dyn FileSystem> = rt.block_on(async {
@@ -193,26 +234,28 @@ fn mount_fuse(args: MountArgs) -> Result<()> {
     }
 }
 
+/// Open the database for the pre-daemonize schema check with the same keyed
+/// open as the real mount, so an encrypted CURRENT database classifies as
+/// current instead of failing before classification.
 #[cfg(target_os = "linux")]
 async fn require_schema_current_for_mount_precheck(
     db_path: &str,
+    encryption: Option<&(String, String)>,
 ) -> std::result::Result<(), SdkError> {
-    let db = turso::Builder::new_local(db_path).build().await?;
+    let db = super::safety::build_local_database(Path::new(db_path), encryption)
+        .await
+        .map_err(|err| SdkError::Internal(format!("{err:#}")))?;
     let conn = db.connect()?;
     agentfs_core::schema::require_current(&conn).await
 }
 
 /// Mount the agent filesystem using NFS over localhost.
-async fn mount_nfs_backend(args: MountArgs) -> Result<()> {
+///
+/// `mountpoint` is pre-canonicalized by `mount_nfs` before any fork.
+async fn mount_nfs_backend(args: MountArgs, mountpoint: PathBuf) -> Result<()> {
     use crate::cmd::init::open_agentfs;
 
-    let opts = AgentFSOptions::resolve(&args.id_or_path)?;
-
-    if !args.mountpoint.exists() {
-        anyhow::bail!("Mountpoint does not exist: {}", args.mountpoint.display());
-    }
-
-    let mountpoint = std::fs::canonicalize(args.mountpoint.clone())?;
+    let opts = apply_encryption(AgentFSOptions::resolve(&args.id_or_path)?, &args.encryption);
 
     let fsname = format!(
         "agentfs:{}",
@@ -222,13 +265,9 @@ async fn mount_nfs_backend(args: MountArgs) -> Result<()> {
     );
 
     // Open AgentFS
-    let agentfs = match open_agentfs(opts).await {
-        Ok(fs) => fs,
-        Err(SdkError::SchemaVersionMismatch { found, expected }) => {
-            exit_schema_version_mismatch(&found, &expected, &args.id_or_path);
-        }
-        Err(e) => return Err(e.into()),
-    };
+    let agentfs = open_agentfs(opts)
+        .await
+        .map_err(|err| super::migrate::open_error_with_guidance(err, &args.id_or_path))?;
 
     // Check for overlay configuration
     // Query base_path in a separate scope so connection is released before load_whiteouts
@@ -282,19 +321,7 @@ async fn mount_nfs_backend(args: MountArgs) -> Result<()> {
         timeout: std::time::Duration::from_secs(10),
     };
 
-    if args.foreground {
-        run_mount_session(fs, mount_opts, true).await
-    } else {
-        let ready_mountpoint = mountpoint.clone();
-        agentfs_mount::daemon::daemonize(
-            move || {
-                let rt = crate::get_runtime();
-                rt.block_on(run_mount_session(fs, mount_opts, false))
-            },
-            move || agentfs_mount::is_mountpoint(&ready_mountpoint),
-            std::time::Duration::from_secs(10),
-        )
-    }
+    run_mount_session(fs, mount_opts, args.foreground).await
 }
 
 async fn run_mount_session(
@@ -519,16 +546,6 @@ pub fn prune_mounts(_force: bool) -> Result<()> {
     anyhow::bail!("Mount pruning is only available on Linux")
 }
 
-/// Print schema version mismatch error and exit.
-fn exit_schema_version_mismatch(found: &str, expected: &str, id_or_path: &str) -> ! {
-    eprintln!(
-        "Error: {}",
-        crate::cmd::migrate::schema_upgrade_guidance(found, expected, id_or_path)
-    );
-    crate::profiling::emit_cli_report();
-    std::process::exit(1);
-}
-
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
@@ -542,7 +559,7 @@ mod tests {
         let db_path = dir.path().join("legacy-whiteout.db");
         create_currentish_db_with_legacy_whiteout(&db_path).await;
 
-        require_schema_current_for_mount_precheck(db_path.to_str().unwrap())
+        require_schema_current_for_mount_precheck(db_path.to_str().unwrap(), None)
             .await
             .unwrap();
 
@@ -571,6 +588,39 @@ mod tests {
         );
         assert_eq!(parent_path, "/dir");
         assert_eq!(created_at, 123);
+    }
+
+    #[tokio::test]
+    async fn mount_precheck_opens_encrypted_current_db_with_key() {
+        const TEST_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        const TEST_CIPHER: &str = "aes256gcm";
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("encrypted.db");
+        let agentfs = agentfs_core::AgentFS::open(
+            AgentFSOptions::with_path(db_path.to_str().unwrap().to_string()).with_encryption(
+                EncryptionConfig {
+                    hex_key: TEST_KEY.to_string(),
+                    cipher: TEST_CIPHER.to_string(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        drop(agentfs);
+
+        let encryption = (TEST_KEY.to_string(), TEST_CIPHER.to_string());
+        require_schema_current_for_mount_precheck(db_path.to_str().unwrap(), Some(&encryption))
+            .await
+            .expect("keyed precheck must classify an encrypted CURRENT database as current");
+
+        let err = require_schema_current_for_mount_precheck(db_path.to_str().unwrap(), None)
+            .await
+            .expect_err("keyless precheck of an encrypted database must fail, not classify");
+        assert!(
+            !matches!(err, SdkError::SchemaVersionMismatch { .. }),
+            "keyless open must not misclassify as a schema mismatch: {err}"
+        );
     }
 
     async fn create_currentish_db_with_legacy_whiteout(db_path: &Path) {

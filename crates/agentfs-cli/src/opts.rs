@@ -119,7 +119,7 @@ pub struct SyncCommandOptions {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Manage shell completions
+    /// Manage shell completions (supported shells: bash, zsh, fish, elvish, powershell)
     Completions {
         #[command(subcommand)]
         command: CompletionsCommand,
@@ -345,6 +345,15 @@ pub enum Command {
         /// Size threshold for --partial-origin auto
         #[arg(long = "partial-origin-threshold-bytes", value_name = "BYTES")]
         partial_origin_threshold_bytes: Option<u64>,
+
+        /// Hex-encoded encryption key for encrypted databases.
+        #[arg(long, env = "AGENTFS_KEY")]
+        key: Option<String>,
+
+        /// Cipher algorithm for encryption (required with --key).
+        /// Options: aegis128l, aegis128x2, aegis128x4, aegis256, aegis256x2, aegis256x4, aes128gcm, aes256gcm
+        #[arg(long, env = "AGENTFS_CIPHER")]
+        cipher: Option<String>,
     },
     /// Show differences between base filesystem and delta (overlay mode only)
     Diff {
@@ -389,6 +398,15 @@ pub enum Command {
         /// Port to listen on
         #[arg(long, default_value = "11111")]
         port: u32,
+
+        /// Hex-encoded encryption key for encrypted databases.
+        #[arg(long, env = "AGENTFS_KEY")]
+        key: Option<String>,
+
+        /// Cipher algorithm for encryption (required with --key).
+        /// Options: aegis128l, aegis128x2, aegis128x4, aegis256, aegis256x2, aegis256x4, aes128gcm, aes256gcm
+        #[arg(long, env = "AGENTFS_CIPHER")]
+        cipher: Option<String>,
     },
 
     /// Start an MCP server exposing filesystem and KV-store tools
@@ -578,6 +596,15 @@ pub enum ServeCommand {
         /// Port to listen on
         #[arg(long, default_value = "11111")]
         port: u32,
+
+        /// Hex-encoded encryption key for encrypted databases.
+        #[arg(long, env = "AGENTFS_KEY")]
+        key: Option<String>,
+
+        /// Cipher algorithm for encryption (required with --key).
+        /// Options: aegis128l, aegis128x2, aegis128x4, aegis256, aegis256x2, aegis256x4, aes128gcm, aes256gcm
+        #[arg(long, env = "AGENTFS_CIPHER")]
+        cipher: Option<String>,
     },
 
     /// Start an MCP server exposing filesystem and KV-store tools

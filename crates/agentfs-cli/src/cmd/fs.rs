@@ -32,12 +32,10 @@ pub async fn ls_filesystem(
         .map_err(|err| super::migrate::open_error_with_guidance(err, &id_or_path))?;
     let conn = agentfs.get_connection().await?;
 
-    if path != "/" {
-        anyhow::bail!("Only root directory (/) is currently supported");
-    }
+    let start_ino = resolve_directory_ino(&conn, path).await?;
 
     let mut queue: VecDeque<(i64, String)> = VecDeque::new();
-    queue.push_back((ROOT_INO, String::new()));
+    queue.push_back((start_ino, String::new()));
 
     while let Some((parent_ino, prefix)) = queue.pop_front() {
         let query = format!(
@@ -102,6 +100,42 @@ pub async fn ls_filesystem(
     }
 
     Ok(())
+}
+
+/// Resolve a directory path (absolute or relative to `/`) to its inode.
+async fn resolve_directory_ino(conn: &turso::Connection, path: &str) -> AnyhowResult<i64> {
+    let mut ino = ROOT_INO;
+    let mut mode = S_IFDIR;
+
+    for component in path.split('/').filter(|component| !component.is_empty()) {
+        let mut rows = conn
+            .query(
+                "SELECT d.ino, i.mode FROM fs_dentry d
+                 JOIN fs_inode i ON d.ino = i.ino
+                 WHERE d.parent_ino = ? AND d.name = ?",
+                (ino, component),
+            )
+            .await
+            .context("Failed to query directory entry")?;
+        let Some(row) = rows.next().await.context("Failed to fetch row")? else {
+            anyhow::bail!("Path not found: {}", path);
+        };
+        ino = row
+            .get_value(0)
+            .ok()
+            .and_then(|v| v.as_integer().copied())
+            .with_context(|| format!("Corrupt dentry ino for {}", path))?;
+        mode = row
+            .get_value(1)
+            .ok()
+            .and_then(|v| v.as_integer().copied())
+            .with_context(|| format!("Corrupt inode mode for {}", path))? as u32;
+    }
+
+    if mode & S_IFMT != S_IFDIR {
+        anyhow::bail!("Not a directory: {}", path);
+    }
+    Ok(ino)
 }
 
 pub async fn cat_filesystem(
@@ -412,6 +446,72 @@ f a/b/1.md
 f a/c/2.md
 f d/e/3.md
 "
+        );
+    }
+
+    #[tokio::test]
+    pub async fn ls_subdir_lists_only_subtree() {
+        let (agentfs, path, _file) = agentfs().await;
+        agentfs.fs.mkdir("a", 0, 0).await.unwrap();
+        agentfs.fs.mkdir("a/b", 0, 0).await.unwrap();
+        agentfs.fs.mkdir("a/c", 0, 0).await.unwrap();
+        agentfs.fs.mkdir("d", 0, 0).await.unwrap();
+        write_file(&agentfs.fs, "a/b/1.md", b"1", 0, 0)
+            .await
+            .unwrap();
+        write_file(&agentfs.fs, "a/c/2.md", b"11", 0, 0)
+            .await
+            .unwrap();
+        write_file(&agentfs.fs, "d/3.md", b"111", 0, 0)
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        ls_filesystem(&mut buf, path.clone(), "/a", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            buf,
+            b"d b
+d c
+f b/1.md
+f c/2.md
+"
+        );
+
+        // Relative paths resolve the same as absolute ones.
+        let mut relative_buf = Vec::new();
+        ls_filesystem(&mut relative_buf, path.clone(), "a/b", None)
+            .await
+            .unwrap();
+        assert_eq!(relative_buf, b"f 1.md\n");
+    }
+
+    #[tokio::test]
+    pub async fn ls_missing_path_errors() {
+        let (_agentfs, path, _file) = agentfs().await;
+        let mut buf = Vec::new();
+        let err = ls_filesystem(&mut buf, path, "/missing", None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Path not found"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    pub async fn ls_file_path_errors() {
+        let (agentfs, path, _file) = agentfs().await;
+        write_file(&agentfs.fs, "file.md", b"1", 0, 0)
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        let err = ls_filesystem(&mut buf, path, "/file.md", None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Not a directory"),
+            "unexpected error: {err}"
         );
     }
 

@@ -71,38 +71,25 @@ impl Shell {
     }
 }
 
-pub fn handle_completions(command: CompletionsCommand) {
+pub fn handle_completions(command: CompletionsCommand) -> anyhow::Result<()> {
     match command {
         CompletionsCommand::Install { shell } => {
-            let shell = match shell.or_else(Shell::detect) {
-                Some(s) => s,
-                None => exit_with_error(
-                    "Could not detect current shell. Please specify a shell explicitly.",
-                ),
-            };
-            if let Err(err) = install(shell) {
-                exit_with_error(err);
-            }
+            let shell = detect_or_specified(shell)?;
+            install(shell)?;
         }
         CompletionsCommand::Uninstall { shell } => {
-            let shell = match shell.or_else(Shell::detect) {
-                Some(s) => s,
-                None => exit_with_error(
-                    "Could not detect current shell. Please specify a shell explicitly.",
-                ),
-            };
-            if let Err(err) = uninstall(shell) {
-                exit_with_error(err);
-            }
+            let shell = detect_or_specified(shell)?;
+            uninstall(shell)?;
         }
         CompletionsCommand::Show => show(),
     }
+    Ok(())
 }
 
-fn exit_with_error(message: impl std::fmt::Display) -> ! {
-    eprintln!("Error: {message}");
-    crate::profiling::emit_cli_report();
-    std::process::exit(1)
+fn detect_or_specified(shell: Option<Shell>) -> anyhow::Result<Shell> {
+    shell.or_else(Shell::detect).ok_or_else(|| {
+        anyhow::anyhow!("Could not detect current shell. Please specify a shell explicitly.")
+    })
 }
 
 fn install(shell: Shell) -> io::Result<()> {
@@ -203,4 +190,46 @@ fn show() {
     println!("  {}\n", Shell::PowerShell.completion_line());
 
     println!("Then restart your shell or source your config file.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Shell;
+    use clap::ValueEnum;
+
+    #[test]
+    fn shell_enum_matches_clap_complete_builtins() {
+        let mut ours: Vec<String> = Shell::value_variants()
+            .iter()
+            .map(|shell| shell.to_string())
+            .collect();
+        ours.sort();
+        let mut builtins: Vec<String> = clap_complete::env::Shells::builtins()
+            .names()
+            .map(str::to_string)
+            .collect();
+        builtins.sort();
+        assert_eq!(
+            ours, builtins,
+            "Shell enum drifted from clap_complete's COMPLETE env shells"
+        );
+    }
+
+    #[test]
+    fn completions_help_names_every_supported_shell() {
+        use clap::CommandFactory;
+        let cmd = crate::opts::Args::command();
+        let about = cmd
+            .find_subcommand("completions")
+            .expect("completions subcommand")
+            .get_about()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        for shell in Shell::value_variants() {
+            assert!(
+                about.contains(&shell.to_string()),
+                "completions help must name {shell}; got: {about}"
+            );
+        }
+    }
 }

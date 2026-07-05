@@ -9,13 +9,26 @@ fn main() {
 
     // Capture git version from tags for --version flag
     // Rerun if git HEAD changes (new commits or tags)
+    let git_dir = repo_root.join(".git");
+    println!("cargo:rerun-if-changed={}", git_dir.join("HEAD").display());
     println!(
         "cargo:rerun-if-changed={}",
-        repo_root.join(".git/HEAD").display()
+        git_dir.join("refs/tags").display()
     );
+    // .git/HEAD only changes on branch switches. Commits move the branch ref
+    // HEAD points at, so track that file too (and packed-refs, where the ref
+    // lands after `git pack-refs`) or --version reports stale git metadata.
+    if let Ok(head) = std::fs::read_to_string(git_dir.join("HEAD")) {
+        if let Some(head_ref) = head.strip_prefix("ref: ") {
+            println!(
+                "cargo:rerun-if-changed={}",
+                git_dir.join(head_ref.trim()).display()
+            );
+        }
+    }
     println!(
         "cargo:rerun-if-changed={}",
-        repo_root.join(".git/refs/tags").display()
+        git_dir.join("packed-refs").display()
     );
 
     let version = Command::new("git")
