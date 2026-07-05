@@ -399,8 +399,8 @@ pub enum Command {
         id_or_path: String,
 
         /// Tools to expose (comma-separated). If not provided, all tools are exposed.
-        /// Available tools: read_file, write_file, readdir, mkdir, rmdir, rm, unlink,
-        /// copy_file, rename, stat, access, kv_get, kv_set, kv_delete, kv_list
+        /// Available tools: read_file, write_file, readdir, mkdir, remove, rename,
+        /// stat, access, kv_get, kv_set, kv_delete, kv_list
         #[arg(long, value_delimiter = ',')]
         tools: Option<Vec<String>>,
     },
@@ -587,8 +587,8 @@ pub enum ServeCommand {
         id_or_path: String,
 
         /// Tools to expose (comma-separated). If not provided, all tools are exposed.
-        /// Available tools: read_file, write_file, readdir, mkdir, rmdir, rm, unlink,
-        /// copy_file, rename, stat, access, kv_get, kv_set, kv_delete, kv_list
+        /// Available tools: read_file, write_file, readdir, mkdir, remove, rename,
+        /// stat, access, kv_get, kv_set, kv_delete, kv_list
         #[arg(long, value_delimiter = ',')]
         tools: Option<Vec<String>>,
     },

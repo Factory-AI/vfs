@@ -1,8 +1,5 @@
-use agentfs_core::fs::FileSystem;
+use agentfs_core::fs::{FileSystem, DEFAULT_FILE_MODE};
 use agentfs_core::{AgentFS, AgentFSOptions, Stats};
-
-const ROOT_INO: i64 = 1;
-const S_IFREG: u32 = 0o100000;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
@@ -13,6 +10,69 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::cmd::init::open_agentfs;
+
+/// The complete dispatchable tool surface. `tools/list`, `tools/call`
+/// dispatch, and `--tools` filter validation all key off this list; the
+/// parity tests in `mcp_server/tests.rs` keep it honest.
+const ALL_TOOLS: &[&str] = &[
+    "read_file",
+    "write_file",
+    "readdir",
+    "mkdir",
+    "remove",
+    "rename",
+    "stat",
+    "access",
+    "kv_get",
+    "kv_set",
+    "kv_delete",
+    "kv_list",
+];
+
+const METHOD_NOT_FOUND: i64 = -32601;
+const INVALID_PARAMS: i64 = -32602;
+const INTERNAL_ERROR: i64 = -32603;
+
+/// A JSON-RPC error with the code it must be reported under.
+#[derive(Debug)]
+struct RpcError {
+    code: i64,
+    message: String,
+}
+
+impl RpcError {
+    fn method_not_found(method: &str) -> Self {
+        Self {
+            code: METHOD_NOT_FOUND,
+            message: format!("Unknown method: {method}"),
+        }
+    }
+
+    fn invalid_params(message: String) -> Self {
+        Self {
+            code: INVALID_PARAMS,
+            message,
+        }
+    }
+
+    fn internal(message: String) -> Self {
+        Self {
+            code: INTERNAL_ERROR,
+            message,
+        }
+    }
+}
+
+impl From<anyhow::Error> for RpcError {
+    fn from(err: anyhow::Error) -> Self {
+        Self::internal(format!("{err:#}"))
+    }
+}
+
+fn parse_tool_params<T: serde::de::DeserializeOwned>(arguments: JsonValue) -> Result<T, RpcError> {
+    serde_json::from_value(arguments)
+        .map_err(|err| RpcError::invalid_params(format!("Invalid tool arguments: {err}")))
+}
 
 /// Main entry point for MCP server command
 pub async fn handle_mcp_server_command(
@@ -27,10 +87,8 @@ pub async fn handle_mcp_server_command(
 
     eprintln!("Using agent: {}", id_or_path);
 
-    let agentfs = open_agentfs(options).await?;
-
     // Create MCP server with tool filtering
-    let server = McpServer::new(agentfs, tools_filter);
+    let server = McpServer::new(options, tools_filter).await?;
 
     // Run server with stdio transport
     eprintln!("Starting MCP server on stdio...");
@@ -40,27 +98,80 @@ pub async fn handle_mcp_server_command(
     Ok(())
 }
 
+/// Where request handlers get their AgentFS from.
+enum AgentFsSource {
+    /// Ephemeral (in-memory) databases live exactly as long as this handle.
+    Held(Arc<AgentFS>),
+    /// File-backed databases are reopened per request. The database file
+    /// lock is exclusive (one process at a time), so holding it across the
+    /// whole stdio session would block every other CLI command (including
+    /// `agentfs timeline` reading the tool audit) for as long as a client
+    /// keeps the server open. Reopening per request releases the lock while
+    /// the server is idle.
+    PerRequest(Box<AgentFSOptions>),
+}
+
 /// MCP Server implementation
 struct McpServer {
-    agentfs: Arc<AgentFS>,
+    source: AgentFsSource,
     enabled_tools: Option<HashSet<String>>,
 }
 
 impl McpServer {
-    fn new(agentfs: AgentFS, tools_filter: Option<Vec<String>>) -> Self {
-        let enabled_tools = tools_filter.map(|tools| {
-            let set: HashSet<String> = tools.into_iter().collect();
-            eprintln!("Tool filter enabled. Exposing tools: {:?}", set);
-            set
-        });
+    async fn new(options: AgentFSOptions, tools_filter: Option<Vec<String>>) -> Result<Self> {
+        let enabled_tools = match tools_filter {
+            None => {
+                eprintln!("No tool filter specified. Exposing all tools.");
+                None
+            }
+            Some(tools) => {
+                let mut unknown: Vec<String> = tools
+                    .iter()
+                    .filter(|tool| !ALL_TOOLS.contains(&tool.as_str()))
+                    .cloned()
+                    .collect();
+                unknown.sort();
+                unknown.dedup();
+                if !unknown.is_empty() {
+                    anyhow::bail!(
+                        "unknown tool(s) in --tools filter: {}. Available tools: {}",
+                        unknown.join(", "),
+                        ALL_TOOLS.join(", ")
+                    );
+                }
+                let set: HashSet<String> = tools.into_iter().collect();
+                if set.is_empty() {
+                    anyhow::bail!(
+                        "--tools filter selected no tools. Available tools: {}",
+                        ALL_TOOLS.join(", ")
+                    );
+                }
+                eprintln!("Tool filter enabled. Exposing tools: {:?}", set);
+                Some(set)
+            }
+        };
 
-        if enabled_tools.is_none() {
-            eprintln!("No tool filter specified. Exposing all tools.");
-        }
+        let source = if options.db_path()? == ":memory:" {
+            AgentFsSource::Held(Arc::new(open_agentfs(options).await?))
+        } else {
+            // Open once up front so startup fails cleanly on a missing or
+            // incompatible database, then release the file lock.
+            drop(open_agentfs(options.clone()).await?);
+            AgentFsSource::PerRequest(Box::new(options))
+        };
 
-        Self {
-            agentfs: Arc::new(agentfs),
+        Ok(Self {
+            source,
             enabled_tools,
+        })
+    }
+
+    async fn agentfs(&self) -> Result<Arc<AgentFS>> {
+        match &self.source {
+            AgentFsSource::Held(agentfs) => Ok(agentfs.clone()),
+            AgentFsSource::PerRequest(options) => {
+                Ok(Arc::new(open_agentfs((**options).clone()).await?))
+            }
         }
     }
 
@@ -116,17 +227,24 @@ impl McpServer {
 
         // Handle method
         let result = match method {
-            "initialize" => self.handle_initialize(params).await,
-            "initialized" => {
-                // Notification, no response needed
-                return None;
-            }
-            "tools/list" => self.handle_tools_list().await,
+            "initialize" => self.handle_initialize(params).await.map_err(RpcError::from),
+            // Spec notifications (e.g. notifications/initialized) are
+            // acknowledged by ignoring them; they must never get a response.
+            "initialized" => return None,
+            method if method.starts_with("notifications/") => return None,
+            "tools/list" => self.handle_tools_list().await.map_err(RpcError::from),
             "tools/call" => self.handle_tools_call(params).await,
-            "resources/list" => self.handle_resources_list().await,
-            "resources/read" => self.handle_resources_read(params).await,
-            _ => Err(anyhow::anyhow!("Unknown method: {}", method)),
+            "resources/list" => self.handle_resources_list().await.map_err(RpcError::from),
+            "resources/read" => self
+                .handle_resources_read(params)
+                .await
+                .map_err(RpcError::from),
+            _ => Err(RpcError::method_not_found(method)),
         };
+
+        // JSON-RPC requests without an id are notifications: process them
+        // above, but never respond (not even with an error).
+        let id = id.filter(|id| !id.is_null())?;
 
         // Build JSON-RPC response
         let response = match result {
@@ -138,13 +256,13 @@ impl McpServer {
                 })
             }
             Err(e) => {
-                eprintln!("Error handling {}: {}", method, e);
+                eprintln!("Error handling {}: {}", method, e.message);
                 json!({
                     "jsonrpc": "2.0",
                     "id": id,
                     "error": {
-                        "code": -32603,
-                        "message": e.to_string()
+                        "code": e.code,
+                        "message": e.message
                     }
                 })
             }
@@ -172,61 +290,45 @@ impl McpServer {
         Ok(json!({ "tools": tools }))
     }
 
-    async fn handle_tools_call(&self, params: JsonValue) -> Result<JsonValue> {
+    async fn handle_tools_call(&self, params: JsonValue) -> Result<JsonValue, RpcError> {
         let name = params
             .get("name")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing tool name"))?;
+            .ok_or_else(|| RpcError::invalid_params("Missing tool name".to_string()))?;
 
         let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
-        let result_text = match name {
-            "read_file" => {
-                let params: ReadFileParams = serde_json::from_value(arguments)?;
-                self.handle_read_file(params).await?
+        let agentfs = self
+            .agentfs()
+            .await
+            .map_err(|err| RpcError::internal(format!("Failed to open database: {err:#}")))?;
+
+        // Every tools/call attempt is audited, including rejected ones, so
+        // `agentfs timeline` shows the full MCP activity for the database.
+        let audit_id = agentfs
+            .tools
+            .start(name, Some(arguments.clone()))
+            .await
+            .map_err(|err| {
+                RpcError::internal(format!("Failed to record tool call audit row: {err}"))
+            })?;
+
+        let outcome = self.dispatch_tool(&agentfs, name, arguments).await;
+
+        match &outcome {
+            Ok(text) => {
+                agentfs
+                    .tools
+                    .success(audit_id, Some(JsonValue::String(text.clone())))
+                    .await
             }
-            "write_file" => {
-                let params: WriteFileParams = serde_json::from_value(arguments)?;
-                self.handle_write_file(params).await?
-            }
-            "readdir" => {
-                let params: ReaddirParams = serde_json::from_value(arguments)?;
-                self.handle_readdir(params).await?
-            }
-            "mkdir" => {
-                let params: MkdirParams = serde_json::from_value(arguments)?;
-                self.handle_mkdir(params).await?
-            }
-            "rename" => {
-                let params: RenameParams = serde_json::from_value(arguments)?;
-                self.handle_rename(params).await?
-            }
-            "remove" => {
-                let params: RemoveParams = serde_json::from_value(arguments)?;
-                self.handle_remove(params).await?
-            }
-            "stat" => {
-                let params: StatParams = serde_json::from_value(arguments)?;
-                self.handle_stat(params).await?
-            }
-            "access" => {
-                let params: AccessParams = serde_json::from_value(arguments)?;
-                self.handle_access(params).await?
-            }
-            "kv_get" => {
-                let params: KvGetParams = serde_json::from_value(arguments)?;
-                self.handle_kv_get(params).await?
-            }
-            "kv_set" => {
-                let params: KvSetParams = serde_json::from_value(arguments)?;
-                self.handle_kv_set(params).await?
-            }
-            "kv_delete" => {
-                let params: KvDeleteParams = serde_json::from_value(arguments)?;
-                self.handle_kv_delete(params).await?
-            }
-            _ => anyhow::bail!("Unknown tool: {}", name),
-        };
+            Err(err) => agentfs.tools.error(audit_id, &err.message).await,
+        }
+        .map_err(|err| {
+            RpcError::internal(format!("Failed to record tool call audit row: {err}"))
+        })?;
+
+        let result_text = outcome?;
 
         Ok(json!({
             "content": [
@@ -238,8 +340,46 @@ impl McpServer {
         }))
     }
 
+    async fn dispatch_tool(
+        &self,
+        agentfs: &AgentFS,
+        name: &str,
+        arguments: JsonValue,
+    ) -> Result<String, RpcError> {
+        if !ALL_TOOLS.contains(&name) {
+            return Err(RpcError::invalid_params(format!("Unknown tool: {name}")));
+        }
+        if !self.is_tool_enabled(name) {
+            return Err(RpcError::invalid_params(format!(
+                "Tool not enabled by --tools filter: {name}"
+            )));
+        }
+
+        let result = match name {
+            "read_file" => handle_read_file(agentfs, parse_tool_params(arguments)?).await,
+            "write_file" => handle_write_file(agentfs, parse_tool_params(arguments)?).await,
+            "readdir" => handle_readdir(agentfs, parse_tool_params(arguments)?).await,
+            "mkdir" => handle_mkdir(agentfs, parse_tool_params(arguments)?).await,
+            "rename" => handle_rename(agentfs, parse_tool_params(arguments)?).await,
+            "remove" => handle_remove(agentfs, parse_tool_params(arguments)?).await,
+            "stat" => handle_stat(agentfs, parse_tool_params(arguments)?).await,
+            "access" => handle_access(agentfs, parse_tool_params(arguments)?).await,
+            "kv_get" => handle_kv_get(agentfs, parse_tool_params(arguments)?).await,
+            "kv_set" => handle_kv_set(agentfs, parse_tool_params(arguments)?).await,
+            "kv_delete" => handle_kv_delete(agentfs, parse_tool_params(arguments)?).await,
+            "kv_list" => handle_kv_list(agentfs, parse_tool_params(arguments)?).await,
+            _ => Err(anyhow::anyhow!(
+                "Tool {name} is advertised but has no dispatch arm; \
+                 ALL_TOOLS and dispatch_tool are out of sync"
+            )),
+        };
+
+        result.map_err(RpcError::from)
+    }
+
     async fn handle_resources_list(&self) -> Result<JsonValue> {
-        let resources = self.list_resources().await?;
+        let agentfs = self.agentfs().await?;
+        let resources = list_resources(&agentfs).await?;
         Ok(json!({ "resources": resources }))
     }
 
@@ -249,7 +389,8 @@ impl McpServer {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing resource uri"))?;
 
-        let contents = self.read_resource(uri).await?;
+        let agentfs = self.agentfs().await?;
+        let contents = read_resource(&agentfs, uri).await?;
         let mime_type = guess_mime_type(uri);
 
         // Try to decode as UTF-8, fall back to base64
@@ -299,7 +440,7 @@ impl McpServer {
         if self.is_tool_enabled("write_file") {
             tools.push(json!({
                 "name": "write_file",
-                "description": "Write content to a file in the filesystem",
+                "description": "Write content to a file in the filesystem. Existing files are overwritten in place and keep their mode; new files are created with mode 0644.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -637,317 +778,308 @@ struct KvDeleteParams {
     key: String,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct KvListParams {
+    #[serde(default)]
+    prefix: Option<String>,
+}
+
 // ============================================================================
 // Tool implementations
 // ============================================================================
 
-impl McpServer {
-    /// Read file contents
-    async fn handle_read_file(&self, params: ReadFileParams) -> Result<String> {
-        let path = normalize_path(&params.path)?;
+/// Read file contents
+async fn handle_read_file(agentfs: &AgentFS, params: ReadFileParams) -> Result<String> {
+    let path = normalize_path(&params.path)?;
 
-        let data = self
-            .agentfs
-            .fs
-            .read_file(&path)
-            .await
-            .context("Failed to read file")?
-            .ok_or_else(|| anyhow::anyhow!("File not found: {}", path))?;
+    let data = agentfs
+        .fs
+        .read_file(&path)
+        .await
+        .context("Failed to read file")?
+        .ok_or_else(|| anyhow::anyhow!("File not found: {}", path))?;
 
-        let content = match params.encoding.as_deref() {
-            Some("base64") => base64_encode(&data),
-            _ => String::from_utf8(data)
-                .context("File is not valid UTF-8. Use encoding=base64 for binary files.")?,
-        };
+    let content = match params.encoding.as_deref() {
+        Some("base64") => base64_encode(&data),
+        _ => String::from_utf8(data)
+            .context("File is not valid UTF-8. Use encoding=base64 for binary files.")?,
+    };
 
-        Ok(content)
+    Ok(content)
+}
+
+/// Write file contents.
+///
+/// Existing files are overwritten in place so they keep their inode and
+/// mode; new files are created with the default mode (0644).
+async fn handle_write_file(agentfs: &AgentFS, params: WriteFileParams) -> Result<String> {
+    let path = normalize_path(&params.path)?;
+
+    let data = match params.encoding.as_deref() {
+        Some("base64") => base64_decode(&params.content)?,
+        _ => params.content.into_bytes(),
+    };
+
+    // Create parent directories if requested
+    if params.create_dirs.unwrap_or(false) {
+        ensure_parent_dirs(agentfs, &path).await?;
     }
 
-    /// Write file contents
-    async fn handle_write_file(&self, params: WriteFileParams) -> Result<String> {
-        let path = normalize_path(&params.path)?;
-
-        let data = match params.encoding.as_deref() {
-            Some("base64") => base64_decode(&params.content)?,
-            _ => params.content.into_bytes(),
-        };
-
-        // Create parent directories if requested
-        if params.create_dirs.unwrap_or(false) {
-            Box::pin(self.ensure_parent_dirs(&path)).await?;
-        }
-
-        // Remove file if it exists (overwrite behavior)
-        if self.agentfs.fs.stat(&path).await?.is_some() {
-            self.agentfs.fs.remove(&path).await?;
-        }
-        let (_, file) = self
-            .agentfs
-            .fs
-            .create_file(&path, S_IFREG | 0o644, 0, 0)
-            .await
-            .context("Failed to create file")?;
-        file.pwrite(0, &data)
-            .await
-            .context("Failed to write file")?;
-
-        Ok(format!("Wrote {} bytes to {}", data.len(), path))
-    }
-
-    /// Helper to create parent directories recursively
-    fn ensure_parent_dirs<'a>(
-        &'a self,
-        path: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
-        Box::pin(async move {
-            let path_obj = Path::new(path);
-            let parent = match path_obj.parent() {
-                Some(p) if !p.as_os_str().is_empty() && p != Path::new("/") => p,
-                _ => return Ok(()),
-            };
-
-            let parent_str = parent.to_string_lossy().to_string();
-            let parent_path = normalize_path(&parent_str)?;
-
-            // Check if parent exists
-            if self.agentfs.fs.stat(&parent_path).await?.is_some() {
-                return Ok(());
-            }
-
-            // Recursively ensure grandparent exists
-            self.ensure_parent_dirs(&parent_path).await?;
-
-            // Create parent
-            self.agentfs
-                .fs
-                .mkdir(&parent_path, 0, 0)
+    let file = match agentfs.fs.stat(&path).await? {
+        Some(stats) if stats.is_file() => {
+            let file = FileSystem::open(&agentfs.fs, stats.ino, libc::O_WRONLY)
                 .await
-                .context(format!("Failed to create directory: {}", parent_path))?;
+                .context("Failed to open file")?;
+            file.truncate(0).await.context("Failed to truncate file")?;
+            file
+        }
+        Some(_) => anyhow::bail!("Not a regular file: {}", path),
+        None => {
+            let (_, file) = agentfs
+                .fs
+                .create_file(&path, DEFAULT_FILE_MODE, 0, 0)
+                .await
+                .context("Failed to create file")?;
+            file
+        }
+    };
+    file.pwrite(0, &data)
+        .await
+        .context("Failed to write file")?;
+    // Flush batched writes so the data is durable even if the server
+    // exits right after this call (each MCP call is a complete exchange).
+    file.drain_writes().await.context("Failed to flush file")?;
 
-            Ok(())
-        })
-    }
+    Ok(format!("Wrote {} bytes to {}", data.len(), path))
+}
 
-    /// List directory contents
-    async fn handle_readdir(&self, params: ReaddirParams) -> Result<String> {
-        let path = normalize_path(&params.path)?;
+/// Helper to create parent directories recursively
+fn ensure_parent_dirs<'a>(
+    agentfs: &'a AgentFS,
+    path: &'a str,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+    Box::pin(async move {
+        let path_obj = Path::new(path);
+        let parent = match path_obj.parent() {
+            Some(p) if !p.as_os_str().is_empty() && p != Path::new("/") => p,
+            _ => return Ok(()),
+        };
 
-        let stats = self
-            .agentfs
+        let parent_str = parent.to_string_lossy().to_string();
+        let parent_path = normalize_path(&parent_str)?;
+
+        // Check if parent exists
+        if agentfs.fs.stat(&parent_path).await?.is_some() {
+            return Ok(());
+        }
+
+        // Recursively ensure grandparent exists
+        ensure_parent_dirs(agentfs, &parent_path).await?;
+
+        // Create parent
+        agentfs
             .fs
-            .stat(&path)
+            .mkdir(&parent_path, 0, 0)
             .await
-            .context("Failed to stat directory")?
-            .ok_or_else(|| anyhow::anyhow!("Directory not found: {}", path))?;
+            .context(format!("Failed to create directory: {}", parent_path))?;
 
-        let entries = self
-            .agentfs
-            .fs
-            .readdir(stats.ino)
-            .await
-            .context("Failed to read directory")?
-            .ok_or_else(|| anyhow::anyhow!("Directory not found: {}", path))?;
+        Ok(())
+    })
+}
 
-        Ok(serde_json::to_string_pretty(&entries)?)
-    }
+/// List directory contents
+async fn handle_readdir(agentfs: &AgentFS, params: ReaddirParams) -> Result<String> {
+    let path = normalize_path(&params.path)?;
 
-    /// Create directory
-    async fn handle_mkdir(&self, params: MkdirParams) -> Result<String> {
-        let path = normalize_path(&params.path)?;
+    let stats = agentfs
+        .fs
+        .stat(&path)
+        .await
+        .context("Failed to stat directory")?
+        .ok_or_else(|| anyhow::anyhow!("Directory not found: {}", path))?;
 
-        self.agentfs
-            .fs
-            .mkdir(&path, 0, 0)
-            .await
-            .context("Failed to create directory")?;
+    let entries = agentfs
+        .fs
+        .readdir(stats.ino)
+        .await
+        .context("Failed to read directory")?
+        .ok_or_else(|| anyhow::anyhow!("Directory not found: {}", path))?;
 
-        Ok(format!("Created directory: {}", path))
-    }
+    Ok(serde_json::to_string_pretty(&entries)?)
+}
 
-    /// Remove empty directory
-    async fn handle_remove(&self, params: RemoveParams) -> Result<String> {
-        let path = normalize_path(&params.path)?;
+/// Create directory
+async fn handle_mkdir(agentfs: &AgentFS, params: MkdirParams) -> Result<String> {
+    let path = normalize_path(&params.path)?;
 
-        self.agentfs
-            .fs
-            .remove(&path)
-            .await
-            .context("Failed to remove directory")?;
+    agentfs
+        .fs
+        .mkdir(&path, 0, 0)
+        .await
+        .context("Failed to create directory")?;
 
-        Ok(format!("Removed directory: {}", path))
-    }
+    Ok(format!("Created directory: {}", path))
+}
 
-    /// Rename/move file or directory
-    async fn handle_rename(&self, params: RenameParams) -> Result<String> {
-        let from = normalize_path(&params.from)?;
-        let to = normalize_path(&params.to)?;
-        let (from_parent, from_name) = self.parent_and_name(&from).await?;
-        let (to_parent, to_name) = self.parent_and_name(&to).await?;
+/// Remove empty directory
+async fn handle_remove(agentfs: &AgentFS, params: RemoveParams) -> Result<String> {
+    let path = normalize_path(&params.path)?;
 
-        FileSystem::rename(
-            &self.agentfs.fs,
-            from_parent,
-            &from_name,
-            to_parent,
-            &to_name,
-        )
+    agentfs
+        .fs
+        .remove(&path)
+        .await
+        .context("Failed to remove directory")?;
+
+    Ok(format!("Removed directory: {}", path))
+}
+
+/// Rename/move file or directory
+async fn handle_rename(agentfs: &AgentFS, params: RenameParams) -> Result<String> {
+    let from = normalize_path(&params.from)?;
+    let to = normalize_path(&params.to)?;
+    let (from_parent, from_name) = agentfs.fs.resolve_parent_and_name(&from).await?;
+    let (to_parent, to_name) = agentfs.fs.resolve_parent_and_name(&to).await?;
+
+    FileSystem::rename(&agentfs.fs, from_parent, &from_name, to_parent, &to_name)
         .await
         .context("Failed to rename")?;
 
-        Ok(format!("Renamed {} to {}", from, to))
-    }
+    Ok(format!("Renamed {} to {}", from, to))
+}
 
-    async fn parent_and_name(&self, path: &str) -> Result<(i64, String)> {
-        let path_obj = Path::new(path);
-        let name = path_obj
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| anyhow::anyhow!("Cannot operate on root path"))?
-            .to_string();
-        let parent_path = path_obj
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("/"))
-            .to_string_lossy()
-            .to_string();
-        let parent_ino = if parent_path == "/" {
-            ROOT_INO
-        } else {
-            self.agentfs
-                .fs
-                .stat(&parent_path)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("Parent path not found: {}", parent_path))?
-                .ino
+/// Get file metadata
+async fn handle_stat(agentfs: &AgentFS, params: StatParams) -> Result<String> {
+    let path = normalize_path(&params.path)?;
+
+    let stats = agentfs
+        .fs
+        .stat(&path)
+        .await
+        .context("Failed to stat")?
+        .ok_or_else(|| anyhow::anyhow!("Path not found: {}", path))?;
+
+    Ok(serde_json::to_string_pretty(&StatsResponse::from(stats))?)
+}
+
+/// Test if path exists
+async fn handle_access(agentfs: &AgentFS, params: AccessParams) -> Result<String> {
+    let path = normalize_path(&params.path)?;
+
+    let exists = agentfs.fs.stat(&path).await?.is_some();
+
+    Ok(serde_json::to_string(&json!({ "exists": exists }))?)
+}
+
+/// Get KV value
+async fn handle_kv_get(agentfs: &AgentFS, params: KvGetParams) -> Result<String> {
+    let value: Option<JsonValue> = agentfs
+        .kv
+        .get(&params.key)
+        .await
+        .context("Failed to get value")?;
+
+    Ok(serde_json::to_string_pretty(&value)?)
+}
+
+/// Set KV value
+async fn handle_kv_set(agentfs: &AgentFS, params: KvSetParams) -> Result<String> {
+    agentfs
+        .kv
+        .set(&params.key, &params.value)
+        .await
+        .context("Failed to set value")?;
+
+    Ok(format!("Set key: {}", params.key))
+}
+
+/// Delete KV value
+async fn handle_kv_delete(agentfs: &AgentFS, params: KvDeleteParams) -> Result<String> {
+    agentfs
+        .kv
+        .delete(&params.key)
+        .await
+        .context("Failed to delete key")?;
+
+    Ok(format!("Deleted key: {}", params.key))
+}
+
+/// List KV keys, optionally filtered by prefix
+async fn handle_kv_list(agentfs: &AgentFS, params: KvListParams) -> Result<String> {
+    let mut keys = agentfs.kv.keys().await.context("Failed to list keys")?;
+    if let Some(prefix) = &params.prefix {
+        keys.retain(|key| key.starts_with(prefix.as_str()));
+    }
+    keys.sort();
+
+    Ok(serde_json::to_string_pretty(&keys)?)
+}
+
+/// List all files as resources
+async fn list_resources(agentfs: &AgentFS) -> Result<Vec<JsonValue>> {
+    let mut resources = Vec::new();
+    collect_file_resources(agentfs, "/", &mut resources).await?;
+    Ok(resources)
+}
+
+/// Recursively collect file resources
+fn collect_file_resources<'a>(
+    agentfs: &'a AgentFS,
+    path: &'a str,
+    resources: &'a mut Vec<JsonValue>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+    Box::pin(async move {
+        let dir_stats = match agentfs.fs.stat(path).await? {
+            Some(s) => s,
+            None => return Ok(()),
         };
-        Ok((parent_ino, name))
-    }
 
-    /// Get file metadata
-    async fn handle_stat(&self, params: StatParams) -> Result<String> {
-        let path = normalize_path(&params.path)?;
+        let entries = match agentfs.fs.readdir(dir_stats.ino).await? {
+            Some(entries) => entries,
+            None => return Ok(()),
+        };
 
-        let stats = self
-            .agentfs
-            .fs
-            .stat(&path)
-            .await
-            .context("Failed to stat")?
-            .ok_or_else(|| anyhow::anyhow!("Path not found: {}", path))?;
+        for entry in entries {
+            let full_path = if path == "/" {
+                format!("/{}", entry)
+            } else {
+                format!("{}/{}", path, entry)
+            };
 
-        Ok(serde_json::to_string_pretty(&StatsResponse::from(stats))?)
-    }
-
-    /// Test if path exists
-    async fn handle_access(&self, params: AccessParams) -> Result<String> {
-        let path = normalize_path(&params.path)?;
-
-        let exists = self.agentfs.fs.stat(&path).await?.is_some();
-
-        Ok(serde_json::to_string(&json!({ "exists": exists }))?)
-    }
-
-    /// Get KV value
-    async fn handle_kv_get(&self, params: KvGetParams) -> Result<String> {
-        let value: Option<JsonValue> = self
-            .agentfs
-            .kv
-            .get(&params.key)
-            .await
-            .context("Failed to get value")?;
-
-        Ok(serde_json::to_string_pretty(&value)?)
-    }
-
-    /// Set KV value
-    async fn handle_kv_set(&self, params: KvSetParams) -> Result<String> {
-        self.agentfs
-            .kv
-            .set(&params.key, &params.value)
-            .await
-            .context("Failed to set value")?;
-
-        Ok(format!("Set key: {}", params.key))
-    }
-
-    /// Delete KV value
-    async fn handle_kv_delete(&self, params: KvDeleteParams) -> Result<String> {
-        self.agentfs
-            .kv
-            .delete(&params.key)
-            .await
-            .context("Failed to delete key")?;
-
-        Ok(format!("Deleted key: {}", params.key))
-    }
-
-    /// List all files as resources
-    async fn list_resources(&self) -> Result<Vec<JsonValue>> {
-        let mut resources = Vec::new();
-        Box::pin(self.collect_file_resources("/", &mut resources)).await?;
-        Ok(resources)
-    }
-
-    /// Recursively collect file resources
-    fn collect_file_resources<'a>(
-        &'a self,
-        path: &'a str,
-        resources: &'a mut Vec<JsonValue>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
-        Box::pin(async move {
-            let dir_stats = match self.agentfs.fs.stat(path).await? {
+            let stats = match agentfs.fs.stat(&full_path).await? {
                 Some(s) => s,
-                None => return Ok(()),
+                None => continue,
             };
 
-            let entries = match self.agentfs.fs.readdir(dir_stats.ino).await? {
-                Some(entries) => entries,
-                None => return Ok(()),
-            };
-
-            for entry in entries {
-                let full_path = if path == "/" {
-                    format!("/{}", entry)
-                } else {
-                    format!("{}/{}", path, entry)
-                };
-
-                let stats = match self.agentfs.fs.stat(&full_path).await? {
-                    Some(s) => s,
-                    None => continue,
-                };
-
-                if stats.is_file() {
-                    resources.push(json!({
-                        "uri": full_path,
-                        "name": entry,
-                        "description": format!("File at {}", full_path),
-                        "mimeType": guess_mime_type(&full_path)
-                    }));
-                } else if stats.is_directory() {
-                    // Recurse into subdirectory
-                    self.collect_file_resources(&full_path, resources).await?;
-                }
+            if stats.is_file() {
+                resources.push(json!({
+                    "uri": full_path,
+                    "name": entry,
+                    "description": format!("File at {}", full_path),
+                    "mimeType": guess_mime_type(&full_path)
+                }));
+            } else if stats.is_directory() {
+                // Recurse into subdirectory
+                collect_file_resources(agentfs, &full_path, resources).await?;
             }
+        }
 
-            Ok(())
-        })
-    }
+        Ok(())
+    })
+}
 
-    /// Read a resource by path
-    async fn read_resource(&self, path: &str) -> Result<Vec<u8>> {
-        let normalized = normalize_path(path)?;
+/// Read a resource by path
+async fn read_resource(agentfs: &AgentFS, path: &str) -> Result<Vec<u8>> {
+    let normalized = normalize_path(path)?;
 
-        let data = self
-            .agentfs
-            .fs
-            .read_file(&normalized)
-            .await
-            .context("Failed to read file")?
-            .ok_or_else(|| anyhow::anyhow!("File not found: {}", normalized))?;
+    let data = agentfs
+        .fs
+        .read_file(&normalized)
+        .await
+        .context("Failed to read file")?
+        .ok_or_else(|| anyhow::anyhow!("File not found: {}", normalized))?;
 
-        Ok(data)
-    }
+    Ok(data)
 }
 
 // ============================================================================
@@ -990,91 +1122,4 @@ impl From<Stats> for StatsResponse {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use agentfs_core::{error::Error as SdkError, FsError};
-    use tempfile::tempdir;
-
-    async fn create_test_server() -> Result<(McpServer, tempfile::TempDir)> {
-        let dir = tempdir()?;
-        let db_path = dir.path().join("test.db");
-        let agentfs = AgentFS::open(AgentFSOptions::with_path(
-            db_path.to_string_lossy().to_string(),
-        ))
-        .await?;
-        Ok((McpServer::new(agentfs, None), dir))
-    }
-
-    #[tokio::test]
-    async fn mcp_rename_directory_into_own_subtree_returns_error_and_preserves_namespace(
-    ) -> Result<()> {
-        let (server, _dir) = create_test_server().await?;
-        server.agentfs.fs.mkdir("/parent", 0, 0).await?;
-        server.agentfs.fs.mkdir("/parent/child", 0, 0).await?;
-
-        let parent_ino = server.agentfs.fs.stat("/parent").await?.unwrap().ino;
-        let child_ino = server.agentfs.fs.stat("/parent/child").await?.unwrap().ino;
-        let root_before = server.agentfs.fs.readdir(ROOT_INO).await?.unwrap();
-        let parent_before = server.agentfs.fs.readdir(parent_ino).await?.unwrap();
-        let child_before = server.agentfs.fs.readdir(child_ino).await?.unwrap();
-
-        let direct_error = server
-            .handle_rename(RenameParams {
-                from: "/parent".to_string(),
-                to: "/parent/child/parent".to_string(),
-            })
-            .await
-            .expect_err("cycle rename should fail");
-        assert!(
-            direct_error.chain().any(|cause| {
-                matches!(
-                    cause.downcast_ref::<SdkError>(),
-                    Some(SdkError::Fs(FsError::InvalidRename))
-                )
-            }),
-            "expected InvalidRename in error chain, got {direct_error:#}"
-        );
-
-        let response = server
-            .handle_request(json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "tools/call",
-                "params": {
-                    "name": "rename",
-                    "arguments": {
-                        "from": "/parent",
-                        "to": "/parent/child/parent"
-                    }
-                }
-            }))
-            .await
-            .expect("tools/call requests must produce a response");
-        assert!(
-            response.get("error").is_some(),
-            "cycle rename should return a JSON-RPC error response: {response}"
-        );
-
-        assert_eq!(
-            server.agentfs.fs.readdir(ROOT_INO).await?.unwrap(),
-            root_before
-        );
-        assert_eq!(
-            server.agentfs.fs.readdir(parent_ino).await?.unwrap(),
-            parent_before
-        );
-        assert_eq!(
-            server.agentfs.fs.readdir(child_ino).await?.unwrap(),
-            child_before
-        );
-        assert!(server.agentfs.fs.stat("/parent").await?.is_some());
-        assert!(server.agentfs.fs.stat("/parent/child").await?.is_some());
-        assert!(server
-            .agentfs
-            .fs
-            .stat("/parent/child/parent")
-            .await?
-            .is_none());
-        Ok(())
-    }
-}
+mod tests;

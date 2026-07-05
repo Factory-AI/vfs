@@ -744,7 +744,12 @@ impl AgentFS {
         Ok(Some(current_ino))
     }
 
-    async fn resolve_parent_and_name(&self, path: &str) -> Result<(i64, String)> {
+    /// Resolve a path to its parent directory inode and final component name.
+    ///
+    /// This is the canonical parent/name resolver backing every path-based
+    /// mutation helper; external path consumers (e.g. the CLI MCP server)
+    /// must use it rather than re-deriving parent inodes.
+    pub async fn resolve_parent_and_name(&self, path: &str) -> Result<(i64, String)> {
         let path = self.normalize_path(path);
         let components = self.split_path(&path);
         if components.is_empty() {

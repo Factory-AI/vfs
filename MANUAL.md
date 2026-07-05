@@ -193,13 +193,17 @@ agentfs serve mcp <ID_OR_PATH> [OPTIONS]
 ```
 
 **Options:**
-- `--tools <TOOLS>` - Comma-separated list of tools to expose (default: all)
+- `--tools <TOOLS>` - Comma-separated list of tools to expose (default: all). Unknown tool names are rejected at startup.
 
 **Available tools:**
 
 Filesystem: `read_file`, `write_file`, `readdir`, `mkdir`, `remove`, `rename`, `stat`, `access`
 
 Key-Value: `kv_get`, `kv_set`, `kv_delete`, `kv_list`
+
+`write_file` overwrites existing files in place, preserving their mode; new files are created with mode `0644`.
+
+Every `tools/call` is recorded in the `tool_calls` audit table; inspect it with `agentfs timeline`.
 
 ### agentfs serve nfs
 
