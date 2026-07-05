@@ -75,6 +75,7 @@ pub fn run(options: RunOptions) -> Result<()> {
         args,
     } = options;
     let cwd = std::env::current_dir().context("Failed to get current directory")?;
+    let run_started_at_ms = unix_timestamp_ms();
 
     // Build the list of allowed writable paths
     let allowed_paths = build_allowed_paths(&allow, no_default_allows)?;
@@ -147,6 +148,7 @@ pub fn run(options: RunOptions) -> Result<()> {
     // The child blocks on the pipe protocol until the parent signals, so the
     // FUSE mount is guaranteed live before the child bind-mounts it.
     let rt = crate::get_runtime();
+    let audit_encryption = encryption.clone();
     let mount_handle = match rt.block_on(mount_session_fs(
         &cwd,
         &session,
@@ -188,7 +190,84 @@ pub fn run(options: RunOptions) -> Result<()> {
     }
 
     let exit_code = rt.block_on(run_parent(child_pid, mount_handle, &session.run_id))?;
+
+    // The mount is torn down and the delta DB finalized, so the session's own
+    // audit row can be written through a plain reopen without a second opener
+    // racing the live FUSE session.
+    if let Err(error) = rt.block_on(record_run_audit(
+        &session.db_path,
+        &session.run_id,
+        &command,
+        &args,
+        audit_encryption,
+        run_started_at_ms,
+        exit_code,
+    )) {
+        eprintln!("Warning: Failed to record run session in timeline: {error:#}");
+    }
+
     std::process::exit(exit_code);
+}
+
+/// Record the completed run session in the delta database's tool-call audit
+/// log so `agentfs timeline <session-db>` reports the sandboxed command and
+/// its exit status (VAL-CROSS-006).
+async fn record_run_audit(
+    db_path: &Path,
+    session_id: &str,
+    command: &Path,
+    args: &[String],
+    encryption: Option<EncryptionConfig>,
+    started_at_ms: i64,
+    exit_code: i32,
+) -> Result<()> {
+    let db_path_str = db_path
+        .to_str()
+        .context("Database path contains non-UTF8 characters")?;
+    let mut options = AgentFSOptions::with_path(db_path_str)
+        .with_core_config(crate::config::core_config_from_env());
+    if let Some(encryption) = encryption {
+        options = options.with_encryption(encryption);
+    }
+    let agentfs = AgentFS::open(options)
+        .await
+        .context("Failed to reopen delta database for the audit row")?;
+
+    let mut argv = vec![command.to_string_lossy().into_owned()];
+    argv.extend(args.iter().cloned());
+    let parameters = serde_json::json!({ "session": session_id, "command": argv });
+    let result = serde_json::json!({ "exit_code": exit_code });
+    let error_text = (exit_code != 0).then(|| format!("exit code {exit_code}"));
+
+    agentfs
+        .tools
+        .record(
+            "run",
+            started_at_ms,
+            unix_timestamp_ms(),
+            Some(parameters),
+            Some(result),
+            error_text.as_deref(),
+        )
+        .await
+        .context("Failed to insert the run audit row")?;
+
+    // Leave the DB in single-file journal mode again: without this the audit
+    // insert sits in a fresh WAL sidecar, undoing the clean teardown the
+    // supervised session just performed.
+    agentfs
+        .fs
+        .finalize()
+        .await
+        .context("Failed to finalize the delta database after the audit row")?;
+    Ok(())
+}
+
+fn unix_timestamp_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Open the delta database, build the overlay, and mount it on the session's

@@ -81,6 +81,25 @@ run_agentfs run --session smoke-run -- sh -c 'echo run-ok' >"$ROOT/run.log" 2>&1
     fail "run failed: $(cat "$ROOT/run.log")"
 grep -q "run-ok" "$ROOT/run.log" || fail "run output missing"
 
+# --- run session is audited in timeline (VAL-CROSS-006) ---------------------------
+mkdir -p "$ROOT/home"
+env HOME="$ROOT/home" "$BIN" run --session smoke-audit -- sh -c 'echo audit-ok' \
+    >"$ROOT/run-audit.log" 2>&1 ||
+    fail "audited run failed: $(cat "$ROOT/run-audit.log")"
+AUDIT_DB="$ROOT/home/.agentfs/run/smoke-audit/delta.db"
+[ -f "$AUDIT_DB" ] || fail "session delta.db missing at $AUDIT_DB"
+# The audit reopen must finalize: a leftover WAL/SHM next to the session DB
+# breaks the single-file invariant the run teardown just established. Checked
+# before timeline below, which (like any reopen) may recreate a header WAL.
+[ ! -e "$AUDIT_DB-wal" ] || fail "run audit left $AUDIT_DB-wal behind"
+[ ! -e "$AUDIT_DB-shm" ] || fail "run audit left $AUDIT_DB-shm behind"
+run_agentfs timeline "$AUDIT_DB" --format json >"$ROOT/timeline-audit.json" 2>&1 ||
+    fail "timeline on session DB failed: $(cat "$ROOT/timeline-audit.json")"
+grep -q '"name": "run"' "$ROOT/timeline-audit.json" || fail "timeline missing run audit row"
+grep -q 'smoke-audit' "$ROOT/timeline-audit.json" || fail "run audit row missing session id"
+grep -q '"status": "success"' "$ROOT/timeline-audit.json" || fail "run audit row not success"
+grep -q 'exit_code' "$ROOT/timeline-audit.json" || fail "run audit row missing exit_code"
+
 # --- exec (mount-owning) ----------------------------------------------------------
 run_agentfs exec "$DB" sh -c 'echo exec-ok' >"$ROOT/exec.log" 2>&1 ||
     fail "exec failed: $(cat "$ROOT/exec.log")"
