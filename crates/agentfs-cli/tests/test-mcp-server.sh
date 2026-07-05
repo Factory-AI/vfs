@@ -11,6 +11,8 @@
 #   - unknown tools and unknown methods get proper JSON-RPC errors
 #   - --tools filters both listing and dispatch; unknown filter names are
 #     rejected at startup
+#   - the database family is single-file (no -wal/-shm) once the startup
+#     validation probe has run and again after graceful shutdown (invariant I1)
 set -eu
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -71,9 +73,14 @@ fi
 # --- Main stdio JSON-RPC session ---------------------------------------------
 timeout 120 python3 - "$BIN" "$DB" "$HAVE_FUSE" >"$ROOT/session.out" 2>"$ROOT/session.err" <<'EOF' \
     || fail "stdio session failed: $(tail -20 "$ROOT/session.out" "$ROOT/session.err")"
-import json, subprocess, sys
+import json, os, subprocess, sys
 
 BIN, DB, HAVE_FUSE = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
+
+def assert_single_file_family(stage):
+    sidecars = [DB + suffix for suffix in ("-wal", "-shm")
+                if os.path.exists(DB + suffix)]
+    assert not sidecars, f"{stage} left sidecars behind: {sidecars}"
 EXPECTED_TOOLS = ["read_file", "write_file", "readdir", "mkdir", "remove",
                   "rename", "stat", "access", "kv_get", "kv_set", "kv_delete",
                   "kv_list"]
@@ -98,6 +105,11 @@ def result_text(resp):
 
 resp = rpc(1, "initialize", {"protocolVersion": "2024-11-05", "capabilities": {}})
 assert resp["result"]["protocolVersion"], resp
+
+# The per-request-mode startup validation probe (open + close) must restore
+# the single-file family before the server starts serving: initialize opens
+# no database, so any sidecar visible here was left by the probe.
+assert_single_file_family("startup validation probe")
 
 # Strict clients send this right after initialize; the server must accept it
 # silently. The next request's response proves nothing was written for it.
@@ -174,6 +186,10 @@ result_text(rpc(50, "tools/call", {"name": "access", "arguments": {"path": "/fre
 proc.stdin.close()
 proc.wait(timeout=15)
 assert proc.returncode == 0, f"server exit code {proc.returncode}"
+
+# Graceful shutdown (stdin EOF) must restore the single-file family the
+# per-request opens materialized while serving.
+assert_single_file_family("graceful shutdown")
 print("SESSION-OK")
 EOF
 grep -q 'SESSION-OK' "$ROOT/session.out" || fail "stdio session did not complete"

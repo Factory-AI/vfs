@@ -223,10 +223,12 @@ pub async fn write_filesystem(
         .await?;
     file.pwrite(0, content.as_bytes()).await?;
     // Tier Four: writes go into the in-memory batcher first. This CLI is a
-    // one-shot operation — flush so the bytes are durable in SQLite before
-    // we drop the AgentFS, otherwise a subsequent process or `cat` against
-    // the same path would see only the pre-write state.
-    agentfs.fs.drain_all().await?;
+    // one-shot operation — finalize so the bytes are durable in SQLite before
+    // we drop the AgentFS (otherwise a subsequent process or `cat` against
+    // the same path would see only the pre-write state) and the database
+    // family is single-file again (invariant I1) instead of keeping the
+    // truncated 0-byte -wal a bare drain leaves behind.
+    agentfs.fs.finalize().await?;
     Ok(())
 }
 

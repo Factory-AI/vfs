@@ -145,9 +145,10 @@ run_agentfs materialize "$DB" --output "$ROOT/materialized.db" --verify >/dev/nu
 run_agentfs integrity --json "$DB" >"$ROOT/integrity.json" 2>&1 ||
     fail "integrity failed: $(cat "$ROOT/integrity.json")"
 
-# --- read-only commands leave a single-file database family (invariant I1) --------------
+# --- one-shot commands leave a single-file database family (invariant I1) ---------------
 # Census every read-style reopen: each used to leave a header-only -wal next
 # to the DB after exit, which the phase8 stress gate's size==0 unlink missed.
+# fs write is censused too: it drained but left a truncated 0-byte -wal.
 RDB="$ROOT/readonly.db"
 cp "$ROOT/backup.db" "$RDB"
 no_sidecars() {
@@ -168,6 +169,11 @@ if run_agentfs fs "$RDB" cat /missing.txt >/dev/null 2>&1; then
     fail "fs cat of a missing file succeeded"
 fi
 no_sidecars "fs cat (error path)"
+run_agentfs fs "$RDB" write /census-write.txt census-payload >/dev/null 2>&1 ||
+    fail "fs write (census) failed"
+no_sidecars "fs write"
+[ "$(run_agentfs fs "$RDB" cat /census-write.txt 2>/dev/null)" = "census-payload" ] ||
+    fail "fs write payload not durable after finalize"
 run_agentfs diff "$RDB" >/dev/null 2>&1 || fail "diff (read census) failed"
 no_sidecars "diff"
 run_agentfs integrity --json "$RDB" >/dev/null 2>&1 || fail "integrity --json (read census) failed"

@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use crate::cmd::init::open_agentfs;
+use crate::cmd::init::{finalize_readonly, open_agentfs};
 
 /// The complete dispatchable tool surface. `tools/list`, `tools/call`
 /// dispatch, and `--tools` filter validation all key off this list; the
@@ -155,8 +155,12 @@ impl McpServer {
             AgentFsSource::Held(Arc::new(open_agentfs(options).await?))
         } else {
             // Open once up front so startup fails cleanly on a missing or
-            // incompatible database, then release the file lock.
-            drop(open_agentfs(options.clone()).await?);
+            // incompatible database, then release the file lock with the
+            // single-file family restored: even this never-writing probe
+            // materializes a -wal sidecar (invariant I1).
+            let probe = open_agentfs(options.clone()).await?;
+            finalize_readonly(&probe).await;
+            drop(probe);
             AgentFsSource::PerRequest(Box::new(options))
         };
 
@@ -185,6 +189,32 @@ impl McpServer {
 
     async fn serve(self) -> Result<()> {
         let server = Arc::new(Mutex::new(self));
+        let result = Self::serve_stdio(&server).await;
+        // Per-request opens leave a -wal next to a file-backed database
+        // while serving; restore the single-file family at exit even when
+        // the stdio loop errored, mirroring the NFS server's
+        // finalize-on-shutdown (agentfs-nfs server/tcp.rs).
+        server.lock().await.finalize_on_shutdown().await;
+        result
+    }
+
+    /// Restore the single-file database family before the server exits.
+    /// Best-effort like every one-shot command's finalize: a concurrent
+    /// holder of the database must not turn a clean shutdown into an error.
+    async fn finalize_on_shutdown(&self) {
+        // Ephemeral databases have no on-disk family to restore.
+        let AgentFsSource::PerRequest(options) = &self.source else {
+            return;
+        };
+        match open_agentfs((**options).clone()).await {
+            Ok(agentfs) => finalize_readonly(&agentfs).await,
+            Err(error) => eprintln!(
+                "Warning: Failed to reopen the database to restore the single-file family: {error:#}"
+            ),
+        }
+    }
+
+    async fn serve_stdio(server: &Arc<Mutex<Self>>) -> Result<()> {
         let stdin = io::stdin();
         let mut stdout = io::stdout();
 
