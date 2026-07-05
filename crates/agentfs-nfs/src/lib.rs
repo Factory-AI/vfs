@@ -2,7 +2,23 @@
 //!
 //! The adopted NFS protocol server and AgentFS adapter are private
 //! implementation details. Callers receive only the serve entry point, serve
-//! options, and server handle needed for lifecycle management.
+//! options, and server handle needed for lifecycle management (`serve`,
+//! `NfsServeOptions`, `ServerHandle`).
+//!
+//! Owned invariants:
+//!
+//! - Server-side enforcement: permission checks go through the shared
+//!   `agentfs_core::semantics` access implementation, and write authority is
+//!   granted only via handle-table tokens (LRU-bounded, invalidated on
+//!   unlink/rename) — local processes reaching the TCP port are inside the
+//!   threat model.
+//! - Honest durability: a WRITE is acknowledged `FILE_SYNC` only after the
+//!   bytes are committed through the core durability contract.
+//! - Duplicate request handling: retransmitted non-idempotent RPCs replay
+//!   their recorded reply instead of re-executing.
+//! - Graceful shutdown: the accept loop stops on cancellation, in-flight
+//!   tasks are joined, and the filesystem is finalized before the handle
+//!   resolves.
 
 mod adapter;
 mod server;

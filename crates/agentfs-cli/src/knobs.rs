@@ -1001,6 +1001,9 @@ mod tests {
                 | "AGENTFS_SANDBOX"
                 | "AGENTFS_SESSION"
                 | "TURSO_DB_AUTH_TOKEN"
+                // Doc-regeneration test flag (docs.rs), not a runtime knob;
+                // its knobs.rs sibling is exempt via the knobs.rs file skip.
+                | "AGENTFS_UPDATE_MANUAL"
         ) || name.starts_with("AGENTFS_TEST_")
             || name.ends_with('_')
     }

@@ -1,3 +1,28 @@
+//! AgentFS core: the SQLite-backed virtual filesystem engine.
+//!
+//! This is the only externally consumed crate. It owns the storage engine
+//! (chunk/inline layout per docs/SPEC.md), the write batcher, inode
+//! lifecycle and reap hooks, the overlay layer (whiteouts, origin tracking,
+//! the partial-origin policy), scoped host-FS reads, schema authority
+//! (`user_version` migrations plus the integrity battery), the typed config
+//! system parsed at the crate edge (`config::EnvReader`), the telemetry
+//! registry with its single report sink, and the `semantics` facade
+//! (access, durability, handles) that the transport adapter crates build on.
+//!
+//! Owned invariants:
+//!
+//! - All virtual filesystem state lives in the single AgentFS SQLite
+//!   database. Sandboxed writes never touch the host filesystem; overlay
+//!   reads are scoped to the configured read-only base directory.
+//! - Buffered (volatile-ack) writes are acceleration state only: durable
+//!   acks (`AckDurability::Committed`, commit barriers, shutdown finalize)
+//!   return only after the bytes are committed to SQLite, metadata reads
+//!   merge pending state, and deletions discard it.
+//! - Errors are typed (`FsError` at the trait, `Error` above it); row
+//!   decoding never fabricates defaults for corrupt data.
+//! - Environment variables are read only inside `config`; everything
+//!   downstream receives values.
+
 pub mod config;
 pub mod error;
 pub mod fs;

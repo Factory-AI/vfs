@@ -2,7 +2,23 @@
 //!
 //! This module provides a unified mount API that abstracts over FUSE and NFS backends.
 //! The `mount_fs()` function returns a `MountHandle` whose explicit `unmount`
-//! path drains and joins backend-owned work before returning.
+//! path drains and joins backend-owned work before returning. The exported
+//! surface is the mount lifecycle only: `mount_fs`/`MountOpts`/`MountHandle`,
+//! the `supervise` module (the one supervision path for every mount-owning
+//! command), the `daemon` module, and mountpoint helpers.
+//!
+//! Owned invariants:
+//!
+//! - One mount lifecycle: every backend mount is created through `mount_fs`
+//!   and torn down through `MountHandle::unmount`, which joins all
+//!   backend-owned threads/tasks within bounded timeouts — no leaked mounts
+//!   or orphan sessions on the success path.
+//! - One supervision path: `supervise::run_supervised*` owns
+//!   signal-forwarding, child-exit propagation, and
+//!   unmount-before-exit ordering for commands that hold a mount while a
+//!   child process runs.
+//! - Readiness and teardown are time-bounded (`wait_for_mount`, unmount
+//!   timeouts), so a wedged backend surfaces as an error instead of a hang.
 //!
 //! # Example
 //!
