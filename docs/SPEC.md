@@ -4,7 +4,7 @@
 
 ## Introduction
 
-The Agent Filesystem Specification defines a SQLite schema for representing agent filesystem state. The current v0.5 format adds 64 KiB default chunks, inline storage for dense files at or below 4 KiB, and copy-only migration from v0.4 databases. The specification consists of three main components:
+The Agent Filesystem Specification defines a SQLite schema for representing agent filesystem state. The current v0.5 format adds 64 KiB default chunks, inline storage for dense files at or below 4 KiB, and `user_version`-keyed migration from older databases (in place by default, or copy-based re-chunking with `--copy`). The specification consists of three main components:
 
 1. **Tool Call Audit Trail**: Captures tool invocations, parameters, and results for debugging, auditing, and performance analysis
 2. **Virtual Filesystem**: Stores agent artifacts (files, documents, outputs) using a Unix-like inode design with support for hard links, proper metadata, and efficient file operations
@@ -38,6 +38,80 @@ filesystem lookup path or explicitly retain the backing inode reference before
 replying; later `FORGET` requests must release the same reference count.
 Namespace mutations MUST invalidate affected cached dentries and attributes
 before the mutation is considered visible to the caller.
+
+The subsections below describe the acceleration structures the reference
+implementation actually ships and the invariants each one must preserve.
+Every one of them has a declared kill switch or policy knob in the generated
+knob ledger (`docs/KNOBS.md`).
+
+### Write Batching and Durability
+
+Writes MAY be acknowledged from an in-memory pending map before their bytes
+reach SQLite. The reference implementation batches FUSE writeback-cache
+writes and drains them on a short timer window, a per-inode pending-byte
+trigger, a global pending-byte cap, and bounded per-transaction inode/byte
+budgets (`AGENTFS_BATCH_*` knobs). Buffered acknowledgement is only permitted
+for volatile-durability writes; any operation that promises durability —
+`fsync`, an NFSv3 `WRITE` acknowledged as `FILE_SYNC`, or unmount/shutdown
+finalization — MUST NOT return until the affected pending bytes are committed
+to the database (a per-inode or filesystem-wide commit barrier).
+
+Pending state is an acceleration structure, never a second authority:
+metadata reads (`stat`, directory attributes) MUST merge pending sizes and
+times so applications observe their own buffered writes, and deletions MUST
+discard the dead inode's pending bytes. On unclean termination, volatile
+(never-fsynced) bytes MAY be lost, but the database MUST remain consistent:
+a crash may lose the tail of un-synced data, never corrupt committed state.
+
+### FUSE no-open / no-flush Lifecycle
+
+On Linux the FUSE adapter runs with zero-message opens and zero-message
+flush by default: it answers `OPEN`/`RELEASE` (and close-time `FLUSH`) with
+`ENOSYS`, after which the kernel stops sending them and issues data requests
+with `fh = 0`. Implementations using this mode MUST NOT key any state to
+open/release pairs. Per-inode resources (backing file handles for base reads,
+caches) are keyed by inode number, held in a bounded LRU
+(`AGENTFS_FUSE_INO_FILES_CAP`), and reclaimed by kernel `FORGET` traffic and
+LRU eviction rather than by `RELEASE`.
+
+Consequences that MUST hold:
+
+1. Unlink-while-open works through lookup-reference accounting: an unlinked
+   inode's rows are reaped only after the kernel drops its last lookup
+   reference (deferred reap), not at `RELEASE` time.
+2. Close does not imply commit. With no-flush enabled the kernel has already
+   written back dirty pages before close; durability is promised only by
+   `fsync` (see the durability contract above).
+3. Both behaviors retain kill switches (`AGENTFS_FUSE_NOOPEN`,
+   `AGENTFS_FUSE_NOFLUSH`) and dedicated coherence gates
+   (`scripts/validation/noopen-coherence.py`,
+   `scripts/validation/flush-coherence.py`) that validate the default and
+   disabled legs.
+
+### FUSE-over-io_uring Transport
+
+On kernels that expose `/sys/module/fuse/parameters/enable_uring = Y`, the
+FUSE session attempts the FUSE-over-io_uring transport by default
+(`AGENTFS_FUSE_URING`, bounded queue depth via `AGENTFS_FUSE_URING_DEPTH`)
+and falls back to the classic `/dev/fuse` read/write loop when io_uring
+setup is unavailable or fails. The transport is a performance detail only:
+request semantics, reply contents, cache invalidation, and teardown bounds
+MUST be identical on both legs, and unmount MUST join transport threads on
+both legs without leaking the mount.
+
+### Overlay Base Reality
+
+Overlay mounts scope reads to the configured base directory and write only
+to the delta database (see the sandbox invariants above). Two consequences
+are contractual:
+
+1. Renaming a base-layer directory returns `EXDEV` rather than attempting a
+   recursive copy-up; callers (e.g. `mv`) then perform an explicit
+   copy+delete, which lands in the delta layer.
+2. External mutation of the base tree under a live mount is detected where
+   it matters: partial-origin reads validate the recorded base fingerprint
+   and MUST fail rather than silently mix bytes from a drifted base file
+   (see Partial-Origin Overlay Mode).
 
 ## Tool Calls
 
@@ -727,18 +801,24 @@ If a mapping exists, return `base_ino` instead of `delta_ino` in stat results.
 
 ### Partial-Origin Overlay Mode
 
-Partial-origin copy-up is an experimental opt-in overlay mode enabled by the
-CLI `--partial-origin` policy. The default overlay behavior remains whole-file
-copy-up. In opt-in mode, write-opening a regular base-layer file
-creates a delta inode with the original size and metadata, records the base
-path/fingerprint in `fs_partial_origin`, and stores only changed chunk indexes
-in `fs_data` plus `fs_chunk_override`. Reads merge changed chunks from the
-delta layer with unchanged chunks from the base layer.
+Partial-origin copy-up is an opt-in overlay mode selected by the first-class
+CLI policy `--partial-origin <off|on|auto>` (with
+`--partial-origin-threshold-bytes` sizing the `auto` cutoff). The default
+overlay behavior remains whole-file copy-up (`off`). In opt-in mode,
+write-opening a regular base-layer file creates a delta inode with the
+original size and metadata, records the base path/fingerprint in
+`fs_partial_origin`, and stores only changed chunk indexes in `fs_data` plus
+`fs_chunk_override`. Reads merge changed chunks from the delta layer with
+unchanged chunks from the base layer.
 
 The base fallback is part of the file's integrity contract. Implementations MUST
 fail reads of partial-origin files if the recorded base size or modification
 metadata no longer matches the current base file. Snapshot/restore of the main
 delta database is supported only when the same unchanged base path is available.
+A database containing partial-origin rows is not portable on its own:
+`agentfs backup` rejects it unless `--materialize` folds the base bytes in,
+`agentfs materialize` produces a portable copy, and `agentfs integrity`
+exposes the dependency via `--require-portable` and `--check-base`.
 
 #### Tables: `fs_partial_origin` and `fs_chunk_override`
 
@@ -763,12 +843,11 @@ CREATE TABLE fs_chunk_override (
 )
 ```
 
-Phase 5.5 evidence keeps this mode opt-in: SDK coverage now includes remount,
+Partial-origin stays opt-in. Coverage pinning the mode includes remount,
 main-DB snapshot restore, unlink cleanup/whiteout behavior, hardlink survival,
-rename plus `readdir_plus`, truncate shrink/extend, base drift detection, and
-large-edit smoke output that reports whether the env flag was enabled. It SHOULD
-NOT be defaulted until the broader FUSE/CLI torture and POSIX gates pass with
-the flag enabled.
+rename plus `readdir_plus`, truncate shrink/extend, and base drift detection.
+It SHOULD NOT become the default until the FUSE/CLI torture and POSIX gates
+pass with the policy enabled.
 
 ### Consistency Rules
 
@@ -865,6 +944,15 @@ Implementations MAY extend the key-value store schema with additional functional
 Such extensions SHOULD use separate tables to maintain referential integrity.
 
 ## Revision History
+
+### Version 0.5
+
+- Default chunk size raised to 64 KiB for new filesystems (`chunk_size` in `fs_config`)
+- Added inline storage for dense regular files at or below `inline_threshold` (default 4 KiB): `data_inline` and `storage_kind` columns on `fs_inode`, with layout rules and consistency checks
+- Added `inline_threshold` to the required `fs_config` keys
+- Added partial-origin overlay mode tables (`fs_partial_origin`, `fs_chunk_override`) behind the opt-in `--partial-origin` CLI policy
+- Whiteout schema requires `parent_path`; legacy `fs_whiteout(path, created_at)` rows are synthesized on migration
+- Schema migrations are keyed by `PRAGMA user_version`; `agentfs migrate` lands any supported old schema (v0.0, v0.2, v0.4) at the current version in place, and `--copy` rebuilds with the current chunk layout
 
 ### Version 0.4
 
