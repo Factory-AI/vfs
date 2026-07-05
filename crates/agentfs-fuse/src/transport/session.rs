@@ -538,20 +538,35 @@ fn abort_fuse_connection(device: &std::fs::File) -> io::Result<()> {
 /// (fuse_dev_poll reports `EPOLLERR` once `fc->connected` drops).
 #[cfg(target_os = "linux")]
 fn connection_is_aborted(device: &std::fs::File) -> bool {
+    connection_is_aborted_by(device.as_raw_fd(), |poll_fd| {
+        match unsafe { libc::poll(poll_fd, 1, 0) } {
+            -1 => Err(io::Error::last_os_error()),
+            result => Ok(result),
+        }
+    })
+}
+
+/// Fail closed: only a successful poll can positively confirm the connection
+/// is still alive, and writing the fusectl abort after the connection id has
+/// been freed and recycled kills an unrelated fresh mount, so a non-EINTR
+/// poll error reports the connection as aborted and the caller skips the
+/// abort.
+#[cfg(target_os = "linux")]
+fn connection_is_aborted_by(
+    fd: std::os::fd::RawFd,
+    mut poll: impl FnMut(&mut libc::pollfd) -> io::Result<libc::c_int>,
+) -> bool {
     let mut poll_fd = libc::pollfd {
-        fd: device.as_raw_fd(),
+        fd,
         events: 0,
         revents: 0,
     };
     loop {
-        let result = unsafe { libc::poll(&mut poll_fd, 1, 0) };
-        if result == -1 {
-            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return false;
+        match poll(&mut poll_fd) {
+            Ok(result) => return result == 1 && (poll_fd.revents & libc::POLLERR) != 0,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return true,
         }
-        return result == 1 && (poll_fd.revents & libc::POLLERR) != 0;
     }
 }
 
@@ -574,5 +589,49 @@ impl<FS: Filesystem> Drop for Session<FS> {
         if let Some((mountpoint, _mount)) = std::mem::take(&mut *self.mount.lock().unwrap()) {
             debug!("unmounting session at {}", mountpoint.display());
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poll_error_reports_connection_aborted() {
+        let aborted =
+            connection_is_aborted_by(-1, |_| Err(io::Error::from_raw_os_error(libc::EIO)));
+        assert!(
+            aborted,
+            "a poll error cannot confirm liveness; the fusectl abort must be skipped"
+        );
+    }
+
+    #[test]
+    fn eintr_poll_retries_until_a_definitive_answer() {
+        let mut calls = 0;
+        let aborted = connection_is_aborted_by(-1, |_| {
+            calls += 1;
+            if calls == 1 {
+                Err(io::Error::from_raw_os_error(libc::EINTR))
+            } else {
+                Ok(0)
+            }
+        });
+        assert!(!aborted);
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn pollerr_revent_reports_connection_aborted() {
+        let aborted = connection_is_aborted_by(-1, |poll_fd| {
+            poll_fd.revents = libc::POLLERR;
+            Ok(1)
+        });
+        assert!(aborted);
+    }
+
+    #[test]
+    fn quiet_live_connection_is_not_aborted() {
+        assert!(!connection_is_aborted_by(-1, |_| Ok(0)));
     }
 }

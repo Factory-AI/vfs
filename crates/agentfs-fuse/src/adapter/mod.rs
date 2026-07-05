@@ -326,13 +326,13 @@ impl Filesystem for AgentFSFuse {
     fn destroy(&self) {
         tracing::debug!("FUSE::destroy");
         if let Err(e) = self.flush_all_pending() {
-            tracing::warn!("FUSE::destroy failed to flush pending writes: {}", e);
+            tracing::warn!(error = ?e, "FUSE::destroy failed to flush pending writes");
         }
         if let Err(e) = self.commit_barrier(None) {
-            tracing::warn!("FUSE::destroy failed to commit pending writes: {}", e);
+            tracing::warn!(error = ?e, "FUSE::destroy failed to commit pending writes");
         }
         if let Err(e) = self.finalize_filesystem() {
-            tracing::warn!("FUSE::destroy failed to finalize filesystem: {}", e);
+            tracing::warn!(error = ?e, "FUSE::destroy failed to finalize filesystem");
         }
     }
 
@@ -1820,9 +1820,8 @@ impl Filesystem for AgentFSFuse {
             if drain_on_forget {
                 if let Err(error) = fs.drain_inode_writes(ino as i64).await {
                     tracing::warn!(
-                        "FUSE::forget failed to drain batched writes for inode {}: {}",
-                        ino,
-                        error
+                        ?error,
+                        "FUSE::forget failed to drain batched writes for inode {ino}"
                     );
                 }
             }
@@ -1848,9 +1847,8 @@ impl Filesystem for AgentFSFuse {
                 if drain_on_forget {
                     if let Err(error) = fs.drain_inode_writes(ino).await {
                         tracing::warn!(
-                            "FUSE::batch_forget failed to drain batched writes for inode {}: {}",
-                            ino,
-                            error
+                            ?error,
+                            "FUSE::batch_forget failed to drain batched writes for inode {ino}"
                         );
                     }
                 }
@@ -1863,13 +1861,13 @@ impl Filesystem for AgentFSFuse {
 impl Drop for AgentFSFuse {
     fn drop(&mut self) {
         if let Err(e) = self.flush_all_pending() {
-            tracing::warn!("FUSE drop failed to flush pending writes: {}", e);
+            tracing::warn!(error = ?e, "FUSE drop failed to flush pending writes");
         }
         if let Err(e) = self.commit_barrier(None) {
-            tracing::warn!("FUSE drop failed to commit pending writes: {}", e);
+            tracing::warn!(error = ?e, "FUSE drop failed to commit pending writes");
         }
         if let Err(e) = self.finalize_filesystem() {
-            tracing::warn!("FUSE drop failed to finalize filesystem: {}", e);
+            tracing::warn!(error = ?e, "FUSE drop failed to finalize filesystem");
         }
     }
 }
@@ -2143,7 +2141,10 @@ impl AgentFSFuse {
         };
         if let Some(drain) = drain {
             if let Err(error) = flush_pending_batched_out_of_lock(&self.runtime, drain) {
-                tracing::warn!("FUSE::forget failed to flush pending writes for {ino}: {error}");
+                tracing::warn!(
+                    ?error,
+                    "FUSE::forget failed to flush pending writes for {ino}"
+                );
             }
         }
     }

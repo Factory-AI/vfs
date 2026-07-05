@@ -888,8 +888,8 @@ impl AgentFSWriteBatcher {
                     Ok(false) => break,
                     Err(error) => {
                         tracing::warn!(
-                            "AgentFS write batcher: scheduled group drain failed (will retry): {}",
-                            error
+                            ?error,
+                            "AgentFS write batcher: scheduled group drain failed (will retry)"
                         );
                         break;
                     }
