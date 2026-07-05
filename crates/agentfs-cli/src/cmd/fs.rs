@@ -4,7 +4,7 @@ use agentfs_core::{AgentFSOptions, EncryptionConfig};
 use anyhow::{Context, Result as AnyhowResult};
 use turso::Value;
 
-use crate::cmd::init::open_agentfs;
+use crate::cmd::init::{finalize_readonly, open_agentfs};
 
 const ROOT_INO: i64 = 1;
 const S_IFMT: u32 = 0o170000;
@@ -30,6 +30,16 @@ pub async fn ls_filesystem(
     let agentfs = open_agentfs(options)
         .await
         .map_err(|err| super::migrate::open_error_with_guidance(err, &id_or_path))?;
+    let result = ls_opened(stdout, &agentfs, path).await;
+    finalize_readonly(&agentfs).await;
+    result
+}
+
+async fn ls_opened(
+    stdout: &mut impl std::io::Write,
+    agentfs: &agentfs_core::AgentFS,
+    path: &str,
+) -> AnyhowResult<()> {
     let conn = agentfs.get_connection().await?;
 
     let start_ino = resolve_directory_ino(&conn, path).await?;
@@ -155,13 +165,18 @@ pub async fn cat_filesystem(
         .await
         .map_err(|err| super::migrate::open_error_with_guidance(err, &id_or_path))?;
 
-    match agentfs.fs.read_file(path).await? {
-        Some(file) => {
-            stdout.write_all(&file)?;
-            Ok(())
+    let result: AnyhowResult<()> = async {
+        match agentfs.fs.read_file(path).await? {
+            Some(file) => {
+                stdout.write_all(&file)?;
+                Ok(())
+            }
+            None => anyhow::bail!("File not found: {}", path),
         }
-        None => anyhow::bail!("File not found: {}", path),
     }
+    .await;
+    finalize_readonly(&agentfs).await;
+    result
 }
 
 pub async fn write_filesystem(
@@ -256,7 +271,12 @@ pub async fn diff_filesystem(id_or_path: String) -> AnyhowResult<()> {
     let agent = open_agentfs(options)
         .await
         .map_err(|err| super::migrate::open_error_with_guidance(err, &id_or_path))?;
+    let result = diff_opened(&agent).await;
+    finalize_readonly(&agent).await;
+    result
+}
 
+async fn diff_opened(agent: &agentfs_core::AgentFS) -> AnyhowResult<()> {
     // Check if overlay is enabled
     let base_path = match agent.is_overlay_enabled().await? {
         Some(path) => path,
@@ -520,6 +540,43 @@ f c/2.md
         assert!(
             err.to_string().contains("Not a directory"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    pub async fn read_commands_leave_no_wal_sidecar() {
+        let (agentfs, path, _file) = agentfs().await;
+        write_file(&agentfs.fs, "test.md", b"1", 0, 0)
+            .await
+            .unwrap();
+        drop(agentfs);
+        let wal = format!("{path}-wal");
+
+        let mut buf = Vec::new();
+        ls_filesystem(&mut buf, path.clone(), "/", None)
+            .await
+            .unwrap();
+        assert!(
+            !std::path::Path::new(&wal).exists(),
+            "fs ls must not leave a WAL sidecar"
+        );
+
+        let mut buf = Vec::new();
+        cat_filesystem(&mut buf, path.clone(), "test.md", None)
+            .await
+            .unwrap();
+        assert!(
+            !std::path::Path::new(&wal).exists(),
+            "fs cat must not leave a WAL sidecar"
+        );
+
+        let mut buf = Vec::new();
+        cat_filesystem(&mut buf, path.clone(), "missing.md", None)
+            .await
+            .unwrap_err();
+        assert!(
+            !std::path::Path::new(&wal).exists(),
+            "a failing fs cat must not leave a WAL sidecar"
         );
     }
 

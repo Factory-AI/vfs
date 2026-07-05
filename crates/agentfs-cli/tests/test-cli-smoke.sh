@@ -89,12 +89,14 @@ env HOME="$ROOT/home" "$BIN" run --session smoke-audit -- sh -c 'echo audit-ok' 
 AUDIT_DB="$ROOT/home/.agentfs/run/smoke-audit/delta.db"
 [ -f "$AUDIT_DB" ] || fail "session delta.db missing at $AUDIT_DB"
 # The audit reopen must finalize: a leftover WAL/SHM next to the session DB
-# breaks the single-file invariant the run teardown just established. Checked
-# before timeline below, which (like any reopen) may recreate a header WAL.
+# breaks the single-file invariant the run teardown just established.
 [ ! -e "$AUDIT_DB-wal" ] || fail "run audit left $AUDIT_DB-wal behind"
 [ ! -e "$AUDIT_DB-shm" ] || fail "run audit left $AUDIT_DB-shm behind"
 run_agentfs timeline "$AUDIT_DB" --format json >"$ROOT/timeline-audit.json" 2>&1 ||
     fail "timeline on session DB failed: $(cat "$ROOT/timeline-audit.json")"
+# Read-style reopens must restore the single-file family too.
+[ ! -e "$AUDIT_DB-wal" ] || fail "timeline left $AUDIT_DB-wal behind"
+[ ! -e "$AUDIT_DB-shm" ] || fail "timeline left $AUDIT_DB-shm behind"
 grep -q '"name": "run"' "$ROOT/timeline-audit.json" || fail "timeline missing run audit row"
 grep -q 'smoke-audit' "$ROOT/timeline-audit.json" || fail "run audit row missing session id"
 grep -q '"status": "success"' "$ROOT/timeline-audit.json" || fail "run audit row not success"
@@ -142,6 +144,45 @@ run_agentfs materialize "$DB" --output "$ROOT/materialized.db" --verify >/dev/nu
 # --- integrity -------------------------------------------------------------------------
 run_agentfs integrity --json "$DB" >"$ROOT/integrity.json" 2>&1 ||
     fail "integrity failed: $(cat "$ROOT/integrity.json")"
+
+# --- read-only commands leave a single-file database family (invariant I1) --------------
+# Census every read-style reopen: each used to leave a header-only -wal next
+# to the DB after exit, which the phase8 stress gate's size==0 unlink missed.
+RDB="$ROOT/readonly.db"
+cp "$ROOT/backup.db" "$RDB"
+no_sidecars() {
+    [ ! -e "$RDB-wal" ] || fail "$1 left $RDB-wal behind"
+    [ ! -e "$RDB-shm" ] || fail "$1 left $RDB-shm behind"
+}
+no_sidecars "cp of backup.db"
+run_agentfs timeline "$RDB" >/dev/null 2>&1 || fail "timeline (read census) failed"
+no_sidecars "timeline"
+run_agentfs timeline "$RDB" --format json >/dev/null 2>&1 ||
+    fail "timeline --format json (read census) failed"
+no_sidecars "timeline --format json"
+run_agentfs fs "$RDB" ls / >/dev/null 2>&1 || fail "fs ls (read census) failed"
+no_sidecars "fs ls"
+run_agentfs fs "$RDB" cat /smoke.txt >/dev/null 2>&1 || fail "fs cat (read census) failed"
+no_sidecars "fs cat"
+if run_agentfs fs "$RDB" cat /missing.txt >/dev/null 2>&1; then
+    fail "fs cat of a missing file succeeded"
+fi
+no_sidecars "fs cat (error path)"
+run_agentfs diff "$RDB" >/dev/null 2>&1 || fail "diff (read census) failed"
+no_sidecars "diff"
+run_agentfs integrity --json "$RDB" >/dev/null 2>&1 || fail "integrity --json (read census) failed"
+no_sidecars "integrity --json"
+run_agentfs migrate "$RDB" >/dev/null 2>&1 || fail "migrate already-current (read census) failed"
+no_sidecars "migrate (already current)"
+cp "$DIR/fixtures/migrate/v0_4.db" "$ROOT/dry-run.db"
+run_agentfs migrate "$ROOT/dry-run.db" --dry-run >/dev/null 2>&1 || fail "migrate --dry-run failed"
+[ ! -e "$ROOT/dry-run.db-wal" ] || fail "migrate --dry-run left $ROOT/dry-run.db-wal behind"
+[ ! -e "$ROOT/dry-run.db-shm" ] || fail "migrate --dry-run left $ROOT/dry-run.db-shm behind"
+# sync stats errors on a non-synced local DB but must still exit single-file
+run_agentfs sync "$RDB" stats >/dev/null 2>&1 || true
+no_sidecars "sync stats"
+run_agentfs ps >/dev/null 2>&1 || fail "ps (read census) failed"
+no_sidecars "ps"
 
 # --- migrate a committed old-schema fixture ----------------------------------------------
 cp "$DIR/fixtures/migrate/v0_4.db" "$ROOT/old.db"

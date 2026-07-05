@@ -28,6 +28,18 @@ pub async fn open_agentfs(options: AgentFSOptions) -> Result<AgentFS, agentfs_co
     AgentFS::open(options).await
 }
 
+/// Restore the single-file database family before a one-shot command exits:
+/// reopening a WAL-mode database materializes a header-only `-wal` sidecar
+/// even when the command never writes, which would undo the clean teardown
+/// the owning session performed (invariant I1). Best-effort — a finalize
+/// failure (e.g. a concurrent holder of the database) must not fail a
+/// command whose real work already succeeded.
+pub async fn finalize_readonly(agentfs: &AgentFS) {
+    if let Err(error) = agentfs.fs.finalize().await {
+        eprintln!("Warning: Failed to restore the single-file database family: {error:#}");
+    }
+}
+
 pub fn build_sync_options(sync_cmd_options: &SyncCommandOptions) -> SyncOptions {
     let mut sync = SyncOptions {
         remote_url: sync_cmd_options.sync_remote_url.clone(),

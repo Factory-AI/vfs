@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use turso::transaction::{Transaction, TransactionBehavior};
 use turso::{Connection, Value};
 
-use super::safety::build_local_database;
+use super::safety::{build_local_database, ReadOnlyOpenSidecars};
 
 const S_IFMT: i64 = 0o170000;
 const S_IFREG: i64 = 0o100000;
@@ -77,6 +77,7 @@ pub async fn handle_migrate_command(
 
     // Open directly via turso::Builder (not the SDK) so the open-path version
     // gate does not reject the database migrate exists to upgrade.
+    let sidecars = ReadOnlyOpenSidecars::capture(db_path);
     let db = build_local_database(db_path, encryption).await?;
     let conn = db.connect().context("Failed to connect to database")?;
 
@@ -92,6 +93,9 @@ pub async fn handle_migrate_command(
 
     if current_version == schema::CURRENT {
         writeln!(stdout, "Database is already at schema {}.", schema::CURRENT)?;
+        drop(conn);
+        drop(db);
+        sidecars.remove_created_frameless();
         return Ok(());
     }
 
@@ -102,6 +106,9 @@ pub async fn handle_migrate_command(
         )?;
         print_pending_migrations(stdout, current_version)?;
         writeln!(stdout, "\nRun without --dry-run to apply migrations.")?;
+        drop(conn);
+        drop(db);
+        sidecars.remove_created_frameless();
     } else {
         writeln!(stdout, "\nApplying migrations...")?;
         schema::ensure_current(&conn)
@@ -2134,6 +2141,43 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("already at schema"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_in_place_migrate_read_path_leaves_single_file_family() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("current.db");
+        {
+            let agent = agentfs_core::AgentFS::open(agentfs_core::AgentFSOptions::with_path(
+                db_path.to_string_lossy(),
+            ))
+            .await
+            .unwrap();
+            agent.fs.finalize().await.unwrap();
+        }
+        let wal = PathBuf::from(format!("{}-wal", db_path.display()));
+        let shm = PathBuf::from(format!("{}-shm", db_path.display()));
+        assert!(!wal.exists(), "fixture must start as a single file");
+
+        let mut stdout = Vec::new();
+        handle_migrate_command(
+            &mut stdout,
+            db_path.to_string_lossy().into_owned(),
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        let stdout = String::from_utf8(stdout).unwrap();
+        assert!(stdout.contains("already at schema"), "{stdout}");
+        assert!(
+            !wal.exists(),
+            "already-current migrate must not leave a WAL sidecar it created"
+        );
+        assert!(
+            !shm.exists(),
+            "already-current migrate must not leave an SHM sidecar it created"
+        );
     }
 
     #[tokio::test]

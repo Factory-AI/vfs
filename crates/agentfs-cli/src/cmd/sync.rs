@@ -40,7 +40,12 @@ pub async fn handle_stats_command(
     eprintln!("Using agent: {}", id_or_path);
 
     let agent = open_agentfs(options).await?;
-    let stats = agent.sync_stats().await?;
-    stdout.write_all(serde_json::to_string(&stats)?.as_bytes())?;
-    Ok(())
+    let result: anyhow::Result<()> = async {
+        let stats = agent.sync_stats().await?;
+        stdout.write_all(serde_json::to_string(&stats)?.as_bytes())?;
+        Ok(())
+    }
+    .await;
+    crate::cmd::init::finalize_readonly(&agent).await;
+    result
 }

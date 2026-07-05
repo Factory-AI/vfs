@@ -85,7 +85,19 @@ async fn open_and_check_integrity(
     encryption: Option<&(String, String)>,
 ) -> AnyhowResult<(PathBuf, integrity::Report)> {
     let db_path = resolve_local_db_path(id_or_path)?;
-    let db = build_local_database(&db_path, encryption).await?;
+    let sidecars = ReadOnlyOpenSidecars::capture(&db_path);
+    let result = check_integrity_readonly(&db_path, require_portable, check_base, encryption).await;
+    sidecars.remove_created_frameless();
+    Ok((db_path, result?))
+}
+
+async fn check_integrity_readonly(
+    db_path: &Path,
+    require_portable: bool,
+    check_base: bool,
+    encryption: Option<&(String, String)>,
+) -> AnyhowResult<integrity::Report> {
+    let db = build_local_database(db_path, encryption).await?;
     let conn = db.connect().context("Failed to connect to database")?;
     conn.execute("PRAGMA query_only = 1", ())
         .await
@@ -93,12 +105,12 @@ async fn open_and_check_integrity(
 
     let report = integrity::check(
         &conn,
-        &integrity::CheckOpts::new(db_path.clone())
+        &integrity::CheckOpts::new(db_path.to_path_buf())
             .require_portable(require_portable)
             .check_base(check_base),
     )
     .await?;
-    Ok((db_path, report))
+    Ok(report)
 }
 
 /// Create a portable main-database backup of a local AgentFS database.
@@ -896,6 +908,50 @@ fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(format!("{}{}", path.display(), suffix))
 }
 
+/// Sidecar census around a raw turso open on a read path. turso materializes
+/// an empty `-wal` next to the main file the moment a database is opened,
+/// even for query-only connections; the frameless sidecars the open itself
+/// created must be removed on exit (single-file invariant I1) without ever
+/// touching a pre-existing family, which read paths must not mutate.
+pub(crate) struct ReadOnlyOpenSidecars {
+    wal: PathBuf,
+    shm: PathBuf,
+    wal_preexisted: bool,
+    shm_preexisted: bool,
+}
+
+impl ReadOnlyOpenSidecars {
+    pub(crate) fn capture(db_path: &Path) -> Self {
+        let wal = sidecar_path(db_path, "-wal");
+        let shm = sidecar_path(db_path, "-shm");
+        let wal_preexisted = wal.exists();
+        let shm_preexisted = shm.exists();
+        Self {
+            wal,
+            shm,
+            wal_preexisted,
+            shm_preexisted,
+        }
+    }
+
+    /// Best-effort removal of sidecars this open created. A WAL is removed
+    /// only while frameless (empty or the bare 32-byte header): once frames
+    /// exist, unlinking would drop committed data.
+    pub(crate) fn remove_created_frameless(&self) {
+        const WAL_HEADER_SIZE: u64 = 32;
+        if !self.wal_preexisted {
+            if let Ok(metadata) = fs::metadata(&self.wal) {
+                if metadata.len() <= WAL_HEADER_SIZE {
+                    let _ = fs::remove_file(&self.wal);
+                }
+            }
+        }
+        if !self.shm_preexisted && self.shm.exists() {
+            let _ = fs::remove_file(&self.shm);
+        }
+    }
+}
+
 pub(crate) fn remove_sqlite_sidecars_after_checkpoint(path: &Path) -> AnyhowResult<()> {
     let wal = sidecar_path(path, "-wal");
     if let Ok(metadata) = fs::metadata(&wal) {
@@ -1151,6 +1207,44 @@ mod tests {
         assert_eq!(
             family_before, family_after,
             "read-only integrity must not mutate the database family"
+        );
+    }
+
+    #[tokio::test]
+    async fn integrity_read_only_creates_no_sidecars() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("single-file.db");
+        {
+            let agent = AgentFS::open(AgentFSOptions::with_path(db_path.to_string_lossy()))
+                .await
+                .unwrap();
+            write_agent_file(&agent, "/hello.txt", b"hello").await;
+            agent.fs.finalize().await.unwrap();
+        }
+        let wal = PathBuf::from(format!("{}-wal", db_path.display()));
+        let shm = PathBuf::from(format!("{}-shm", db_path.display()));
+        assert!(!wal.exists(), "fixture must start as a single file");
+
+        let mut stdout = Vec::new();
+        handle_integrity_command(
+            &mut stdout,
+            db_path.to_string_lossy().to_string(),
+            false,
+            false,
+            false,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !wal.exists(),
+            "read-only integrity must not leave a WAL sidecar it created"
+        );
+        assert!(
+            !shm.exists(),
+            "read-only integrity must not leave an SHM sidecar it created"
         );
     }
 

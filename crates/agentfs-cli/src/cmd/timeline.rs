@@ -4,7 +4,7 @@ use chrono::TimeZone;
 use std::io::Write;
 use std::str::FromStr;
 
-use crate::cmd::init::open_agentfs;
+use crate::cmd::init::{finalize_readonly, open_agentfs};
 
 /// Output format for timeline display
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +46,16 @@ pub async fn show_timeline(
         .await
         .map_err(|err| super::migrate::open_error_with_guidance(err, id_or_path))?;
 
+    let result = show_timeline_opened(stdout, &agentfs, options).await;
+    finalize_readonly(&agentfs).await;
+    result
+}
+
+async fn show_timeline_opened(
+    stdout: &mut impl Write,
+    agentfs: &agentfs_core::AgentFS,
+    options: &TimelineOptions,
+) -> AnyhowResult<()> {
     let toolcalls = ToolCalls::from_pool(agentfs.get_pool())
         .await
         .context("Failed to create tool calls tracker")?;
@@ -84,13 +94,15 @@ fn truncate_with_ellipsis(s: &str, max_len: usize) -> String {
     }
 }
 
-/// Format timestamp as YYYY-MM-DD HH:MM:SS
-fn format_timestamp(timestamp: i64) -> String {
+/// Format a unix-seconds timestamp as YYYY-MM-DD HH:MM:SS. `tool_calls`
+/// stores milliseconds, but `ToolCalls` normalizes to seconds on read, so
+/// both this table column and the JSON form render second granularity.
+fn format_timestamp(timestamp_secs: i64) -> String {
     chrono::Utc
-        .timestamp_opt(timestamp, 0)
+        .timestamp_opt(timestamp_secs, 0)
         .single()
         .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-        .unwrap_or_else(|| format!("Invalid timestamp: {}", timestamp))
+        .unwrap_or_else(|| format!("Invalid timestamp: {}", timestamp_secs))
 }
 
 /// Format tool calls in table format
@@ -307,6 +319,72 @@ mod tests {
         assert!(!output.contains("tool_2"));
         assert!(!output.contains("tool_1"));
         assert!(!output.contains("tool_0"));
+    }
+
+    #[tokio::test]
+    async fn test_timeline_leaves_no_wal_sidecar() {
+        let (agentfs, path, _file) = create_test_agentfs().await;
+        agentfs.tools.start("test_tool", None).await.unwrap();
+        drop(agentfs);
+
+        let mut buf = Vec::new();
+        show_timeline(&mut buf, &path, &default_options())
+            .await
+            .unwrap();
+
+        assert!(
+            !std::path::Path::new(&format!("{path}-wal")).exists(),
+            "timeline reopen must not leave a WAL sidecar"
+        );
+        assert!(
+            !std::path::Path::new(&format!("{path}-shm")).exists(),
+            "timeline reopen must not leave an SHM sidecar"
+        );
+    }
+
+    #[test]
+    fn format_timestamp_renders_unix_seconds() {
+        assert_eq!(format_timestamp(1_600_000_000), "2020-09-13 12:26:40");
+    }
+
+    #[tokio::test]
+    async fn test_timeline_started_at_units_consistent() {
+        let (agentfs, path, _file) = create_test_agentfs().await;
+        // tool_calls stores milliseconds; both display forms must expose the
+        // same second-granularity value.
+        agentfs
+            .tools
+            .record(
+                "clock",
+                1_600_000_000_000,
+                1_600_000_000_500,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut buf = Vec::new();
+        show_timeline(&mut buf, &path, &default_options())
+            .await
+            .unwrap();
+        let table = String::from_utf8(buf).unwrap();
+        assert!(
+            table.contains("2020-09-13 12:26:40"),
+            "table must render millisecond-stored started_at as a date: {table}"
+        );
+
+        let mut buf = Vec::new();
+        let options = TimelineOptions {
+            format: "json".to_string(),
+            ..default_options()
+        };
+        show_timeline(&mut buf, &path, &options).await.unwrap();
+        let calls: Vec<serde_json::Value> = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(calls[0]["started_at"], 1_600_000_000);
+        assert_eq!(calls[0]["completed_at"], 1_600_000_000);
+        assert_eq!(calls[0]["duration_ms"], 500);
     }
 
     #[tokio::test]

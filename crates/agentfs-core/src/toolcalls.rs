@@ -488,6 +488,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn timestamps_stored_in_ms_decode_to_unix_seconds() -> Result<()> {
+        let dir = tempdir()?;
+        let db_path = dir.path().join("tools.db");
+        let tools = ToolCalls::new(db_path.to_str().unwrap()).await?;
+
+        let id = tools
+            .record(
+                "clock",
+                1_600_000_000_000,
+                1_600_000_000_500,
+                None,
+                None,
+                None,
+            )
+            .await?;
+
+        let call = tools.get(id).await?.expect("tool call should exist");
+        assert_eq!(call.started_at, 1_600_000_000);
+        assert_eq!(call.completed_at, Some(1_600_000_000));
+        assert_eq!(call.duration_ms, Some(500));
+
+        let conn = tools.pool.get_connection().await?;
+        let mut stmt = conn
+            .prepare_cached("SELECT started_at FROM tool_calls WHERE id = ?")
+            .await?;
+        let row = stmt.query_row((id,)).await?;
+        let stored = row
+            .get_value(0)
+            .ok()
+            .and_then(|v| v.as_integer().copied())
+            .expect("started_at should be an integer");
+        assert_eq!(
+            stored, 1_600_000_000_000,
+            "storage stays millisecond-granular; only decode normalizes"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn invalid_toolcall_json_propagates() -> Result<()> {
         let dir = tempdir()?;
         let db_path = dir.path().join("tools.db");
