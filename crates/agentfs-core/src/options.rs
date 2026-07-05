@@ -63,9 +63,12 @@ impl AgentFSOptions {
     }
     pub fn db_path(&self) -> Result<String> {
         // Determine database path: path takes precedence over id
-        if let Some(path) = &self.path {
+        let path = if let Some(path) = &self.path {
             // Custom path provided directly
-            Ok(path.to_string())
+            if path == ":memory:" {
+                return Ok(path.clone());
+            }
+            PathBuf::from(path)
         } else if let Some(id) = &self.id {
             // Validate agent ID to prevent path traversal attacks
             if !Self::validate_agent_id(id) {
@@ -77,11 +80,18 @@ impl AgentFSOptions {
             if !agentfs_dir.exists() {
                 std::fs::create_dir_all(agentfs_dir)?;
             }
-            Ok(format!("{}/{}.db", agentfs_dir.display(), id))
+            agentfs_dir.join(format!("{}.db", id))
         } else {
             // No id or path = ephemeral in-memory database
-            Ok(":memory:".to_string())
-        }
+            return Ok(":memory:".to_string());
+        };
+        // turso retains this string verbatim for by-path operations, and mount
+        // teardown chdirs the process to `/`; hand it an absolute path so
+        // nothing downstream can resolve it against the wrong cwd.
+        let path = std::path::absolute(path)?;
+        path.into_os_string()
+            .into_string()
+            .map_err(|p| Error::InvalidUtf8Path(PathBuf::from(p).display().to_string()))
     }
     /// Create options for a persistent agent with the given ID
     pub fn with_id(id: impl Into<String>) -> Self {

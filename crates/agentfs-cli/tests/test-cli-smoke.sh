@@ -212,6 +212,16 @@ run_agentfs sync "$RDB" stats >/dev/null 2>&1 || true
 no_sidecars "sync stats"
 run_agentfs ps >/dev/null 2>&1 || fail "ps (read census) failed"
 no_sidecars "ps"
+# exec is mount-owning: teardown chdirs to / before the sidecar sweep runs, and
+# agent-id resolution hands core a cwd-relative db path, which used to leave a
+# truncated 0-byte -wal next to the DB after exit.
+EXEC_DB="$ROOT/.agentfs/exec-census.db"
+cp "$RDB" "$EXEC_DB"
+run_agentfs exec exec-census sh -c 'echo exec-census-ok' >"$ROOT/exec-census.log" 2>&1 ||
+    fail "exec (census) failed: $(cat "$ROOT/exec-census.log")"
+grep -q "exec-census-ok" "$ROOT/exec-census.log" || fail "exec (census) output missing"
+[ ! -e "$EXEC_DB-wal" ] || fail "exec left $EXEC_DB-wal behind"
+[ ! -e "$EXEC_DB-shm" ] || fail "exec left $EXEC_DB-shm behind"
 
 # --- migrate a committed old-schema fixture ----------------------------------------------
 cp "$DIR/fixtures/migrate/v0_4.db" "$ROOT/old.db"

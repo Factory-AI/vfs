@@ -754,6 +754,35 @@ mod tests {
     }
 
     #[test]
+    fn test_db_path_is_absolute() {
+        // Mount teardown chdirs the process to `/`; a relative db path handed
+        // to turso would make every later by-path operation resolve wrong.
+        let by_path = AgentFSOptions::with_path("some-dir/relative.db")
+            .db_path()
+            .unwrap();
+        assert!(
+            std::path::Path::new(&by_path).is_absolute(),
+            "with_path must absolutize: {by_path}"
+        );
+        assert!(by_path.ends_with("/some-dir/relative.db"));
+
+        let by_id = AgentFSOptions::with_id("db-path-absolute-test")
+            .db_path()
+            .unwrap();
+        assert!(
+            std::path::Path::new(&by_id).is_absolute(),
+            "with_id must absolutize: {by_id}"
+        );
+        assert!(by_id.ends_with("/.agentfs/db-path-absolute-test.db"));
+
+        assert_eq!(AgentFSOptions::ephemeral().db_path().unwrap(), ":memory:");
+        assert_eq!(
+            AgentFSOptions::with_path(":memory:").db_path().unwrap(),
+            ":memory:"
+        );
+    }
+
+    #[test]
     fn test_resolve_valid_agent_id_formats() {
         // Setup: create .agentfs directory and test databases
         let agentfs_dir = agentfs_dir();
