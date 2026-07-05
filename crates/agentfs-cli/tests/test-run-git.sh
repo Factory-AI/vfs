@@ -1,15 +1,47 @@
 #!/bin/sh
-set -e
+set -eu
 
 echo -n "TEST git init and commit in overlay... "
 
-# Clean up any previous test directory
-rm -rf test-git-repo
+DIR="$(cd "$(dirname "$0")" && pwd)"
+CLI_DIR="$(cd "$DIR/.." && pwd)"
+
+ROOT="$(mktemp -d "${TMPDIR:-/tmp}/agentfs-run-git.XXXXXX")"
+
+cleanup() {
+    rm -rf "$ROOT"
+}
+trap cleanup EXIT INT TERM
+
+run_agentfs() {
+    if [ -n "${AGENTFS_BIN:-}" ]; then
+        "$AGENTFS_BIN" "$@"
+    else
+        cargo run --quiet --manifest-path "$CLI_DIR/Cargo.toml" -- "$@"
+    fi
+}
+
+# The user PATH may route `git` through a hook-manager shim that daemonizes
+# out of test repos (library/environment.md); pin the distro binary.
+mkdir -p "$ROOT/bin"
+for candidate in /usr/bin/git /bin/git; do
+    if [ -x "$candidate" ]; then
+        ln -sf "$candidate" "$ROOT/bin/git"
+        break
+    fi
+done
+[ -e "$ROOT/bin/git" ] || ln -sf "$(command -v git)" "$ROOT/bin/git"
+PATH="$ROOT/bin:$PATH"
+export PATH
+
+# The temp root is the overlay base layer; the session DB lands under
+# $ROOT/.agentfs instead of the repo working tree.
+cd "$ROOT"
 
 # Run git operations in overlay: init, add, commit.
 # Identity is set explicitly: read scoping hides ~/.gitconfig inside the
 # sandbox, and CI runners have no global identity anyway.
-output=$(cargo run -- run /bin/bash -c '
+output=$(run_agentfs run /bin/bash -c '
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 export GIT_AUTHOR_NAME="AgentFS Test" GIT_AUTHOR_EMAIL="agentfs-test@example.com"
 export GIT_COMMITTER_NAME="AgentFS Test" GIT_COMMITTER_EMAIL="agentfs-test@example.com"
@@ -32,7 +64,6 @@ echo "$output" | grep -q "Initial commit" || {
 # Verify the directory was NOT written to the host (it's in the delta layer)
 if [ -d "test-git-repo" ]; then
     echo "FAILED: test-git-repo should not exist on host filesystem"
-    rm -rf test-git-repo
     exit 1
 fi
 

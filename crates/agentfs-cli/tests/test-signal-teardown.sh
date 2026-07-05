@@ -226,7 +226,10 @@ assert_no_processes() {
 new_case_home() {
     name="$1"
     TEST_HOME="$TEST_ROOT/home-$name"
-    mkdir -p "$TEST_HOME/.cache" "$TEST_HOME/.config"
+    mkdir -p "$TEST_HOME/.cache" "$TEST_HOME/.config" "$TEST_HOME/git-hooks-none"
+    # Hookless git config: the user's hook manager must not daemonize out of
+    # case repos under this temp HOME (library/environment.md).
+    printf '[core]\n\thooksPath = %s\n' "$TEST_HOME/git-hooks-none" >"$TEST_HOME/.gitconfig"
 }
 
 run_init_signal_case() {
@@ -345,7 +348,16 @@ TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/agentfs-signal-teardown.XXXXXX")"
 BEFORE_INIT_DIRS="$TEST_ROOT/before-init-dirs.txt"
 BEFORE_CLONE_DIRS="$TEST_ROOT/before-clone-dirs.txt"
 BEFORE_EXEC_DIRS="$TEST_ROOT/before-exec-dirs.txt"
-REAL_GIT="$(command -v git)"
+# Pin the distro git binary: the user's PATH may route `git` through a
+# hook-manager shim that daemonizes out of test repos (library/environment.md).
+REAL_GIT=""
+for candidate in /usr/bin/git /bin/git; do
+    if [ -x "$candidate" ]; then
+        REAL_GIT="$candidate"
+        break
+    fi
+done
+[ -n "$REAL_GIT" ] || REAL_GIT="$(command -v git)"
 snapshot_tmp_dirs "agentfs-init-" "$BEFORE_INIT_DIRS"
 snapshot_tmp_dirs "agentfs-clone-" "$BEFORE_CLONE_DIRS"
 snapshot_tmp_dirs "agentfs-exec-" "$BEFORE_EXEC_DIRS"

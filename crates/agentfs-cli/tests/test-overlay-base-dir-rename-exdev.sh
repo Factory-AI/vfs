@@ -1,25 +1,37 @@
 #!/bin/sh
-set -e
+set -eu
 
 echo -n "TEST overlay base directory rename EXDEV fallback... "
 
+DIR="$(cd "$(dirname "$0")" && pwd)"
+CLI_DIR="$(cd "$DIR/.." && pwd)"
+
 TEST_AGENT_ID="test-overlay-base-dir-rename-agent"
-TMPDIR="${TMPDIR:-/tmp}/agentfs-test-overlay-base-dir-rename-$$"
-MOUNTPOINT="$TMPDIR/mnt"
-BASEDIR="$TMPDIR/base"
-MOUNT_LOG="$TMPDIR/mount.log"
+ROOT="$(mktemp -d "${TMPDIR:-/tmp}/agentfs-overlay-rename.XXXXXX")"
+MOUNTPOINT="$ROOT/mnt"
+BASEDIR="$ROOT/base"
+MOUNT_LOG="$ROOT/mount.log"
 
 cleanup() {
     fusermount3 -u "$MOUNTPOINT" 2>/dev/null || fusermount -u "$MOUNTPOINT" 2>/dev/null || true
     if [ "${MOUNT_PID:-}" ]; then
         wait "$MOUNT_PID" 2>/dev/null || true
     fi
-    rm -f ".agentfs/${TEST_AGENT_ID}.db" ".agentfs/${TEST_AGENT_ID}.db-shm" ".agentfs/${TEST_AGENT_ID}.db-wal"
-    rm -rf "$TMPDIR" 2>/dev/null || true
+    rm -rf "$ROOT" 2>/dev/null || true
 }
 
-trap cleanup EXIT
-cleanup
+trap cleanup EXIT INT TERM
+
+run_agentfs() {
+    if [ -n "${AGENTFS_BIN:-}" ]; then
+        "$AGENTFS_BIN" "$@"
+    else
+        cargo run --quiet --manifest-path "$CLI_DIR/Cargo.toml" -- "$@"
+    fi
+}
+
+# The session DB lands under $ROOT/.agentfs instead of the repo working tree.
+cd "$ROOT"
 
 mkdir -p \
     "$BASEDIR/rename_probe/sub" \
@@ -36,13 +48,13 @@ printf "merged probe nested\n" > "$BASEDIR/merged_probe/sub/nested.txt"
 printf "merged mv root\n" > "$BASEDIR/merged_mv_src/root.txt"
 printf "merged mv nested\n" > "$BASEDIR/merged_mv_src/sub/nested.txt"
 
-if ! output=$(cargo run -- init "$TEST_AGENT_ID" --base "$BASEDIR" 2>&1); then
+if ! output=$(run_agentfs init "$TEST_AGENT_ID" --base "$BASEDIR" 2>&1); then
     echo "FAILED: init with --base failed"
     echo "Output was: $output"
     exit 1
 fi
 
-cargo run -- mount ".agentfs/${TEST_AGENT_ID}.db" "$MOUNTPOINT" --foreground >"$MOUNT_LOG" 2>&1 &
+run_agentfs mount ".agentfs/${TEST_AGENT_ID}.db" "$MOUNTPOINT" --foreground >"$MOUNT_LOG" 2>&1 &
 MOUNT_PID=$!
 
 MAX_WAIT=10

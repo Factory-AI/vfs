@@ -9,6 +9,17 @@ set -u
 
 echo "TEST run read scoping..."
 
+DIR="$(cd "$(dirname "$0")" && pwd)"
+CLI_DIR="$(cd "$DIR/.." && pwd)"
+
+run_agentfs() {
+    if [ -n "${AGENTFS_BIN:-}" ]; then
+        "$AGENTFS_BIN" "$@"
+    else
+        cargo run --quiet --manifest-path "$CLI_DIR/Cargo.toml" -- "$@"
+    fi
+}
+
 session_prefix="scope-test-$$"
 tmp_secret_dir="$(mktemp -d)"
 home_secret_dir="$(mktemp -d "${HOME}/.agentfs-scope-test.XXXXXX")"
@@ -34,7 +45,7 @@ fail() {
 }
 
 # Leg 1 (denied reads): neither the tmp nor the home secret is reachable.
-denied_output=$(cargo run -- run --no-default-allows --session "${session_prefix}-denied" \
+denied_output=$(run_agentfs run --no-default-allows --session "${session_prefix}-denied" \
     /bin/sh -c "cat '$tmp_secret_dir/secret.txt'; cat '$home_secret_dir/secret.txt'" 2>&1)
 denied_status=$?
 case "$denied_output" in
@@ -43,13 +54,13 @@ esac
 [ "$denied_status" -ne 0 ] || fail "denied run exited 0; expected the final cat to fail" "$denied_output"
 
 # Leg 2 (denied writes): a write to a scoped host path must not reach the host.
-write_output=$(cargo run -- run --no-default-allows --session "${session_prefix}-write" \
+write_output=$(run_agentfs run --no-default-allows --session "${session_prefix}-write" \
     /bin/sh -c "echo intruder >'$tmp_secret_dir/evil.txt'" 2>&1)
 [ ! -f "$tmp_secret_dir/evil.txt" ] || fail "sandbox write escaped to the host" "$write_output"
 [ "$(cat "$tmp_secret_dir/secret.txt")" = "s3cr3t-tmp" ] || fail "host secret was mutated" "$write_output"
 
 # Leg 3 (allowed reads): --allow re-exposes the directory with exact bytes.
-allowed_output=$(cargo run -- run --no-default-allows --allow "$tmp_secret_dir" \
+allowed_output=$(run_agentfs run --no-default-allows --allow "$tmp_secret_dir" \
     --session "${session_prefix}-allowed" \
     /bin/sh -c "cat '$tmp_secret_dir/secret.txt'" 2>&1)
 allowed_status=$?

@@ -1,23 +1,39 @@
 #!/bin/sh
-set -e
+set -eu
 
 echo -n "TEST symlink handling... "
 
+DIR="$(cd "$(dirname "$0")" && pwd)"
+CLI_DIR="$(cd "$DIR/.." && pwd)"
+
+ROOT="$(mktemp -d "${TMPDIR:-/tmp}/agentfs-symlinks.XXXXXX")"
+
+cleanup() {
+    rm -rf "$ROOT"
+}
+trap cleanup EXIT INT TERM
+
+run_agentfs() {
+    if [ -n "${AGENTFS_BIN:-}" ]; then
+        "$AGENTFS_BIN" "$@"
+    else
+        cargo run --quiet --manifest-path "$CLI_DIR/Cargo.toml" -- "$@"
+    fi
+}
+
+# The temp root is the overlay base layer; the session DB lands under
+# $ROOT/.agentfs instead of the repo working tree.
+cd "$ROOT"
+
 # Create test directory with symlinks on the host (these will be visible in the sandbox)
-TEST_DIR=".agentfs/symlink-test-$$"
-rm -rf "$TEST_DIR"
+TEST_DIR="symlink-test"
 mkdir -p "$TEST_DIR/target_dir"
 echo "test content" > "$TEST_DIR/target_dir/file.txt"
 ln -s target_dir "$TEST_DIR/link_to_dir"
 ln -s target_dir/file.txt "$TEST_DIR/link_to_file"
 
-cleanup() {
-    rm -rf "$TEST_DIR"
-}
-trap cleanup EXIT
-
 # Test 1 & 2: Verify symlinks are reported correctly (not as directories)
-output=$(cargo run -- run /bin/bash -c "ls -la $TEST_DIR/" 2>&1)
+output=$(run_agentfs run /bin/bash -c "ls -la $TEST_DIR/" 2>&1)
 
 # The output should contain 'lrwxrwxrwx' for symlinks (not 'drwxr-xr-x' for directory)
 if ! echo "$output" | grep -qE "^lrwx.* link_to_dir"; then
@@ -34,7 +50,7 @@ fi
 
 # Test 3: Verify rm can remove symlink to directory (this was the original bug)
 # Previously this would fail with "Is a directory" because symlinks were misidentified
-output=$(cargo run -- run /bin/bash -c "rm $TEST_DIR/link_to_dir && echo 'symlink removed successfully'" 2>&1)
+output=$(run_agentfs run /bin/bash -c "rm $TEST_DIR/link_to_dir && echo 'symlink removed successfully'" 2>&1)
 
 if ! echo "$output" | grep -q "symlink removed successfully"; then
     echo "FAILED: could not remove symlink to directory"
@@ -50,7 +66,7 @@ if ! cat "$TEST_DIR/target_dir/file.txt" | grep -q "test content"; then
 fi
 
 # Test 5: Create a symlink inside the sandbox (tests FUSE symlink creation)
-output=$(cargo run -- run /bin/bash -c "ln -s target_dir/file.txt $TEST_DIR/new_symlink && readlink $TEST_DIR/new_symlink" 2>&1)
+output=$(run_agentfs run /bin/bash -c "ln -s target_dir/file.txt $TEST_DIR/new_symlink && readlink $TEST_DIR/new_symlink" 2>&1)
 
 if ! echo "$output" | grep -q "target_dir/file.txt"; then
     echo "FAILED: could not create symlink in sandbox"
@@ -59,7 +75,7 @@ if ! echo "$output" | grep -q "target_dir/file.txt"; then
 fi
 
 # Test 6: Create and follow symlink to read file content
-output=$(cargo run -- run /bin/bash -c "ln -s target_dir $TEST_DIR/new_dir_link && cat $TEST_DIR/new_dir_link/file.txt" 2>&1)
+output=$(run_agentfs run /bin/bash -c "ln -s target_dir $TEST_DIR/new_dir_link && cat $TEST_DIR/new_dir_link/file.txt" 2>&1)
 
 if ! echo "$output" | grep -q "test content"; then
     echo "FAILED: could not read through newly created symlink"
@@ -68,7 +84,7 @@ if ! echo "$output" | grep -q "test content"; then
 fi
 
 # Test 7: Verify symlinks created in sandbox are visible via ls -l
-output=$(cargo run -- run /bin/bash -c "ln -s foo $TEST_DIR/test_link && ls -la $TEST_DIR/test_link" 2>&1)
+output=$(run_agentfs run /bin/bash -c "ln -s foo $TEST_DIR/test_link && ls -la $TEST_DIR/test_link" 2>&1)
 
 if ! echo "$output" | grep -qE "^lrwx.*test_link -> foo"; then
     echo "FAILED: newly created symlink not shown correctly in ls"

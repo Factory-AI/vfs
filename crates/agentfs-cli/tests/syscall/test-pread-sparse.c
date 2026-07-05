@@ -30,13 +30,6 @@ int test_pread_sparse(const char *base_path) {
     char buf1[4096];
     memset(buf1, 'A', sizeof(buf1));
     ssize_t n = pwrite(fd, buf1, sizeof(buf1), 0);
-    if (n < 0 && errno == EBADF) {
-        /* Experimental sandbox doesn't support pwrite, skip test */
-        printf("  pwrite not supported, skipping test\n");
-        close(fd);
-        unlink(path);
-        return 0;
-    }
     TEST_ASSERT_ERRNO(n == sizeof(buf1), "pwrite at 0 should succeed");
 
     /* Skip 8KB (create a hole), write at offset 12KB */
@@ -59,7 +52,6 @@ int test_pread_sparse(const char *base_path) {
      * 20480-24575: 'C' (written)
      */
 
-    /* fsync is optional - experimental sandbox doesn't support it */
     fsync(fd);
     close(fd);
 

@@ -169,6 +169,17 @@ mountpoint -q "$MNT" || fail "migrated database did not mount: $(tail -5 "$ROOT/
     cd "$MNT"
     mkdir -p repo && cd repo
     export HOME="$ROOT/home" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+    # Pin the distro git: the user's PATH shim daemonizes hook managers out
+    # of test repos (library/environment.md).
+    for candidate in /usr/bin/git /bin/git; do
+        if [ -x "$candidate" ]; then
+            mkdir -p "$ROOT/home/bin"
+            ln -sf "$candidate" "$ROOT/home/bin/git"
+            PATH="$ROOT/home/bin:$PATH"
+            export PATH
+            break
+        fi
+    done
     git init -q .
     git config user.email agentfs@example.invalid
     git config user.name AgentFS

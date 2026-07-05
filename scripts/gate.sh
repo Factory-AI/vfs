@@ -16,6 +16,14 @@ RUST_TOOLCHAIN="${RUST_TOOLCHAIN:-nightly}"
 SHELL_TIMEOUT="${AGENTFS_GATE_SHELL_TIMEOUT:-900}"
 PHASE8_TIMEOUT="${AGENTFS_GATE_PHASE8_TIMEOUT:-20}"
 
+# Pin TMPDIR to a per-run scratch dir cleaned on exit: turso_core 0.5.3 leaks
+# /tmp/tursodb-ephemeral-* sort-spill files (vdbe/execute.rs:10096 never
+# unlinks them), so dependency litter must not accumulate on the host.
+GATE_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/agentfs-gate.XXXXXX")"
+trap 'rm -rf "$GATE_TMPDIR"' EXIT
+export TMPDIR="$GATE_TMPDIR" TMP="$GATE_TMPDIR" TEMP="$GATE_TMPDIR"
+export PYTHONDONTWRITEBYTECODE=1
+
 run() {
     printf '\n==> %s\n' "$*"
     "$@"
@@ -33,6 +41,7 @@ run_cargo build --release --workspace --bins
 
 printf '\n==> crates/agentfs-cli/tests/all.sh\n'
 AGENTFS_GATE_STRICT=1 \
+AGENTFS_BIN="$AGENTFS_BIN" \
 CORRUPTION_TORTURE_WORKERS="${CORRUPTION_TORTURE_WORKERS:-4}" \
 CORRUPTION_TORTURE_ITERATIONS="${CORRUPTION_TORTURE_ITERATIONS:-3}" \
 CORRUPTION_TORTURE_TIMEOUT="${CORRUPTION_TORTURE_TIMEOUT:-120}" \

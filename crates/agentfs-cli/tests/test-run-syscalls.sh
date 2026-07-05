@@ -3,27 +3,47 @@
 # Test syscalls through agentfs run (FUSE overlay).
 #
 # This tests the copy-on-write behavior when files exist in the base layer
-# (host filesystem) and are modified through the overlay.
+# and are modified through the overlay.
 #
 # Requires user namespaces support.
 #
-set -e
+set -eu
 
 echo -n "TEST syscalls (agentfs run - FUSE overlay)... "
 
-DIR="$(dirname "$0")"
+DIR="$(cd "$(dirname "$0")" && pwd)"
+CLI_DIR="$(cd "$DIR/.." && pwd)"
 
-# Compile the test program
+ROOT="$(mktemp -d "${TMPDIR:-/tmp}/agentfs-run-syscalls.XXXXXX")"
+
+cleanup() {
+    rm -rf "$ROOT"
+}
+trap cleanup EXIT INT TERM
+
+fail() {
+    echo "FAILED: $*"
+    exit 1
+}
+
+run_agentfs() {
+    if [ -n "${AGENTFS_BIN:-}" ]; then
+        "$AGENTFS_BIN" "$@"
+    else
+        cargo run --quiet --manifest-path "$CLI_DIR/Cargo.toml" -- "$@"
+    fi
+}
+
+# Compile the test program (artifacts stay in the source tree; gitignored).
 make -C "$DIR/syscall" clean > /dev/null 2>&1
 make -C "$DIR/syscall" > /dev/null 2>&1
+cp "$DIR/syscall/test-syscalls" "$ROOT/test-syscalls"
 
-TEST_DB="agent.db"
+# The temp root is the overlay base layer; the session DB lands under
+# $ROOT/.agentfs instead of the repo working tree.
+cd "$ROOT"
 
-# Clean up any existing test database
-rm -f "$TEST_DB" "${TEST_DB}-wal" "${TEST_DB}-shm"
-
-# Initialize the database
-cargo run -- init > /dev/null 2>&1
+run_agentfs init > /dev/null 2>&1
 
 # Create pre-existing files in the BASE LAYER (current directory)
 # These will trigger copy-on-write when modified through the overlay
@@ -64,23 +84,15 @@ echo -n "content for fallocate copyup test" > copyup_fallocate_test.txt
 # - Files from current directory are visible (base layer)
 # - Modifications go to the delta layer (AgentFS database)
 # - O_APPEND on existing.txt triggers copy-on-write
-if ! output=$(cargo run -- run "$DIR/syscall/test-syscalls" . 2>&1); then
-    echo "FAILED"
-    echo "Output was: $output"
-    rm -rf "$TEST_DB" "${TEST_DB}-wal" "${TEST_DB}-shm" existing.txt test.txt subdir executable_base.txt copyup_*_test.txt readonly.txt
-    exit 1
-fi
+output=$(run_agentfs run ./test-syscalls . 2>&1) ||
+    fail "run exited nonzero
+Output was: $output"
 
-echo "$output" | grep -q "All tests passed!" || {
-    echo "FAILED: 'All tests passed!' not found"
-    echo "Output was: $output"
-    rm -rf "$TEST_DB" "${TEST_DB}-wal" "${TEST_DB}-shm" existing.txt test.txt subdir executable_base.txt copyup_*_test.txt readonly.txt
-    exit 1
-}
+echo "$output" | grep -q "All tests passed!" ||
+    fail "'All tests passed!' not found
+Output was: $output"
 
 # Note: output.txt is created in the delta layer (session-specific) so we can't
 # verify it with a separate agentfs run. The "All tests passed!" check is sufficient.
-
-rm -rf "$TEST_DB" "${TEST_DB}-wal" "${TEST_DB}-shm" existing.txt test.txt subdir executable_base.txt copyup_*_test.txt readonly.txt
 
 echo "OK"

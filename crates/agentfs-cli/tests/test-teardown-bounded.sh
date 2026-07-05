@@ -305,6 +305,23 @@ run_leg() {
     JOINER_LOG="$LOGDIR/joiner.log"
     mkdir -p "$TEST_HOME/.cache" "$TEST_HOME/.config" "$WORKDIR" "$LOGDIR"
 
+    # The user's PATH may route `git` through a hook-manager shim that
+    # daemonizes out of test repos (library/environment.md); pin the distro
+    # binary and give the temp HOME a hookless git config.
+    mkdir -p "$TEST_HOME/bin" "$TEST_HOME/git-hooks-none"
+    GIT_REAL=""
+    for candidate in /usr/bin/git /bin/git; do
+        if [ -x "$candidate" ]; then
+            GIT_REAL="$candidate"
+            break
+        fi
+    done
+    [ -n "$GIT_REAL" ] || GIT_REAL="$(command -v git)"
+    ln -sf "$GIT_REAL" "$TEST_HOME/bin/git"
+    printf '[core]\n\thooksPath = %s\n' "$TEST_HOME/git-hooks-none" >"$TEST_HOME/.gitconfig"
+    PATH="$TEST_HOME/bin:$PATH"
+    export PATH
+
     (
         cd "$WORKDIR"
         HOME="$TEST_HOME" \

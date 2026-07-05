@@ -5,42 +5,61 @@
 # After readdirplus populates the dcache, unlink/rmdir/rename must
 # invalidate the affected entries so subsequent readdir sees the change.
 #
-set -e
+set -eu
 
 echo -n "TEST fuse cache invalidation after mutations... "
 
-TEST_AGENT_ID="test-fuse-cache-inval-agent"
-MOUNTPOINT="/tmp/agentfs-test-cache-inval-$$"
+DIR="$(cd "$(dirname "$0")" && pwd)"
+CLI_DIR="$(cd "$DIR/.." && pwd)"
 
-cleanup() {
-    # Unmount if mounted
-    fusermount -u "$MOUNTPOINT" 2>/dev/null || true
-    # Wait for FUSE process to exit after unmount
-    [ -n "$MOUNT_PID" ] && wait $MOUNT_PID 2>/dev/null || true
-    # Remove mountpoint
-    rmdir "$MOUNTPOINT" 2>/dev/null || true
-    # Remove test database
-    rm -f ".agentfs/${TEST_AGENT_ID}.db" ".agentfs/${TEST_AGENT_ID}.db-shm" ".agentfs/${TEST_AGENT_ID}.db-wal"
+TEST_AGENT_ID="test-fuse-cache-inval-agent"
+ROOT="$(mktemp -d "${TMPDIR:-/tmp}/agentfs-cache-inval.XXXXXX")"
+MOUNTPOINT="$ROOT/mnt"
+MOUNT_PID=""
+
+unmount_quiet() {
+    fusermount3 -u "$MOUNTPOINT" 2>/dev/null ||
+        fusermount -u "$MOUNTPOINT" 2>/dev/null || true
 }
 
-# Ensure cleanup on exit
-trap cleanup EXIT
+cleanup() {
+    unmount_quiet
+    if [ -n "$MOUNT_PID" ]; then
+        kill "$MOUNT_PID" 2>/dev/null || true
+        wait "$MOUNT_PID" 2>/dev/null || true
+    fi
+    rm -rf "$ROOT"
+}
+trap cleanup EXIT INT TERM
 
-# Clean up any existing test artifacts
-cleanup
+fail() {
+    echo "FAILED: $*"
+    exit 1
+}
+
+run_agentfs() {
+    if [ -n "${AGENTFS_BIN:-}" ]; then
+        "$AGENTFS_BIN" "$@"
+    else
+        cargo run --quiet --manifest-path "$CLI_DIR/Cargo.toml" -- "$@"
+    fi
+}
+
+# The session DB lands under $ROOT/.agentfs instead of the repo working tree.
+cd "$ROOT"
 
 # Initialize the database
-cargo run -- init "$TEST_AGENT_ID" > /dev/null 2>&1
+run_agentfs init "$TEST_AGENT_ID" > /dev/null 2>&1
 
 # Create mountpoint
 mkdir -p "$MOUNTPOINT"
 
 # Mount in foreground mode (background it ourselves so we can control it)
-cargo run -- mount ".agentfs/${TEST_AGENT_ID}.db" "$MOUNTPOINT" --foreground &
+run_agentfs mount ".agentfs/${TEST_AGENT_ID}.db" "$MOUNTPOINT" --foreground &
 MOUNT_PID=$!
 
 # Wait for mount to be ready
-MAX_WAIT=10
+MAX_WAIT=20
 WAITED=0
 while [ $WAITED -lt $MAX_WAIT ]; do
     if mountpoint -q "$MOUNTPOINT" 2>/dev/null; then
@@ -50,12 +69,7 @@ while [ $WAITED -lt $MAX_WAIT ]; do
     WAITED=$((WAITED + 1))
 done
 
-if ! mountpoint -q "$MOUNTPOINT" 2>/dev/null; then
-    echo "FAILED: mount did not become ready in time"
-    kill $MOUNT_PID 2>/dev/null || true
-    wait $MOUNT_PID 2>/dev/null || true
-    exit 1
-fi
+mountpoint -q "$MOUNTPOINT" 2>/dev/null || fail "mount did not become ready in time"
 
 # Test 1: unlink should not leave stale entries in readdir
 # Populate the directory with files
@@ -75,24 +89,14 @@ rm "$MOUNTPOINT/file1.txt"
 
 LS_OUTPUT=$(ls "$MOUNTPOINT")
 if echo "$LS_OUTPUT" | grep -q "file1.txt"; then
-    echo "FAILED: readdir still shows file1.txt after unlink"
-    echo "ls output was: $LS_OUTPUT"
-    kill $MOUNT_PID 2>/dev/null || true
-    wait $MOUNT_PID 2>/dev/null || true
-    exit 1
+    fail "readdir still shows file1.txt after unlink
+ls output was: $LS_OUTPUT"
 fi
 
-if ! echo "$LS_OUTPUT" | grep -q "file2.txt"; then
-    echo "FAILED: file2.txt disappeared"
-    kill $MOUNT_PID 2>/dev/null || true
-    wait $MOUNT_PID 2>/dev/null || true
-    exit 1
-fi
+echo "$LS_OUTPUT" | grep -q "file2.txt" || fail "file2.txt disappeared"
+
 if stat "$MOUNTPOINT/file1.txt" > /dev/null 2>&1; then
-    echo "FAILED: stat still resolves file1.txt after unlink"
-    kill $MOUNT_PID 2>/dev/null || true
-    wait $MOUNT_PID 2>/dev/null || true
-    exit 1
+    fail "stat still resolves file1.txt after unlink"
 fi
 
 # Test 2: rmdir should not leave stale entries in readdir
@@ -105,17 +109,11 @@ rmdir "$MOUNTPOINT/subdir"
 
 LS_OUTPUT=$(ls "$MOUNTPOINT")
 if echo "$LS_OUTPUT" | grep -q "subdir"; then
-    echo "FAILED: readdir still shows subdir after rmdir"
-    echo "ls output was: $LS_OUTPUT"
-    kill $MOUNT_PID 2>/dev/null || true
-    wait $MOUNT_PID 2>/dev/null || true
-    exit 1
+    fail "readdir still shows subdir after rmdir
+ls output was: $LS_OUTPUT"
 fi
 if stat "$MOUNTPOINT/subdir" > /dev/null 2>&1; then
-    echo "FAILED: stat still resolves subdir after rmdir"
-    kill $MOUNT_PID 2>/dev/null || true
-    wait $MOUNT_PID 2>/dev/null || true
-    exit 1
+    fail "stat still resolves subdir after rmdir"
 fi
 
 # Test 3: rename should not leave stale source entry in readdir
@@ -128,32 +126,18 @@ mv "$MOUNTPOINT/before.txt" "$MOUNTPOINT/after.txt"
 
 LS_OUTPUT=$(ls "$MOUNTPOINT")
 if echo "$LS_OUTPUT" | grep -q "before.txt"; then
-    echo "FAILED: readdir still shows before.txt after rename"
-    echo "ls output was: $LS_OUTPUT"
-    kill $MOUNT_PID 2>/dev/null || true
-    wait $MOUNT_PID 2>/dev/null || true
-    exit 1
+    fail "readdir still shows before.txt after rename
+ls output was: $LS_OUTPUT"
 fi
 
-if ! echo "$LS_OUTPUT" | grep -q "after.txt"; then
-    echo "FAILED: after.txt not visible after rename"
-    echo "ls output was: $LS_OUTPUT"
-    kill $MOUNT_PID 2>/dev/null || true
-    wait $MOUNT_PID 2>/dev/null || true
-    exit 1
-fi
+echo "$LS_OUTPUT" | grep -q "after.txt" || fail "after.txt not visible after rename
+ls output was: $LS_OUTPUT"
+
 if stat "$MOUNTPOINT/before.txt" > /dev/null 2>&1; then
-    echo "FAILED: stat still resolves before.txt after rename"
-    kill $MOUNT_PID 2>/dev/null || true
-    wait $MOUNT_PID 2>/dev/null || true
-    exit 1
+    fail "stat still resolves before.txt after rename"
 fi
-if [ "$(cat "$MOUNTPOINT/after.txt")" != "rename me" ]; then
-    echo "FAILED: after.txt content is stale after rename"
-    kill $MOUNT_PID 2>/dev/null || true
-    wait $MOUNT_PID 2>/dev/null || true
-    exit 1
-fi
+[ "$(cat "$MOUNTPOINT/after.txt")" = "rename me" ] ||
+    fail "after.txt content is stale after rename"
 
 # Test 4: create must defeat a cached negative dentry
 # Prime a negative dentry: stat a name that doesn't exist yet
@@ -164,22 +148,13 @@ ls -la "$MOUNTPOINT" > /dev/null                          # readdirplus confirms
 echo "new file" > "$MOUNTPOINT/negfile.txt"
 
 # stat must resolve (not serve cached ENOENT)
-if ! stat "$MOUNTPOINT/negfile.txt" > /dev/null 2>&1; then
-    echo "FAILED: stat returns ENOENT for negfile.txt after create (negative dentry not invalidated)"
-    kill $MOUNT_PID 2>/dev/null || true
-    wait $MOUNT_PID 2>/dev/null || true
-    exit 1
-fi
+stat "$MOUNTPOINT/negfile.txt" > /dev/null 2>&1 ||
+    fail "stat returns ENOENT for negfile.txt after create (negative dentry not invalidated)"
 
 # readdir must list it
 LS_OUTPUT=$(ls "$MOUNTPOINT")
-if ! echo "$LS_OUTPUT" | grep -q "negfile.txt"; then
-    echo "FAILED: readdir does not show negfile.txt after create"
-    echo "ls output was: $LS_OUTPUT"
-    kill $MOUNT_PID 2>/dev/null || true
-    wait $MOUNT_PID 2>/dev/null || true
-    exit 1
-fi
+echo "$LS_OUTPUT" | grep -q "negfile.txt" || fail "readdir does not show negfile.txt after create
+ls output was: $LS_OUTPUT"
 
 # Test 5: mkdir must defeat a cached negative dentry
 ls -la "$MOUNTPOINT" > /dev/null
@@ -188,21 +163,12 @@ ls -la "$MOUNTPOINT" > /dev/null                          # readdirplus confirms
 
 mkdir "$MOUNTPOINT/negdir"
 
-if ! stat "$MOUNTPOINT/negdir" > /dev/null 2>&1; then
-    echo "FAILED: stat returns ENOENT for negdir after mkdir (negative dentry not invalidated)"
-    kill $MOUNT_PID 2>/dev/null || true
-    wait $MOUNT_PID 2>/dev/null || true
-    exit 1
-fi
+stat "$MOUNTPOINT/negdir" > /dev/null 2>&1 ||
+    fail "stat returns ENOENT for negdir after mkdir (negative dentry not invalidated)"
 
 LS_OUTPUT=$(ls "$MOUNTPOINT")
-if ! echo "$LS_OUTPUT" | grep -q "negdir"; then
-    echo "FAILED: readdir does not show negdir after mkdir"
-    echo "ls output was: $LS_OUTPUT"
-    kill $MOUNT_PID 2>/dev/null || true
-    wait $MOUNT_PID 2>/dev/null || true
-    exit 1
-fi
+echo "$LS_OUTPUT" | grep -q "negdir" || fail "readdir does not show negdir after mkdir
+ls output was: $LS_OUTPUT"
 
 # Test 6: truncate must invalidate stale attrs and cached file data
 printf "abcdefghij" > "$MOUNTPOINT/truncate.txt"
@@ -211,19 +177,9 @@ stat "$MOUNTPOINT/truncate.txt" > /dev/null 2>&1
 truncate -s 4 "$MOUNTPOINT/truncate.txt"
 
 TRUNC_SIZE=$(wc -c < "$MOUNTPOINT/truncate.txt" | tr -d ' ')
-if [ "$TRUNC_SIZE" != "4" ]; then
-    echo "FAILED: truncate.txt size is stale after truncate: $TRUNC_SIZE"
-    kill $MOUNT_PID 2>/dev/null || true
-    wait $MOUNT_PID 2>/dev/null || true
-    exit 1
-fi
+[ "$TRUNC_SIZE" = "4" ] || fail "truncate.txt size is stale after truncate: $TRUNC_SIZE"
 TRUNC_CONTENT=$(cat "$MOUNTPOINT/truncate.txt")
-if [ "$TRUNC_CONTENT" != "abcd" ]; then
-    echo "FAILED: truncate.txt content is stale after truncate: $TRUNC_CONTENT"
-    kill $MOUNT_PID 2>/dev/null || true
-    wait $MOUNT_PID 2>/dev/null || true
-    exit 1
-fi
+[ "$TRUNC_CONTENT" = "abcd" ] || fail "truncate.txt content is stale after truncate: $TRUNC_CONTENT"
 
 # Test 7: repeated read/open cache must not serve stale data after write
 printf "cache-before" > "$MOUNTPOINT/keep-cache.txt"
@@ -231,25 +187,18 @@ cat "$MOUNTPOINT/keep-cache.txt" > /dev/null
 cat "$MOUNTPOINT/keep-cache.txt" > /dev/null
 printf "cache-after" > "$MOUNTPOINT/keep-cache.txt"
 KEEP_CACHE_CONTENT=$(cat "$MOUNTPOINT/keep-cache.txt")
-if [ "$KEEP_CACHE_CONTENT" != "cache-after" ]; then
-    echo "FAILED: keep-cache.txt content is stale after overwrite: $KEEP_CACHE_CONTENT"
-    kill $MOUNT_PID 2>/dev/null || true
-    wait $MOUNT_PID 2>/dev/null || true
-    exit 1
-fi
+[ "$KEEP_CACHE_CONTENT" = "cache-after" ] ||
+    fail "keep-cache.txt content is stale after overwrite: $KEEP_CACHE_CONTENT"
 truncate -s 5 "$MOUNTPOINT/keep-cache.txt"
 KEEP_CACHE_CONTENT=$(cat "$MOUNTPOINT/keep-cache.txt")
-if [ "$KEEP_CACHE_CONTENT" != "cache" ]; then
-    echo "FAILED: keep-cache.txt content is stale after truncate: $KEEP_CACHE_CONTENT"
-    kill $MOUNT_PID 2>/dev/null || true
-    wait $MOUNT_PID 2>/dev/null || true
-    exit 1
-fi
+[ "$KEEP_CACHE_CONTENT" = "cache" ] ||
+    fail "keep-cache.txt content is stale after truncate: $KEEP_CACHE_CONTENT"
 
 # Unmount
-fusermount -u "$MOUNTPOINT"
+unmount_quiet
 
 # Wait for mount process to exit
 wait $MOUNT_PID 2>/dev/null || true
+MOUNT_PID=""
 
 echo "OK"

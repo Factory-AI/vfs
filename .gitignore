@@ -28,8 +28,6 @@ Temporary Items
 
 .agentfs
 target/
-/cli/tests/syscall/*.o
-/cli/tests/syscall/test-syscalls
 
 # Python bytecode cache
 __pycache__/

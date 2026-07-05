@@ -1,38 +1,57 @@
 #!/bin/sh
-set -e
+set -eu
 
 echo -n "TEST mount... "
 
-TEST_AGENT_ID="test-mount-agent"
-MOUNTPOINT="/tmp/agentfs-test-mount-$$"
+DIR="$(cd "$(dirname "$0")" && pwd)"
+CLI_DIR="$(cd "$DIR/.." && pwd)"
 
-cleanup() {
-    # Unmount if mounted
-    fusermount -u "$MOUNTPOINT" 2>/dev/null || true
-    # Remove mountpoint
-    rmdir "$MOUNTPOINT" 2>/dev/null || true
-    # Remove test database
-    rm -f ".agentfs/${TEST_AGENT_ID}.db" ".agentfs/${TEST_AGENT_ID}.db-shm" ".agentfs/${TEST_AGENT_ID}.db-wal"
+TEST_AGENT_ID="test-mount-agent"
+ROOT="$(mktemp -d "${TMPDIR:-/tmp}/agentfs-mount.XXXXXX")"
+MOUNTPOINT="$ROOT/mnt"
+MOUNT_PID=""
+
+unmount_quiet() {
+    fusermount3 -u "$MOUNTPOINT" 2>/dev/null ||
+        fusermount -u "$MOUNTPOINT" 2>/dev/null || true
 }
 
-# Ensure cleanup on exit
-trap cleanup EXIT
+cleanup() {
+    unmount_quiet
+    if [ -n "$MOUNT_PID" ]; then
+        kill "$MOUNT_PID" 2>/dev/null || true
+        wait "$MOUNT_PID" 2>/dev/null || true
+    fi
+    rm -rf "$ROOT"
+}
+trap cleanup EXIT INT TERM
 
-# Clean up any existing test artifacts
-cleanup
+fail() {
+    echo "FAILED: $*"
+    exit 1
+}
 
-# Initialize the database
-cargo run -- init "$TEST_AGENT_ID" > /dev/null 2>&1
+run_agentfs() {
+    if [ -n "${AGENTFS_BIN:-}" ]; then
+        "$AGENTFS_BIN" "$@"
+    else
+        cargo run --quiet --manifest-path "$CLI_DIR/Cargo.toml" -- "$@"
+    fi
+}
 
-# Create mountpoint
+# The session DB lands under $ROOT/.agentfs instead of the repo working tree.
+cd "$ROOT"
+
+run_agentfs init "$TEST_AGENT_ID" > /dev/null 2>&1
+
 mkdir -p "$MOUNTPOINT"
 
 # Mount in foreground mode (background it ourselves so we can control it)
-cargo run -- mount ".agentfs/${TEST_AGENT_ID}.db" "$MOUNTPOINT" --foreground &
+run_agentfs mount ".agentfs/${TEST_AGENT_ID}.db" "$MOUNTPOINT" --foreground &
 MOUNT_PID=$!
 
-# Wait for mount to be ready (check if mountpoint has different device ID)
-MAX_WAIT=10
+# Wait for mount to be ready
+MAX_WAIT=20
 WAITED=0
 while [ $WAITED -lt $MAX_WAIT ]; do
     if mountpoint -q "$MOUNTPOINT" 2>/dev/null; then
@@ -42,18 +61,11 @@ while [ $WAITED -lt $MAX_WAIT ]; do
     WAITED=$((WAITED + 1))
 done
 
-if ! mountpoint -q "$MOUNTPOINT" 2>/dev/null; then
-    echo "FAILED: mount did not become ready in time"
-    kill $MOUNT_PID 2>/dev/null || true
-    exit 1
-fi
+mountpoint -q "$MOUNTPOINT" 2>/dev/null || fail "mount did not become ready in time"
 
 # Test that 'agentfs mount' (no args) lists our mount
-if ! cargo run -- mount 2>/dev/null | grep -q "$MOUNTPOINT"; then
-    echo "FAILED: 'agentfs mount' did not list our mountpoint"
-    kill $MOUNT_PID 2>/dev/null || true
-    exit 1
-fi
+run_agentfs mount 2>/dev/null | grep -q "$MOUNTPOINT" ||
+    fail "'agentfs mount' did not list our mountpoint"
 
 # Write a file through the FUSE mount
 echo "hello from fuse mount" > "$MOUNTPOINT/hello.txt"
@@ -61,80 +73,49 @@ echo "hello from fuse mount" > "$MOUNTPOINT/hello.txt"
 # Read it back
 CONTENT=$(cat "$MOUNTPOINT/hello.txt")
 
-if [ "$CONTENT" != "hello from fuse mount" ]; then
-    echo "FAILED: file content mismatch"
-    echo "Expected: hello from fuse mount"
-    echo "Got: $CONTENT"
-    kill $MOUNT_PID 2>/dev/null || true
-    exit 1
-fi
+[ "$CONTENT" = "hello from fuse mount" ] || fail "file content mismatch
+Expected: hello from fuse mount
+Got: $CONTENT"
 
 # Test mkdir
 mkdir "$MOUNTPOINT/testdir"
-if [ ! -d "$MOUNTPOINT/testdir" ]; then
-    echo "FAILED: mkdir did not create directory"
-    kill $MOUNT_PID 2>/dev/null || true
-    exit 1
-fi
+[ -d "$MOUNTPOINT/testdir" ] || fail "mkdir did not create directory"
 
 # Test creating file in subdirectory
 echo "nested file" > "$MOUNTPOINT/testdir/nested.txt"
 NESTED_CONTENT=$(cat "$MOUNTPOINT/testdir/nested.txt")
 
-if [ "$NESTED_CONTENT" != "nested file" ]; then
-    echo "FAILED: nested file content mismatch"
-    kill $MOUNT_PID 2>/dev/null || true
-    exit 1
-fi
+[ "$NESTED_CONTENT" = "nested file" ] || fail "nested file content mismatch"
 
 # Test symlink creation
 ln -s nested.txt "$MOUNTPOINT/testdir/link_to_nested"
-if [ ! -L "$MOUNTPOINT/testdir/link_to_nested" ]; then
-    echo "FAILED: symlink was not created"
-    kill $MOUNT_PID 2>/dev/null || true
-    exit 1
-fi
+[ -L "$MOUNTPOINT/testdir/link_to_nested" ] || fail "symlink was not created"
 
 # Test reading symlink target
 LINK_TARGET=$(readlink "$MOUNTPOINT/testdir/link_to_nested")
-if [ "$LINK_TARGET" != "nested.txt" ]; then
-    echo "FAILED: symlink target mismatch"
-    echo "Expected: nested.txt"
-    echo "Got: $LINK_TARGET"
-    kill $MOUNT_PID 2>/dev/null || true
-    exit 1
-fi
+[ "$LINK_TARGET" = "nested.txt" ] || fail "symlink target mismatch
+Expected: nested.txt
+Got: $LINK_TARGET"
 
 # Test following symlink to read file
 LINKED_CONTENT=$(cat "$MOUNTPOINT/testdir/link_to_nested")
-if [ "$LINKED_CONTENT" != "nested file" ]; then
-    echo "FAILED: reading through symlink failed"
-    echo "Expected: nested file"
-    echo "Got: $LINKED_CONTENT"
-    kill $MOUNT_PID 2>/dev/null || true
-    exit 1
-fi
+[ "$LINKED_CONTENT" = "nested file" ] || fail "reading through symlink failed
+Expected: nested file
+Got: $LINKED_CONTENT"
 
 # Test symlink to directory
 ln -s testdir "$MOUNTPOINT/link_to_testdir"
-if [ ! -L "$MOUNTPOINT/link_to_testdir" ]; then
-    echo "FAILED: symlink to directory was not created"
-    kill $MOUNT_PID 2>/dev/null || true
-    exit 1
-fi
+[ -L "$MOUNTPOINT/link_to_testdir" ] || fail "symlink to directory was not created"
 
 # Test accessing file through directory symlink
 DIR_LINKED_CONTENT=$(cat "$MOUNTPOINT/link_to_testdir/nested.txt")
-if [ "$DIR_LINKED_CONTENT" != "nested file" ]; then
-    echo "FAILED: reading through directory symlink failed"
-    kill $MOUNT_PID 2>/dev/null || true
-    exit 1
-fi
+[ "$DIR_LINKED_CONTENT" = "nested file" ] || fail "reading through directory symlink failed"
 
 # Unmount
-fusermount -u "$MOUNTPOINT"
+unmount_quiet
 
 # Wait for mount process to exit
 wait $MOUNT_PID 2>/dev/null || true
+MOUNT_PID=""
 
 echo "OK"

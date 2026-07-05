@@ -48,6 +48,23 @@ export TMP="$PINNED_TMP"
 export TEMP="$PINNED_TMP"
 export HOME="$ROOT/home"
 
+# The user's PATH may route `git` through a hook-manager shim that daemonizes
+# out of test repos (library/environment.md); pin the distro binary and give
+# the temp HOME a hookless git config.
+mkdir -p "$HOME/bin" "$HOME/git-hooks-none"
+GIT_REAL=""
+for candidate in /usr/bin/git /bin/git; do
+    if [ -x "$candidate" ]; then
+        GIT_REAL="$candidate"
+        break
+    fi
+done
+[ -n "$GIT_REAL" ] || GIT_REAL="$(command -v git)"
+ln -sf "$GIT_REAL" "$HOME/bin/git"
+printf '[core]\n\thooksPath = %s\n' "$HOME/git-hooks-none" >"$HOME/.gitconfig"
+PATH="$HOME/bin:$PATH"
+export PATH
+
 cd "$WORK"
 
 assert_no_sidecars "before"

@@ -8,6 +8,16 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(cd "$DIR/.." && pwd)"
 cd "$CLI_DIR"
 
+# Pin TMPDIR to a per-run scratch dir cleaned on exit: turso_core 0.5.3 leaks
+# /tmp/tursodb-ephemeral-* sort-spill files (vdbe/execute.rs:10096 never
+# unlinks them), so dependency litter must not accumulate on the host.
+SUITE_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/agentfs-all.XXXXXX")"
+trap 'rm -rf "$SUITE_TMPDIR"' EXIT INT TERM
+TMPDIR="$SUITE_TMPDIR"
+TMP="$SUITE_TMPDIR"
+TEMP="$SUITE_TMPDIR"
+export TMPDIR TMP TEMP
+
 PASS_COUNT=0
 SKIP_COUNT=0
 FAIL_COUNT=0
