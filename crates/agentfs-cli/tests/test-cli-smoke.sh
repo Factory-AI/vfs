@@ -1,0 +1,187 @@
+#!/bin/sh
+#
+# CLI smoke suite (VAL-CLI-024): one fast end-to-end pass over the user-level
+# command surface — init, run, exec, clone, fs, timeline, backup/materialize,
+# integrity, migrate, MCP, ps, completions, and the deprecated `nfs` /
+# `mcp-server` aliases. Deep per-command behavior lives in the dedicated
+# suites; this gate proves every surface dispatches and succeeds.
+set -eu
+
+echo -n "TEST cli smoke... "
+
+DIR="$(cd "$(dirname "$0")" && pwd)"
+CLI_DIR="$(cd "$DIR/.." && pwd)"
+
+ROOT="$(mktemp -d "${TMPDIR:-/tmp}/agentfs-cli-smoke.XXXXXX")"
+NFS_PID=""
+
+cleanup() {
+    if [ -n "$NFS_PID" ]; then
+        kill "$NFS_PID" 2>/dev/null || true
+        wait "$NFS_PID" 2>/dev/null || true
+    fi
+    rm -rf "$ROOT"
+}
+trap cleanup EXIT INT TERM
+
+fail() {
+    echo "FAILED: $*"
+    exit 1
+}
+
+# Resolve the binary once: background legs must track the agentfs PID itself
+# (backgrounding a wrapper orphans the real process on cleanup kill).
+if [ -n "${AGENTFS_BIN:-}" ]; then
+    BIN="$AGENTFS_BIN"
+else
+    cargo build --quiet --manifest-path "$CLI_DIR/Cargo.toml" || fail "could not build agentfs"
+    BIN="$CLI_DIR/../../target/debug/agentfs"
+fi
+[ -x "$BIN" ] || fail "agentfs binary not found at $BIN"
+
+run_agentfs() {
+    "$BIN" "$@"
+}
+
+# The user's PATH may route `git` through a hook-manager shim that daemonizes
+# out of test repos (library/environment.md); pin the distro binary and keep
+# git config isolated.
+mkdir -p "$ROOT/bin"
+for candidate in /usr/bin/git /bin/git; do
+    if [ -x "$candidate" ]; then
+        ln -sf "$candidate" "$ROOT/bin/git"
+        break
+    fi
+done
+[ -e "$ROOT/bin/git" ] || ln -sf "$(command -v git)" "$ROOT/bin/git"
+PATH="$ROOT/bin:$PATH"
+export PATH
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+
+cd "$ROOT"
+
+# --- init: create, refuse duplicate, --force -----------------------------------
+run_agentfs init smoke >"$ROOT/init.log" 2>&1 || fail "init failed: $(cat "$ROOT/init.log")"
+DB="$ROOT/.agentfs/smoke.db"
+[ -f "$DB" ] || fail "init did not create $DB"
+if run_agentfs init smoke >"$ROOT/init-dup.log" 2>&1; then
+    fail "repeated init succeeded without --force"
+fi
+grep -q "already exists" "$ROOT/init-dup.log" || fail "duplicate init missing refusal message"
+run_agentfs init smoke --force >/dev/null 2>&1 || fail "init --force failed"
+
+# --- fs write/cat/ls ------------------------------------------------------------
+run_agentfs fs "$DB" write /smoke.txt smoke-payload >/dev/null 2>&1 || fail "fs write failed"
+[ "$(run_agentfs fs "$DB" cat /smoke.txt 2>/dev/null)" = "smoke-payload" ] || fail "fs cat mismatch"
+run_agentfs fs "$DB" ls / >"$ROOT/ls.log" 2>&1 || fail "fs ls failed"
+grep -q "smoke.txt" "$ROOT/ls.log" || fail "fs ls does not list smoke.txt"
+
+# --- run (session sandbox) -------------------------------------------------------
+run_agentfs run --session smoke-run -- sh -c 'echo run-ok' >"$ROOT/run.log" 2>&1 ||
+    fail "run failed: $(cat "$ROOT/run.log")"
+grep -q "run-ok" "$ROOT/run.log" || fail "run output missing"
+
+# --- exec (mount-owning) ----------------------------------------------------------
+run_agentfs exec "$DB" sh -c 'echo exec-ok' >"$ROOT/exec.log" 2>&1 ||
+    fail "exec failed: $(cat "$ROOT/exec.log")"
+grep -q "exec-ok" "$ROOT/exec.log" || fail "exec output missing"
+
+# --- clone a local git repo into a fresh DB ----------------------------------------
+mkdir -p "$ROOT/srcrepo"
+(
+    cd "$ROOT/srcrepo"
+    git init -q
+    git config user.email smoke@example.invalid
+    git config user.name Smoke
+    echo hello >hello.txt
+    git add hello.txt
+    git commit -q -m smoke
+) || fail "could not build clone fixture repo"
+run_agentfs clone "$ROOT/clone.db" "$ROOT/srcrepo" repo >"$ROOT/clone.log" 2>&1 ||
+    fail "clone failed: $(cat "$ROOT/clone.log")"
+run_agentfs fs "$ROOT/clone.db" ls / >"$ROOT/clone-ls.log" 2>&1 ||
+    fail "fs ls on cloned DB failed"
+grep -q "hello.txt" "$ROOT/clone-ls.log" || fail "cloned repo content missing from DB"
+
+# --- timeline -------------------------------------------------------------------------
+run_agentfs timeline "$DB" --format json >"$ROOT/timeline.log" 2>&1 ||
+    fail "timeline failed: $(cat "$ROOT/timeline.log")"
+
+# --- backup --materialize and materialize --------------------------------------------
+run_agentfs backup "$DB" "$ROOT/backup.db" --verify --materialize >/dev/null 2>&1 ||
+    fail "backup --verify --materialize failed"
+[ -f "$ROOT/backup.db" ] || fail "backup did not create target"
+run_agentfs materialize "$DB" --output "$ROOT/materialized.db" --verify >/dev/null 2>&1 ||
+    fail "materialize --verify failed"
+[ -f "$ROOT/materialized.db" ] || fail "materialize did not create target"
+
+# --- integrity -------------------------------------------------------------------------
+run_agentfs integrity --json "$DB" >"$ROOT/integrity.json" 2>&1 ||
+    fail "integrity failed: $(cat "$ROOT/integrity.json")"
+
+# --- migrate a committed old-schema fixture ----------------------------------------------
+cp "$DIR/fixtures/migrate/v0_4.db" "$ROOT/old.db"
+run_agentfs migrate "$ROOT/old.db" >"$ROOT/migrate.log" 2>&1 ||
+    fail "migrate failed: $(cat "$ROOT/migrate.log")"
+run_agentfs integrity --json "$ROOT/old.db" >/dev/null 2>&1 ||
+    fail "integrity on migrated fixture failed"
+
+# --- ps ------------------------------------------------------------------------------------
+run_agentfs ps >/dev/null 2>&1 || fail "ps failed"
+
+# --- completions -----------------------------------------------------------------------------
+run_agentfs completions show >"$ROOT/completions.log" 2>&1 || fail "completions show failed"
+
+# --- MCP over stdio via the deprecated `mcp-server` alias -------------------------------------
+python3 - "$BIN" "$DB" <<'PY' || fail "mcp-server alias initialize round trip failed"
+import json
+import subprocess
+import sys
+
+bin_path, db = sys.argv[1], sys.argv[2]
+argv = [bin_path, "mcp-server", db]
+proc = subprocess.Popen(
+    argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+)
+request = {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "initialize",
+    "params": {
+        "protocolVersion": "2024-11-05",
+        "capabilities": {},
+        "clientInfo": {"name": "cli-smoke", "version": "0"},
+    },
+}
+proc.stdin.write(json.dumps(request) + "\n")
+proc.stdin.flush()
+line = proc.stdout.readline()
+proc.stdin.close()
+try:
+    proc.wait(timeout=30)
+except subprocess.TimeoutExpired:
+    proc.kill()
+    raise SystemExit("mcp-server did not exit after stdin close")
+reply = json.loads(line)
+if reply.get("id") != 1 or "result" not in reply:
+    raise SystemExit(f"unexpected initialize reply: {reply}")
+PY
+
+# --- deprecated `nfs` alias serves on an ephemeral port ------------------------------------------
+"$BIN" nfs "$DB" --port 0 >"$ROOT/nfs.log" 2>&1 &
+NFS_PID=$!
+WAITED=0
+while [ "$WAITED" -lt 40 ]; do
+    if grep -q "AgentFS NFS Server" "$ROOT/nfs.log" 2>/dev/null; then
+        break
+    fi
+    kill -0 "$NFS_PID" 2>/dev/null || fail "nfs alias exited early: $(cat "$ROOT/nfs.log")"
+    sleep 0.25
+    WAITED=$((WAITED + 1))
+done
+grep -q "AgentFS NFS Server" "$ROOT/nfs.log" || fail "nfs alias never reported startup"
+kill "$NFS_PID" 2>/dev/null || true
+wait "$NFS_PID" 2>/dev/null || true
+NFS_PID=""
+
+echo "OK"

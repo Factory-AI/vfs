@@ -87,6 +87,9 @@ run_test() {
 
 run_test "init" "$DIR/test-init.sh"
 
+# Fast end-to-end pass over the whole user-level command surface (VAL-CLI-024).
+run_test "cli-smoke" "$DIR/test-cli-smoke.sh"
+
 # Syscall tests in two configurations:
 # 1. Linux baseline, establishes expected behavior.
 run_test "linux-syscalls" "$DIR/test-linux-syscalls.sh"

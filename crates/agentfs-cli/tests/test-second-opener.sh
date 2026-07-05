@@ -30,12 +30,24 @@ fail() {
     exit 1
 }
 
+# Resolve the binary once: background legs must track the agentfs PID itself
+# (backgrounding a wrapper orphans the real process on cleanup kill).
+if [ -n "${AGENTFS_BIN:-}" ]; then
+    BIN="$AGENTFS_BIN"
+else
+    cargo +nightly build --quiet --manifest-path "$CLI_DIR/Cargo.toml" || {
+        echo "FAILED: could not build agentfs"
+        exit 1
+    }
+    BIN="$CLI_DIR/../../target/debug/agentfs"
+fi
+if [ ! -x "$BIN" ]; then
+    echo "FAILED: agentfs binary not found at $BIN"
+    exit 1
+fi
+
 run_agentfs() {
-    if [ -n "${AGENTFS_BIN:-}" ]; then
-        "$AGENTFS_BIN" "$@"
-    else
-        cargo +nightly run --quiet --manifest-path "$CLI_DIR/Cargo.toml" -- "$@"
-    fi
+    "$BIN" "$@"
 }
 
 # agentfs_dir() is cwd-relative, so init from inside $ROOT.
@@ -47,7 +59,7 @@ run_agentfs fs "$DB" write /keep.txt kept >"$ROOT/write.log" 2>&1 ||
     fail "fs write failed: $(cat "$ROOT/write.log")"
 
 # First opener: exec holds the DB (and its file lock) while the child sleeps.
-run_agentfs exec "$DB" sh -c 'echo first-ready && sleep 8' \
+"$BIN" exec "$DB" sh -c 'echo first-ready && sleep 8' \
     >"$ROOT/first.log" 2>&1 &
 FIRST_PID=$!
 
@@ -64,7 +76,7 @@ grep -q 'first-ready' "$ROOT/first.log" || fail "first exec never became ready"
 
 # Second opener must fail cleanly and promptly: nonzero exit, exactly one
 # Error: line, no panic/debug formatting, bounded (no hang).
-run_agentfs exec "$DB" sh -c true >"$ROOT/second.log" 2>&1 &
+"$BIN" exec "$DB" sh -c true >"$ROOT/second.log" 2>&1 &
 SECOND_PID=$!
 WAITED=0
 while kill -0 "$SECOND_PID" 2>/dev/null; do

@@ -43,12 +43,24 @@ fail() {
     exit 1
 }
 
+# Resolve the binary once: background legs must track the agentfs PID itself
+# (backgrounding a wrapper orphans the real process on cleanup kill).
+if [ -n "${AGENTFS_BIN:-}" ]; then
+    BIN="$AGENTFS_BIN"
+else
+    cargo +nightly build --quiet --manifest-path "$CLI_DIR/Cargo.toml" || {
+        echo "FAILED: could not build agentfs"
+        exit 1
+    }
+    BIN="$CLI_DIR/../../target/debug/agentfs"
+fi
+if [ ! -x "$BIN" ]; then
+    echo "FAILED: agentfs binary not found at $BIN"
+    exit 1
+fi
+
 run_agentfs() {
-    if [ -n "${AGENTFS_BIN:-}" ]; then
-        "$AGENTFS_BIN" "$@"
-    else
-        cargo +nightly run --quiet --manifest-path "$CLI_DIR/Cargo.toml" -- "$@"
-    fi
+    "$BIN" "$@"
 }
 
 user_version_of() {
@@ -148,7 +160,7 @@ case "$(uname -s)" in
 esac
 
 WORK_DB="$ROOT/v0_4.db"   # migrated above
-run_agentfs mount "$WORK_DB" "$MNT" --foreground >"$ROOT/mount.log" 2>&1 &
+"$BIN" mount "$WORK_DB" "$MNT" --foreground >"$ROOT/mount.log" 2>&1 &
 MOUNT_PID=$!
 
 WAITED=0

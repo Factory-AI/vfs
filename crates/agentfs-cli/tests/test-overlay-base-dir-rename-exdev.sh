@@ -22,12 +22,24 @@ cleanup() {
 
 trap cleanup EXIT INT TERM
 
+# Resolve the binary once: background mount legs must track the agentfs PID
+# itself (backgrounding a wrapper orphans the real process on cleanup kill).
+if [ -n "${AGENTFS_BIN:-}" ]; then
+    BIN="$AGENTFS_BIN"
+else
+    cargo build --quiet --manifest-path "$CLI_DIR/Cargo.toml" || {
+        echo "FAILED: could not build agentfs"
+        exit 1
+    }
+    BIN="$CLI_DIR/../../target/debug/agentfs"
+fi
+if [ ! -x "$BIN" ]; then
+    echo "FAILED: agentfs binary not found at $BIN"
+    exit 1
+fi
+
 run_agentfs() {
-    if [ -n "${AGENTFS_BIN:-}" ]; then
-        "$AGENTFS_BIN" "$@"
-    else
-        cargo run --quiet --manifest-path "$CLI_DIR/Cargo.toml" -- "$@"
-    fi
+    "$BIN" "$@"
 }
 
 # The session DB lands under $ROOT/.agentfs instead of the repo working tree.
@@ -54,7 +66,7 @@ if ! output=$(run_agentfs init "$TEST_AGENT_ID" --base "$BASEDIR" 2>&1); then
     exit 1
 fi
 
-run_agentfs mount ".agentfs/${TEST_AGENT_ID}.db" "$MOUNTPOINT" --foreground >"$MOUNT_LOG" 2>&1 &
+"$BIN" mount ".agentfs/${TEST_AGENT_ID}.db" "$MOUNTPOINT" --foreground >"$MOUNT_LOG" 2>&1 &
 MOUNT_PID=$!
 
 MAX_WAIT=10
