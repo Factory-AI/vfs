@@ -3759,6 +3759,103 @@
     }
 
     #[tokio::test]
+    async fn never_batched_attr_cache_fill_survives_prunes_at_retired_map_saturation(
+    ) -> Result<()> {
+        let (fs, _dir) = create_test_fs_with_config(test_config_with_long_batch_window()).await?;
+        let (stable, _stable_file) = fs
+            .create_file("/stable.txt", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        fs.invalidate_attr(stable.ino);
+        let batcher = fs
+            .write_batcher
+            .as_ref()
+            .expect("long-window test config enables the batcher");
+
+        // Two synthetic retirements whose epoch order inverts their generation
+        // order (a long-lived pending entry retiring with its own older
+        // generation after a younger entry already retired with a newer one).
+        const HIGH_GENERATION_INO: i64 = 9001;
+        const LOW_GENERATION_INO: i64 = 9002;
+        batcher.retire_generation_for_test(HIGH_GENERATION_INO, u64::MAX);
+        batcher.retire_generation_for_test(LOW_GENERATION_INO, 1);
+
+        // Saturate the retired map: the prune triggered by the last retirement
+        // removes the oldest entry (the high-generation one), lifting the
+        // watermark above every generation still tracked in the map.
+        for idx in 0..(batcher::MAX_RETIRED_GENERATIONS - 1) {
+            let path = format!("/saturation-{idx}.txt");
+            let (stats, _file) = fs.create_file(&path, DEFAULT_FILE_MODE, 0, 0).await?;
+            batcher
+                .enqueue_for_test(
+                    stats.ino,
+                    vec![WriteRange {
+                        offset: 0,
+                        data: vec![b'x'],
+                    }],
+                )
+                .await?;
+            batcher.discard_pending(stats.ino);
+        }
+        assert!(
+            !batcher.retired_generation_contains(HIGH_GENERATION_INO),
+            "saturation should have pruned the oldest retired entry"
+        );
+        assert!(
+            batcher.retired_generation_contains(LOW_GENERATION_INO),
+            "the low-generation entry must still be tracked (next prune victim)"
+        );
+        assert_eq!(
+            batcher.retired_generation_count(),
+            batcher::MAX_RETIRED_GENERATIONS,
+            "the retired map must sit exactly at saturation"
+        );
+
+        // A never-batched cache fill observes the watermark and reads SQLite.
+        let conn = fs.pool.get_connection().await?;
+        let generation = fs.pending_generation(stable.ino);
+        let stable_stats = store::getattr(&conn, stable.ino)
+            .await?
+            .expect("stable file should exist");
+        drop(conn);
+
+        // Unrelated write traffic advances the global generation counter...
+        let (unrelated, unrelated_file) = fs
+            .create_file("/unrelated.txt", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        unrelated_file.pwrite(0, b"unrelated").await?;
+        assert!(batcher.has_pending(unrelated.ino));
+
+        // ...and a concurrent prune lands inside the observe/compare window,
+        // removing only the low-generation entry already below the watermark.
+        let (churn, _churn_file) = fs
+            .create_file("/saturation-final.txt", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        batcher
+            .enqueue_for_test(
+                churn.ino,
+                vec![WriteRange {
+                    offset: 0,
+                    data: vec![b'x'],
+                }],
+            )
+            .await?;
+        batcher.discard_pending(churn.ino);
+        assert!(
+            !batcher.retired_generation_contains(LOW_GENERATION_INO),
+            "the concurrent retirement should have pruned the low-generation entry"
+        );
+
+        fs.cache_attr_if_pending_generation(stable_stats, generation);
+        assert!(
+            cached_attr(&fs, stable.ino).is_some(),
+            "at retired-map saturation a prune of already-covered generations \
+             must not suppress never-batched inode cache fills"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn concurrent_writers_overlay_merge() -> Result<()> {
         let (fs, _dir) = create_test_fs().await?;
         let (_, fh_a) = fs

@@ -710,18 +710,24 @@ mod tests {
 
     #[test]
     fn test_resolve_invalid_agent_id() {
-        // Agent IDs with path traversal should be rejected
+        // Path traversal is path-shaped: rejected as a missing database, not
+        // as a malformed agent ID.
         let result = AgentFSOptions::resolve("../evil");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("invalid agent ID"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("database not found"));
 
         // Agent IDs with spaces should be rejected
         let result = AgentFSOptions::resolve("invalid agent");
         assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("invalid agent ID"));
 
         // Agent IDs with special characters should be rejected
         let result = AgentFSOptions::resolve("agent@test");
         assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("invalid agent ID"));
     }
 
     #[test]
@@ -729,6 +735,22 @@ mod tests {
         let result = AgentFSOptions::resolve("nonexistent-agent-12345");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[test]
+    fn test_resolve_nonexistent_path_reports_database_not_found() {
+        for arg in [
+            "/definitely/missing.db",
+            "definitely-missing-dir/agent.db",
+            "definitely-missing.db",
+        ] {
+            let err = AgentFSOptions::resolve(arg).unwrap_err();
+            let message = err.to_string();
+            assert!(
+                message.contains("database not found") && message.contains(arg),
+                "path-shaped argument {arg:?} must report a missing database, got: {message}"
+            );
+        }
     }
 
     #[test]

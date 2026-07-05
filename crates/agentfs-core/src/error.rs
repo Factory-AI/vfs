@@ -3,22 +3,27 @@
 use thiserror::Error;
 
 /// The main error type for the AgentFS SDK.
+///
+/// Wrapper variants chain their cause through `source()` only and keep it out
+/// of `Display`: `#[from]` already exposes the inner error to reporters that
+/// walk the chain (anyhow `{:#}`), so repeating `{0}` in the message would
+/// print every cause twice ("database error: X: X").
 #[derive(Debug, Error)]
 pub enum Error {
     /// Database error from turso
-    #[error("database error: {0}")]
+    #[error("database error")]
     Database(#[from] turso::Error),
 
     /// IO error
-    #[error("io error: {0}")]
+    #[error("io error")]
     Io(#[from] std::io::Error),
 
     /// JSON serialization/deserialization error
-    #[error("json error: {0}")]
+    #[error("json error")]
     Json(#[from] serde_json::Error),
 
     /// System time error
-    #[error("time error: {0}")]
+    #[error("time error")]
     Time(#[from] std::time::SystemTimeError),
 
     /// Filesystem-specific error with errno semantics
@@ -32,6 +37,10 @@ pub enum Error {
     /// Agent not found
     #[error("agent '{id}' not found at '{path}'")]
     AgentNotFound { id: String, path: String },
+
+    /// Database file path does not exist
+    #[error("database not found: {0}")]
+    DatabaseNotFound(String),
 
     /// Invalid path encoding
     #[error("path '{0}' is not valid UTF-8")]

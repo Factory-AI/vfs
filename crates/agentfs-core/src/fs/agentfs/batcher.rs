@@ -372,7 +372,6 @@ impl AgentFSWriteBatcherState {
     }
 
     fn prune_retired_generations(&mut self) {
-        let mut pruned = false;
         while self.retired_generations.len() > MAX_RETIRED_GENERATIONS {
             let Some(oldest_ino) = self
                 .retired_generations
@@ -382,11 +381,16 @@ impl AgentFSWriteBatcherState {
             else {
                 break;
             };
-            self.retired_generations.remove(&oldest_ino);
-            pruned = true;
-        }
-        if pruned {
-            self.pruned_generation_watermark = self.last_generation;
+            if let Some(pruned) = self.retired_generations.remove(&oldest_ino) {
+                // Advance only to the pruned entry's own generation, never to
+                // last_generation: a fill for a still-tracked ino compares
+                // against its retained entry, so ABA safety needs the
+                // watermark to cover exactly what was pruned. Jumping to
+                // last_generation would suppress never-batched fills whenever
+                // any prune lands between observe and compare at saturation.
+                self.pruned_generation_watermark =
+                    self.pruned_generation_watermark.max(pruned.generation);
+            }
         }
     }
 
@@ -1234,6 +1238,14 @@ impl AgentFSWriteBatcher {
     #[cfg(test)]
     pub(super) fn retired_generation_contains(&self, ino: i64) -> bool {
         self.state.read().retired_generations.contains_key(&ino)
+    }
+
+    /// Retire an explicit generation at a fresh epoch, reproducing the
+    /// epoch/generation inversion `cleanup_empty_pending` creates when a
+    /// long-lived pending entry retires with its own (older) generation.
+    #[cfg(test)]
+    pub(super) fn retire_generation_for_test(&self, ino: i64, generation: u64) {
+        self.state.write().retire_generation(ino, generation);
     }
 }
 

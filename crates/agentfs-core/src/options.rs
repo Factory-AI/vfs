@@ -163,7 +163,9 @@ impl AgentFSOptions {
     /// 2. Valid agent ID with existing `.agentfs/{id}.db` -> uses that agent
     /// 3. Existing file path -> uses that path directly
     ///
-    /// Returns an error if neither an agent nor a file exists.
+    /// When nothing matches: ID-shaped arguments report `AgentNotFound`,
+    /// path-shaped arguments (a separator or an extension) report
+    /// `DatabaseNotFound`, and everything else `InvalidAgentId`.
     pub fn resolve(id_or_path: impl Into<String>) -> Result<Self> {
         let id_or_path = id_or_path.into();
 
@@ -194,6 +196,10 @@ impl AgentFSOptions {
                     .display()
                     .to_string(),
             })
+        } else if id_or_path.contains(std::path::MAIN_SEPARATOR) || path.extension().is_some() {
+            // Path-shaped (has a separator or an extension) but nothing exists
+            // there: an "invalid agent ID" complaint would be misleading.
+            Err(Error::DatabaseNotFound(id_or_path))
         } else {
             Err(Error::InvalidAgentId(id_or_path))
         }

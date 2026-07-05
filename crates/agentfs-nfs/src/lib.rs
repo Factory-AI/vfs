@@ -108,12 +108,14 @@ impl ServerHandle {
         let Some(task) = self.task.as_mut() else {
             return Ok(());
         };
-        let result = task
-            .await
-            .map_err(|error| anyhow::anyhow!("NFS server task failed to join: {error}"))?
-            .map_err(anyhow::Error::from);
+        // The task must leave the slot as soon as it completes, even on a
+        // JoinError: a retained handle would re-poll a completed JoinHandle on
+        // the next join (panic) and trip the unjoined-task warn in Drop.
+        let result = task.await;
         self.task.take();
         result
+            .map_err(|error| anyhow::anyhow!("NFS server task failed to join: {error}"))?
+            .map_err(anyhow::Error::from)
     }
 }
 
@@ -203,6 +205,36 @@ mod tests {
         assert!(
             aborted.is_err(),
             "aborted task should report a JoinError on the join path"
+        );
+    }
+
+    #[tokio::test]
+    async fn join_after_join_error_empties_task_slot() {
+        let task = tokio::spawn(async { std::future::pending::<io::Result<()>>().await });
+        let mut handle = test_handle(task);
+
+        handle.abort();
+        let first = tokio::time::timeout(Duration::from_secs(1), handle.join())
+            .await
+            .expect("aborted task should join promptly");
+        assert!(first.is_err(), "abort should surface a JoinError");
+
+        assert!(
+            handle.task.is_none(),
+            "JoinError must still take the task out of the slot (Drop would \
+             otherwise warn about an unjoined finished task)"
+        );
+        assert!(
+            handle.is_finished(),
+            "handle with an emptied slot reports finished"
+        );
+
+        let second = tokio::time::timeout(Duration::from_secs(1), handle.join())
+            .await
+            .expect("second join must not re-poll a completed JoinHandle");
+        assert!(
+            second.is_ok(),
+            "second join after a JoinError should be a no-op: {second:?}"
         );
     }
 }

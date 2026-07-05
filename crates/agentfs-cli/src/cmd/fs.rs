@@ -181,6 +181,11 @@ pub async fn write_filesystem(
         .await
         .map_err(|err| super::migrate::open_error_with_guidance(err, &id_or_path))?;
 
+    // Own created entries as the invoking user, matching mount-created files:
+    // uid/gid 0 would make a later chmod inside `agentfs exec` (running as the
+    // invoking uid) fail with EPERM.
+    // SAFETY: getuid/getgid are always safe
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
     let mut components = path.split("/").collect::<Vec<_>>();
     if !path.starts_with("/") {
         components.insert(0, "");
@@ -190,14 +195,17 @@ pub async fn write_filesystem(
     for i in 2..components.len() {
         let dir_path = components[0..i].join("/");
         if agentfs.fs.stat(&dir_path).await?.is_none() {
-            agentfs.fs.mkdir(&dir_path, 0, 0).await?;
+            agentfs.fs.mkdir(&dir_path, uid, gid).await?;
         }
     }
     // Remove file if it exists (overwrite behavior)
     if agentfs.fs.stat(path).await?.is_some() {
         agentfs.fs.remove(path).await?;
     }
-    let (_, file) = agentfs.fs.create_file(path, S_IFREG | 0o644, 0, 0).await?;
+    let (_, file) = agentfs
+        .fs
+        .create_file(path, S_IFREG | 0o644, uid, gid)
+        .await?;
     file.pwrite(0, content.as_bytes()).await?;
     // Tier Four: writes go into the in-memory batcher first. This CLI is a
     // one-shot operation — flush so the bytes are durable in SQLite before
@@ -551,6 +559,34 @@ f c/2.md
             .await
             .unwrap();
         assert_eq!(buf, b"f file1.txt\nf file2.txt\n");
+    }
+
+    #[tokio::test]
+    pub async fn write_filesystem_owns_entries_as_invoking_user() {
+        let (_agentfs, path, _file) = agentfs().await;
+        write_filesystem(path.clone(), "/subdir/owned.txt", "content", None)
+            .await
+            .unwrap();
+
+        // uid/gid 0 entries make a later chmod inside `agentfs exec` (running
+        // as the invoking uid) fail EPERM, unlike mount-created files.
+        // SAFETY: getuid/getgid are always safe
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        let reader = AgentFS::open(AgentFSOptions::with_path(path))
+            .await
+            .unwrap();
+        let file_stats = reader.fs.stat("/subdir/owned.txt").await.unwrap().unwrap();
+        assert_eq!(
+            (file_stats.uid, file_stats.gid),
+            (uid, gid),
+            "fs write must create files owned by the invoking uid/gid"
+        );
+        let dir_stats = reader.fs.stat("/subdir").await.unwrap().unwrap();
+        assert_eq!(
+            (dir_stats.uid, dir_stats.gid),
+            (uid, gid),
+            "fs write must create intermediate directories owned by the invoking uid/gid"
+        );
     }
 
     #[tokio::test]

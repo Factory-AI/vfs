@@ -48,8 +48,11 @@ const SKIP_MOUNT_PREFIXES: &[&str] = &["/proc", "/sys", "/dev", "/tmp"];
 /// World-writable temp directories hidden from the sandbox alongside the home
 /// directory (sacred invariant 2: reads are scopeable). Each is replaced by an
 /// empty namespace-private tmpfs, so host files there are invisible and
-/// sandbox writes to them never reach the host.
-const READ_SCOPED_TMPDIRS: &[&str] = &["/tmp", "/var/tmp"];
+/// sandbox writes to them never reach the host. /dev/shm belongs here even
+/// though the ro-remount pass skips everything under /dev: that skip leaves
+/// the fresh scoping tmpfs writable (intended for these zones) but would leave
+/// the HOST /dev/shm reachable and writable without it.
+const READ_SCOPED_TMPDIRS: &[&str] = &["/tmp", "/var/tmp", "/dev/shm"];
 
 /// Field index for mount point in /proc/self/mountinfo.
 /// Format: ID PARENT_ID MAJOR:MINOR ROOT MOUNT_POINT OPTIONS ...
@@ -369,7 +372,7 @@ fn print_welcome_banner(cwd: &Path, allowed_paths: &[PathBuf], session_id: &str,
     }
     eprintln!();
     eprintln!("🔒 System paths are read-only.");
-    eprintln!("🙈 Other files under your home directory and /tmp are hidden.");
+    eprintln!("🙈 Other files under your home directory and temp dirs (/tmp, /var/tmp, /dev/shm) are hidden.");
     if encrypted {
         eprintln!("🔐 Delta layer is encrypted.");
     }

@@ -86,6 +86,11 @@ run_agentfs exec "$DB" sh -c 'echo exec-ok' >"$ROOT/exec.log" 2>&1 ||
     fail "exec failed: $(cat "$ROOT/exec.log")"
 grep -q "exec-ok" "$ROOT/exec.log" || fail "exec output missing"
 
+# Regression: fs-write-created files must be chmod-able inside exec (they were
+# owned by uid/gid 0, so chmod as the invoking uid failed EPERM).
+run_agentfs exec "$DB" sh -c 'chmod 700 smoke.txt' >"$ROOT/exec-chmod.log" 2>&1 ||
+    fail "chmod of an fs-write-created file failed inside exec: $(cat "$ROOT/exec-chmod.log")"
+
 # --- clone a local git repo into a fresh DB ----------------------------------------
 mkdir -p "$ROOT/srcrepo"
 (
@@ -125,6 +130,14 @@ run_agentfs migrate "$ROOT/old.db" >"$ROOT/migrate.log" 2>&1 ||
     fail "migrate failed: $(cat "$ROOT/migrate.log")"
 run_agentfs integrity --json "$ROOT/old.db" >/dev/null 2>&1 ||
     fail "integrity on migrated fixture failed"
+
+# Regression: a nonexistent path-shaped argument must report a missing
+# database, not "invalid agent ID".
+if run_agentfs migrate "$ROOT/definitely/missing.db" >"$ROOT/migrate-missing.log" 2>&1; then
+    fail "migrate of a missing path succeeded"
+fi
+grep -qi "database not found" "$ROOT/migrate-missing.log" ||
+    fail "migrate missing-path error is not a not-found report: $(cat "$ROOT/migrate-missing.log")"
 
 # --- ps ------------------------------------------------------------------------------------
 run_agentfs ps >/dev/null 2>&1 || fail "ps failed"

@@ -53,7 +53,9 @@ fn error_to_errno(e: &SdkError) -> i32 {
         SdkError::ConnectionPoolTimeout => libc::EAGAIN,
         _ => libc::EIO,
     };
-    tracing::debug!(target: "agentfs_errno", error = %e, errno, "FUSE error reply");
+    // Debug capture: SdkError Display no longer carries the source cause
+    // (source-only chaining), and this trace needs the full detail.
+    tracing::debug!(target: "agentfs_errno", error = ?e, errno, "FUSE error reply");
     errno
 }
 
