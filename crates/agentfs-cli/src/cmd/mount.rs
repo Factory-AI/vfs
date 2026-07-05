@@ -86,7 +86,7 @@ fn mount_fuse(args: MountArgs) -> Result<()> {
     {
         let rt = crate::get_runtime();
         let db_path = opts.db_path()?;
-        let result = rt.block_on(ensure_schema_current_for_mount_precheck(&db_path));
+        let result = rt.block_on(require_schema_current_for_mount_precheck(&db_path));
         if let Err(SdkError::SchemaVersionMismatch { found, expected }) = result {
             exit_schema_version_mismatch(&found, &expected, &args.id_or_path);
         }
@@ -194,12 +194,12 @@ fn mount_fuse(args: MountArgs) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-async fn ensure_schema_current_for_mount_precheck(
+async fn require_schema_current_for_mount_precheck(
     db_path: &str,
 ) -> std::result::Result<(), SdkError> {
     let db = turso::Builder::new_local(db_path).build().await?;
     let conn = db.connect()?;
-    agentfs_core::schema::ensure_current(&conn).await
+    agentfs_core::schema::require_current(&conn).await
 }
 
 /// Mount the agent filesystem using NFS over localhost.
@@ -521,17 +521,10 @@ pub fn prune_mounts(_force: bool) -> Result<()> {
 
 /// Print schema version mismatch error and exit.
 fn exit_schema_version_mismatch(found: &str, expected: &str, id_or_path: &str) -> ! {
-    eprintln!("Error: Filesystem `{}` requires migration", id_or_path);
-    eprintln!();
     eprintln!(
-        "Found schema version {}, but this version of agentfs requires {}.",
-        found, expected
+        "Error: {}",
+        crate::cmd::migrate::schema_upgrade_guidance(found, expected, id_or_path)
     );
-    eprintln!();
-    eprintln!("To upgrade, run:");
-    eprintln!();
-    eprintln!("    agentfs migrate {}", id_or_path);
-    eprintln!();
     crate::profiling::emit_cli_report();
     std::process::exit(1);
 }
@@ -549,7 +542,7 @@ mod tests {
         let db_path = dir.path().join("legacy-whiteout.db");
         create_currentish_db_with_legacy_whiteout(&db_path).await;
 
-        ensure_schema_current_for_mount_precheck(db_path.to_str().unwrap())
+        require_schema_current_for_mount_precheck(db_path.to_str().unwrap())
             .await
             .unwrap();
 

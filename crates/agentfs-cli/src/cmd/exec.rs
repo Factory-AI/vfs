@@ -35,7 +35,9 @@ pub async fn handle_exec_command(
     }
 
     // Open AgentFS
-    let agentfs = open_agentfs(opts).await?;
+    let agentfs = open_agentfs(opts)
+        .await
+        .map_err(|err| super::migrate::open_error_with_guidance(err, &id_or_path))?;
 
     // Check for overlay configuration
     let fs: Arc<dyn FileSystem> = {

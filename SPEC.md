@@ -519,13 +519,26 @@ Where `16877` = `0o040755` (directory with rwxr-xr-x permissions)
 
 ### Schema Migration
 
-v0.5 is a layout-changing schema version. Databases created with v0.4 remain valid v0.4 databases until they are copied into a new v0.5 database:
+Migrations are keyed by `PRAGMA user_version` and land any supported old
+schema (v0.0, v0.2, v0.4) at the current version with one command:
 
 ```bash
-agentfs migrate-v0-5 <source-v0.4.db> <target-v0.5.db> --verify
+agentfs migrate <id-or-path>
 ```
 
-Migration requirements:
+In-place migration requirements:
+
+1. Every migration step MUST be an additive, idempotent DDL change applied inside a single transaction that stamps `PRAGMA user_version` before committing.
+2. Existing file contents MUST keep their recorded `chunk_size`; the in-place path does not re-chunk data. A defaulted `inline_threshold` MUST NOT exceed the database's recorded `chunk_size`.
+3. Open paths (mount, fs, exec, SDK open) MUST NOT run version upgrades implicitly; they reject old schemas and direct the user to `agentfs migrate`.
+
+The copy-based mode rebuilds the database with the current chunk layout:
+
+```bash
+agentfs migrate <source-old.db> --copy <target.db> --verify
+```
+
+Copy-migration requirements:
 
 1. The source database MUST NOT be modified in place.
 2. The target database MUST be newly created unless an explicit overwrite option is used.
@@ -535,8 +548,6 @@ Migration requirements:
 6. Sparse holes MUST preserve read-back semantics.
 7. Verification MUST run integrity checks and compare source/target metadata and file contents.
 8. After checkpointing the target, copying only the main `.db` file MUST be sufficient to reopen and verify the target state.
-
-The legacy `agentfs migrate` command is reserved for historical in-place upgrades through v0.4. It MUST NOT label a database as v0.5 without performing the copy-based v0.5 migration.
 
 ### Consistency Rules
 

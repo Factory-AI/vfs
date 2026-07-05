@@ -27,7 +27,9 @@ pub async fn ls_filesystem(
     }
     eprintln!("Using agent: {}", id_or_path);
 
-    let agentfs = open_agentfs(options).await?;
+    let agentfs = open_agentfs(options)
+        .await
+        .map_err(|err| super::migrate::open_error_with_guidance(err, &id_or_path))?;
     let conn = agentfs.get_connection().await?;
 
     if path != "/" {
@@ -115,7 +117,9 @@ pub async fn cat_filesystem(
             cipher: cipher.clone(),
         });
     }
-    let agentfs = open_agentfs(options).await?;
+    let agentfs = open_agentfs(options)
+        .await
+        .map_err(|err| super::migrate::open_error_with_guidance(err, &id_or_path))?;
 
     match agentfs.fs.read_file(path).await? {
         Some(file) => {
@@ -139,7 +143,9 @@ pub async fn write_filesystem(
             cipher: cipher.clone(),
         });
     }
-    let agentfs = open_agentfs(options).await?;
+    let agentfs = open_agentfs(options)
+        .await
+        .map_err(|err| super::migrate::open_error_with_guidance(err, &id_or_path))?;
 
     let mut components = path.split("/").collect::<Vec<_>>();
     if !path.starts_with("/") {
@@ -205,7 +211,9 @@ pub async fn diff_filesystem(id_or_path: String) -> AnyhowResult<()> {
     let options = AgentFSOptions::resolve(&id_or_path)?;
     eprintln!("Using agent: {}", id_or_path);
 
-    let agent = open_agentfs(options).await?;
+    let agent = open_agentfs(options)
+        .await
+        .map_err(|err| super::migrate::open_error_with_guidance(err, &id_or_path))?;
 
     // Check if overlay is enabled
     let base_path = match agent.is_overlay_enabled().await? {

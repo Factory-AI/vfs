@@ -1720,7 +1720,7 @@
     }
 
     #[tokio::test]
-    async fn test_v04_database_migrates_to_current_on_open() -> Result<()> {
+    async fn test_v04_database_is_rejected_on_open_until_migrated() -> Result<()> {
         let dir = tempdir()?;
         let db_path = dir.path().join("legacy-v04.db");
 
@@ -1758,6 +1758,27 @@
                 (),
             )
             .await?;
+        }
+
+        let err =
+            match crate::AgentFS::open(crate::AgentFSOptions::with_path(db_path.to_string_lossy()))
+                .await
+            {
+                Ok(_) => panic!("open must not upgrade a v0.4 schema"),
+                Err(err) => err,
+            };
+        assert!(matches!(err, Error::SchemaVersionMismatch { .. }), "{err}");
+
+        {
+            let db = Builder::new_local(db_path.to_str().unwrap())
+                .build()
+                .await?;
+            let conn = db.connect()?;
+            assert_eq!(
+                schema::detect_schema_version(&conn).await?,
+                Some(schema::SchemaVersion::V0_4)
+            );
+            schema::ensure_current(&conn).await?;
         }
 
         let agent =

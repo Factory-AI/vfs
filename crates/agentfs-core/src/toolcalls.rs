@@ -102,7 +102,7 @@ impl ToolCalls {
     /// Initialize the database schema
     async fn initialize(&self) -> Result<()> {
         let conn = self.pool.get_connection().await?;
-        schema::ensure_current(&conn).await
+        schema::require_current(&conn).await
     }
 
     /// Start a new tool call and mark it as pending

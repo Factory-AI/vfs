@@ -425,30 +425,32 @@ fn main() {
         Command::Migrate {
             id_or_path,
             dry_run,
-        } => {
-            let rt = get_runtime();
-            if let Err(e) = rt.block_on(cmd::migrate::handle_migrate_command(
-                &mut std::io::stdout(),
-                id_or_path,
-                dry_run,
-            )) {
-                exit_with_error(e);
-            }
-        }
-        Command::MigrateV0_5 {
-            source,
-            target,
+            copy,
             verify,
             overwrite_target,
+            key,
+            cipher,
         } => {
+            let encryption = parse_encryption(key, cipher);
             let rt = get_runtime();
-            if let Err(e) = rt.block_on(cmd::migrate::handle_migrate_v0_5_command(
-                &mut std::io::stdout(),
-                source,
-                target,
-                verify,
-                overwrite_target,
-            )) {
+            let result = if let Some(target) = copy {
+                rt.block_on(cmd::migrate::handle_migrate_copy_command(
+                    &mut std::io::stdout(),
+                    id_or_path,
+                    target,
+                    verify,
+                    overwrite_target,
+                    encryption.as_ref(),
+                ))
+            } else {
+                rt.block_on(cmd::migrate::handle_migrate_command(
+                    &mut std::io::stdout(),
+                    id_or_path,
+                    dry_run,
+                    encryption.as_ref(),
+                ))
+            };
+            if let Err(e) = result {
                 exit_with_error(e);
             }
         }

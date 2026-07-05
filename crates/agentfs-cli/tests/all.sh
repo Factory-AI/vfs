@@ -117,6 +117,7 @@ run_test "corruption-torture-uring" env \
     "$DIR/test-corruption-torture.sh"
 
 run_test "mount" "$DIR/test-mount.sh"
+run_test "migrate-consolidation" "$DIR/test-migrate-consolidation.sh"
 run_test "overlay-whiteout" "$DIR/test-overlay-whiteout.sh"
 run_test "overlay-delta-in-base-dir" "$DIR/test-overlay-delta-in-base-dir.sh"
 run_test "overlay-base-dir-rename-exdev" "$DIR/test-overlay-base-dir-rename-exdev.sh"

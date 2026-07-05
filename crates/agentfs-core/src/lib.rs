@@ -159,10 +159,11 @@ impl AgentFS {
             (None, pool)
         };
 
-        // Initialize or migrate schema for existing databases before any
-        // schema-owned callers read or write sidecar sections.
+        // Initialize or normalize schema for existing databases before any
+        // schema-owned callers read or write sidecar sections. Old schema
+        // versions are rejected here; upgrades are `agentfs migrate`'s job.
         let mut conn = pool.get_connection().await?;
-        if let Err(error) = schema::ensure_current(&conn).await {
+        if let Err(error) = schema::require_current(&conn).await {
             conn.mark_unhealthy_if_fatal(&error);
             return Err(error);
         }

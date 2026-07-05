@@ -42,7 +42,9 @@ pub async fn show_timeline(
 ) -> AnyhowResult<()> {
     let agent_options = AgentFSOptions::resolve(id_or_path)?;
 
-    let agentfs = open_agentfs(agent_options).await?;
+    let agentfs = open_agentfs(agent_options)
+        .await
+        .map_err(|err| super::migrate::open_error_with_guidance(err, id_or_path))?;
 
     let toolcalls = ToolCalls::from_pool(agentfs.get_pool())
         .await

@@ -65,6 +65,17 @@ impl SchemaVersion {
         matches!(self, CURRENT)
     }
 
+    /// Parse a version marker string (e.g. "0.4") into a known schema version.
+    pub fn parse(marker: &str) -> Option<Self> {
+        match marker {
+            "0.0" => Some(SchemaVersion::V0_0),
+            "0.2" => Some(SchemaVersion::V0_2),
+            "0.4" => Some(SchemaVersion::V0_4),
+            "0.5" => Some(SchemaVersion::V0_5),
+            _ => None,
+        }
+    }
+
     fn from_user_version(version: i64) -> Option<Self> {
         match version {
             0 => Some(SchemaVersion::V0_0),
@@ -375,6 +386,23 @@ pub async fn check_schema_version(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Gate for open paths: create fresh databases and normalize already-current
+/// ones (compat columns, missing indexes, `user_version` stamp), but never run
+/// version upgrades. An older supported schema returns
+/// [`Error::SchemaVersionMismatch`] so callers can direct the user to
+/// `agentfs migrate`, which owns explicit upgrades via [`ensure_current`].
+pub async fn require_current(conn: &Connection) -> Result<()> {
+    if let Some(version) = detect_schema_version(conn).await? {
+        if version != CURRENT {
+            return Err(Error::SchemaVersionMismatch {
+                found: version.to_string(),
+                expected: CURRENT.to_string(),
+            });
+        }
+    }
+    ensure_current(conn).await
+}
+
 /// Ensure the database is at [`CURRENT`], running all pending migrations inside
 /// a single IMMEDIATE transaction and stamping `PRAGMA user_version` before the
 /// DDL transaction commits.
@@ -657,15 +685,33 @@ async fn ensure_config_defaults(conn: &Connection) -> Result<()> {
         (CONFIG_CHUNK_SIZE_KEY, DEFAULT_CHUNK_SIZE.to_string()),
     )
     .await?;
+    // Old databases keep their recorded chunk_size (e.g. 4096); a defaulted
+    // inline_threshold must not exceed it or the storage invariant
+    // `inline_threshold <= chunk_size` breaks on migrated databases.
+    let chunk_size = read_config_value(conn, CONFIG_CHUNK_SIZE_KEY)
+        .await?
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_CHUNK_SIZE);
     conn.execute(
         "INSERT OR IGNORE INTO fs_config (key, value) VALUES (?, ?)",
         (
             CONFIG_INLINE_THRESHOLD_KEY,
-            DEFAULT_INLINE_THRESHOLD.to_string(),
+            DEFAULT_INLINE_THRESHOLD.min(chunk_size).to_string(),
         ),
     )
     .await?;
     Ok(())
+}
+
+async fn read_config_value(conn: &Connection, key: &str) -> Result<Option<String>> {
+    let mut rows = conn
+        .query("SELECT value FROM fs_config WHERE key = ?", (key,))
+        .await?;
+    if let Some(row) = rows.next().await? {
+        Ok(Some(row.get(0)?))
+    } else {
+        Ok(None)
+    }
 }
 
 async fn add_column_if_missing(
@@ -873,6 +919,107 @@ mod tests {
             let report =
                 integrity::check(&conn, &integrity::CheckOpts::new(db_path.clone())).await?;
             assert!(report.ok, "integrity failed for migrated {version}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migrated_defaults_keep_inline_threshold_within_chunk_size() -> Result<()> {
+        let dir = tempdir()?;
+        let db_path = dir.path().join("legacy-small-chunks.db");
+        let db = Builder::new_local(db_path.to_str().unwrap())
+            .build()
+            .await?;
+        let conn = db.connect()?;
+        create_legacy_fixture(&conn, SchemaVersion::V0_4).await?;
+        conn.execute(
+            "DELETE FROM fs_config WHERE key = ?",
+            (CONFIG_INLINE_THRESHOLD_KEY,),
+        )
+        .await?;
+        conn.execute(
+            "UPDATE fs_config SET value = '4096' WHERE key = ?",
+            (CONFIG_CHUNK_SIZE_KEY,),
+        )
+        .await?;
+
+        ensure_current(&conn).await?;
+
+        let inline_threshold = read_config_value(&conn, CONFIG_INLINE_THRESHOLD_KEY)
+            .await?
+            .expect("inline_threshold default must be inserted");
+        assert_eq!(inline_threshold, "4096");
+        let report = integrity::check(&conn, &integrity::CheckOpts::new(db_path.clone())).await?;
+        let failing = report
+            .checks
+            .iter()
+            .filter(|check| !check.ok)
+            .map(|check| check.name.clone())
+            .collect::<Vec<_>>();
+        assert!(report.ok, "integrity failed: {failing:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn open_paths_reject_old_schema_without_upgrading() -> Result<()> {
+        for version in [
+            SchemaVersion::V0_0,
+            SchemaVersion::V0_2,
+            SchemaVersion::V0_4,
+        ] {
+            let dir = tempdir()?;
+            let db_path = dir.path().join(format!("old-{}.db", version.as_str()));
+            {
+                let db = Builder::new_local(db_path.to_str().unwrap())
+                    .build()
+                    .await?;
+                let conn = db.connect()?;
+                create_legacy_fixture(&conn, version).await?;
+            }
+
+            let err =
+                match AgentFS::open(AgentFSOptions::with_path(db_path.to_string_lossy())).await {
+                    Ok(_) => panic!("{version}: AgentFS::open must not upgrade an old schema"),
+                    Err(err) => err,
+                };
+            assert!(
+                matches!(err, Error::SchemaVersionMismatch { .. }),
+                "{version}: unexpected open error {err}"
+            );
+            let kv_err = match KvStore::new(db_path.to_str().unwrap()).await {
+                Ok(_) => panic!("{version}: KvStore::new must not upgrade an old schema"),
+                Err(err) => err,
+            };
+            assert!(
+                matches!(kv_err, Error::SchemaVersionMismatch { .. }),
+                "{version}: unexpected kv error {kv_err}"
+            );
+            let tool_err = match ToolCalls::new(db_path.to_str().unwrap()).await {
+                Ok(_) => panic!("{version}: ToolCalls::new must not upgrade an old schema"),
+                Err(err) => err,
+            };
+            assert!(
+                matches!(tool_err, Error::SchemaVersionMismatch { .. }),
+                "{version}: unexpected tool-calls error {tool_err}"
+            );
+
+            let db = Builder::new_local(db_path.to_str().unwrap())
+                .build()
+                .await?;
+            let conn = db.connect()?;
+            assert_eq!(user_version(&conn).await?, 0, "{version}: db was stamped");
+            assert_eq!(detect_schema_version(&conn).await?, Some(version));
+            let columns = get_table_columns(&conn, "fs_inode").await?;
+            assert!(
+                !columns.iter().any(|column| column.name == "data_inline"),
+                "{version}: open added v0.5 columns"
+            );
+
+            ensure_current(&conn).await?;
+            drop(conn);
+            drop(db);
+            let agent = AgentFS::open(AgentFSOptions::with_path(db_path.to_string_lossy())).await?;
+            assert_eq!(agent.fs.read_file("/file.txt").await?.unwrap(), b"abcdef");
         }
         Ok(())
     }

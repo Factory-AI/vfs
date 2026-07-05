@@ -1,9 +1,14 @@
 //! Database schema migration command.
 //!
-//! Migrates an agentfs SQLite database to the current schema version.
+//! One `agentfs migrate` lands any supported old schema at the current
+//! version: in place by default (every supported migration is an additive,
+//! transactional ALTER), or copy-based via `--copy <target>` for users who
+//! want a rebuilt database with the current chunk layout, keeping the
+//! hash/verify engine from the historical `migrate-v0-5` command.
 
 use agentfs_core::{
     config::{DEFAULT_CHUNK_SIZE, DEFAULT_INLINE_THRESHOLD},
+    error::Error as SdkError,
     schema, AgentFSOptions, SchemaVersion,
 };
 use anyhow::{Context, Result as AnyhowResult};
@@ -13,16 +18,50 @@ use std::hash::{Hash, Hasher};
 use std::io::{Read as IoRead, Write};
 use std::path::{Path, PathBuf};
 use turso::transaction::{Transaction, TransactionBehavior};
-use turso::{Builder, Connection, Value};
+use turso::{Connection, Value};
+
+use super::safety::build_local_database;
 
 const S_IFMT: i64 = 0o170000;
 const S_IFREG: i64 = 0o100000;
 
-/// Handle the migrate command.
+/// Guidance for a schema-version mismatch surfaced by an open path.
+///
+/// Names a command that actually finishes the job: supported old versions get
+/// `agentfs migrate <id-or-path>` (which lands at CURRENT in one invocation);
+/// anything else is from a newer agentfs and no local command can help.
+pub fn schema_upgrade_guidance(found: &str, expected: &str, id_or_path: &str) -> String {
+    match SchemaVersion::parse(found) {
+        Some(version) if version < schema::CURRENT => format!(
+            "Filesystem `{id_or_path}` requires migration\n\n\
+             Found schema version {found}, but this version of agentfs requires {expected}.\n\n\
+             To upgrade, run:\n\n    agentfs migrate {id_or_path}\n"
+        ),
+        _ => format!(
+            "Filesystem `{id_or_path}` has unsupported schema version {found}; \
+             this version of agentfs supports up to {expected}.\n\
+             The database was likely created by a newer agentfs. Upgrade agentfs to open it."
+        ),
+    }
+}
+
+/// Convert an SDK open error into an anyhow error, attaching migrate guidance
+/// when the failure is a schema-version mismatch.
+pub fn open_error_with_guidance(err: SdkError, id_or_path: &str) -> anyhow::Error {
+    match &err {
+        SdkError::SchemaVersionMismatch { found, expected } => {
+            anyhow::anyhow!("{}", schema_upgrade_guidance(found, expected, id_or_path))
+        }
+        _ => err.into(),
+    }
+}
+
+/// Handle the in-place migrate command.
 pub async fn handle_migrate_command(
     stdout: &mut impl Write,
     id_or_path: String,
     dry_run: bool,
+    encryption: Option<&(String, String)>,
 ) -> AnyhowResult<()> {
     let options = AgentFSOptions::resolve(&id_or_path)?;
     let db_path_str = options
@@ -36,19 +75,20 @@ pub async fn handle_migrate_command(
 
     writeln!(stdout, "Database: {}", db_path.display())?;
 
-    // Open database directly using turso::Builder (not SDK) to avoid version check
-    let db = Builder::new_local(&db_path_str)
-        .build()
-        .await
-        .context("Failed to open database")?;
+    // Open directly via turso::Builder (not the SDK) so the open-path version
+    // gate does not reject the database migrate exists to upgrade.
+    let db = build_local_database(db_path, encryption).await?;
     let conn = db.connect().context("Failed to connect to database")?;
 
-    // Detect current schema version using SDK
     let current_version = schema::detect_schema_version(&conn)
         .await?
         .unwrap_or(SchemaVersion::V0_0);
     writeln!(stdout, "Current schema version: {}", current_version)?;
-    writeln!(stdout, "Target schema version: {}", schema::CURRENT)?;
+    writeln!(
+        stdout,
+        "Target schema version: {} (CURRENT)",
+        schema::CURRENT
+    )?;
 
     if current_version == schema::CURRENT {
         writeln!(stdout, "Database is already at schema {}.", schema::CURRENT)?;
@@ -68,21 +108,42 @@ pub async fn handle_migrate_command(
             .await
             .context("Failed to migrate schema to current")?;
 
+        // Leave a single portable main-db file behind: checkpoint the WAL and
+        // drop the now-empty sidecars.
+        checkpoint_target(&conn, db_path).await?;
+        drop(conn);
+        drop(db);
+        super::safety::remove_sqlite_sidecars_after_checkpoint(db_path)?;
+
         writeln!(stdout, "\nMigration completed successfully.")?;
     }
 
     Ok(())
 }
 
-/// Handle the copy-based v0.4 -> v0.5 migration command.
-pub async fn handle_migrate_v0_5_command(
+/// Handle the copy-based migration mode (`migrate <source> --copy <target>`).
+pub async fn handle_migrate_copy_command(
     stdout: &mut impl Write,
-    source: PathBuf,
+    id_or_path: String,
     target: PathBuf,
     verify: bool,
     overwrite_target: bool,
+    encryption: Option<&(String, String)>,
 ) -> AnyhowResult<()> {
-    migrate_v0_4_to_v0_5(stdout, &source, &target, verify, overwrite_target).await
+    let options = AgentFSOptions::resolve(&id_or_path)?;
+    let source_path_str = options
+        .db_path()
+        .context("Failed to resolve database path")?;
+    let source = PathBuf::from(source_path_str);
+    copy_migrate_to_current(
+        stdout,
+        &source,
+        &target,
+        verify,
+        overwrite_target,
+        encryption,
+    )
+    .await
 }
 
 /// Print pending migrations without applying them.
@@ -105,12 +166,13 @@ fn print_pending_migrations(
     Ok(())
 }
 
-async fn migrate_v0_4_to_v0_5(
+async fn copy_migrate_to_current(
     stdout: &mut impl Write,
     source_path: &Path,
     target_path: &Path,
     verify: bool,
     overwrite_target: bool,
+    encryption: Option<&(String, String)>,
 ) -> AnyhowResult<()> {
     if !source_path.exists() {
         anyhow::bail!("Source database not found: {}", source_path.display());
@@ -131,11 +193,7 @@ async fn migrate_v0_4_to_v0_5(
         remove_db_family(target_path)?;
     }
 
-    let source_db_path = source_path
-        .to_str()
-        .context("Source database path is not valid UTF-8")?;
-    let source_db = Builder::new_local(source_db_path)
-        .build()
+    let source_db = build_local_database(source_path, encryption)
         .await
         .context("Failed to open source database")?;
     let source_conn = source_db
@@ -152,19 +210,17 @@ async fn migrate_v0_4_to_v0_5(
     let source_version = schema::detect_schema_version(&source_conn)
         .await?
         .unwrap_or(SchemaVersion::V0_0);
-    if source_version != SchemaVersion::V0_4 {
+    if source_version == schema::CURRENT {
         anyhow::bail!(
-            "Expected source schema v0.4, found {}. Run the existing migrate command first.",
-            source_version
+            "Source database is already at schema {}. Run `agentfs migrate {}` for in-place \
+             normalization or `agentfs backup` for a portable copy.",
+            schema::CURRENT,
+            source_path.display()
         );
     }
     let source_chunk_size = read_config_usize(&source_conn, "chunk_size", 4096).await?;
 
-    let target_db_path = target_path
-        .to_str()
-        .context("Target database path is not valid UTF-8")?;
-    let target_db = Builder::new_local(target_db_path)
-        .build()
+    let target_db = build_local_database(target_path, encryption)
         .await
         .context("Failed to create target database")?;
     let target_conn = target_db
@@ -174,15 +230,20 @@ async fn migrate_v0_4_to_v0_5(
     writeln!(stdout, "Source: {}", source_path.display())?;
     writeln!(stdout, "Target: {}", target_path.display())?;
     writeln!(stdout, "Source schema version: {source_version}")?;
-    writeln!(stdout, "Target schema version: {}", schema::CURRENT)?;
+    writeln!(
+        stdout,
+        "Target schema version: {} (CURRENT)",
+        schema::CURRENT
+    )?;
 
-    create_v0_5_schema(&target_conn).await?;
+    create_current_schema(&target_conn).await?;
 
     let txn = Transaction::new_unchecked(&target_conn, TransactionBehavior::Immediate).await?;
     let copy_result: AnyhowResult<()> = async {
         copy_fs_config(&source_conn, &target_conn).await?;
         migrate_inodes_and_file_data(&source_conn, &target_conn, source_chunk_size).await?;
         copy_table_common_columns(&source_conn, &target_conn, "fs_dentry").await?;
+        backfill_target_nlink_if_missing(&source_conn, &target_conn).await?;
         copy_table_common_columns(&source_conn, &target_conn, "fs_symlink").await?;
         copy_optional_whiteouts(&source_conn, &target_conn).await?;
         copy_optional_table_common_columns(&source_conn, &target_conn, "fs_origin").await?;
@@ -203,7 +264,8 @@ async fn migrate_v0_4_to_v0_5(
 
     if verify {
         verify_migration_equivalence(&source_conn, &target_conn).await?;
-        checkpoint_target_and_verify_copy(&source_conn, &target_conn, target_path).await?;
+        checkpoint_target_and_verify_copy(&source_conn, &target_conn, target_path, encryption)
+            .await?;
     } else {
         checkpoint_target(&target_conn, target_path).await?;
     }
@@ -223,10 +285,43 @@ async fn migrate_v0_4_to_v0_5(
     Ok(())
 }
 
-async fn create_v0_5_schema(conn: &Connection) -> AnyhowResult<()> {
+async fn create_current_schema(conn: &Connection) -> AnyhowResult<()> {
     schema::ensure_current(conn)
         .await
         .map_err(anyhow::Error::from)
+}
+
+/// The v0.0 -> v0.2 nlink backfill rule, applied on the copy target when the
+/// source predates the nlink column. Must stay in step with the in-place
+/// migration in `agentfs_core::schema`.
+const NLINK_BACKFILL_CASE: &str = "CASE
+     WHEN fs_inode.ino = 1 THEN 2
+     WHEN (fs_inode.mode & 61440) = 16384
+         THEN MAX(1, (SELECT COUNT(*) FROM fs_dentry d WHERE d.ino = fs_inode.ino))
+     ELSE (SELECT COUNT(*) FROM fs_dentry d WHERE d.ino = fs_inode.ino)
+ END";
+
+async fn backfill_target_nlink_if_missing(
+    source: &Connection,
+    target: &Connection,
+) -> AnyhowResult<()> {
+    if source_has_column(source, "fs_inode", "nlink").await? {
+        return Ok(());
+    }
+    target
+        .execute(
+            &format!("UPDATE fs_inode SET nlink = {NLINK_BACKFILL_CASE}"),
+            (),
+        )
+        .await?;
+    Ok(())
+}
+
+async fn source_has_column(conn: &Connection, table: &str, column: &str) -> AnyhowResult<bool> {
+    Ok(get_table_columns(conn, table)
+        .await?
+        .iter()
+        .any(|name| name == column))
 }
 
 async fn copy_fs_config(source: &Connection, target: &Connection) -> AnyhowResult<()> {
@@ -286,15 +381,28 @@ async fn migrate_inodes_and_file_data(
     target: &Connection,
     source_chunk_size: usize,
 ) -> AnyhowResult<()> {
-    let mut rows = source
-        .query(
-            "SELECT ino, mode, nlink, uid, gid, size, atime, mtime, ctime, rdev,
-                    atime_nsec, mtime_nsec, ctime_nsec
-             FROM fs_inode
-             ORDER BY ino",
-            (),
-        )
-        .await?;
+    // Older schemas predate some inode columns (v0.0: nlink; v0.0/v0.2:
+    // rdev and the *_nsec columns); select zeros for the missing ones so one
+    // copy loop serves every supported source version.
+    let source_columns = get_table_columns(source, "fs_inode").await?;
+    let select_column = |name: &str| {
+        if source_columns.iter().any(|column| column == name) {
+            quote_identifier(name)
+        } else {
+            format!("0 AS {}", quote_identifier(name))
+        }
+    };
+    let select_sql = format!(
+        "SELECT ino, mode, {}, uid, gid, size, atime, mtime, ctime, {}, {}, {}, {}
+         FROM fs_inode
+         ORDER BY ino",
+        select_column("nlink"),
+        select_column("rdev"),
+        select_column("atime_nsec"),
+        select_column("mtime_nsec"),
+        select_column("ctime_nsec"),
+    );
+    let mut rows = source.query(&select_sql, ()).await?;
 
     while let Some(row) = rows.next().await? {
         let ino = row_i64(&row, 0)?;
@@ -606,27 +714,11 @@ async fn verify_migration_equivalence(
     run_integrity_check(target, "target").await?;
     verify_target_v0_5_invariants(target).await?;
     verify_target_v0_5_config(target).await?;
-    compare_table_rows(
-        source,
-        target,
-        "fs_inode",
-        &[
-            "ino",
-            "mode",
-            "nlink",
-            "uid",
-            "gid",
-            "size",
-            "atime",
-            "mtime",
-            "ctime",
-            "rdev",
-            "atime_nsec",
-            "mtime_nsec",
-            "ctime_nsec",
-        ],
-    )
-    .await?;
+    // Compare the inode columns both sides share; columns the source predates
+    // (nlink for v0.0, rdev/*_nsec for v0.0/v0.2) are zero-defaulted or
+    // backfilled on the target and verified against their rule below.
+    compare_common_table_rows(source, target, "fs_inode").await?;
+    verify_target_nlink_rule_if_source_missing(source, target).await?;
     compare_table_rows(
         source,
         target,
@@ -650,10 +742,27 @@ async fn verify_migration_equivalence(
     Ok(())
 }
 
+async fn verify_target_nlink_rule_if_source_missing(
+    source: &Connection,
+    target: &Connection,
+) -> AnyhowResult<()> {
+    if source_has_column(source, "fs_inode", "nlink").await? {
+        return Ok(());
+    }
+    let sql = format!("SELECT ino FROM fs_inode WHERE nlink != {NLINK_BACKFILL_CASE} LIMIT 1");
+    let mut rows = target.query(&sql, ()).await?;
+    if let Some(row) = rows.next().await? {
+        let ino = row_i64(&row, 0).unwrap_or_default();
+        anyhow::bail!("Target nlink backfill violates the migration rule (ino {ino})");
+    }
+    Ok(())
+}
+
 async fn checkpoint_target_and_verify_copy(
     source: &Connection,
     target: &Connection,
     target_path: &Path,
+    encryption: Option<&(String, String)>,
 ) -> AnyhowResult<()> {
     checkpoint_target(target, target_path).await?;
     let snapshot_path = target_path.with_extension("snapshot-check.db");
@@ -665,11 +774,7 @@ async fn checkpoint_target_and_verify_copy(
             snapshot_path.display()
         )
     })?;
-    let snapshot_db_path = snapshot_path
-        .to_str()
-        .context("Snapshot check database path is not valid UTF-8")?;
-    let snapshot_db = Builder::new_local(snapshot_db_path)
-        .build()
+    let snapshot_db = build_local_database(&snapshot_path, encryption)
         .await
         .context("Failed to open target main-db snapshot")?;
     let snapshot_conn = snapshot_db
@@ -1171,6 +1276,7 @@ fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+    use turso::Builder;
 
     async fn create_test_db_v0_0() -> (turso::Database, NamedTempFile) {
         let file = NamedTempFile::new().unwrap();
@@ -1387,9 +1493,16 @@ mod tests {
         let source_bytes_before = fs::read(&source).unwrap();
 
         let mut stdout = Vec::new();
-        handle_migrate_v0_5_command(&mut stdout, source.clone(), target.clone(), true, false)
-            .await
-            .unwrap();
+        handle_migrate_copy_command(
+            &mut stdout,
+            source.to_string_lossy().into_owned(),
+            target.clone(),
+            true,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(hash_file(&source).unwrap(), source_hash_before);
         assert_eq!(fs::read(&source).unwrap(), source_bytes_before);
@@ -1493,7 +1606,7 @@ mod tests {
             .await
             .unwrap();
         let target_conn = target_db.connect().unwrap();
-        create_v0_5_schema(&target_conn).await.unwrap();
+        create_current_schema(&target_conn).await.unwrap();
         copy_optional_whiteouts(&source_conn, &target_conn)
             .await
             .unwrap();
@@ -1529,9 +1642,14 @@ mod tests {
         drop(db);
 
         let mut stdout = Vec::new();
-        handle_migrate_command(&mut stdout, db_path.to_string_lossy().into_owned(), false)
-            .await
-            .unwrap();
+        handle_migrate_command(
+            &mut stdout,
+            db_path.to_string_lossy().into_owned(),
+            false,
+            None,
+        )
+        .await
+        .unwrap();
         let stdout = String::from_utf8(stdout).unwrap();
         assert!(
             stdout.contains("Migration completed successfully."),
@@ -1868,6 +1986,501 @@ mod tests {
             "INSERT INTO tool_calls
              (id, name, parameters, result, error, status, started_at, completed_at, duration_ms)
              VALUES (1, 'migrate-test', '{\"input\":1}', '{\"ok\":true}', '', 'success', 30, 31, 1000)",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn schema_upgrade_guidance_names_a_command_that_finishes_the_job() {
+        for (found, id_or_path) in [
+            ("0.0", "my-agent"),
+            ("0.2", "/tmp/old.db"),
+            ("0.4", "other-agent"),
+        ] {
+            let guidance = schema_upgrade_guidance(found, "0.5", id_or_path);
+            assert!(
+                guidance.contains(&format!("agentfs migrate {id_or_path}")),
+                "{found}: {guidance}"
+            );
+            assert!(!guidance.contains("migrate-v0-5"), "{found}: {guidance}");
+        }
+
+        let future = schema_upgrade_guidance("user_version 7", "0.5", "my-agent");
+        assert!(
+            !future.contains("agentfs migrate"),
+            "future versions must not promise migrate can fix them: {future}"
+        );
+        assert!(future.contains("newer agentfs"), "{future}");
+    }
+
+    #[tokio::test]
+    async fn test_copy_migrate_v0_0_source_lands_current_with_nlink_backfill() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source = temp_dir.path().join("source-v00.db");
+        let target = temp_dir.path().join("target.db");
+        let small = b"tiny".to_vec();
+        let large = patterned_bytes(DEFAULT_CHUNK_SIZE + 77, 0x21);
+        create_synthetic_legacy_database(&source, SchemaVersion::V0_0, &small, &large).await;
+
+        let mut stdout = Vec::new();
+        handle_migrate_copy_command(
+            &mut stdout,
+            source.to_string_lossy().into_owned(),
+            target.clone(),
+            true,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        let stdout = String::from_utf8(stdout).unwrap();
+        assert!(stdout.contains("Source schema version: 0.0"), "{stdout}");
+        assert!(stdout.contains("Verification completed successfully."));
+
+        let db = Builder::new_local(target.to_str().unwrap())
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        let mut rows = conn.query("PRAGMA user_version", ()).await.unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row_i64(&row, 0).unwrap(), schema::CURRENT.user_version());
+
+        for (ino, expected_nlink) in [(1, 2), (2, 1), (3, 1), (4, 2)] {
+            let mut rows = conn
+                .query("SELECT nlink FROM fs_inode WHERE ino = ?", (ino,))
+                .await
+                .unwrap();
+            let row = rows.next().await.unwrap().unwrap();
+            assert_eq!(
+                row_i64(&row, 0).unwrap(),
+                expected_nlink,
+                "nlink for ino {ino}"
+            );
+        }
+
+        let migrated_small = read_target_file_bytes(&conn, 3, small.len(), DEFAULT_CHUNK_SIZE)
+            .await
+            .unwrap();
+        assert_eq!(migrated_small, small);
+        let migrated_large = read_target_file_bytes(&conn, 4, large.len(), DEFAULT_CHUNK_SIZE)
+            .await
+            .unwrap();
+        assert_eq!(migrated_large, large);
+    }
+
+    #[tokio::test]
+    async fn test_copy_migrate_v0_2_source_lands_current() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source = temp_dir.path().join("source-v02.db");
+        let target = temp_dir.path().join("target.db");
+        let small = b"inline me".to_vec();
+        let large = patterned_bytes(2 * DEFAULT_CHUNK_SIZE + 5, 0x55);
+        create_synthetic_legacy_database(&source, SchemaVersion::V0_2, &small, &large).await;
+
+        let mut stdout = Vec::new();
+        handle_migrate_copy_command(
+            &mut stdout,
+            source.to_string_lossy().into_owned(),
+            target.clone(),
+            true,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        let stdout = String::from_utf8(stdout).unwrap();
+        assert!(stdout.contains("Source schema version: 0.2"), "{stdout}");
+
+        let db = Builder::new_local(target.to_str().unwrap())
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        let mut rows = conn.query("PRAGMA user_version", ()).await.unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row_i64(&row, 0).unwrap(), schema::CURRENT.user_version());
+        let migrated_large = read_target_file_bytes(&conn, 4, large.len(), DEFAULT_CHUNK_SIZE)
+            .await
+            .unwrap();
+        assert_eq!(migrated_large, large);
+    }
+
+    #[tokio::test]
+    async fn test_copy_migrate_rejects_current_source() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source = temp_dir.path().join("current.db");
+        let target = temp_dir.path().join("target.db");
+        {
+            let db = Builder::new_local(source.to_str().unwrap())
+                .build()
+                .await
+                .unwrap();
+            let conn = db.connect().unwrap();
+            schema::ensure_current(&conn).await.unwrap();
+        }
+
+        let mut stdout = Vec::new();
+        let err = handle_migrate_copy_command(
+            &mut stdout,
+            source.to_string_lossy().into_owned(),
+            target.clone(),
+            false,
+            false,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("already at schema"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_in_place_migrate_encrypted_v0_4_with_key() {
+        let key = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let cipher = "aes256gcm";
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("encrypted-v04.db");
+
+        {
+            let db = Builder::new_local(db_path.to_str().unwrap())
+                .experimental_encryption(true)
+                .with_encryption(turso::EncryptionOpts {
+                    cipher: cipher.to_string(),
+                    hexkey: key.to_string(),
+                })
+                .build()
+                .await
+                .unwrap();
+            let conn = db.connect().unwrap();
+            create_synthetic_v0_4_fixture_tables(&conn).await;
+        }
+
+        let encryption = (key.to_string(), cipher.to_string());
+        let mut stdout = Vec::new();
+        handle_migrate_command(
+            &mut stdout,
+            db_path.to_string_lossy().into_owned(),
+            false,
+            Some(&encryption),
+        )
+        .await
+        .unwrap();
+        let stdout = String::from_utf8(stdout).unwrap();
+        assert!(stdout.contains("Current schema version: 0.4"), "{stdout}");
+        assert!(
+            stdout.contains("Migration completed successfully."),
+            "{stdout}"
+        );
+
+        // No plaintext copy may appear next to the fixture during migration.
+        let names = fs::read_dir(temp_dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| !name.starts_with("encrypted-v04.db"))
+            .collect::<Vec<_>>();
+        assert!(names.is_empty(), "unexpected files: {names:?}");
+
+        let db = build_local_database(&db_path, Some(&encryption))
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        let mut rows = conn.query("PRAGMA user_version", ()).await.unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row_i64(&row, 0).unwrap(), schema::CURRENT.user_version());
+        assert_eq!(
+            table_count_for_test(&conn, "fs_data", "ino = 2").await,
+            1,
+            "file data must survive the encrypted migration"
+        );
+        drop(conn);
+        drop(db);
+
+        let without_key = async {
+            let db = build_local_database(&db_path, None).await?;
+            let conn = db.connect()?;
+            let mut rows = conn.query("SELECT COUNT(*) FROM fs_inode", ()).await?;
+            rows.next().await?;
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        assert!(
+            without_key.is_err(),
+            "encrypted database must not open without the key"
+        );
+    }
+
+    async fn create_synthetic_v0_4_fixture_tables(conn: &Connection) {
+        conn.execute(
+            "CREATE TABLE fs_config (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO fs_config (key, value) VALUES
+             ('schema_version', '0.4'),
+             ('chunk_size', '4096')",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE fs_inode (
+                ino INTEGER PRIMARY KEY AUTOINCREMENT,
+                mode INTEGER NOT NULL,
+                nlink INTEGER NOT NULL DEFAULT 0,
+                uid INTEGER NOT NULL DEFAULT 0,
+                gid INTEGER NOT NULL DEFAULT 0,
+                size INTEGER NOT NULL DEFAULT 0,
+                atime INTEGER NOT NULL,
+                mtime INTEGER NOT NULL,
+                ctime INTEGER NOT NULL,
+                rdev INTEGER NOT NULL DEFAULT 0,
+                atime_nsec INTEGER NOT NULL DEFAULT 0,
+                mtime_nsec INTEGER NOT NULL DEFAULT 0,
+                ctime_nsec INTEGER NOT NULL DEFAULT 0
+            )",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE fs_dentry (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                parent_ino INTEGER NOT NULL,
+                ino INTEGER NOT NULL,
+                UNIQUE(parent_ino, name)
+            )",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE fs_data (
+                ino INTEGER NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                data BLOB NOT NULL,
+                PRIMARY KEY (ino, chunk_index)
+            )",
+            (),
+        )
+        .await
+        .unwrap();
+        let dir_mode = 0o040000 | 0o755;
+        let file_mode = 0o100000 | 0o644;
+        conn.execute(
+            "INSERT INTO fs_inode
+             (ino, mode, nlink, uid, gid, size, atime, mtime, ctime, rdev,
+              atime_nsec, mtime_nsec, ctime_nsec)
+             VALUES
+             (1, ?, 2, 1000, 1000, 0, 10, 10, 10, 0, 0, 0, 0),
+             (2, ?, 1, 1000, 1000, 6, 11, 11, 11, 0, 0, 0, 0)",
+            (dir_mode, file_mode),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO fs_dentry (id, name, parent_ino, ino) VALUES (1, 'file.txt', 1, 2)",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO fs_data (ino, chunk_index, data) VALUES (2, 0, ?)",
+            (Value::Blob(b"secret".to_vec()),),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn create_synthetic_legacy_database(
+        path: &Path,
+        version: SchemaVersion,
+        small_content: &[u8],
+        large_content: &[u8],
+    ) {
+        assert!(matches!(version, SchemaVersion::V0_0 | SchemaVersion::V0_2));
+        let db = Builder::new_local(path.to_str().unwrap())
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+
+        conn.execute(
+            "CREATE TABLE fs_config (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO fs_config (key, value) VALUES
+             ('schema_version', ?),
+             ('chunk_size', '4096'),
+             ('custom_metadata', 'preserve-me')",
+            (version.as_str(),),
+        )
+        .await
+        .unwrap();
+
+        let nlink_column = if version >= SchemaVersion::V0_2 {
+            "nlink INTEGER NOT NULL DEFAULT 0,"
+        } else {
+            ""
+        };
+        conn.execute(
+            &format!(
+                "CREATE TABLE fs_inode (
+                    ino INTEGER PRIMARY KEY AUTOINCREMENT,
+                    mode INTEGER NOT NULL,
+                    {nlink_column}
+                    uid INTEGER NOT NULL DEFAULT 0,
+                    gid INTEGER NOT NULL DEFAULT 0,
+                    size INTEGER NOT NULL DEFAULT 0,
+                    atime INTEGER NOT NULL,
+                    mtime INTEGER NOT NULL,
+                    ctime INTEGER NOT NULL
+                )"
+            ),
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE fs_dentry (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                parent_ino INTEGER NOT NULL,
+                ino INTEGER NOT NULL,
+                UNIQUE(parent_ino, name)
+            )",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE fs_data (
+                ino INTEGER NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                data BLOB NOT NULL,
+                PRIMARY KEY (ino, chunk_index)
+            )",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE fs_symlink (ino INTEGER PRIMARY KEY, target TEXT NOT NULL)",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE kv_store (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                created_at INTEGER DEFAULT (unixepoch()),
+                updated_at INTEGER DEFAULT (unixepoch())
+            )",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE tool_calls (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                parameters TEXT,
+                result TEXT,
+                error TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                started_at INTEGER NOT NULL,
+                completed_at INTEGER,
+                duration_ms INTEGER
+            )",
+            (),
+        )
+        .await
+        .unwrap();
+
+        let dir_mode = 0o040000 | 0o755;
+        let file_mode = 0o100000 | 0o644;
+        let (columns, nlink_values): (&str, Vec<i64>) = if version >= SchemaVersion::V0_2 {
+            (
+                "ino, mode, nlink, uid, gid, size, atime, mtime, ctime",
+                vec![2, 1, 1, 2],
+            )
+        } else {
+            ("ino, mode, uid, gid, size, atime, mtime, ctime", Vec::new())
+        };
+        for (index, (ino, mode, size)) in [
+            (1_i64, dir_mode, 0_i64),
+            (2, dir_mode, 0),
+            (3, file_mode, small_content.len() as i64),
+            (4, file_mode, large_content.len() as i64),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut values = vec![Value::Integer(ino), Value::Integer(mode)];
+            if version >= SchemaVersion::V0_2 {
+                values.push(Value::Integer(nlink_values[index]));
+            }
+            values.extend([
+                Value::Integer(1000),
+                Value::Integer(1000),
+                Value::Integer(size),
+                Value::Integer(10),
+                Value::Integer(10),
+                Value::Integer(10),
+            ]);
+            let placeholders = std::iter::repeat_n("?", values.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            conn.execute(
+                &format!("INSERT INTO fs_inode ({columns}) VALUES ({placeholders})"),
+                values,
+            )
+            .await
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO fs_dentry (id, name, parent_ino, ino) VALUES
+             (1, 'dir', 1, 2),
+             (2, 'small.txt', 2, 3),
+             (3, 'large.bin', 2, 4),
+             (4, 'large-hardlink.bin', 2, 4)",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO fs_data (ino, chunk_index, data) VALUES (3, 0, ?)",
+            (Value::Blob(small_content.to_vec()),),
+        )
+        .await
+        .unwrap();
+        for (chunk_index, chunk) in large_content.chunks(4096).enumerate() {
+            conn.execute(
+                "INSERT INTO fs_data (ino, chunk_index, data) VALUES (4, ?, ?)",
+                (chunk_index as i64, Value::Blob(chunk.to_vec())),
+            )
+            .await
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO kv_store (key, value, created_at, updated_at)
+             VALUES ('metadata', '{\"ok\":true}', 20, 21)",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tool_calls
+             (id, name, parameters, result, error, status, started_at, completed_at, duration_ms)
+             VALUES (1, 'legacy-test', '{}', '{}', '', 'success', 30, 31, 42)",
             (),
         )
         .await

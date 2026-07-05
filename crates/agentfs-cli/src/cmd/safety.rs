@@ -38,7 +38,53 @@ pub async fn handle_integrity_command(
     checkpoint: bool,
     encryption: Option<&(String, String)>,
 ) -> AnyhowResult<()> {
-    let db_path = resolve_local_db_path(&id_or_path)?;
+    // Failures before a report exists (unresolvable path, unopenable or
+    // hard-corrupt database) still emit a minimal JSON object under --json so
+    // scripted consumers always get `ok` on stdout.
+    let (db_path, report) =
+        match open_and_check_integrity(&id_or_path, require_portable, check_base, encryption).await
+        {
+            Ok(checked) => checked,
+            Err(err) => {
+                if json {
+                    let error_report = serde_json::json!({
+                        "ok": false,
+                        "error": format!("{err:#}"),
+                    });
+                    serde_json::to_writer_pretty(&mut *stdout, &error_report)?;
+                    writeln!(stdout)?;
+                }
+                return Err(err);
+            }
+        };
+    write_integrity_report(stdout, &report, json)?;
+    if !report.ok {
+        anyhow::bail!("integrity checks failed for {}", db_path.display());
+    }
+    if !checkpoint {
+        return Ok(());
+    }
+    let cleanup_db = build_local_database(&db_path, encryption).await?;
+    let cleanup_conn = cleanup_db
+        .connect()
+        .context("Failed to connect to database for sidecar cleanup")?;
+    checkpoint_for_backup(&cleanup_conn, &db_path).await?;
+    drop(cleanup_conn);
+    drop(cleanup_db);
+    remove_sqlite_sidecars_after_checkpoint(&db_path)?;
+    if !json {
+        writeln!(stdout, "Checkpoint: complete")?;
+    }
+    Ok(())
+}
+
+async fn open_and_check_integrity(
+    id_or_path: &str,
+    require_portable: bool,
+    check_base: bool,
+    encryption: Option<&(String, String)>,
+) -> AnyhowResult<(PathBuf, integrity::Report)> {
+    let db_path = resolve_local_db_path(id_or_path)?;
     let db = build_local_database(&db_path, encryption).await?;
     let conn = db.connect().context("Failed to connect to database")?;
     conn.execute("PRAGMA query_only = 1", ())
@@ -52,27 +98,7 @@ pub async fn handle_integrity_command(
             .check_base(check_base),
     )
     .await?;
-    write_integrity_report(stdout, &report, json)?;
-    if !report.ok {
-        anyhow::bail!("integrity checks failed for {}", db_path.display());
-    }
-    if !checkpoint {
-        return Ok(());
-    }
-    drop(conn);
-    drop(db);
-    let cleanup_db = build_local_database(&db_path, encryption).await?;
-    let cleanup_conn = cleanup_db
-        .connect()
-        .context("Failed to connect to database for sidecar cleanup")?;
-    checkpoint_for_backup(&cleanup_conn, &db_path).await?;
-    drop(cleanup_conn);
-    drop(cleanup_db);
-    remove_sqlite_sidecars_after_checkpoint(&db_path)?;
-    if !json {
-        writeln!(stdout, "Checkpoint: complete")?;
-    }
-    Ok(())
+    Ok((db_path, report))
 }
 
 /// Create a portable main-database backup of a local AgentFS database.
@@ -172,7 +198,7 @@ pub async fn handle_materialize_command(
     Ok(())
 }
 
-async fn build_local_database(
+pub(crate) async fn build_local_database(
     path: &Path,
     encryption: Option<&(String, String)>,
 ) -> AnyhowResult<turso::Database> {
@@ -870,7 +896,7 @@ fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(format!("{}{}", path.display(), suffix))
 }
 
-fn remove_sqlite_sidecars_after_checkpoint(path: &Path) -> AnyhowResult<()> {
+pub(crate) fn remove_sqlite_sidecars_after_checkpoint(path: &Path) -> AnyhowResult<()> {
     let wal = sidecar_path(path, "-wal");
     if let Ok(metadata) = fs::metadata(&wal) {
         if metadata.len() != 0 {
@@ -1032,6 +1058,100 @@ mod tests {
         .unwrap();
         let output = String::from_utf8(checkpoint_stdout).unwrap();
         assert!(output.contains("Checkpoint: complete"));
+    }
+
+    #[tokio::test]
+    async fn integrity_json_emits_error_object_for_hard_corruption() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("hard-corrupt.db");
+        {
+            let agent = AgentFS::open(AgentFSOptions::with_path(db_path.to_string_lossy()))
+                .await
+                .unwrap();
+            write_agent_file(&agent, "/hello.txt", b"hello").await;
+        }
+        {
+            use std::io::{Seek, SeekFrom, Write as IoWrite};
+            let mut file = fs::OpenOptions::new().write(true).open(&db_path).unwrap();
+            file.seek(SeekFrom::Start(4096)).unwrap();
+            file.write_all(&[0xa0; 4096]).unwrap();
+        }
+
+        let mut stdout = Vec::new();
+        let err = handle_integrity_command(
+            &mut stdout,
+            db_path.to_string_lossy().to_string(),
+            true,
+            false,
+            false,
+            false,
+            None,
+        )
+        .await
+        .unwrap_err();
+        let json: JsonValue = serde_json::from_slice(&stdout)
+            .unwrap_or_else(|parse| panic!("--json must emit a JSON object on stdout even for hard corruption; stdout={:?} parse={parse} err={err:#}", String::from_utf8_lossy(&stdout)));
+        assert_eq!(json["ok"], false);
+        let error = json["error"].as_str().unwrap();
+        assert!(!error.is_empty());
+    }
+
+    #[tokio::test]
+    async fn integrity_read_only_tolerates_stale_shm_without_mutating_family() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("stale-shm.db");
+        {
+            let agent = AgentFS::open(AgentFSOptions::with_path(db_path.to_string_lossy()))
+                .await
+                .unwrap();
+            write_agent_file(&agent, "/hello.txt", b"hello").await;
+        }
+        // Crash residue from a SIGKILLed writer: a wal-index sidecar whose
+        // contents cannot be trusted. The read-only open must not consult it
+        // and must not repair or remove it.
+        let shm_path = PathBuf::from(format!("{}-shm", db_path.display()));
+        fs::write(&shm_path, [0xde, 0xad, 0xbe, 0xef].repeat(8192)).unwrap();
+
+        let family_before: Vec<(String, Vec<u8>)> = ["", "-wal", "-shm"]
+            .into_iter()
+            .filter_map(|suffix| {
+                let path = PathBuf::from(format!("{}{}", db_path.display(), suffix));
+                fs::read(&path)
+                    .ok()
+                    .map(|bytes| (suffix.to_string(), bytes))
+            })
+            .collect();
+
+        for json in [false, true] {
+            let mut stdout = Vec::new();
+            handle_integrity_command(
+                &mut stdout,
+                db_path.to_string_lossy().to_string(),
+                json,
+                false,
+                false,
+                false,
+                None,
+            )
+            .await
+            .unwrap_or_else(|err| {
+                panic!("read-only integrity must tolerate a stale -shm (json={json}): {err:#}")
+            });
+        }
+
+        let family_after: Vec<(String, Vec<u8>)> = ["", "-wal", "-shm"]
+            .into_iter()
+            .filter_map(|suffix| {
+                let path = PathBuf::from(format!("{}{}", db_path.display(), suffix));
+                fs::read(&path)
+                    .ok()
+                    .map(|bytes| (suffix.to_string(), bytes))
+            })
+            .collect();
+        assert_eq!(
+            family_before, family_after,
+            "read-only integrity must not mutate the database family"
+        );
     }
 
     #[tokio::test]

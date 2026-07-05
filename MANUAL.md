@@ -298,19 +298,34 @@ materialize the overlay before creating a portable backup.
 
 ### agentfs migrate
 
-Migrate historical database schemas through the legacy v0.4 layout.
+Migrate a database to the current schema version.
 
 ```
 agentfs migrate [OPTIONS] <ID_OR_PATH>
 ```
 
-Upgrades an AgentFS database schema through the legacy v0.4 layout. v0.5 is a layout-changing schema and uses the copy-based `agentfs migrate-v0-5` command instead of in-place mutation.
+One command lands any supported old schema (v0.0, v0.2, v0.4) at the current
+version. The default mode migrates in place: every supported migration is an
+additive, transactional `ALTER`, applied inside a single transaction that
+stamps `PRAGMA user_version` before committing. Existing file contents keep
+their recorded chunk layout.
+
+With `--copy <TARGET>`, the database is instead rebuilt into a new file with
+the current chunk layout (64 KiB chunks, small dense files stored inline).
+The source is locked, hashed before and after to prove it was untouched, and
+`--verify` additionally compares source/target metadata and file contents,
+including a checkpointed single-file snapshot check.
 
 **Arguments:**
 - `ID_OR_PATH` - Agent identifier or database path
 
 **Options:**
 - `--dry-run` - Preview migration without applying changes
+- `--copy <TARGET>` - Copy-migrate into a new database file at `TARGET` instead of migrating in place
+- `--verify` - Verify migrated filesystem, KV, tool-call, and overlay state equivalence (requires `--copy`)
+- `--overwrite-target` - Replace an existing `--copy` target database
+- `--key <KEY>` - Hex-encoded encryption key for encrypted databases
+- `--cipher <CIPHER>` - Encryption cipher (required with `--key`)
 
 **Examples:**
 
@@ -318,11 +333,17 @@ Upgrades an AgentFS database schema through the legacy v0.4 layout. v0.5 is a la
 # Preview pending migrations
 agentfs migrate my-agent --dry-run
 
-# Apply migrations
+# Migrate in place to the current schema
 agentfs migrate my-agent
 
 # Migrate using database path
 agentfs migrate .agentfs/my-agent.db
+
+# Migrate an encrypted database
+agentfs migrate .agentfs/my-agent.db --key "$KEY" --cipher aes256gcm
+
+# Rebuild into a new database with the current chunk layout, with verification
+agentfs migrate .agentfs/my-agent.db --copy .agentfs/my-agent-new.db --verify
 ```
 
 **Output:**
@@ -331,58 +352,19 @@ The command displays the current and target schema versions, then applies any ne
 
 ```
 Database: .agentfs/my-agent.db
-Current schema version: v0.2
-Target schema version: v0.4
+Current schema version: 0.2
+Target schema version: 0.5 (CURRENT)
 
 Applying migrations...
-  Migrating v0.2 -> v0.4...
-    Added atime_nsec column to fs_inode
-    Added mtime_nsec column to fs_inode
-    Added ctime_nsec column to fs_inode
-    Added rdev column to fs_inode
-  v0.2 -> v0.4 migration complete.
 
 Migration completed successfully.
 ```
 
 **Notes:**
 - Migrations are idempotent and safe to run multiple times
-- This command does not convert v0.4 databases to v0.5
+- In-place migration checkpoints the WAL on completion, leaving a single portable `.db` file
+- `--copy` never modifies the source database; overlay tables (`fs_whiteout`, `fs_origin`, and `fs_overlay_config`) are preserved and files are re-chunked to the current layout
 - Always backup your database before running migrations on production data
-
-### agentfs migrate-v0-5
-
-Copy a v0.4 database into a new v0.5 database.
-
-```
-agentfs migrate-v0-5 [OPTIONS] <SOURCE> <TARGET>
-```
-
-v0.5 changes the file-content layout by defaulting to 64 KiB chunks and storing dense regular files at or below 4 KiB inline in `fs_inode`. Because this is a layout change, migration is copy-only: the source database is opened for verification and copied into a separate target database.
-
-**Arguments:**
-- `SOURCE` - Source v0.4 database path
-- `TARGET` - Target v0.5 database path
-
-**Options:**
-- `--verify` - Verify migrated filesystem, KV, tool-call, and overlay state equivalence
-- `--overwrite-target` - Replace an existing target database
-
-**Examples:**
-
-```bash
-# Copy and verify a v0.4 database into v0.5
-agentfs migrate-v0-5 .agentfs/my-agent.db .agentfs/my-agent-v05.db --verify
-
-# Replace an existing target
-agentfs migrate-v0-5 old.db new.db --verify --overwrite-target
-```
-
-**Notes:**
-- The source database is never migrated in place
-- Overlay tables (`fs_whiteout`, `fs_origin`, and `fs_overlay_config`) are preserved
-- Sparse and large files are streamed during copy/verification rather than materialized whole-file
-- Verification includes a checkpointed single-file snapshot check for the target database
 
 ### agentfs fs
 

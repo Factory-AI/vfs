@@ -300,7 +300,7 @@ impl AgentFS {
 
     /// Initialize the database schema
     pub async fn initialize_schema(conn: &Connection) -> Result<()> {
-        schema::ensure_current(conn).await?;
+        schema::require_current(conn).await?;
 
         // Ensure root directory exists with correct ownership
         let mut rows = conn

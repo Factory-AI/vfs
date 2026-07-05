@@ -501,25 +501,29 @@ pub enum Command {
         id_or_path: String,
 
         /// Preview migration without applying changes
-        #[arg(long)]
+        #[arg(long, conflicts_with = "copy")]
         dry_run: bool,
-    },
-    /// Copy a v0.4 database into a v0.5 database
-    #[command(name = "migrate-v0-5")]
-    MigrateV0_5 {
-        /// Source v0.4 database path
-        source: PathBuf,
 
-        /// Target v0.5 database path
-        target: PathBuf,
+        /// Copy-migrate into a new database file at this path instead of
+        /// migrating in place
+        #[arg(long, value_name = "TARGET")]
+        copy: Option<PathBuf>,
 
-        /// Verify migrated state equivalence
-        #[arg(long)]
+        /// Verify migrated state equivalence (requires --copy)
+        #[arg(long, requires = "copy")]
         verify: bool,
 
-        /// Allow replacing an existing target database
-        #[arg(long)]
+        /// Allow replacing an existing --copy target database
+        #[arg(long, requires = "copy")]
         overwrite_target: bool,
+
+        /// Hex-encoded encryption key for encrypted databases
+        #[arg(long)]
+        key: Option<String>,
+
+        /// Encryption cipher (required with --key)
+        #[arg(long)]
+        cipher: Option<String>,
     },
 }
 
