@@ -12,20 +12,39 @@ WORK="$ROOT/work"
 MNT="$ROOT/mnt"
 mkdir -p "$PINNED_TMP" "$WORK" "$MNT" "$ROOT/home"
 
+MOUNT_PID=""
+
 cleanup() {
     if mountpoint -q "$MNT" 2>/dev/null; then
         fusermount3 -u "$MNT" >/dev/null 2>&1 || true
+    fi
+    if [ -n "$MOUNT_PID" ] && kill -0 "$MOUNT_PID" 2>/dev/null; then
+        kill "$MOUNT_PID" 2>/dev/null || true
+        wait "$MOUNT_PID" 2>/dev/null || true
     fi
     rm -rf "$ROOT"
 }
 trap cleanup EXIT INT TERM
 
+# Resolve the binary once: the mount leg must track the agentfs PID itself
+# and reap it before the test exits (a lingering FUSE connection draining in
+# the kernel wedges the next fuse-over-io_uring mount attempt forever).
+if [ -n "${AGENTFS_BIN:-}" ]; then
+    BIN="$AGENTFS_BIN"
+else
+    cargo +nightly build --quiet --manifest-path "$CLI_DIR/Cargo.toml" || {
+        echo "FAILED: could not build agentfs"
+        exit 1
+    }
+    BIN="$CLI_DIR/../../target/debug/agentfs"
+fi
+if [ ! -x "$BIN" ]; then
+    echo "FAILED: agentfs binary not found at $BIN"
+    exit 1
+fi
+
 run_agentfs() {
-    if [ -n "${AGENTFS_BIN:-}" ]; then
-        "$AGENTFS_BIN" "$@"
-    else
-        cargo +nightly run --quiet --manifest-path "$CLI_DIR/Cargo.toml" -- "$@"
-    fi
+    "$BIN" "$@"
 }
 
 sidecar_count() {
@@ -96,7 +115,8 @@ GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null run_agentfs run --sessio
     git fsck --no-dangling >/dev/null
 ' >/dev/null
 assert_no_sidecars "run-git"
-run_agentfs mount sidecar "$MNT"
+"$BIN" mount sidecar "$MNT" --foreground >"$ROOT/mount.log" 2>&1 &
+MOUNT_PID=$!
 
 mounted=0
 i=0
@@ -105,18 +125,35 @@ while [ "$i" -lt 100 ]; do
         mounted=1
         break
     fi
+    if ! kill -0 "$MOUNT_PID" 2>/dev/null; then
+        break
+    fi
     i=$((i + 1))
     sleep 0.1
 done
 
 if [ "$mounted" -ne 1 ]; then
     echo "FAILED: mount did not become live"
+    sed 's/^/  /' "$ROOT/mount.log" || true
     exit 1
 fi
 
 printf mounted-data > "$MNT/mounted.txt"
 cat "$MNT/mounted.txt" >/dev/null
 fusermount3 -u "$MNT"
+
+i=0
+while kill -0 "$MOUNT_PID" 2>/dev/null && [ "$i" -lt 100 ]; do
+    i=$((i + 1))
+    sleep 0.1
+done
+if kill -0 "$MOUNT_PID" 2>/dev/null; then
+    echo "FAILED: mount process did not exit after unmount"
+    exit 1
+fi
+wait "$MOUNT_PID" 2>/dev/null || true
+MOUNT_PID=""
+
 assert_no_sidecars "mount-unmount"
 
 echo "OK"
