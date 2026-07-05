@@ -5,6 +5,9 @@ edition.workspace = true
 description = "Mount lifecycle and supervision for AgentFS"
 license.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 agentfs-core = { workspace = true }
 agentfs-nfs = { workspace = true }

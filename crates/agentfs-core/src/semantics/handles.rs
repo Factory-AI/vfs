@@ -4,6 +4,10 @@
 //! captured by a successful CREATE response so later mode changes do not make
 //! already-open client writeback fail. This table is scoped to one
 //! [`Semantics`](super::Semantics) facade.
+//!
+//! Lock order: the single `inner` mutex is a leaf lock; guards cover only
+//! in-memory table updates and are dropped before any filesystem `.await`
+//! (`clippy::await_holding_lock` is deny-by-workspace).
 
 use crate::error::Result;
 use crate::fs::{agentfs::ReapHook, BoxedFile, FileSystem};

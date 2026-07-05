@@ -5,6 +5,9 @@ edition.workspace = true
 description = "AgentFS SDK for Rust"
 license.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 turso = { workspace = true }
 tokio = { workspace = true }

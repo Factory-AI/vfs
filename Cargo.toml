@@ -14,6 +14,11 @@ edition = "2021"
 license = "MIT"
 repository = "https://github.com/tursodatabase/agentfs"
 
+# Concurrency canon (architecture.md section 7 item 7): no lock guard held
+# across an .await; enforced structurally, not by review.
+[workspace.lints.clippy]
+await_holding_lock = "deny"
+
 [workspace.dependencies]
 agentfs-core = { path = "crates/agentfs-core" }
 agentfs-cli = { path = "crates/agentfs-cli" }

@@ -338,7 +338,7 @@ impl Knob {
 const CORE_OWNER: &str = "agentfs-core config";
 const FUSE_OWNER: &str = "agentfs FUSE config";
 const CLI_OWNER: &str = "agentfs CLI edge";
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 const KNOBS_DOC_REGEN_ENV: &str = "AGENTFS_UPDATE_KNOBS";
 const KNOBS_DOC_REGEN_COMMAND: &str = "AGENTFS_UPDATE_KNOBS=1 cargo +nightly test -p agentfs-cli --lib knobs::tests::generated_knobs_doc_matches_declarations -- --exact";
 
@@ -743,9 +743,15 @@ fn markdown_escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
 
+    // The checked-in KNOBS.md is generated from the Linux (first-tier)
+    // surface; LINUX_FUSE_KNOBS is empty on other targets, so doc parity is
+    // asserted only where the doc is generated (matching docs.rs
+    // manual_help_parity).
+    #[cfg(target_os = "linux")]
     #[test]
     fn generated_knobs_doc_matches_declarations() {
         assert_runtime_env_mentions_are_declared();
@@ -796,6 +802,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn knob_defaults_in_docs_match_runtime_defaults() {
         let active = active_knobs();
@@ -823,6 +830,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn all_knobs_have_class_and_sunset_criteria() {
         let mut sunset_names = Vec::new();
@@ -864,6 +872,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn fuse_kill_switches_are_declared_and_gated() {
         let active = active_knobs();
@@ -882,6 +891,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn find_knob<'a>(knobs: &'a [Knob], name: &str) -> &'a Knob {
         knobs
             .iter()
@@ -897,6 +907,7 @@ mod tests {
         )
     }
 
+    #[cfg(target_os = "linux")]
     fn assert_unique_names<'a>(knobs: impl Iterator<Item = &'a Knob>) {
         let mut seen = BTreeSet::new();
         let mut duplicates = Vec::new();
@@ -908,6 +919,7 @@ mod tests {
         assert!(duplicates.is_empty(), "duplicate knob rows: {duplicates:?}");
     }
 
+    #[cfg(target_os = "linux")]
     fn assert_runtime_env_mentions_are_declared() {
         let declared = active_knobs()
             .iter()
@@ -930,6 +942,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     fn collect_runtime_env_mentions() -> BTreeSet<&'static str> {
         let root = repo_root();
         let mut tokens = BTreeSet::new();
@@ -945,6 +958,7 @@ mod tests {
         tokens
     }
 
+    #[cfg(target_os = "linux")]
     fn collect_runtime_env_mentions_from_path(path: &Path, tokens: &mut BTreeSet<&'static str>) {
         if path
             .components()
@@ -972,6 +986,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn extract_env_tokens(contents: &str) -> BTreeSet<String> {
         let mut tokens = BTreeSet::new();
         for prefix in ["AGENTFS_", "TURSO_DB_AUTH_TOKEN"] {
@@ -993,6 +1008,7 @@ mod tests {
         tokens
     }
 
+    #[cfg(target_os = "linux")]
     fn ignored_env_token(name: &str) -> bool {
         matches!(
             name,

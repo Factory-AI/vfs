@@ -1,3 +1,10 @@
+//! Overlay filesystem: base layer + delta DB with whiteouts and origin maps.
+//!
+//! Lock order: the overlay's sync locks (`maps`, `whiteouts`, `origin_map`,
+//! `whiteout_fault`) are leaf locks. Each is taken alone for a short critical
+//! section, they never nest with one another, and DB awaits complete before
+//! any guard is taken (`clippy::await_holding_lock` is deny-by-workspace).
+
 mod copyup;
 mod fs;
 mod maps;

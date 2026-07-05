@@ -18,6 +18,9 @@ path = "src/main.rs"
 default = []
 strict = []
 
+[lints]
+workspace = true
+
 [dependencies]
 agentfs-core = { workspace = true }
 agentfs-mount = { workspace = true }

@@ -1,3 +1,11 @@
+//! Write batcher: pending-write state plus the `PendingView`/`Drain` split.
+//!
+//! Lock order: `commit_lock` (tokio `AsyncMutex`) -> `state` (parking_lot
+//! `RwLock`). Drains take the commit lock first and only then take short
+//! `state` guards to extract owned pending batches; enqueue/peek paths take
+//! `state` alone and never acquire `commit_lock`. No sync guard is held
+//! across an `.await` (`clippy::await_holding_lock` is deny-by-workspace).
+
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use std::collections::HashMap;

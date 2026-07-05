@@ -1,3 +1,13 @@
+//! Adapter-side kernel cache coherence state (`AdapterCaches`).
+//!
+//! Lock order: `reply_lock` -> one cache map lock at a time (`dir_entries`,
+//! `attr`, `entry`, `negative_entry`, `external_read_*`, `keepcache_drift`).
+//! Mutations go through [`AdapterCaches::mutate`], which holds `reply_lock`
+//! while bumping the epoch and touching map locks sequentially; cacheable
+//! replies hold only [`CacheReplyGuard`]. Map locks never nest with each
+//! other, and no guard is held across backend `block_on`/`.await` calls
+//! (`clippy::await_holding_lock` is deny-by-workspace).
+
 use crate::transport::FileAttr;
 use agentfs_core::Stats;
 use parking_lot::{Mutex, MutexGuard};
