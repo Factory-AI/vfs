@@ -72,7 +72,7 @@ fi
 
 # --- Main stdio JSON-RPC session ---------------------------------------------
 timeout 120 python3 - "$BIN" "$DB" "$HAVE_FUSE" >"$ROOT/session.out" 2>"$ROOT/session.err" <<'EOF' \
-    || fail "stdio session failed: $(tail -20 "$ROOT/session.out" "$ROOT/session.err")"
+    || fail "stdio session failed: $(tail -n 20 -- "$ROOT/session.out" "$ROOT/session.err")"
 import json, os, subprocess, sys
 
 BIN, DB, HAVE_FUSE = sys.argv[1], sys.argv[2], sys.argv[3] == "1"

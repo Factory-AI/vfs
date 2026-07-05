@@ -194,6 +194,10 @@ impl AgentFS {
         mut config: CoreConfig,
         reap_hooks: Vec<Arc<dyn ReapHook>>,
     ) -> Result<Self> {
+        // finalize() resolves this path for sidecar removal long after the
+        // caller may have changed the working directory (mount teardown
+        // chdirs to `/`), so a relative path would silently miss the -wal.
+        let db_path = db_path.map(std::path::absolute).transpose()?;
         let conn = pool.get_connection().await?;
 
         // Initialize or migrate schema first. The schema module owns DDL and

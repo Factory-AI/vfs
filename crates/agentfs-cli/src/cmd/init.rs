@@ -207,6 +207,10 @@ pub async fn init_database(
     // If a command was provided, mount the filesystem and execute it
     if let Some(cmd_str) = command {
         run_init_cmd(&id, cmd_str, backend, base, agent).await?;
+    } else {
+        // The schema writes above land in a -wal; checkpoint it away so init
+        // exits with a single-file database family (invariant I1).
+        finalize_readonly(&agent).await;
     }
 
     Ok(())

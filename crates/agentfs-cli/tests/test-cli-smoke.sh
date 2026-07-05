@@ -64,11 +64,34 @@ cd "$ROOT"
 run_agentfs init smoke >"$ROOT/init.log" 2>&1 || fail "init failed: $(cat "$ROOT/init.log")"
 DB="$ROOT/.agentfs/smoke.db"
 [ -f "$DB" ] || fail "init did not create $DB"
+# init's schema writes must be checkpointed away before it returns: a fresh
+# init used to leave a ~119KB -wal next to the new DB (invariant I1).
+[ ! -e "$DB-wal" ] || fail "init left $DB-wal behind"
+[ ! -e "$DB-shm" ] || fail "init left $DB-shm behind"
 if run_agentfs init smoke >"$ROOT/init-dup.log" 2>&1; then
     fail "repeated init succeeded without --force"
 fi
 grep -q "already exists" "$ROOT/init-dup.log" || fail "duplicate init missing refusal message"
 run_agentfs init smoke --force >/dev/null 2>&1 || fail "init --force failed"
+[ ! -e "$DB-wal" ] || fail "init --force left $DB-wal behind"
+[ ! -e "$DB-shm" ] || fail "init --force left $DB-shm behind"
+
+# --- init variants exit single-file too: --base (overlay) and -c (mount+command) --
+mkdir -p "$ROOT/initbase"
+echo base-payload >"$ROOT/initbase/base.txt"
+run_agentfs init smoke-base --base "$ROOT/initbase" >"$ROOT/init-base.log" 2>&1 ||
+    fail "init --base failed: $(cat "$ROOT/init-base.log")"
+BASE_DB="$ROOT/.agentfs/smoke-base.db"
+[ -f "$BASE_DB" ] || fail "init --base did not create $BASE_DB"
+[ ! -e "$BASE_DB-wal" ] || fail "init --base left $BASE_DB-wal behind"
+[ ! -e "$BASE_DB-shm" ] || fail "init --base left $BASE_DB-shm behind"
+run_agentfs init smoke-cmd -c 'echo init-cmd-ok' >"$ROOT/init-cmd.log" 2>&1 ||
+    fail "init -c failed: $(cat "$ROOT/init-cmd.log")"
+grep -q "init-cmd-ok" "$ROOT/init-cmd.log" || fail "init -c command output missing"
+CMD_DB="$ROOT/.agentfs/smoke-cmd.db"
+[ -f "$CMD_DB" ] || fail "init -c did not create $CMD_DB"
+[ ! -e "$CMD_DB-wal" ] || fail "init -c left $CMD_DB-wal behind"
+[ ! -e "$CMD_DB-shm" ] || fail "init -c left $CMD_DB-shm behind"
 
 # --- fs write/cat/ls ------------------------------------------------------------
 run_agentfs fs "$DB" write /smoke.txt smoke-payload >/dev/null 2>&1 || fail "fs write failed"
