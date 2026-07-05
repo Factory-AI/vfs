@@ -20,13 +20,33 @@ use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 use std::{mem, ptr};
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 const FUSERMOUNT_BIN: &str = "fusermount";
 const FUSERMOUNT3_BIN: &str = "fusermount3";
 const FUSERMOUNT_COMM_ENV: &str = "_FUSE_COMMFD";
+
+/// On kernels with fuse-over-io_uring enabled, a mount(2) that races the ~2s
+/// kernel-side drain of a just-closed FUSE connection blocks forever
+/// (observed on 7.1.2-cachyos). fusermount performs that mount(2) for
+/// unprivileged callers, so its reply wait is bounded and retried on such
+/// kernels; the drain clears within roughly two seconds, well inside the
+/// retry budget.
+const FUSERMOUNT_REPLY_TIMEOUT: Duration = Duration::from_secs(3);
+const URING_DRAIN_MOUNT_ATTEMPTS: u32 = 3;
+const URING_DRAIN_RETRY_BACKOFF: Duration = Duration::from_millis(750);
+
+fn kernel_fuse_uring_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::fs::read_to_string("/sys/module/fuse/parameters/enable_uring")
+            .map(|value| value.trim() == "Y")
+            .unwrap_or(false)
+    })
+}
 
 #[derive(Debug)]
 pub(crate) struct Mount {
@@ -140,7 +160,44 @@ fn detect_fusermount_bin() -> String {
     FUSERMOUNT3_BIN.to_string()
 }
 
-fn receive_fusermount_message(socket: &UnixStream) -> Result<File, Error> {
+/// Wait until `socket` is readable, failing with `ErrorKind::TimedOut` once
+/// the deadline passes.
+fn wait_for_fusermount_reply(socket: &UnixStream, timeout: Duration) -> Result<(), Error> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let mut poll_fd = libc::pollfd {
+            fd: socket.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let millis = remaining.as_millis().min(i32::MAX as u128) as c_int;
+        let result = unsafe { libc::poll(&mut poll_fd, 1, millis) };
+        match result {
+            0 => {
+                return Err(Error::new(
+                    ErrorKind::TimedOut,
+                    format!("no reply from fusermount within {timeout:?}"),
+                ))
+            }
+            1 => return Ok(()),
+            _ => {
+                let err = Error::last_os_error();
+                if err.kind() != ErrorKind::Interrupted {
+                    return Err(err);
+                }
+            }
+        }
+    }
+}
+
+fn receive_fusermount_message(
+    socket: &UnixStream,
+    reply_timeout: Option<Duration>,
+) -> Result<File, Error> {
+    if let Some(timeout) = reply_timeout {
+        wait_for_fusermount_reply(socket, timeout)?;
+    }
     let mut io_vec_buf = [0u8];
     let mut io_vec = libc::iovec {
         iov_base: io_vec_buf.as_mut_ptr() as *mut libc::c_void,
@@ -218,6 +275,49 @@ fn fuse_mount_fusermount(
     mountpoint: &OsStr,
     options: &[MountOption],
 ) -> Result<(File, Option<UnixStream>), Error> {
+    // Only kernels with fuse-over-io_uring enabled are known to wedge a fresh
+    // mount(2) (the connection-drain race documented above); everything else
+    // keeps the historical unbounded wait for fusermount's reply.
+    if !kernel_fuse_uring_enabled() {
+        return fuse_mount_fusermount_once(mountpoint, options, None);
+    }
+
+    let mut attempt = 1u32;
+    loop {
+        match fuse_mount_fusermount_once(mountpoint, options, Some(FUSERMOUNT_REPLY_TIMEOUT)) {
+            Err(err)
+                if err.kind() == ErrorKind::TimedOut && attempt < URING_DRAIN_MOUNT_ATTEMPTS =>
+            {
+                warn!(
+                    "fusermount did not reply within {FUSERMOUNT_REPLY_TIMEOUT:?} \
+                     (attempt {attempt}/{URING_DRAIN_MOUNT_ATTEMPTS}); likely racing the \
+                     kernel-side drain of a just-closed fuse-over-io_uring connection; retrying"
+                );
+                attempt += 1;
+                std::thread::sleep(URING_DRAIN_RETRY_BACKOFF);
+            }
+            Err(err) if err.kind() == ErrorKind::TimedOut => {
+                return Err(Error::new(
+                    ErrorKind::TimedOut,
+                    format!(
+                        "FUSE mount at {mountpoint:?} did not complete within \
+                         {URING_DRAIN_MOUNT_ATTEMPTS} bounded attempts: a just-closed \
+                         fuse-over-io_uring connection wedges new mounts while the kernel \
+                         drains it (~2s). Retry shortly, avoid rapid unmount-then-mount \
+                         cycles, or set AGENTFS_FUSE_URING=0 on the mount-owning processes."
+                    ),
+                ));
+            }
+            other => return other,
+        }
+    }
+}
+
+fn fuse_mount_fusermount_once(
+    mountpoint: &OsStr,
+    options: &[MountOption],
+    reply_timeout: Option<Duration>,
+) -> Result<(File, Option<UnixStream>), Error> {
     let fusermount_bin = detect_fusermount_bin();
 
     let (child_socket, receive_socket) = UnixStream::pair()?;
@@ -238,12 +338,24 @@ fn fuse_mount_fusermount(
         .arg(mountpoint)
         .env(FUSERMOUNT_COMM_ENV, child_socket.as_raw_fd().to_string());
 
-    let fusermount_child = builder.spawn()?;
+    let mut fusermount_child = builder.spawn()?;
 
     drop(child_socket); // close socket in parent
 
-    let file = match receive_fusermount_message(&receive_socket) {
+    let file = match receive_fusermount_message(&receive_socket, reply_timeout) {
         Ok(f) => f,
+        Err(err) if err.kind() == ErrorKind::TimedOut => {
+            drop(receive_socket);
+            // The child is likely wedged inside mount(2); the kill is
+            // best-effort (an uninterruptible child survives it) and cannot
+            // be awaited without inheriting the wedge. The lazy unmount
+            // clears the mountpoint in case mount(2) actually completed
+            // after the deadline fired, so a retry does not stack mounts.
+            let _ = fusermount_child.kill();
+            let _ = fusermount_child.try_wait();
+            fuse_unmount_pure(&CString::new(mountpoint.as_bytes())?);
+            return Err(err);
+        }
         Err(_) => {
             // Drop receive socket, since fusermount has exited with an error
             drop(receive_socket);
@@ -402,5 +514,39 @@ pub(crate) fn option_group(option: &MountOption) -> MountOptionGroup {
         MountOption::AllowOther => MountOptionGroup::KernelOption,
         MountOption::AllowRoot => MountOptionGroup::KernelOption,
         MountOption::DefaultPermissions => MountOptionGroup::KernelOption,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fusermount_reply_wait_times_out_when_nothing_arrives() {
+        let (_silent_peer, socket) = UnixStream::pair().unwrap();
+        let start = Instant::now();
+        let err = receive_fusermount_message(&socket, Some(Duration::from_millis(200)))
+            .expect_err("a silent fusermount peer must not block the mount forever");
+        assert_eq!(err.kind(), ErrorKind::TimedOut);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the reply wait must be bounded, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn fusermount_reply_wait_surfaces_peer_exit_before_the_deadline() {
+        let (peer, socket) = UnixStream::pair().unwrap();
+        drop(peer);
+        let start = Instant::now();
+        let err = receive_fusermount_message(&socket, Some(Duration::from_secs(30)))
+            .expect_err("a dead fusermount peer must surface as an error");
+        assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "peer exit must not wait out the deadline, took {:?}",
+            start.elapsed()
+        );
     }
 }

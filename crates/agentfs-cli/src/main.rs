@@ -53,6 +53,10 @@ fn exit_with_code(code: i32) -> ! {
 }
 
 fn main() {
+    // Before any threads exist: the TMPDIR override mutates the process
+    // environment (see config::init_private_spill_dir).
+    agentfs_cli::config::init_private_spill_dir();
+
     let _ = tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer())
         .with(default_env_filter())

@@ -51,13 +51,25 @@ sidecar_count() {
     find "$PINNED_TMP" -maxdepth 1 -type f -name 'tursodb-ephemeral-*' -print | wc -l | tr -d ' '
 }
 
+spill_dir_count() {
+    find "$PINNED_TMP" -maxdepth 1 -type d -name 'agentfs-spill-*' -print | wc -l | tr -d ' '
+}
+
 assert_no_sidecars() {
     phase="$1"
     count="$(sidecar_count)"
-    printf '\n%s sidecar_count=%s\n' "$phase" "$count"
+    spills="$(spill_dir_count)"
+    printf '\n%s sidecar_count=%s spill_dir_count=%s\n' "$phase" "$count" "$spills"
     if [ "$count" -ne 0 ]; then
         echo "FAILED: residual tursodb ephemeral sidecars after $phase"
         find "$PINNED_TMP" -maxdepth 1 -type f -name 'tursodb-ephemeral-*' -printf '%f %s\n' | sort
+        exit 1
+    fi
+    # The CLI's private TMPDIR spill dir must be cleaned up when the process
+    # exits (no process of ours is running between phases).
+    if [ "$spills" -ne 0 ]; then
+        echo "FAILED: residual agentfs-spill dirs after $phase"
+        find "$PINNED_TMP" -maxdepth 1 -type d -name 'agentfs-spill-*' -print | sort
         exit 1
     fi
 }
@@ -95,6 +107,31 @@ run_agentfs fs sidecar cat /hello.txt >/dev/null
 assert_no_sidecars "fs-cat"
 run_agentfs run --session sidecar-run -- sh -c 'printf run-data > run.txt && cat run.txt' >/dev/null
 assert_no_sidecars "run"
+
+# The private spill-dir TMPDIR override is process-internal: children of
+# run/exec must see the user's TMPDIR, not the agentfs-spill-* dir.
+# Mount tracing emits on stdout; the child's printf (no trailing newline) is
+# always the last line of the captured stream.
+CHILD_TMPDIR="$(run_agentfs run --session sidecar-tmpdir -- sh -c 'printf %s "${TMPDIR:-}"' 2>/dev/null | tail -n 1)"
+if [ "$CHILD_TMPDIR" != "$PINNED_TMP" ]; then
+    echo "FAILED: run child saw TMPDIR='$CHILD_TMPDIR', expected '$PINNED_TMP'"
+    exit 1
+fi
+assert_no_sidecars "run-child-tmpdir"
+CHILD_TMPDIR="$(run_agentfs exec sidecar sh -c 'printf %s "${TMPDIR:-}"' 2>/dev/null | tail -n 1)"
+if [ "$CHILD_TMPDIR" != "$PINNED_TMP" ]; then
+    echo "FAILED: exec child saw TMPDIR='$CHILD_TMPDIR', expected '$PINNED_TMP'"
+    exit 1
+fi
+assert_no_sidecars "exec-child-tmpdir"
+# Stale spill dirs from SIGKILLed processes are reaped on the next CLI start.
+mkdir -p "$PINNED_TMP/agentfs-spill-99999999-0"
+run_agentfs fs sidecar cat /hello.txt >/dev/null
+if [ -d "$PINNED_TMP/agentfs-spill-99999999-0" ]; then
+    echo "FAILED: stale dead-owner spill dir was not garbage-collected"
+    exit 1
+fi
+assert_no_sidecars "stale-spill-gc"
 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null run_agentfs run --session sidecar-git -- sh -c '
     set -eu
     git init repo >/dev/null

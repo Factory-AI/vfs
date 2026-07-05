@@ -940,12 +940,12 @@ fn remount_all_readonly_except(
 /// Check if a mount point should be skipped during read-only remounting.
 ///
 /// Virtual filesystems like /proc, /sys, and /dev must remain writable
-/// for the system to function correctly.
-fn skip_mount(path: &Path) -> bool {
-    let path_str = path.to_string_lossy();
+/// for the system to function correctly. Compared per path component so a
+/// sibling like `/devfoo` is still remounted read-only.
+pub(super) fn skip_mount(path: &Path) -> bool {
     SKIP_MOUNT_PREFIXES
         .iter()
-        .any(|prefix| path_str.starts_with(prefix))
+        .any(|prefix| path.starts_with(prefix))
 }
 
 /// Build the list of allowed writable paths from user input and defaults.
@@ -1108,6 +1108,10 @@ fn exec_command(command: PathBuf, args: Vec<String>, session_id: &str) -> ! {
 
 /// Setup environment variables for the sandbox.
 fn setup_env_vars(session_id: &str) {
+    // The parent CLI overrode TMPDIR with its private spill dir; the
+    // sandboxed command must see the user's TMPDIR instead (inside the
+    // namespace /tmp is a fresh scoping tmpfs anyway).
+    crate::config::restore_original_tmpdir_env();
     std::env::set_var("AGENTFS", "1");
     std::env::set_var("AGENTFS_SANDBOX", "linux-namespace");
     std::env::set_var("AGENTFS_SESSION", session_id);

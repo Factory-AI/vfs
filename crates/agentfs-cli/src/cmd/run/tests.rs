@@ -152,6 +152,29 @@ mod read_scoping {
     }
 }
 
+#[cfg(target_os = "linux")]
+mod skip_mount {
+    use super::super::linux::skip_mount;
+    use std::path::Path;
+
+    #[test]
+    fn matches_virtual_fs_roots_and_descendants() {
+        for path in ["/proc", "/sys/kernel", "/dev", "/dev/shm", "/tmp/x"] {
+            assert!(skip_mount(Path::new(path)), "{path} should be skipped");
+        }
+    }
+
+    #[test]
+    fn sibling_lookalike_prefixes_are_remounted() {
+        for path in ["/devfoo", "/tmpfoo", "/procfs", "/system", "/data/tmp"] {
+            assert!(
+                !skip_mount(Path::new(path)),
+                "{path} must not be skipped by the ro-remount pass"
+            );
+        }
+    }
+}
+
 #[test]
 fn group_paths_by_parent_uses_brace_expansion() {
     let paths = vec![

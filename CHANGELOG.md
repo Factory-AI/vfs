@@ -50,6 +50,14 @@ behavior-preserving moves are not listed individually.
 - Overlay base-directory rename silently emptying the source: now `EXDEV`.
 - Stale-overlay reads after external base mutation are rejected.
 - Schema `ALTER`s no longer swallow errors blanket-`.ok()`-style.
+- Mounts racing the kernel-side drain of a just-closed FUSE-over-io_uring
+  connection are bounded (retry, then a clear error) instead of wedging
+  inside `mount(2)` forever (kernel constraint, see docs/MANUAL.md).
+- `tursodb-ephemeral-*` sort-spill litter from the turso_core 0.5.3
+  dependency (never unlinked upstream, `vdbe/execute.rs:10096`): the CLI
+  now scopes `TMPDIR` to a per-process spill dir cleaned on exit, without
+  leaking the override into `run`/`exec` children. Track the upstream
+  unlink fix before removing this workaround.
 
 ### Validation
 

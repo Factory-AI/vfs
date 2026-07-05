@@ -245,6 +245,9 @@ async fn run_init_cmd(
 
     let mut command = tokio::process::Command::new("sh");
     command.arg("-c").arg(&cmd_str).current_dir(&mountpoint);
+    // The CLI's private spill dir is process-internal; children keep the
+    // user's TMPDIR.
+    crate::config::restore_original_tmpdir(&mut command);
     let status = run_supervised(mount_handle, command)
         .await
         .with_context(|| format!("Failed to execute: {}", cmd_str));

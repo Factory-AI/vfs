@@ -11,6 +11,13 @@ use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use super::{wait_for_mount, Backend, MountHandle, MountHandleInner, MountOpts};
 
+/// Extra margin past `MountOpts::timeout` for the readiness probe channel:
+/// the probe thread itself bounds at `timeout` unless its stat call wedges.
+const READY_PROBE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long the failure path waits for best-effort session teardown before
+/// surfacing the readiness error anyway.
+const READY_TEARDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// FUSE unmount implementation using fusermount.
 pub(super) fn unmount_fuse(mountpoint: &Path, lazy: bool) -> Result<()> {
     const FUSERMOUNT_COMMANDS: &[&str] = &["fusermount3", "fusermount"];
@@ -60,10 +67,48 @@ pub(super) fn mount_fuse(
     let fs_arc: Arc<dyn agentfs_core::FileSystem> = Arc::new(ReadWriteLaneFsAdapter::new(fs));
 
     let rt = crate::get_runtime();
-    let fuse_session = agentfs_fuse::mount(fs_arc, fuse_opts, rt)?;
+    let mut fuse_session = agentfs_fuse::mount(fs_arc, fuse_opts, rt)?;
 
-    if !wait_for_mount(&mountpoint, timeout) {
-        anyhow::bail!("FUSE mount did not become ready within {:?}", timeout);
+    // The readiness probe stats the mountpoint, which can block indefinitely
+    // when a fresh fuse-over-io_uring mount races the kernel-side drain of a
+    // just-closed connection and post-INIT requests stall (docs/MANUAL.md,
+    // "FUSE-over-io_uring"). Probing from a helper thread keeps this wait
+    // bounded either way, so a wedged mount surfaces as an error.
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let probe_mountpoint = mountpoint.clone();
+    let _ = std::thread::Builder::new()
+        .name("agentfs-mount-ready".into())
+        .spawn(move || {
+            let _ = ready_tx.send(wait_for_mount(&probe_mountpoint, timeout));
+        });
+    let ready = ready_rx
+        .recv_timeout(timeout + READY_PROBE_GRACE)
+        .unwrap_or(false);
+
+    if !ready {
+        // Teardown from a helper thread too: joining a wedged session could
+        // block, and the caller is owed a bounded, clear failure.
+        let (teardown_tx, teardown_rx) = std::sync::mpsc::channel();
+        let _ = std::thread::Builder::new()
+            .name("agentfs-mount-teardown".into())
+            .spawn(move || {
+                if let Err(error) = fuse_session.unmount() {
+                    tracing::warn!(%error, "failed to unmount FUSE session after readiness timeout");
+                }
+                if let Err(error) = fuse_session.join() {
+                    tracing::warn!(%error, "FUSE session exited with error after readiness timeout");
+                }
+                let _ = teardown_tx.send(());
+            });
+        let _ = teardown_rx.recv_timeout(READY_TEARDOWN_GRACE);
+        anyhow::bail!(
+            "FUSE mount at {} did not become ready within {:?}. On kernels with \
+             fuse-over-io_uring enabled, a mount racing the drain of a just-closed \
+             FUSE connection can stall; retry shortly, avoid rapid \
+             unmount-then-mount cycles, or set AGENTFS_FUSE_URING=0.",
+            mountpoint.display(),
+            timeout
+        );
     }
 
     Ok(MountHandle {

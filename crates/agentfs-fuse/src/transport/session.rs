@@ -510,6 +510,14 @@ impl SessionUnmounter {
 
 #[cfg(target_os = "linux")]
 fn abort_fuse_connection(device: &std::fs::File) -> io::Result<()> {
+    // Only a still-connected (wedged) connection needs the fusectl abort. An
+    // already-dead connection keeps its id in fdinfo, but the kernel frees
+    // that id at unmount and hands it to the next FUSE mount — writing the
+    // abort then kills an unrelated fresh mount (observed as a silent
+    // mount-then-exit during rapid unmount-then-mount cycles).
+    if connection_is_aborted(device) {
+        return Ok(());
+    }
     let fdinfo_path = format!("/proc/self/fdinfo/{}", device.as_raw_fd());
     let fdinfo = std::fs::read_to_string(fdinfo_path)?;
     let Some(connection_id) = fdinfo.lines().find_map(|line| {
@@ -523,6 +531,27 @@ fn abort_fuse_connection(device: &std::fs::File) -> io::Result<()> {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err),
+    }
+}
+
+/// Whether the FUSE connection behind `device` is already disconnected
+/// (fuse_dev_poll reports `EPOLLERR` once `fc->connected` drops).
+#[cfg(target_os = "linux")]
+fn connection_is_aborted(device: &std::fs::File) -> bool {
+    let mut poll_fd = libc::pollfd {
+        fd: device.as_raw_fd(),
+        events: 0,
+        revents: 0,
+    };
+    loop {
+        let result = unsafe { libc::poll(&mut poll_fd, 1, 0) };
+        if result == -1 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return false;
+        }
+        return result == 1 && (poll_fd.revents & libc::POLLERR) != 0;
     }
 }
 

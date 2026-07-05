@@ -512,6 +512,30 @@ Every runtime knob (env var or first-class flag) is declared in the generated
 the commands whose `--key` / `--cipher` options declare them (see the
 generated sections above); `TURSO_DB_AUTH_TOKEN` authenticates cloud sync.
 
+### FUSE-over-io_uring and rapid remounts
+
+On Linux kernels with `fuse.enable_uring=1` (the `AGENTFS_FUSE_URING` knob
+controls whether AgentFS uses the transport), the kernel drains a just-closed
+FUSE connection for roughly two seconds, and a new mount racing that drain can
+block inside `mount(2)` indefinitely (observed on kernel 7.1.2). AgentFS
+bounds this: the mount is retried for a few seconds and then fails with a
+clear error instead of hanging. If rapid unmount-then-mount cycles keep
+hitting the error, wait a couple of seconds between cycles or set
+`AGENTFS_FUSE_URING=0` on the mount-owning processes. A mount left wedged by
+other tooling can be recovered with
+`echo 1 > /sys/fs/fuse/connections/<id>/abort` (verify the connection id
+first).
+
+### Temp files (`TMPDIR`)
+
+The `turso_core` dependency (0.5.3) leaks `tursodb-ephemeral-*` sort-spill
+files into the temp dir and never unlinks them (`vdbe/execute.rs:10096`). The
+CLI therefore points its own `TMPDIR` at a private per-process directory that
+is removed on exit, so hosts do not accumulate spill litter. This override is
+process-internal: commands spawned by `agentfs run`, `agentfs exec`, and
+`agentfs init -c` see the original `TMPDIR`. Stale spill directories from
+`SIGKILL`ed processes are garbage-collected on the next CLI start.
+
 Variables set inside an `agentfs run` sandbox:
 
 | Variable | Description |

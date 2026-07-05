@@ -368,6 +368,9 @@ fn command_in_mount(
         .env("PS1", "🤖 \\w\\$ ")
         // Zsh: use custom ZDOTDIR to override prompt
         .env("ZDOTDIR", session.run_dir.join("zsh"));
+    // The CLI's private spill dir is process-internal; children keep the
+    // user's TMPDIR.
+    crate::config::restore_original_tmpdir(&mut cmd);
 
     cmd
 }
