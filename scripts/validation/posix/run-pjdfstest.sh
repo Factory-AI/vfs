@@ -46,7 +46,7 @@ usage() {
 print_testing_guidance() {
     cat >&2 <<'EOF'
 
-Relevant setup guidance from TESTING.md:
+Relevant setup guidance from docs/TESTING.md:
 
 ## pjdfstest
 
@@ -61,7 +61,7 @@ command -v prove
 command -v pjdfstest
 ```
 
-AgentFS harness command from TESTING.md:
+AgentFS harness command from docs/TESTING.md:
 
 ```bash
 scripts/validation/posix/run-pjdfstest.sh \
