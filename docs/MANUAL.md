@@ -2,463 +2,530 @@
 
 Command-line reference for the AgentFS CLI.
 
-For guides, tutorials, and SDK documentation, see [docs.turso.tech/agentfs](https://docs.turso.tech/agentfs).
+The command and option sections between the `GENERATED COMMAND REFERENCE`
+markers are rendered from the CLI's clap definitions and checked by
+`docs::tests::manual_help_parity`, so this manual always matches
+`agentfs --help`.
 
 ## Installation
 
+Build from source (Linux is the first-tier platform; macOS is second-tier,
+NFS mount only):
+
 ```bash
-curl -fsSL https://github.com/tursodatabase/agentfs/releases/latest/download/agentfs-installer.sh | sh
+cargo +nightly build --release --workspace --bins
+install -m 0755 target/release/agentfs ~/.local/bin/
 ```
+
+<!-- BEGIN GENERATED COMMAND REFERENCE (do not edit by hand) -->
+<!-- Regenerate with: `AGENTFS_UPDATE_MANUAL=1 cargo +nightly test -p agentfs-cli --lib docs::tests::manual_help_parity -- --exact` -->
 
 ## Commands
 
+Every section below is generated from the clap definitions the binary actually parses; `agentfs <command> --help` and this reference cannot disagree.
+
+### agentfs completions
+
+Manage shell completions (supported shells: bash, zsh, fish, elvish, powershell)
+
+```
+agentfs completions <COMMAND>
+```
+
+#### agentfs completions install
+
+Install shell completions to your shell rc file
+
+```
+agentfs completions install [SHELL]
+```
+
+**Arguments:**
+
+- `[SHELL]` — Shell to install completions for (defaults to current shell) [possible values: bash, zsh, fish, elvish, power-shell]
+
+#### agentfs completions uninstall
+
+Uninstall shell completions from your shell rc file
+
+```
+agentfs completions uninstall [SHELL]
+```
+
+**Arguments:**
+
+- `[SHELL]` — Shell to uninstall completions for (defaults to current shell) [possible values: bash, zsh, fish, elvish, power-shell]
+
+#### agentfs completions show
+
+Print instructions for manual installation
+
+```
+agentfs completions show
+```
+
 ### agentfs init
 
-Initialize a new agent filesystem.
+Initialize a new agent filesystem
 
 ```
 agentfs init [OPTIONS] [ID]
 ```
 
 **Arguments:**
-- `ID` - Agent identifier (default: `agent-{timestamp}`)
+
+- `[ID]` — Agent identifier (if not provided, generates a unique one)
 
 **Options:**
-- `--force` - Overwrite existing agent filesystem
-- `--base <PATH>` - Base directory for overlay filesystem (copy-on-write)
-- `--key <KEY>` - Hex-encoded encryption key for local encryption
-- `--cipher <CIPHER>` - Cipher algorithm (required with `--key`)
-- `--sync-remote-url <URL>` - Remote Turso database URL for sync
-- `--sync-partial-prefetch` - Enable prefetching for partial sync
-- `--sync-partial-segment-size <SIZE>` - Segment size for partial sync
-- `--sync-partial-bootstrap-query <QUERY>` - Custom bootstrap query
-- `--sync-partial-bootstrap-length <LENGTH>` - Bootstrap prefix length
 
-**Note:** Local encryption and cloud sync cannot be used together.
+- `--force` — Overwrite existing file if it exists
+- `--base <BASE>` — Base directory for overlay filesystem (copy-on-write)
+- `--key <KEY>` — Hex-encoded encryption key. Enables local encryption when provided [env: AGENTFS_KEY]
+- `--cipher <CIPHER>` — Cipher algorithm for encryption (required with --key). Options: aegis128l, aegis128x2, aegis128x4, aegis256, aegis256x2, aegis256x4, aes128gcm, aes256gcm [env: AGENTFS_CIPHER]
+- `-c, --command <COMMAND>` — Command to execute after initialization (mounts the filesystem, runs command, unmounts)
+- `--backend <BACKEND>` — Backend to use for mounting when using -c (default: fuse on Linux, nfs on macOS) [possible values: fuse, nfs; default: fuse]
+- `--sync-remote-url <SYNC_REMOTE_URL>`
+- `--sync-partial-prefetch <SYNC_PARTIAL_PREFETCH>` [possible values: true, false]
+- `--sync-partial-segment-size <SYNC_PARTIAL_SEGMENT_SIZE>`
+- `--sync-partial-bootstrap-query <SYNC_PARTIAL_BOOTSTRAP_QUERY>`
+- `--sync-partial-bootstrap-length <SYNC_PARTIAL_BOOTSTRAP_LENGTH>`
 
-**Options (continued):**
-- `-c, --command <CMD>` - Command to execute after initialization (see below)
-- `--backend <BACKEND>` - Mount backend for `-c` option (`fuse` or `nfs`)
+### agentfs sync
 
-**Running a command after init:**
+Remote sync operations
 
-The `-c` option initializes the filesystem, mounts it to a temporary directory, runs the specified command with that directory as the working directory, then automatically unmounts.
-
-```bash
-# Initialize and run a command in the new filesystem
-agentfs init my-agent -c "touch hello.txt && ls -la"
-
-# With overlay filesystem
-agentfs init my-overlay --base /path/to/project -c "make build"
 ```
+agentfs sync <ID_OR_PATH> <COMMAND>
+```
+
+**Arguments:**
+
+- `<ID_OR_PATH>` — Agent ID or database path
+
+#### agentfs sync pull
+
+Pull remote changes (only of agentfs was initialized with remote sync)
+
+```
+agentfs sync <ID_OR_PATH> pull
+```
+
+#### agentfs sync push
+
+Push remote changes (only of agentfs was initialized with remote sync)
+
+```
+agentfs sync <ID_OR_PATH> push
+```
+
+#### agentfs sync stats
+
+Print synced database stats
+
+```
+agentfs sync <ID_OR_PATH> stats
+```
+
+#### agentfs sync checkpoint
+
+Checkpoint local synced db
+
+```
+agentfs sync <ID_OR_PATH> checkpoint
+```
+
+### agentfs fs
+
+Filesystem operations
+
+```
+agentfs fs [OPTIONS] <ID_OR_PATH> <COMMAND>
+```
+
+**Arguments:**
+
+- `<ID_OR_PATH>` — Agent ID or database path
+
+**Options:**
+
+- `--key <KEY>` — Hex-encoded encryption key for encrypted databases [env: AGENTFS_KEY]
+- `--cipher <CIPHER>` — Cipher algorithm for encryption (required with --key). Options: aegis128l, aegis128x2, aegis128x4, aegis256, aegis256x2, aegis256x4, aes128gcm, aes256gcm [env: AGENTFS_CIPHER]
+
+#### agentfs fs ls
+
+List files in the filesystem
+
+```
+agentfs fs <ID_OR_PATH> ls [FS_PATH]
+```
+
+**Arguments:**
+
+- `[FS_PATH]` — Path to list (default: /) [default: /]
+
+#### agentfs fs cat
+
+Display file contents
+
+```
+agentfs fs <ID_OR_PATH> cat <FILE_PATH>
+```
+
+**Arguments:**
+
+- `<FILE_PATH>` — Path to the file in the filesystem
+
+#### agentfs fs write
+
+Write file content
+
+```
+agentfs fs <ID_OR_PATH> write <FILE_PATH> <CONTENT>
+```
+
+**Arguments:**
+
+- `<FILE_PATH>` — Path to the file in the filesystem
+- `<CONTENT>` — Content of the file
+
+### agentfs run
+
+Run a command in the sandboxed environment.
+
+By default, uses FUSE+overlay with Linux user and mount namespaces for isolation. The overlay uses the host filesystem as a read-only base and stores all changes in an AgentFS-backed delta layer.
+
+```
+agentfs run [OPTIONS] [COMMAND] [ARGS]...
+```
+
+**Arguments:**
+
+- `[COMMAND]` — Command to execute (defaults to bash on Linux, zsh on macOS)
+- `[ARGS]...` — Arguments for the command
+
+**Options:**
+
+- `--allow <PATH>` — Allow write access to additional directories (can be specified multiple times)
+- `--no-default-allows` — Disable default allowed directories (~/.config, ~/.cache, ~/.local, ~/.claude, etc.)
+- `--session <ID>` — Session identifier for sharing delta layer across multiple runs. If not provided, a unique session ID is generated for each run. Use the same session ID to share the delta layer between runs
+- `--system` — Allow other system users to access this mount (requires /etc/fuse.conf user_allow_other; use cautiously)
+- `--partial-origin <MODE>` — Partial-origin policy for base-file writes: off, on, or auto [possible values: off, on, auto]
+- `--partial-origin-threshold-bytes <BYTES>` — Size threshold for --partial-origin auto
+- `--key <KEY>` — Hex-encoded encryption key for the delta layer. Enables local encryption when provided [env: AGENTFS_KEY]
+- `--cipher <CIPHER>` — Cipher algorithm for encryption (required with --key). Options: aegis128l, aegis128x2, aegis128x4, aegis256, aegis256x2, aegis256x4, aes128gcm, aes256gcm [env: AGENTFS_CIPHER]
 
 ### agentfs exec
 
-Execute a command with an AgentFS filesystem mounted (Unix only).
+Execute a command with an AgentFS filesystem mounted.
+
+Mounts the specified AgentFS to a temporary directory, runs the command with that directory as the working directory, then automatically unmounts. This is useful for running tools that need filesystem access without a persistent mount.
 
 ```
 agentfs exec [OPTIONS] <ID_OR_PATH> <COMMAND> [ARGS]...
 ```
 
-Mounts the specified AgentFS to a temporary directory, runs the command with that directory as the working directory, then automatically unmounts. This is useful for running tools that need filesystem access without a persistent mount.
+**Arguments:**
 
-If the AgentFS was initialized with `--base` (overlay mode), the overlay filesystem is used automatically.
+- `<ID_OR_PATH>` — Agent ID or database path
+- `<COMMAND>` — Command to execute
+- `[ARGS]...` — Arguments for the command
+
+**Options:**
+
+- `--backend <BACKEND>` — Backend to use for mounting (default: fuse on Linux, nfs on macOS) [possible values: fuse, nfs; default: fuse]
+- `--key <KEY>` — Hex-encoded encryption key for encrypted databases [env: AGENTFS_KEY]
+- `--cipher <CIPHER>` — Cipher algorithm for encryption (required with --key) [env: AGENTFS_CIPHER]
+
+### agentfs clone
+
+Clone a git repository into an AgentFS database (fast bulk ingest).
+
+Runs `git clone --no-checkout` through a temporary mount (pack files are large sequential writes), then materializes the worktree by bulk-importing blobs straight into the database in large transactions and fabricating a matching git index, skipping the per-file FUSE round trips of a regular checkout. The resulting repository lives entirely inside the database; nothing is written to the host filesystem. Submodules and smudge/clean filters are not supported.
+
+```
+agentfs clone [OPTIONS] <ID_OR_PATH> <SOURCE> [NAME]
+```
 
 **Arguments:**
-- `ID_OR_PATH` - Agent identifier or database path
-- `COMMAND` - Command to execute
-- `ARGS` - Arguments for the command
+
+- `<ID_OR_PATH>` — Agent ID or database path (created if it does not exist)
+- `<SOURCE>` — Git repository to clone (URL or local path)
+- `[NAME]` — Directory name for the repository inside the filesystem (default: derived from the source)
 
 **Options:**
-- `--backend <BACKEND>` - Mount backend (`fuse` on Linux, `nfs` on macOS by default)
-- `--key <KEY>` - Hex-encoded encryption key for encrypted databases
-- `--cipher <CIPHER>` - Cipher algorithm (required with `--key`)
 
-**Examples:**
-
-```bash
-# Run ls in the AgentFS root
-agentfs exec my-agent ls -la
-
-# Run a build command
-agentfs exec my-overlay make build
-
-# With encryption
-agentfs exec my-agent --key $KEY --cipher aes256gcm cat /config.json
-```
-
-### agentfs run
-
-Execute a program in a sandboxed environment with copy-on-write filesystem.
-
-```
-agentfs run [OPTIONS] <COMMAND> [ARGS]...
-```
-
-**Options:**
-- `--session <ID>` - Named session for persistence across runs
-- `--allow <PATH>` - Allow write access to additional directories (repeatable)
-- `--no-default-allows` - Disable default allowed directories
-- `--key <KEY>` - Hex-encoded encryption key for delta layer
-- `--cipher <CIPHER>` - Cipher algorithm (required with `--key`)
-
-**Platform behavior:**
-
-Linux uses FUSE + overlay filesystem with user namespaces. macOS uses NFS + overlay filesystem with Apple's Sandbox.
-
-Default allowed directories (macOS): `~/.claude`, `~/.codex`, `~/.config`, `~/.cache`, `~/.local`, `~/.npm`, `/tmp`
-
-**Linux FUSE performance and cache controls:**
-
-AgentFS uses a bounded FUSE worker pool on Linux. The pool removes the old
-global backend mutex from read paths while preserving copy-on-write isolation:
-reads are admitted through a shared read lane, and metadata/content mutations
-are admitted through an exclusive write lane before reaching the SQLite-backed
-delta.
-
-| Variable | Default | Description |
-|---|---:|---|
-| `AGENTFS_FUSE_WORKERS` | `auto` | `serial`, `auto`, an integer worker count, or a percent such as `25%`. Defaults to `auto` (~`AGENTFS_FUSE_CPU_PERCENT`% of host CPUs). Set to `serial` to fall back to single-threaded dispatch. |
-| `AGENTFS_FUSE_QUEUE` | derived | Request queue capacity. Accepts an integer or memory percent. |
-| `AGENTFS_FUSE_CPU_PERCENT` | `25` | Target CPU fraction when `AGENTFS_FUSE_WORKERS=auto`. |
-| `AGENTFS_FUSE_MEMORY_PERCENT` | `25` | Target memory fraction for derived queue sizing. |
-| `AGENTFS_FUSE_SYNC_INVAL` | `0` | Opt-in synchronous kernel cache invalidation. Default uses deferred (off-thread) invalidation which is safer under parallel workers: synchronous notifies issued from a request handler can block waiting for inline `FUSE_FORGET` traffic that the session thread cannot deliver while every dispatch lane is busy, so combining `AGENTFS_FUSE_SYNC_INVAL=1` with parallel `AGENTFS_FUSE_WORKERS` can deadlock under git workloads. The kernel cache fast path no longer requires this flag. |
-| `AGENTFS_FUSE_ENTRY_TTL_MS` | `1000` | Kernel dentry TTL when the kernel cache fast path is active (parallel workers); otherwise forced to `0`. |
-| `AGENTFS_FUSE_ATTR_TTL_MS` | `1000` | Kernel attribute TTL when the kernel cache fast path is active (parallel workers); otherwise forced to `0`. |
-| `AGENTFS_FUSE_NEG_TTL_MS` | `1000` | Kernel negative-entry TTL when the kernel cache fast path is active (parallel workers); otherwise forced to `0`. |
-| `AGENTFS_FUSE_READDIRPLUS` | `auto` | `off`, `auto`, or `always`; accepted when the kernel cache fast path is active (parallel workers). |
-| `AGENTFS_FUSE_WRITEBACK` | `1` | Requests FUSE writeback cache; accepted when the kernel cache fast path is active (parallel workers). |
-| `AGENTFS_FUSE_KEEPCACHE` | `1` | Requests `FOPEN_KEEP_CACHE` for eligible read-only base files; accepted when the kernel cache fast path is active (parallel workers). |
-
-By default (no env vars set), AgentFS runs with parallel FUSE dispatch and
-deferred kernel-cache invalidation, which enables the kernel cache fast path:
-1 s TTLs on dentries/attrs/negative lookups, writeback cache, `FOPEN_KEEP_CACHE`
-on eligible reads, and readdirplus auto. Each mutation path (`create`, `mkdir`,
-`mknod`, `symlink`, `link`, `unlink`, `rmdir`, `rename`, `write`, `flush`,
-`setattr`) is audited in debug builds to confirm a kernel cache invalidation
-(synchronous or deferred) is queued before any success reply.
-
-Override to `AGENTFS_FUSE_WORKERS=serial` to fall back to the pre-Phase-8
-behavior where the kernel cache fast path is fully disabled (TTLs=0, no
-writeback, no keepcache, no readdirplus). Setting `AGENTFS_FUSE_SYNC_INVAL=1`
-re-enables synchronous invalidation; use it only with `AGENTFS_FUSE_WORKERS=serial`
-to avoid the parallel-dispatch deadlock described above. All copy-on-write
-writes remain in the AgentFS database; no sandbox write is applied to the base
-filesystem regardless of the cache configuration.
+- `--backend <BACKEND>` — Backend to use for mounting (default: fuse on Linux, nfs on macOS) [possible values: fuse, nfs; default: fuse]
+- `--verify` — Verify `git status` is clean through the mount before finishing
 
 ### agentfs mount
 
-Mount an agent filesystem or list mounted filesystems.
+Mount an agent filesystem using FUSE (or list mounts if no args)
 
 ```
-agentfs mount [OPTIONS] [ID_OR_PATH] [MOUNT_POINT]
+agentfs mount [OPTIONS] [ID_OR_PATH] [MOUNTPOINT]
 ```
 
-Without arguments, lists all mounted agentfs filesystems.
+**Arguments:**
+
+- `[ID_OR_PATH]` — Agent ID or database path (if omitted, lists current mounts)
+- `[MOUNTPOINT]` — Mount point directory
 
 **Options:**
-- `-a, --auto-unmount` - Automatically unmount on exit
-- `--allow-root` - Allow root user to access filesystem
-- `-f, --foreground` - Run in foreground
-- `--uid <UID>` - User ID for all files
-- `--gid <GID>` - Group ID for all files
 
-**Unmounting:**
-- Linux: `fusermount -u <MOUNT_POINT>`
-- macOS: `umount <MOUNT_POINT>`
+- `-a, --auto-unmount` — Automatically unmount on exit
+- `--allow-root` — Allow root user to access filesystem
+- `--system` — Allow other system users to access this mount (requires /etc/fuse.conf user_allow_other; use cautiously)
+- `-f, --foreground` — Run in foreground (don't daemonize)
+- `--uid <UID>` — User ID to report for all files (defaults to current user)
+- `--gid <GID>` — Group ID to report for all files (defaults to current group)
+- `--backend <BACKEND>` — Backend to use for mounting [possible values: fuse, nfs; default: fuse]
+- `--partial-origin <MODE>` — Partial-origin policy for base-file writes: off, on, or auto [possible values: off, on, auto]
+- `--partial-origin-threshold-bytes <BYTES>` — Size threshold for --partial-origin auto
+- `--key <KEY>` — Hex-encoded encryption key for encrypted databases [env: AGENTFS_KEY]
+- `--cipher <CIPHER>` — Cipher algorithm for encryption (required with --key). Options: aegis128l, aegis128x2, aegis128x4, aegis256, aegis256x2, aegis256x4, aes128gcm, aes256gcm [env: AGENTFS_CIPHER]
 
-**macOS NFS git validation (#333):**
+### agentfs diff
 
-To manually validate the macOS NFS path used by git loose-object writes, run the
-repository harness on a macOS host:
-
-```bash
-cargo build --manifest-path cli/Cargo.toml --no-default-features
-scripts/validation/macos-nfs-git-validation.sh \
-  --agentfs-bin "$PWD/cli/target/debug/agentfs"
-```
-
-The script initializes a temporary AgentFS database, mounts it via
-`agentfs mount --backend nfs`, runs `git init`, `git add`, `git commit`, and
-`git fsck --strict`, then unmounts and cleans up. A passing run ends with
-`macOS NFS git validation passed` and a nonzero loose-object count. On non-macOS
-hosts the script exits `77` to report an intentional skip.
-
-### agentfs serve mcp
-
-Start an MCP (Model Context Protocol) server.
+Show differences between base filesystem and delta (overlay mode only)
 
 ```
-agentfs serve mcp <ID_OR_PATH> [OPTIONS]
+agentfs diff <ID_OR_PATH>
+```
+
+**Arguments:**
+
+- `<ID_OR_PATH>` — Agent ID or database path
+
+### agentfs timeline
+
+Display agent action timeline from tool call audit log
+
+```
+agentfs timeline [OPTIONS] <ID_OR_PATH>
+```
+
+**Arguments:**
+
+- `<ID_OR_PATH>` — Agent ID or database path
+
+**Options:**
+
+- `--limit <LIMIT>` — Limit number of entries to display [default: 100]
+- `--filter <FILTER>` — Filter by tool name
+- `--status <STATUS>` — Filter by status (pending/success/error) [possible values: pending, success, error]
+- `--format <FORMAT>` — Output format [possible values: table, json; default: table]
+
+### agentfs nfs
+
+Start an NFS server to export an AgentFS filesystem over the network (deprecated: use `agentfs serve nfs` instead)
+
+```
+agentfs nfs [OPTIONS] <ID_OR_PATH>
+```
+
+**Arguments:**
+
+- `<ID_OR_PATH>` — Agent ID or database path
+
+**Options:**
+
+- `--bind <BIND>` — IP address to bind to [default: 127.0.0.1]
+- `--port <PORT>` — Port to listen on [default: 11111]
+- `--key <KEY>` — Hex-encoded encryption key for encrypted databases [env: AGENTFS_KEY]
+- `--cipher <CIPHER>` — Cipher algorithm for encryption (required with --key). Options: aegis128l, aegis128x2, aegis128x4, aegis256, aegis256x2, aegis256x4, aes128gcm, aes256gcm [env: AGENTFS_CIPHER]
+
+### agentfs mcp-server
+
+Start an MCP server exposing filesystem and KV-store tools (deprecated: use `agentfs serve mcp` instead)
+
+```
+agentfs mcp-server [OPTIONS] <ID_OR_PATH>
+```
+
+**Arguments:**
+
+- `<ID_OR_PATH>` — Agent ID or database path
+
+**Options:**
+
+- `--tools <TOOLS>` — Tools to expose (comma-separated). If not provided, all tools are exposed. Available tools: read_file, write_file, readdir, mkdir, remove, rename, stat, access, kv_get, kv_set, kv_delete, kv_list
+
+### agentfs serve
+
+Serve an AgentFS filesystem via different protocols
+
+```
+agentfs serve <COMMAND>
+```
+
+#### agentfs serve nfs
+
+Start an NFS server to export an AgentFS filesystem over the network
+
+```
+agentfs serve nfs [OPTIONS] <ID_OR_PATH>
+```
+
+**Arguments:**
+
+- `<ID_OR_PATH>` — Agent ID or database path
+
+**Options:**
+
+- `--bind <BIND>` — IP address to bind to [default: 127.0.0.1]
+- `--port <PORT>` — Port to listen on [default: 11111]
+- `--key <KEY>` — Hex-encoded encryption key for encrypted databases [env: AGENTFS_KEY]
+- `--cipher <CIPHER>` — Cipher algorithm for encryption (required with --key). Options: aegis128l, aegis128x2, aegis128x4, aegis256, aegis256x2, aegis256x4, aes128gcm, aes256gcm [env: AGENTFS_CIPHER]
+
+#### agentfs serve mcp
+
+Start an MCP server exposing filesystem and KV-store tools
+
+```
+agentfs serve mcp [OPTIONS] <ID_OR_PATH>
+```
+
+**Arguments:**
+
+- `<ID_OR_PATH>` — Agent ID or database path
+
+**Options:**
+
+- `--tools <TOOLS>` — Tools to expose (comma-separated). If not provided, all tools are exposed. Available tools: read_file, write_file, readdir, mkdir, remove, rename, stat, access, kv_get, kv_set, kv_delete, kv_list
+
+### agentfs ps
+
+List active agentfs run sessions
+
+```
+agentfs ps
+```
+
+### agentfs prune
+
+Prune unused resources
+
+```
+agentfs prune <COMMAND>
+```
+
+#### agentfs prune mounts
+
+Unmount unused agentfs mount points
+
+```
+agentfs prune mounts [OPTIONS]
 ```
 
 **Options:**
-- `--tools <TOOLS>` - Comma-separated list of tools to expose (default: all). Unknown tool names are rejected at startup.
 
-**Available tools:**
-
-Filesystem: `read_file`, `write_file`, `readdir`, `mkdir`, `remove`, `rename`, `stat`, `access`
-
-Key-Value: `kv_get`, `kv_set`, `kv_delete`, `kv_list`
-
-`write_file` overwrites existing files in place, preserving their mode; new files are created with mode `0644`.
-
-Every `tools/call` is recorded in the `tool_calls` audit table; inspect it with `agentfs timeline`.
-
-### agentfs serve nfs
-
-Start an NFS server to export AgentFS over the network.
-
-```
-agentfs serve nfs <ID_OR_PATH> [OPTIONS]
-```
-
-**Options:**
-- `--bind <IP>` - IP address to bind (default: `127.0.0.1`)
-- `--port <PORT>` - Port to listen on (default: `11111`)
-
-**Mounting from client:**
-```bash
-mount -t nfs -o vers=3,tcp,port=11111,mountport=11111,nolock <HOST>:/ <MOUNT_POINT>
-```
-
-### agentfs sync
-
-Synchronize agent filesystem with a remote Turso database.
-
-```
-agentfs sync <ID_OR_PATH> <SUBCOMMAND>
-```
-
-**Subcommands:**
-- `pull` - Pull remote changes
-- `push` - Push local changes
-- `stats` - View sync statistics
-- `checkpoint` - Create checkpoint
+- `--force` — Skip confirmation prompt and unmount immediately
 
 ### agentfs integrity
 
-Run SQLite and AgentFS schema-invariant checks against a local database.
+Check a local AgentFS database for SQLite and schema corruption
 
 ```
 agentfs integrity [OPTIONS] <ID_OR_PATH>
 ```
 
 **Arguments:**
-- `ID_OR_PATH` - Agent identifier or database path
+
+- `<ID_OR_PATH>` — Agent ID or database path
 
 **Options:**
-- `--json` - Emit a machine-readable report
-- `--key <KEY>` - Hex-encoded encryption key for encrypted databases
-- `--cipher <CIPHER>` - Cipher algorithm (required with `--key`)
 
-**Examples:**
-
-```bash
-# Check by agent ID
-agentfs integrity my-agent --json
-
-# Check by database path
-agentfs integrity .agentfs/my-agent.db --json
-```
-
-The command runs `PRAGMA integrity_check`, validates required AgentFS tables and
-v0.5 config, checks inline/chunk storage invariants, verifies namespace
-references, and checks overlay metadata tables when present. It exits nonzero if
-any check fails.
+- `--json` — Emit machine-readable JSON
+- `--require-portable` — Fail if the database depends on external partial-origin base files
+- `--check-base` — Validate partial-origin base file fingerprints against the current base tree
+- `--checkpoint` — Checkpoint the WAL and remove empty SQLite sidecars after checks pass
+- `--key <KEY>` — Hex-encoded encryption key for encrypted databases
+- `--cipher <CIPHER>` — Encryption cipher (required with --key)
 
 ### agentfs backup
 
-Create a portable main-database snapshot for a local AgentFS database.
+Create a portable local AgentFS database backup
 
 ```
-agentfs backup <ID_OR_PATH> <TARGET_DB> [OPTIONS]
+agentfs backup [OPTIONS] <ID_OR_PATH> <TARGET>
 ```
 
 **Arguments:**
-- `ID_OR_PATH` - Agent identifier or database path
-- `TARGET_DB` - New database path to create
+
+- `<ID_OR_PATH>` — Agent ID or database path
+- `<TARGET>` — Target database path to create
 
 **Options:**
-- `--verify` - Reopen the copied main database and run integrity checks
-- `--key <KEY>` - Hex-encoded encryption key for encrypted databases
-- `--cipher <CIPHER>` - Cipher algorithm (required with `--key`)
 
-**Examples:**
+- `--verify` — Reopen and verify the copied main database
+- `--materialize` — Materialize partial-origin files into a portable backup
+- `--key <KEY>` — Hex-encoded encryption key for encrypted databases
+- `--cipher <CIPHER>` — Encryption cipher (required with --key)
 
-```bash
-# Checkpoint, copy, reopen, and verify a portable backup
-agentfs backup my-agent /tmp/my-agent-backup.db --verify
+### agentfs materialize
 
-# Backup using database paths
-agentfs backup .agentfs/my-agent.db ./my-agent-backup.db --verify
+Create a portable database by materializing partial-origin files
+
+```
+agentfs materialize [OPTIONS] <ID_OR_PATH>
 ```
 
-The command checkpoints and truncates the source WAL before copying only the
-main database file. The target must not already exist. Databases with
-partial-origin overlay rows are rejected because their file contents still
-depend on the external base tree; keep the base tree with the database or
-materialize the overlay before creating a portable backup.
+**Arguments:**
+
+- `<ID_OR_PATH>` — Agent ID or database path
+
+**Options:**
+
+- `--output <OUTPUT>` — Target database path to create
+- `--verify` — Reopen and verify the materialized database
+- `--key <KEY>` — Hex-encoded encryption key for encrypted databases
+- `--cipher <CIPHER>` — Encryption cipher (required with --key)
 
 ### agentfs migrate
 
-Migrate a database to the current schema version.
+Migrate database schema to the current version
 
 ```
 agentfs migrate [OPTIONS] <ID_OR_PATH>
 ```
 
-One command lands any supported old schema (v0.0, v0.2, v0.4) at the current
-version. The default mode migrates in place: every supported migration is an
-additive, transactional `ALTER`, applied inside a single transaction that
-stamps `PRAGMA user_version` before committing. Existing file contents keep
-their recorded chunk layout.
-
-With `--copy <TARGET>`, the database is instead rebuilt into a new file with
-the current chunk layout (64 KiB chunks, small dense files stored inline).
-The source is locked, hashed before and after to prove it was untouched, and
-`--verify` additionally compares source/target metadata and file contents,
-including a checkpointed single-file snapshot check.
-
 **Arguments:**
-- `ID_OR_PATH` - Agent identifier or database path
+
+- `<ID_OR_PATH>` — Agent ID or database path
 
 **Options:**
-- `--dry-run` - Preview migration without applying changes
-- `--copy <TARGET>` - Copy-migrate into a new database file at `TARGET` instead of migrating in place
-- `--verify` - Verify migrated filesystem, KV, tool-call, and overlay state equivalence (requires `--copy`)
-- `--overwrite-target` - Replace an existing `--copy` target database
-- `--key <KEY>` - Hex-encoded encryption key for encrypted databases
-- `--cipher <CIPHER>` - Encryption cipher (required with `--key`)
 
-**Examples:**
+- `--dry-run` — Preview migration without applying changes
+- `--copy <TARGET>` — Copy-migrate into a new database file at this path instead of migrating in place
+- `--verify` — Verify migrated state equivalence (requires --copy)
+- `--overwrite-target` — Allow replacing an existing --copy target database
+- `--key <KEY>` — Hex-encoded encryption key for encrypted databases
+- `--cipher <CIPHER>` — Encryption cipher (required with --key)
 
-```bash
-# Preview pending migrations
-agentfs migrate my-agent --dry-run
+<!-- END GENERATED COMMAND REFERENCE -->
 
-# Migrate in place to the current schema
-agentfs migrate my-agent
+## Runtime Knobs and Environment Variables
 
-# Migrate using database path
-agentfs migrate .agentfs/my-agent.db
+Every runtime knob (env var or first-class flag) is declared in the generated
+[docs/KNOBS.md](KNOBS.md) ledger with its class, default, owner, and gate.
+`AGENTFS_KEY` / `AGENTFS_CIPHER` provide default encryption credentials for
+the commands whose `--key` / `--cipher` options declare them (see the
+generated sections above); `TURSO_DB_AUTH_TOKEN` authenticates cloud sync.
 
-# Migrate an encrypted database
-agentfs migrate .agentfs/my-agent.db --key "$KEY" --cipher aes256gcm
-
-# Rebuild into a new database with the current chunk layout, with verification
-agentfs migrate .agentfs/my-agent.db --copy .agentfs/my-agent-new.db --verify
-```
-
-**Output:**
-
-The command displays the current and target schema versions, then applies any necessary migrations:
-
-```
-Database: .agentfs/my-agent.db
-Current schema version: 0.2
-Target schema version: 0.5 (CURRENT)
-
-Applying migrations...
-
-Migration completed successfully.
-```
-
-**Notes:**
-- Migrations are idempotent and safe to run multiple times
-- In-place migration checkpoints the WAL on completion, leaving a single portable `.db` file
-- `--copy` never modifies the source database; overlay tables (`fs_whiteout`, `fs_origin`, and `fs_overlay_config`) are preserved and files are re-chunked to the current layout
-- Always backup your database before running migrations on production data
-
-### agentfs fs
-
-Filesystem operations on agent databases.
-
-**Common Options:**
-- `--key <KEY>` - Hex-encoded encryption key for encrypted databases
-- `--cipher <CIPHER>` - Cipher algorithm (required with `--key`)
-
-#### agentfs fs ls
-
-```
-agentfs fs <ID_OR_PATH> [OPTIONS] ls [FS_PATH]
-```
-
-List files and directories. Output: `f <name>` for files, `d <name>` for directories.
-
-#### agentfs fs cat
-
-```
-agentfs fs <ID_OR_PATH> [OPTIONS] cat <FILE_PATH>
-```
-
-Display file contents.
-
-#### agentfs fs write
-
-```
-agentfs fs <ID_OR_PATH> [OPTIONS] write <FILE_PATH> <CONTENT>
-```
-
-Write content to a file.
-
-### agentfs diff
-
-Show filesystem changes in overlay mode.
-
-```
-agentfs diff <ID_OR_PATH>
-```
-
-### agentfs timeline
-
-Display agent action timeline from the tool call audit log.
-
-```
-agentfs timeline [OPTIONS] <ID_OR_PATH>
-```
-
-**Options:**
-- `--limit <N>` - Limit entries (default: 100)
-- `--filter <TOOL>` - Filter by tool name
-- `--status <STATUS>` - Filter by status: `pending`, `success`, `error`
-- `--format <FORMAT>` - Output format: `table`, `json` (default: table)
-
-### agentfs completions
-
-Manage shell completions.
-
-```
-agentfs completions install [SHELL]
-agentfs completions uninstall [SHELL]
-agentfs completions show
-```
-
-Supported shells: `bash`, `zsh`, `fish`, `powershell`
-
-## Environment Variables
-
-**Configuration variables:**
+Variables set inside an `agentfs run` sandbox:
 
 | Variable | Description |
 |----------|-------------|
-| `AGENTFS_KEY` | Default encryption key (hex-encoded) |
-| `AGENTFS_CIPHER` | Default cipher algorithm |
-| `TURSO_DB_AUTH_TOKEN` | Authentication token for cloud sync |
-
-**Variables set inside the sandbox:**
-
-| Variable | Description |
-|----------|-------------|
-| `AGENTFS` | Set to `1` inside AgentFS sandbox |
-| `AGENTFS_SANDBOX` | Sandbox type: `macos-sandbox` or `linux-namespace` |
+| `AGENTFS` | Set to `1` inside the AgentFS sandbox |
+| `AGENTFS_SANDBOX` | Sandbox type: `linux-namespace` or `macos-sandbox` |
 | `AGENTFS_SESSION` | Current session ID |
 
 ## Local Encryption
 
-AgentFS supports encrypting the local SQLite database at rest using libSQL's encryption feature.
+AgentFS supports encrypting the local SQLite database at rest.
 
 **Supported ciphers:**
+
 - `aes256gcm` - AES-256-GCM (requires 64-character hex key)
 - `aes128gcm` - AES-128-GCM (requires 32-character hex key)
 - `aegis256` - AEGIS-256 (requires 64-character hex key)
@@ -495,15 +562,23 @@ agentfs fs my-secure-agent ls /
 ```
 
 **Limitations:**
+
 - Local encryption cannot be used with cloud sync (`--sync-remote-url`)
 
 ## Files
 
-- `.agentfs/<ID>.db` - Agent filesystem database
-- `~/.config/agentfs/` - Configuration directory
+- `.agentfs/<ID>.db` - Agent filesystem database (relative to the working
+  directory where `agentfs init` ran)
+- `~/.agentfs/run/` - `agentfs run` session state (listed by `agentfs ps`)
+
+## Unmounting
+
+- Linux (FUSE): `fusermount3 -u <MOUNT_POINT>` (or `fusermount -u`)
+- macOS (NFS): `umount <MOUNT_POINT>`
 
 ## See Also
 
-- [AgentFS Documentation](https://docs.turso.tech/agentfs) - Guides, tutorials, SDK docs
-- [AgentFS Specification](SPEC.md) - SQLite schema specification
-- [GitHub Repository](https://github.com/tursodatabase/agentfs) - Source code and examples
+- [Agent Filesystem Specification](SPEC.md) - SQLite schema specification
+- [Runtime Knobs](KNOBS.md) - generated knob ledger
+- [Testing](TESTING.md) - validation gates, benchmarks, and the manual
+  macOS release gate

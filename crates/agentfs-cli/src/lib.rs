@@ -7,6 +7,7 @@
 
 pub mod cmd;
 pub mod config;
+pub mod docs;
 pub mod knobs;
 pub mod logging;
 pub mod opts;
