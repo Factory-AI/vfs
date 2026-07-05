@@ -107,8 +107,10 @@ jobs:
 
     - name: Run shell and Python gate
       run: |
-        # scripts/gate.sh runs cli/tests/all.sh with AGENTFS_GATE_STRICT=1.
-        # It also runs phase8-validation.py --smoke, noopen-coherence.py, and flush-coherence.py.
+        # scripts/gate.sh runs crates/agentfs-cli/tests/all.sh with
+        # AGENTFS_GATE_STRICT=1, then phase8-validation.py --smoke (which
+        # includes the noopen/flush/base-drift coherence harnesses) and the
+        # consistency-canon census.
         scripts/gate.sh
 
     - name: Run pjdfstest phase5-ci
