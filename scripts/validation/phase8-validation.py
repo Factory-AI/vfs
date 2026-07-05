@@ -10,7 +10,6 @@ targets.
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import os
 import shutil
@@ -21,18 +20,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional
 
-
-def load_common() -> Any:
-    common_path = Path(__file__).with_name("phase8-writeback-durability.py")
-    spec = importlib.util.spec_from_file_location("phase8_writeback_durability_common", common_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"failed to load common helpers from {common_path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-common = load_common()
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lib import common  # noqa: E402
 
 
 def env_float(name: str, default: float) -> float:
@@ -458,6 +447,39 @@ def main(argv: list[str]) -> int:
             gates["base_read_repeated_read_threshold"],
             base_read_performance_checks(gates["base_read_repeated_read_threshold"].get("result"), enforce_phase8),
             enforce=enforce_phase8,
+        )
+
+        # FUSE coherence harnesses for the default-on noopen/noflush semantics
+        # and external base drift; folded into the Phase 8 gate per the M7
+        # scripts consolidation (scripts-docs-sweep.md recommendation 1). Each
+        # runs its own config matrix, so wall timeouts are per-harness.
+        coherence_wall_timeout = max(args.timeout * 4, 300.0)
+        gates["noopen_coherence"] = run_json_gate(
+            "noopen-coherence",
+            scripts / "noopen-coherence.py",
+            ["--agentfs-bin", agentfs_bin],
+            repo_root,
+            env,
+            coherence_wall_timeout,
+            output_dir,
+        )
+        gates["flush_coherence"] = run_json_gate(
+            "flush-coherence",
+            scripts / "flush-coherence.py",
+            ["--agentfs-bin", agentfs_bin],
+            repo_root,
+            env,
+            coherence_wall_timeout,
+            output_dir,
+        )
+        gates["external_base_mutation_coherence"] = run_json_gate(
+            "external-base-mutation-coherence",
+            scripts / "external-base-mutation-coherence.py",
+            ["--agentfs-bin", agentfs_bin],
+            repo_root,
+            env,
+            coherence_wall_timeout,
+            output_dir,
         )
 
         failed_gates = [name for name, gate in gates.items() if not gate_passed(gate)]

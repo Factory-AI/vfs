@@ -29,7 +29,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -37,7 +36,8 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-OUTPUT_TAIL_CHARS = 8000
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lib.common import resolve_agentfs_bin, tail_text  # noqa: E402
 
 WORKLOAD = r'''
 import ctypes
@@ -110,29 +110,6 @@ check("closed_tail_stat", os.stat(tail).st_size, 15_000)
 
 print(json.dumps({"mismatches": mismatches, "iterations": iterations}))
 '''
-
-
-def tail_text(text: str) -> str:
-    return text if len(text) <= OUTPUT_TAIL_CHARS else text[-OUTPUT_TAIL_CHARS:]
-
-
-def resolve_agentfs_bin(agentfs_bin: Optional[str], repo_root: Path) -> str:
-    if agentfs_bin:
-        candidate = Path(agentfs_bin).expanduser()
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return str(candidate.resolve())
-        if os.sep not in agentfs_bin:
-            found = shutil.which(agentfs_bin)
-            if found:
-                return found
-        raise RuntimeError(f"agentfs binary not found or not executable: {agentfs_bin}")
-    for candidate in (
-        repo_root / "cli" / "target" / "release" / "agentfs",
-        repo_root / "cli" / "target" / "debug" / "agentfs",
-    ):
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return str(candidate)
-    raise RuntimeError("no agentfs binary found; pass --agentfs-bin or set AGENTFS_BIN")
 
 
 def parse_workload_json(stdout: str) -> Optional[dict[str, Any]]:

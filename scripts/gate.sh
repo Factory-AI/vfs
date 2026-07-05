@@ -48,12 +48,14 @@ CORRUPTION_TORTURE_TIMEOUT="${CORRUPTION_TORTURE_TIMEOUT:-120}" \
 CORRUPTION_TORTURE_TEARDOWN_TIMEOUT="${CORRUPTION_TORTURE_TEARDOWN_TIMEOUT:-10}" \
 timeout "$SHELL_TIMEOUT" crates/agentfs-cli/tests/all.sh
 
+# Phase 8 smoke is the top-level python gate; the noopen/flush/base-drift
+# coherence harnesses run inside it (M7 scripts consolidation).
 run python3 scripts/validation/phase8-validation.py \
     --smoke \
     --timeout "$PHASE8_TIMEOUT" \
     --agentfs-bin "$AGENTFS_BIN" \
     --output /tmp/vfs-val/phase8.json
-run python3 scripts/validation/noopen-coherence.py --agentfs-bin "$AGENTFS_BIN"
-run python3 scripts/validation/flush-coherence.py --agentfs-bin "$AGENTFS_BIN"
+
+run scripts/validation/consistency-canon.sh
 
 printf '\nHonest gate passed with AGENTFS_BIN=%s\n' "$AGENTFS_BIN"

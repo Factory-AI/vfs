@@ -13,16 +13,21 @@ first failing command and runs, in order:
 2. `cargo +nightly clippy --workspace --all-targets -- -D warnings`
 3. `cargo +nightly test --workspace`
 4. `cargo +nightly build --release --workspace --bins`
-5. `crates/agentfs-cli/tests/all.sh` with `AGENTFS_GATE_STRICT=1`
+5. `crates/agentfs-cli/tests/all.sh` with `AGENTFS_GATE_STRICT=1` and
+   `AGENTFS_BIN` pointing at the release binary
    (a SKIP is a failure on the designated runner)
-6. `scripts/validation/phase8-validation.py --smoke`
-7. `scripts/validation/noopen-coherence.py`
-8. `scripts/validation/flush-coherence.py`
+6. `scripts/validation/phase8-validation.py --smoke` — the top-level Python
+   gate; it runs the noopen/flush/base-drift coherence harnesses internally
+7. `scripts/validation/consistency-canon.sh` — the structural canon census
+   (crate DAG, sealed transport surfaces, file-size cap, tracing-only
+   logging, env-reads-at-the-config-edge, `await_holding_lock`, lock-order
+   headers, docs layout, changelog)
 
 Knobs: `AGENTFS_BIN` (defaults to `target/release/agentfs`),
 `AGENTFS_GATE_SHELL_TIMEOUT` (default 900 s), `AGENTFS_GATE_PHASE8_TIMEOUT`
 (default 20 s), and the `CORRUPTION_TORTURE_*` variables forwarded to the
-shell suite.
+shell suite. The gate pins `TMPDIR` to a per-run scratch dir cleaned on exit
+so dependency temp-file litter cannot accumulate on the host.
 
 CI (`.github/workflows/rust.yml`) runs the workspace job (fmt/clippy/build/test
 on Linux and macOS, build+test on Linux arm64), the honest milestone gate
@@ -53,8 +58,12 @@ AGENTFS_GATE_STRICT=1 crates/agentfs-cli/tests/all.sh
 
 The suite covers init/mount/run/exec flows, syscall coverage, signal
 teardown, corruption torture (both `AGENTFS_FUSE_URING=1` and `=0` legs),
-sidecar cleanup, and MCP server behavior, and prints a PASS/SKIP/FAIL
-summary. In strict mode a SKIP is red; `AGENTFS_GATE_FORCE_SKIP=<label|all>`
+sidecar cleanup, MCP server behavior, and a `cli-smoke` pass over the whole
+user-level command surface (init, run, exec, clone, fs, timeline,
+backup/materialize, integrity, migrate, MCP, ps, completions, and the
+deprecated `nfs`/`mcp-server` aliases), and prints a PASS/SKIP/FAIL
+summary. Every test runs out of its own `mktemp -d` root with trap cleanup
+and honors `AGENTFS_BIN` (falling back to `cargo run`). In strict mode a SKIP is red; `AGENTFS_GATE_FORCE_SKIP=<label|all>`
 synthesizes a SKIP for testing the runner itself. Never run the corruption
 torture test concurrently with another mount, test suite, or benchmark.
 
@@ -64,10 +73,12 @@ All harnesses take `--agentfs-bin` (or `AGENTFS_BIN`); build a release binary
 first for anything timing-sensitive.
 
 ```bash
-# Orchestrated Phase 8 policy gate (smoke profile is the milestone gate)
+# Orchestrated Phase 8 policy gate (smoke profile is the milestone gate).
+# Includes the noopen/flush/base-drift coherence harnesses as named gates.
 python3 scripts/validation/phase8-validation.py --smoke --timeout 20 \
   --agentfs-bin "$PWD/target/release/agentfs" --output /tmp/vfs-val/phase8.json
 
+# Focused standalone runs of the coherence harnesses:
 # Default-on FUSE semantics coherence (no-open and no-flush legs)
 python3 scripts/validation/noopen-coherence.py --agentfs-bin "$PWD/target/release/agentfs"
 python3 scripts/validation/flush-coherence.py --agentfs-bin "$PWD/target/release/agentfs"
@@ -77,6 +88,11 @@ python3 scripts/validation/external-base-mutation-coherence.py \
   --agentfs-bin "$PWD/target/release/agentfs" \
   --output /tmp/vfs-val/external-base-mutation.json
 ```
+
+Shared harness helpers (binary resolution, subprocess handling with
+process-group timeouts, JSON parsing) live in `scripts/validation/lib/`.
+Historical one-off validators are archived under
+`scripts/validation/archive/` (see its README) and are not part of any gate.
 
 Focused stress harnesses used by Phase 8 and available directly:
 `phase8-concurrent-git-stress.py` (concurrent git correctness, base
