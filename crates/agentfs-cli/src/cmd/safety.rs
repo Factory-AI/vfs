@@ -873,7 +873,12 @@ fn ensure_backup_target(source_path: &Path, target: &Path) -> AnyhowResult<()> {
             );
         }
     }
-    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    // A bare relative target ("backup.db") has Some("") as its parent, not
+    // None; both mean the current directory.
+    let parent = match target.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
     if !parent.is_dir() {
         anyhow::bail!("Backup target parent does not exist: {}", parent.display());
     }
@@ -1045,6 +1050,32 @@ mod tests {
                 Some((suffix.to_string(), metadata.len(), metadata.modified().ok()))
             })
             .collect()
+    }
+
+    #[test]
+    fn backup_target_with_bare_relative_name_treats_parent_as_cwd() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source = temp_dir.path().join("source.db");
+        fs::write(&source, b"stub").unwrap();
+
+        let bare = format!("agentfs-backup-target-{}.db", std::process::id());
+        ensure_backup_target(&source, Path::new(&bare)).expect(
+            "a bare relative backup target must resolve its parent to the current directory",
+        );
+    }
+
+    #[test]
+    fn backup_target_with_missing_parent_still_errors() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source = temp_dir.path().join("source.db");
+        fs::write(&source, b"stub").unwrap();
+
+        let target = temp_dir.path().join("no-such-dir").join("backup.db");
+        let err = ensure_backup_target(&source, &target).unwrap_err();
+        assert!(
+            err.to_string().contains("no-such-dir"),
+            "missing-parent error must name the directory: {err:#}"
+        );
     }
 
     #[tokio::test]

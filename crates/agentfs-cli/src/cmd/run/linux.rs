@@ -63,6 +63,12 @@ const MOUNTINFO_MOUNT_POINT_FIELD: usize = 4;
 /// Forks the sandbox child BEFORE any tokio runtime exists: forking a live
 /// multi-threaded runtime can deadlock the child on the allocator lock held
 /// by another worker thread at fork time (cli-cmd-sandbox-deep Q4).
+///
+/// The pre-runtime fork order means the parent's FUSE mount happens after
+/// the child's `unshare(CLONE_NEWNS)`, so the child sees it only through
+/// shared mount propagation on `/` (systemd default; kernel default is
+/// private). `run_child` guards this prerequisite with an is-mountpoint
+/// check before binding the overlay over cwd.
 pub fn run(options: RunOptions) -> Result<()> {
     let RunOptions {
         allow,
@@ -231,6 +237,7 @@ async fn record_run_audit(
     }
     let agentfs = AgentFS::open(options)
         .await
+        .map_err(|err| crate::cmd::migrate::open_error_with_guidance(err, db_path_str))
         .context("Failed to reopen delta database for the audit row")?;
 
     let mut argv = vec![command.to_string_lossy().into_owned()];
@@ -300,6 +307,7 @@ async fn mount_session_fs(
     }
     let agentfs = AgentFS::open(options)
         .await
+        .map_err(|err| crate::cmd::migrate::open_error_with_guidance(err, db_path_str))
         .context("Failed to create delta AgentFS")?;
 
     let hostfs = HostFS::new(&fd_path).context("Failed to create HostFS")?;
@@ -667,6 +675,24 @@ fn run_child(
         child_exit(&format!(
             "Failed to make mounts private: {}",
             std::io::Error::last_os_error()
+        ));
+    }
+
+    // Step 5 prerequisite: the parent mounts FUSE AFTER this child unshared
+    // its mount namespace, so the mount reaches this namespace only via
+    // shared mount propagation from the parent (systemd makes `/` rshared;
+    // the kernel default is private). The maps-done signal above is sent
+    // post-mount, so a missing mount here is a propagation failure, not a
+    // race. Without this guard the bind below would silently place the
+    // EMPTY underlying directory over cwd.
+    if !is_mountpoint(fuse_mountpoint) {
+        child_exit(&format!(
+            "FUSE overlay never appeared at {} inside the sandbox mount namespace.\n\
+             agentfs run requires shared mount propagation on / (the systemd default);\n\
+             this host appears to use private propagation (check with\n\
+             `findmnt -o TARGET,PROPAGATION /`). Enable it with `mount --make-rshared /`\n\
+             and retry.",
+            fuse_mountpoint.display()
         ));
     }
 

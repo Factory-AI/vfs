@@ -504,6 +504,11 @@ agentfs migrate [OPTIONS] <ID_OR_PATH>
 
 <!-- END GENERATED COMMAND REFERENCE -->
 
+## MCP Server (`agentfs serve mcp`)
+
+The `write_file` tool overwrites existing files in place and keeps their
+mode; files it creates get the default mode `0644` (`rw-r--r--`).
+
 ## Sandboxing (`agentfs run`)
 
 `agentfs run` scopes both writes and reads at the OS level; the mechanism
@@ -513,7 +518,11 @@ differs by platform.
 Writes land only in the copy-on-write overlay and the allowed directories.
 Reads are scoped by hiding the home directory and temp dirs behind
 namespace-private tmpfs, re-exposing only the overlay cwd and the allowed
-paths; all other system paths are remounted read-only.
+paths; all other system paths are remounted read-only. Writes to those
+hidden non-allowed paths land in an ephemeral session-private view (the
+namespace tmpfs): the host is protected, but that view is not persisted —
+files written there vanish when the session exits and are not visible when
+the session is resumed with `--session`.
 
 **macOS (second-tier):** NFS mount + a generated `sandbox-exec` (Seatbelt)
 profile. Writes are restricted to the mountpoint, temp directories,

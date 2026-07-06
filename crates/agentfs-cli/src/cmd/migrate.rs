@@ -75,9 +75,29 @@ pub async fn handle_migrate_command(
 
     writeln!(stdout, "Database: {}", db_path.display())?;
 
+    let sidecars = ReadOnlyOpenSidecars::capture(db_path);
+    let result = migrate_in_place(stdout, db_path, dry_run, encryption, &sidecars).await;
+    if result.is_err() {
+        // A failed migrate must not leave behind the frameless WAL/SHM its
+        // own open materialized (single-file invariant I1); the database and
+        // connection are already dropped when migrate_in_place returns.
+        sidecars.remove_created_frameless();
+    }
+    result
+}
+
+/// The open-to-finish body of the in-place migrate. Owns the database handle
+/// so every return path (success or error) has dropped it before the caller
+/// runs sidecar cleanup.
+async fn migrate_in_place(
+    stdout: &mut impl Write,
+    db_path: &Path,
+    dry_run: bool,
+    encryption: Option<&(String, String)>,
+    sidecars: &ReadOnlyOpenSidecars,
+) -> AnyhowResult<()> {
     // Open directly via turso::Builder (not the SDK) so the open-path version
     // gate does not reject the database migrate exists to upgrade.
-    let sidecars = ReadOnlyOpenSidecars::capture(db_path);
     let db = build_local_database(db_path, encryption).await?;
     let conn = db.connect().context("Failed to connect to database")?;
 
@@ -2177,6 +2197,54 @@ mod tests {
         assert!(
             !shm.exists(),
             "already-current migrate must not leave an SHM sidecar it created"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_failing_migrate_removes_frameless_sidecars_it_created() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("future.db");
+        {
+            let db = Builder::new_local(db_path.to_str().unwrap())
+                .build()
+                .await
+                .unwrap();
+            let conn = db.connect().unwrap();
+            // A user_version no SchemaVersion maps to makes detect_schema_version
+            // (and thus the migrate) fail after the open already succeeded.
+            conn.execute("PRAGMA user_version = 999", ()).await.unwrap();
+            let mut rows = conn
+                .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
+                .await
+                .unwrap();
+            while rows.next().await.unwrap().is_some() {}
+        }
+        let wal = PathBuf::from(format!("{}-wal", db_path.display()));
+        let shm = PathBuf::from(format!("{}-shm", db_path.display()));
+        let _ = std::fs::remove_file(&wal);
+        let _ = std::fs::remove_file(&shm);
+        assert!(!wal.exists(), "fixture must start as a single file");
+
+        let mut stdout = Vec::new();
+        let err = handle_migrate_command(
+            &mut stdout,
+            db_path.to_string_lossy().into_owned(),
+            false,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("user_version 999"),
+            "migrate must fail on the unsupported version, got: {err:#}"
+        );
+        assert!(
+            !wal.exists(),
+            "failing migrate must not leave the frameless WAL sidecar its own open created"
+        );
+        assert!(
+            !shm.exists(),
+            "failing migrate must not leave the SHM sidecar its own open created"
         );
     }
 

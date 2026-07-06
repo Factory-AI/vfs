@@ -48,7 +48,7 @@ pub struct AgentFSOptions {
     /// Encryption configuration for database at rest
     pub encryption: Option<EncryptionConfig>,
     /// Typed core runtime configuration. When omitted, [`CoreConfig::from_env`]
-    /// is evaluated once by [`AgentFS::open`].
+    /// is evaluated once by [`AgentFS::open`](crate::AgentFS::open).
     pub core_config: Option<CoreConfig>,
 }
 

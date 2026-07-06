@@ -332,6 +332,7 @@ pub async fn run(options: RunOptions) -> Result<()> {
     }
     let agentfs = AgentFS::open(options)
         .await
+        .map_err(|err| crate::cmd::migrate::open_error_with_guidance(err, db_path_str))
         .context("Failed to create AgentFS")?;
 
     // Create overlay filesystem with CWD as base

@@ -69,7 +69,7 @@ pub async fn handle_clone_command(
         .unwrap_or_else(|_| AgentFSOptions::with_path(&id_or_path));
     let agentfs = open_agentfs(options)
         .await
-        .with_context(|| format!("failed to open AgentFS database: {id_or_path}"))?;
+        .map_err(|err| super::migrate::open_error_with_guidance(err, &id_or_path))?;
     let agent = agentfs.fs.clone();
     let fs: Arc<dyn FileSystem> = Arc::new(agentfs.fs);
 

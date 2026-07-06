@@ -88,7 +88,7 @@ pub async fn handle_mcp_server_command(
     eprintln!("Using agent: {}", id_or_path);
 
     // Create MCP server with tool filtering
-    let server = McpServer::new(options, tools_filter).await?;
+    let server = McpServer::new(id_or_path, options, tools_filter).await?;
 
     // Run server with stdio transport
     eprintln!("Starting MCP server on stdio...");
@@ -113,12 +113,20 @@ enum AgentFsSource {
 
 /// MCP Server implementation
 struct McpServer {
+    /// The user-supplied database identity, kept for schema-mismatch
+    /// guidance on the per-request reopens (the database can be replaced
+    /// underneath a long-lived stdio session).
+    id_or_path: String,
     source: AgentFsSource,
     enabled_tools: Option<HashSet<String>>,
 }
 
 impl McpServer {
-    async fn new(options: AgentFSOptions, tools_filter: Option<Vec<String>>) -> Result<Self> {
+    async fn new(
+        id_or_path: String,
+        options: AgentFSOptions,
+        tools_filter: Option<Vec<String>>,
+    ) -> Result<Self> {
         let enabled_tools = match tools_filter {
             None => {
                 eprintln!("No tool filter specified. Exposing all tools.");
@@ -152,19 +160,25 @@ impl McpServer {
         };
 
         let source = if options.db_path()? == ":memory:" {
-            AgentFsSource::Held(Arc::new(open_agentfs(options).await?))
+            let agentfs = open_agentfs(options)
+                .await
+                .map_err(|err| super::migrate::open_error_with_guidance(err, &id_or_path))?;
+            AgentFsSource::Held(Arc::new(agentfs))
         } else {
             // Open once up front so startup fails cleanly on a missing or
             // incompatible database, then release the file lock with the
             // single-file family restored: even this never-writing probe
             // materializes a -wal sidecar (invariant I1).
-            let probe = open_agentfs(options.clone()).await?;
+            let probe = open_agentfs(options.clone())
+                .await
+                .map_err(|err| super::migrate::open_error_with_guidance(err, &id_or_path))?;
             finalize_readonly(&probe).await;
             drop(probe);
             AgentFsSource::PerRequest(Box::new(options))
         };
 
         Ok(Self {
+            id_or_path,
             source,
             enabled_tools,
         })
@@ -174,7 +188,10 @@ impl McpServer {
         match &self.source {
             AgentFsSource::Held(agentfs) => Ok(agentfs.clone()),
             AgentFsSource::PerRequest(options) => {
-                Ok(Arc::new(open_agentfs((**options).clone()).await?))
+                let agentfs = open_agentfs((**options).clone()).await.map_err(|err| {
+                    super::migrate::open_error_with_guidance(err, &self.id_or_path)
+                })?;
+                Ok(Arc::new(agentfs))
             }
         }
     }
@@ -206,7 +223,10 @@ impl McpServer {
         let AgentFsSource::PerRequest(options) = &self.source else {
             return;
         };
-        match open_agentfs((**options).clone()).await {
+        match open_agentfs((**options).clone())
+            .await
+            .map_err(|err| super::migrate::open_error_with_guidance(err, &self.id_or_path))
+        {
             Ok(agentfs) => finalize_readonly(&agentfs).await,
             Err(error) => eprintln!(
                 "Warning: Failed to reopen the database to restore the single-file family: {error:#}"

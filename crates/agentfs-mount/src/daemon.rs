@@ -26,6 +26,17 @@ where
     F: FnOnce() -> Result<()> + Send + 'static,
     R: Fn() -> bool,
 {
+    // fork() from inside a live multi-threaded runtime can deadlock the
+    // child on locks (allocator, runtime internals) held by runtime worker
+    // threads at fork time. Callers must daemonize first and build their
+    // runtime in `daemon_fn` (see `agentfs mount`).
+    if tokio::runtime::Handle::try_current().is_ok() {
+        anyhow::bail!(
+            "daemonize called from inside a tokio runtime; fork before any runtime exists \
+             and create the runtime inside the daemon function instead"
+        );
+    }
+
     // Create pipe for child->parent signaling
     let mut pipe_fds: [libc::c_int; 2] = [0; 2];
     if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
@@ -255,5 +266,20 @@ fn redirect_stdio() {
                 libc::close(devnull);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn daemonize_refuses_to_fork_inside_a_live_runtime() {
+        let err = daemonize(|| Ok(()), || true, Duration::from_secs(1))
+            .expect_err("daemonize must refuse to fork from inside a tokio runtime");
+        assert!(
+            err.to_string().contains("tokio runtime"),
+            "error must name the runtime constraint: {err:#}"
+        );
     }
 }

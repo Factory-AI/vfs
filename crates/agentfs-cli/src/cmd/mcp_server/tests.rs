@@ -15,7 +15,12 @@ async fn create_test_server() -> Result<(McpServer, Arc<AgentFS>)> {
 async fn create_filtered_test_server(
     tools_filter: Option<Vec<String>>,
 ) -> Result<(McpServer, Arc<AgentFS>)> {
-    let server = McpServer::new(AgentFSOptions::ephemeral(), tools_filter).await?;
+    let server = McpServer::new(
+        ":memory:".to_string(),
+        AgentFSOptions::ephemeral(),
+        tools_filter,
+    )
+    .await?;
     let agentfs = server.agentfs().await?;
     Ok((server, agentfs))
 }
@@ -362,6 +367,7 @@ async fn tools_filter_limits_both_listing_and_dispatch() -> Result<()> {
 #[tokio::test]
 async fn unknown_tools_filter_is_rejected_at_startup() -> Result<()> {
     let error = match McpServer::new(
+        ":memory:".to_string(),
         AgentFSOptions::ephemeral(),
         Some(vec!["copy_file".to_string()]),
     )
