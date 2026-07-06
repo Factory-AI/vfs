@@ -8,6 +8,12 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(cd "$DIR/.." && pwd)"
 cd "$CLI_DIR"
 
+# Suite hygiene contract: every suite that invokes `agentfs run` with the real
+# HOME must pass an explicit unique `--session` id and remove exactly the
+# ~/.agentfs/run/<session> dirs it created in its cleanup trap (the user may
+# have real sessions there — NEVER sweep ~/.agentfs/run wholesale). Suites
+# that override HOME to a temp root are covered by their temp-root removal.
+
 # Pin TMPDIR to a per-run scratch dir cleaned on exit: turso_core 0.5.3 leaks
 # /tmp/tursodb-ephemeral-* sort-spill files (vdbe/execute.rs:10096 never
 # unlinks them), so dependency litter must not accumulate on the host.

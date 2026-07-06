@@ -6,6 +6,11 @@
 # has had joiners and filesystem activity. This exercises both the legacy
 # /dev/fuse reader path and the FUSE-over-io_uring path on capable kernels.
 #
+# A third leg covers the parent abort error path: when the sandbox child dies
+# before the namespace handshake completes, the parent must tear down its live
+# FUSE mount gracefully before exiting instead of leaving a dead mount table
+# entry behind.
+#
 set -eu
 
 echo -n "TEST bounded FUSE teardown on SIGTERM... "
@@ -395,12 +400,109 @@ run_leg() {
     return 0
 }
 
+# Parent abort-path teardown: capping max_user_namespaces at 0 inside a nested
+# user namespace makes the sandbox child's unshare fail deterministically
+# AFTER the parent's FUSE mount is live, driving the parent through its abort
+# error path. The parent must exit 1 with the mount gone from the namespace's
+# mount table (pre-fix it exited via process::exit without dropping the
+# MountHandle, stranding a dead mount entry).
+run_abort_leg() {
+    if ! command -v unshare >/dev/null 2>&1 || ! unshare -Ur true 2>/dev/null; then
+        echo "SKIP: nested user namespaces unavailable for the abort-path leg"
+        return 0
+    fi
+
+    TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/agentfs-teardown-bounded.XXXXXX")"
+    TEST_HOME="$TEST_ROOT/home"
+    WORKDIR="$TEST_ROOT/work"
+    LOGDIR="$TEST_ROOT/logs"
+    SESSION_ID="abort-path-$$"
+    OWNER_LOG="$LOGDIR/abort-leg.log"
+    mkdir -p "$TEST_HOME" "$WORKDIR" "$LOGDIR"
+
+    inner="$TEST_ROOT/abort-inner.sh"
+    cat >"$inner" <<'INNER'
+#!/bin/sh
+set -u
+BIN="$1"
+TEST_HOME="$2"
+WORKDIR="$3"
+SESSION_ID="$4"
+if ! echo 0 >/proc/sys/user/max_user_namespaces 2>/dev/null; then
+    echo "ABORT-LEG-SETUP-SKIP"
+    exit 0
+fi
+cd "$WORKDIR" || exit 90
+rc=0
+HOME="$TEST_HOME" "$BIN" run --session "$SESSION_ID" -- /bin/true || rc=$?
+echo "ABORT-LEG-EXIT=$rc"
+if grep -qF "$TEST_HOME" /proc/self/mountinfo; then
+    echo "ABORT-LEG-STALE-MOUNT=1"
+else
+    echo "ABORT-LEG-STALE-MOUNT=0"
+fi
+INNER
+    chmod +x "$inner"
+
+    abort_rc=0
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$((START_TIMEOUT + TEARDOWN_TIMEOUT))" \
+            unshare -Ur -m "$inner" "$AGENTFS_BIN" "$TEST_HOME" "$WORKDIR" "$SESSION_ID" \
+            >"$OWNER_LOG" 2>&1 || abort_rc=$?
+    else
+        unshare -Ur -m "$inner" "$AGENTFS_BIN" "$TEST_HOME" "$WORKDIR" "$SESSION_ID" \
+            >"$OWNER_LOG" 2>&1 || abort_rc=$?
+    fi
+
+    if grep -q "ABORT-LEG-SETUP-SKIP" "$OWNER_LOG" 2>/dev/null; then
+        cleanup_current
+        echo "SKIP: cannot cap max_user_namespaces inside a nested user namespace"
+        return 0
+    fi
+
+    if [ "$abort_rc" -ne 0 ]; then
+        dump_failure_context "abort-path leg did not complete within $((START_TIMEOUT + TEARDOWN_TIMEOUT))s (rc=$abort_rc)"
+        kill_abort_leg_stragglers
+        cleanup_current
+        return 1
+    fi
+    if ! grep -q "ABORT-LEG-EXIT=1" "$OWNER_LOG"; then
+        dump_failure_context "abort-path leg: run did not exit 1 after the child handshake failure"
+        kill_abort_leg_stragglers
+        cleanup_current
+        return 1
+    fi
+    if ! grep -q "ABORT-LEG-STALE-MOUNT=0" "$OWNER_LOG"; then
+        dump_failure_context "abort-path leg: FUSE mount left in the mount table after the parent abort"
+        kill_abort_leg_stragglers
+        cleanup_current
+        return 1
+    fi
+
+    cleanup_current
+    printf " abort-path=OK"
+    return 0
+}
+
+# A timed-out abort leg can strand the namespaced agentfs owner (timeout only
+# kills the unshare wrapper); reap it by PID via its unique session id.
+kill_abort_leg_stragglers() {
+    ps -e -o pid= -o args= | grep "$SESSION_ID" | grep agentfs | grep -v grep |
+        while read -r pid _; do
+            kill -KILL "$pid" 2>/dev/null || true
+        done
+}
+
 failed=0
 for leg in 1 0; do
     if ! run_leg "$leg"; then
         failed=1
     fi
 done
+
+if ! run_abort_leg; then
+    failed=1
+fi
 
 if [ "$failed" -ne 0 ]; then
     exit 1

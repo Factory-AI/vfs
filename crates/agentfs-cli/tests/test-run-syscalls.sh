@@ -15,9 +15,10 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(cd "$DIR/.." && pwd)"
 
 ROOT="$(mktemp -d "${TMPDIR:-/tmp}/agentfs-run-syscalls.XXXXXX")"
+SESSION_ID="run-syscalls-$$"
 
 cleanup() {
-    rm -rf "$ROOT"
+    rm -rf "$ROOT" "${HOME}/.agentfs/run/${SESSION_ID}"
 }
 trap cleanup EXIT INT TERM
 
@@ -39,8 +40,11 @@ make -C "$DIR/syscall" clean > /dev/null 2>&1
 make -C "$DIR/syscall" > /dev/null 2>&1
 cp "$DIR/syscall/test-syscalls" "$ROOT/test-syscalls"
 
-# The temp root is the overlay base layer; the session DB lands under
-# $ROOT/.agentfs instead of the repo working tree.
+# The temp root is the overlay base layer; `init` puts its DB under
+# $ROOT/.agentfs instead of the repo working tree. The run session's delta DB
+# lands under ~/.agentfs/run/<session>; pass an explicit session id so cleanup
+# can remove exactly the session dir this test created (never sweep
+# ~/.agentfs/run).
 cd "$ROOT"
 
 run_agentfs init > /dev/null 2>&1
@@ -84,7 +88,7 @@ echo -n "content for fallocate copyup test" > copyup_fallocate_test.txt
 # - Files from current directory are visible (base layer)
 # - Modifications go to the delta layer (AgentFS database)
 # - O_APPEND on existing.txt triggers copy-on-write
-output=$(run_agentfs run ./test-syscalls . 2>&1) ||
+output=$(run_agentfs run --session "$SESSION_ID" ./test-syscalls . 2>&1) ||
     fail "run exited nonzero
 Output was: $output"
 

@@ -14,13 +14,20 @@ CLI_DIR="$(cd "$DIR/.." && pwd)"
 
 ROOT="$(mktemp -d "${TMPDIR:-/tmp}/agentfs-cli-smoke.XXXXXX")"
 NFS_PID=""
+# Sessions run with the real HOME land in ~/.agentfs/run/<session>; use unique
+# ids so cleanup removes exactly the session dirs this test created (never
+# sweep ~/.agentfs/run).
+SESSION_PREFIX="smoke-$$"
 
 cleanup() {
     if [ -n "$NFS_PID" ]; then
         kill "$NFS_PID" 2>/dev/null || true
         wait "$NFS_PID" 2>/dev/null || true
     fi
-    rm -rf "$ROOT"
+    rm -rf "$ROOT" \
+        "${HOME}/.agentfs/run/${SESSION_PREFIX}-run" \
+        "${HOME}/.agentfs/run/${SESSION_PREFIX}-exit-missing" \
+        "${HOME}/.agentfs/run/${SESSION_PREFIX}-exit-nonexec"
 }
 trap cleanup EXIT INT TERM
 
@@ -100,7 +107,7 @@ run_agentfs fs "$DB" ls / >"$ROOT/ls.log" 2>&1 || fail "fs ls failed"
 grep -q "smoke.txt" "$ROOT/ls.log" || fail "fs ls does not list smoke.txt"
 
 # --- run (session sandbox) -------------------------------------------------------
-run_agentfs run --session smoke-run -- sh -c 'echo run-ok' >"$ROOT/run.log" 2>&1 ||
+run_agentfs run --session "$SESSION_PREFIX-run" -- sh -c 'echo run-ok' >"$ROOT/run.log" 2>&1 ||
     fail "run failed: $(cat "$ROOT/run.log")"
 grep -q "run-ok" "$ROOT/run.log" || fail "run output missing"
 
@@ -156,11 +163,11 @@ rc=0
 run_agentfs exec "$DB" sh -c 'exit 43' >"$ROOT/exec-43.log" 2>&1 || rc=$?
 [ "$rc" -eq 43 ] || fail "exec child exit status not passed through: got $rc, want 43"
 rc=0
-run_agentfs run --session smoke-exit-missing -- /definitely/missing \
+run_agentfs run --session "$SESSION_PREFIX-exit-missing" -- /definitely/missing \
     >"$ROOT/run-missing.log" 2>&1 || rc=$?
 [ "$rc" -eq 127 ] || fail "run of a missing command exited $rc, want 127"
 rc=0
-run_agentfs run --session smoke-exit-nonexec -- "$ROOT/nonexec.sh" \
+run_agentfs run --session "$SESSION_PREFIX-exit-nonexec" -- "$ROOT/nonexec.sh" \
     >"$ROOT/run-nonexec.log" 2>&1 || rc=$?
 [ "$rc" -eq 126 ] || fail "run of a non-executable command exited $rc, want 126"
 

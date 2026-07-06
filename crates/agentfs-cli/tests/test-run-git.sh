@@ -7,9 +7,10 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(cd "$DIR/.." && pwd)"
 
 ROOT="$(mktemp -d "${TMPDIR:-/tmp}/agentfs-run-git.XXXXXX")"
+SESSION_ID="run-git-$$"
 
 cleanup() {
-    rm -rf "$ROOT"
+    rm -rf "$ROOT" "${HOME}/.agentfs/run/${SESSION_ID}"
 }
 trap cleanup EXIT INT TERM
 
@@ -34,14 +35,15 @@ done
 PATH="$ROOT/bin:$PATH"
 export PATH
 
-# The temp root is the overlay base layer; the session DB lands under
-# $ROOT/.agentfs instead of the repo working tree.
+# The temp root is the overlay base layer. The session delta DB lands under
+# ~/.agentfs/run/<session>; pass an explicit session id so cleanup can remove
+# exactly the session dir this test created (never sweep ~/.agentfs/run).
 cd "$ROOT"
 
 # Run git operations in overlay: init, add, commit.
 # Identity is set explicitly: read scoping hides ~/.gitconfig inside the
 # sandbox, and CI runners have no global identity anyway.
-output=$(run_agentfs run /bin/bash -c '
+output=$(run_agentfs run --session "$SESSION_ID" /bin/bash -c '
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 export GIT_AUTHOR_NAME="AgentFS Test" GIT_AUTHOR_EMAIL="agentfs-test@example.com"
 export GIT_COMMITTER_NAME="AgentFS Test" GIT_COMMITTER_EMAIL="agentfs-test@example.com"

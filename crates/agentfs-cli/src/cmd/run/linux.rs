@@ -174,11 +174,14 @@ pub fn run(options: RunOptions) -> Result<()> {
     // Wait for child to signal it has called unshare
     if !wait_for_pipe_signal(pipe_to_parent[0]) {
         eprintln!("Error: Failed to read sync signal from child process");
-        abort_child(pipe_to_child[1], child_pid);
+        abort_child_with_teardown(&rt, mount_handle, pipe_to_child[1], child_pid);
     }
 
     // Configure user namespace mappings for the child
-    write_namespace_mappings(child_pid, uid, gid, pipe_to_child[1]);
+    if let Err(error) = write_namespace_mappings(child_pid, uid, gid) {
+        eprintln!("Error: {error:#}");
+        abort_child_with_teardown(&rt, mount_handle, pipe_to_child[1], child_pid);
+    }
 
     // Signal child that mappings are done
     // SAFETY: Writing to and closing valid pipe fds
@@ -413,7 +416,10 @@ fn run_in_existing_session(
     }
 
     // Configure user namespace mappings for the child
-    write_namespace_mappings(child_pid, uid, gid, pipe_to_child[1]);
+    if let Err(error) = write_namespace_mappings(child_pid, uid, gid) {
+        eprintln!("Error: {error:#}");
+        abort_child(pipe_to_child[1], child_pid);
+    }
 
     // Signal child that mappings are done
     unsafe {
@@ -541,48 +547,63 @@ fn wait_for_pipe_signal(fd: libc::c_int) -> bool {
 ///
 /// Closes the pipe to signal the child, waits for it to exit, then exits.
 fn abort_child(pipe_write_fd: libc::c_int, child_pid: libc::pid_t) -> ! {
+    reap_child(pipe_write_fd, child_pid);
+    std::process::exit(1)
+}
+
+/// Abort variant for parent errors raised while the session's FUSE mount is
+/// already live: `process::exit` runs no destructors, so without the explicit
+/// unmount the mount would only be torn down by process death, leaving a dead
+/// mount table entry behind. Reap the child first (mirroring run_parent's
+/// supervise-then-teardown order), then run the bounded graceful teardown.
+fn abort_child_with_teardown(
+    rt: &tokio::runtime::Runtime,
+    mount_handle: MountHandle,
+    pipe_write_fd: libc::c_int,
+    child_pid: libc::pid_t,
+) -> ! {
+    reap_child(pipe_write_fd, child_pid);
+    if let Err(error) = rt.block_on(mount_handle.unmount()) {
+        eprintln!("Warning: Failed to tear down the FUSE session during abort: {error:#}");
+    }
+    std::process::exit(1)
+}
+
+/// Close the coordination pipe to signal the child, then wait for it to exit.
+fn reap_child(pipe_write_fd: libc::c_int, child_pid: libc::pid_t) {
     // SAFETY: Closing valid fd and waiting for valid child pid
     unsafe {
         libc::close(pipe_write_fd);
         let mut status: libc::c_int = 0;
         libc::waitpid(child_pid, &mut status, 0);
     }
-    std::process::exit(1)
 }
 
 /// Write uid_map, gid_map, and setgroups for a child's user namespace.
 ///
 /// Maps the real uid/gid to itself inside the namespace, so the user appears
 /// as themselves (not root) inside the sandbox.
-/// On failure, aborts the child and exits.
 fn write_namespace_mappings(
     child_pid: libc::pid_t,
     uid: libc::uid_t,
     gid: libc::gid_t,
-    pipe_write_fd: libc::c_int,
-) {
+) -> Result<()> {
     let uid_map_path = format!("/proc/{}/uid_map", child_pid);
     let gid_map_path = format!("/proc/{}/gid_map", child_pid);
     let setgroups_path = format!("/proc/{}/setgroups", child_pid);
 
     // Map the user's UID to itself (inside_uid outside_uid count)
-    if let Err(e) = std::fs::write(&uid_map_path, format!("{} {} 1\n", uid, uid)) {
-        eprintln!("Error: Could not write uid_map: {}", e);
-        eprintln!("This may indicate missing unprivileged user namespace support.");
-        abort_child(pipe_write_fd, child_pid);
-    }
+    std::fs::write(&uid_map_path, format!("{} {} 1\n", uid, uid)).context(
+        "Could not write uid_map (this may indicate missing unprivileged user namespace support)",
+    )?;
 
     // Disable setgroups (required before writing gid_map on unprivileged systems)
-    if let Err(e) = std::fs::write(&setgroups_path, "deny") {
-        eprintln!("Error: Could not write setgroups: {}", e);
-        abort_child(pipe_write_fd, child_pid);
-    }
+    std::fs::write(&setgroups_path, "deny").context("Could not write setgroups")?;
 
     // Map the user's GID to itself (inside_gid outside_gid count)
-    if let Err(e) = std::fs::write(&gid_map_path, format!("{} {} 1\n", gid, gid)) {
-        eprintln!("Error: Could not write gid_map: {}", e);
-        abort_child(pipe_write_fd, child_pid);
-    }
+    std::fs::write(&gid_map_path, format!("{} {} 1\n", gid, gid))
+        .context("Could not write gid_map")?;
+    Ok(())
 }
 
 /// Convert a path to a CString, exiting the child process on failure.

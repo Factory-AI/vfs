@@ -7,9 +7,13 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(cd "$DIR/.." && pwd)"
 
 ROOT="$(mktemp -d "${TMPDIR:-/tmp}/agentfs-symlinks.XXXXXX")"
+SESSION_PREFIX="symlinks-$$"
 
 cleanup() {
     rm -rf "$ROOT"
+    for leg in 1 2 3 4 5; do
+        rm -rf "${HOME}/.agentfs/run/${SESSION_PREFIX}-${leg}"
+    done
 }
 trap cleanup EXIT INT TERM
 
@@ -21,8 +25,10 @@ run_agentfs() {
     fi
 }
 
-# The temp root is the overlay base layer; the session DB lands under
-# $ROOT/.agentfs instead of the repo working tree.
+# The temp root is the overlay base layer. Each leg's session delta DB lands
+# under ~/.agentfs/run/<session>; pass explicit session ids so cleanup can
+# remove exactly the session dirs this test created (never sweep
+# ~/.agentfs/run).
 cd "$ROOT"
 
 # Create test directory with symlinks on the host (these will be visible in the sandbox)
@@ -33,7 +39,7 @@ ln -s target_dir "$TEST_DIR/link_to_dir"
 ln -s target_dir/file.txt "$TEST_DIR/link_to_file"
 
 # Test 1 & 2: Verify symlinks are reported correctly (not as directories)
-output=$(run_agentfs run /bin/bash -c "ls -la $TEST_DIR/" 2>&1)
+output=$(run_agentfs run --session "$SESSION_PREFIX-1" /bin/bash -c "ls -la $TEST_DIR/" 2>&1)
 
 # The output should contain 'lrwxrwxrwx' for symlinks (not 'drwxr-xr-x' for directory)
 if ! echo "$output" | grep -qE "^lrwx.* link_to_dir"; then
@@ -50,7 +56,7 @@ fi
 
 # Test 3: Verify rm can remove symlink to directory (this was the original bug)
 # Previously this would fail with "Is a directory" because symlinks were misidentified
-output=$(run_agentfs run /bin/bash -c "rm $TEST_DIR/link_to_dir && echo 'symlink removed successfully'" 2>&1)
+output=$(run_agentfs run --session "$SESSION_PREFIX-2" /bin/bash -c "rm $TEST_DIR/link_to_dir && echo 'symlink removed successfully'" 2>&1)
 
 if ! echo "$output" | grep -q "symlink removed successfully"; then
     echo "FAILED: could not remove symlink to directory"
@@ -66,7 +72,7 @@ if ! cat "$TEST_DIR/target_dir/file.txt" | grep -q "test content"; then
 fi
 
 # Test 5: Create a symlink inside the sandbox (tests FUSE symlink creation)
-output=$(run_agentfs run /bin/bash -c "ln -s target_dir/file.txt $TEST_DIR/new_symlink && readlink $TEST_DIR/new_symlink" 2>&1)
+output=$(run_agentfs run --session "$SESSION_PREFIX-3" /bin/bash -c "ln -s target_dir/file.txt $TEST_DIR/new_symlink && readlink $TEST_DIR/new_symlink" 2>&1)
 
 if ! echo "$output" | grep -q "target_dir/file.txt"; then
     echo "FAILED: could not create symlink in sandbox"
@@ -75,7 +81,7 @@ if ! echo "$output" | grep -q "target_dir/file.txt"; then
 fi
 
 # Test 6: Create and follow symlink to read file content
-output=$(run_agentfs run /bin/bash -c "ln -s target_dir $TEST_DIR/new_dir_link && cat $TEST_DIR/new_dir_link/file.txt" 2>&1)
+output=$(run_agentfs run --session "$SESSION_PREFIX-4" /bin/bash -c "ln -s target_dir $TEST_DIR/new_dir_link && cat $TEST_DIR/new_dir_link/file.txt" 2>&1)
 
 if ! echo "$output" | grep -q "test content"; then
     echo "FAILED: could not read through newly created symlink"
@@ -84,7 +90,7 @@ if ! echo "$output" | grep -q "test content"; then
 fi
 
 # Test 7: Verify symlinks created in sandbox are visible via ls -l
-output=$(run_agentfs run /bin/bash -c "ln -s foo $TEST_DIR/test_link && ls -la $TEST_DIR/test_link" 2>&1)
+output=$(run_agentfs run --session "$SESSION_PREFIX-5" /bin/bash -c "ln -s foo $TEST_DIR/test_link && ls -la $TEST_DIR/test_link" 2>&1)
 
 if ! echo "$output" | grep -qE "^lrwx.*test_link -> foo"; then
     echo "FAILED: newly created symlink not shown correctly in ls"

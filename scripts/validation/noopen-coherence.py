@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -296,20 +297,30 @@ def main() -> int:
             base_root = temp_root / f"{label}-base"
             base_root.mkdir()
             (base_root / "base.txt").write_bytes(b"base-content\n")
+            session_id = f"noopen-coh-{uuid.uuid4().hex[:8]}"
             argv = [
                 agentfs_bin,
                 "run",
                 "--session",
-                f"noopen-coh-{uuid.uuid4().hex[:8]}",
+                session_id,
                 "--no-default-allows",
                 "--",
                 sys.executable,
                 "-c",
                 OVERLAY_WORKLOAD,
             ]
-            runs.append(
-                run_one(argv, base_root, base_env(extra), args.timeout, label, noopen)
-            )
+            try:
+                runs.append(
+                    run_one(argv, base_root, base_env(extra), args.timeout, label, noopen)
+                )
+            finally:
+                # Remove exactly the session dir this leg created; the user
+                # may have real sessions in ~/.agentfs/run, so never sweep
+                # that directory wholesale.
+                shutil.rmtree(
+                    Path.home() / ".agentfs" / "run" / session_id,
+                    ignore_errors=True,
+                )
 
     resolutions = sum(r.get("fuse_ino_file_resolutions") or 0 for r in runs if r["noopen"])
     upgrades = sum(r.get("fuse_ino_file_upgrades") or 0 for r in runs if r["noopen"])

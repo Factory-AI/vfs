@@ -7,9 +7,10 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(cd "$DIR/.." && pwd)"
 
 ROOT="$(mktemp -d "${TMPDIR:-/tmp}/agentfs-run-bash.XXXXXX")"
+SESSION_ID="run-bash-$$"
 
 cleanup() {
-    rm -rf "$ROOT"
+    rm -rf "$ROOT" "${HOME}/.agentfs/run/${SESSION_ID}"
 }
 trap cleanup EXIT INT TERM
 
@@ -21,13 +22,14 @@ run_agentfs() {
     fi
 }
 
-# The temp root is the overlay base layer; the session DB lands under
-# $ROOT/.agentfs instead of the repo working tree.
+# The temp root is the overlay base layer. The session delta DB lands under
+# ~/.agentfs/run/<session>; pass an explicit session id so cleanup can remove
+# exactly the session dir this test created (never sweep ~/.agentfs/run).
 cd "$ROOT"
 
 # Run bash session in overlay: write a file and read it back
 # The current directory becomes copy-on-write with the overlay sandbox
-output=$(run_agentfs run /bin/bash -c '
+output=$(run_agentfs run --session "$SESSION_ID" /bin/bash -c '
 echo "hello from agent" > hello.txt
 cat hello.txt
 ' 2>&1)
