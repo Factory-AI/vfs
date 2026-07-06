@@ -15,7 +15,8 @@ behavior-preserving moves are not listed individually.
   `agentfs run` is FUSE+overlay in Linux user/mount namespaces (NFS +
   Sandbox on macOS).
 - Windows stubs and the Windows dist target; supported platforms are Linux
-  (first-tier) and macOS (second-tier, NFS mount only).
+  (first-tier) and macOS (second-tier: NFS mount plus a sandboxed
+  `agentfs run`).
 - The `abi-7-*` FUSE feature matrix (17 features collapsed into the one
   compiled ABI level) and the dead vendored fuser/nfsserve surface.
 - The legacy path-based SDK API and the `AGENTFS_OVERLAY_PARTIAL_ORIGIN`
