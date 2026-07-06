@@ -17,7 +17,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use agentfs_mount::supervise::{
-    exit_code_for_status, run_supervised, supervise_command, ChildOutcome,
+    exit_code_for_spawn_error, exit_code_for_status, run_supervised, supervise_command,
+    ChildOutcome,
 };
 use agentfs_mount::{mount_fs, Backend, MountOpts};
 
@@ -72,12 +73,14 @@ pub(super) const PLATFORM_READ_ROOTS: &[&str] = &[
 
 /// Standard symlinks and firmlink components that need metadata access for
 /// path resolution (`/var` -> `/private/var`, the `/System/Volumes/Data`
-/// firmlink chain), mirroring the Codex restricted defaults.
+/// firmlink chain, the `/System/Volumes/Preboot` ancestor of the dyld
+/// cryptex read root), mirroring the Codex restricted defaults.
 const PLATFORM_METADATA_PATHS: &[&str] = &[
     "/System/Volumes",
     "/System/Volumes/Data",
     "/System/Volumes/Data/Users",
     "/System/Volumes/Data/private",
+    "/System/Volumes/Preboot",
     "/etc",
     "/private/etc/localtime",
     "/tmp",
@@ -99,19 +102,64 @@ fn read_root_ancestors(roots: &[PathBuf]) -> Vec<PathBuf> {
     ancestors.into_iter().collect()
 }
 
+/// A generated Seatbelt policy plus the dynamic path parameters it
+/// references.
+///
+/// Dynamic paths (session, allow-listed, home) never appear in the SBPL
+/// text: rules reference them as `(param "NAME")` and the values are passed
+/// to `/usr/bin/sandbox-exec` as `-D NAME=value` definitions, so a path
+/// containing SBPL metacharacters (a double quote) cannot corrupt the
+/// profile. This is the Chromium/Codex parameter model
+/// (research/darwin-seatbelt-read-scoping.md).
+#[derive(Debug, Clone)]
+pub(super) struct SandboxProfile {
+    pub(super) policy: String,
+    pub(super) params: Vec<(String, PathBuf)>,
+}
+
+/// Dynamic-path parameter table, deduplicated by value so a path referenced
+/// by several rules (e.g. the mountpoint's read and write allows) is defined
+/// exactly once on the sandbox-exec command line.
+#[derive(Default)]
+struct SandboxParams(Vec<(String, PathBuf)>);
+
+impl SandboxParams {
+    fn define(&mut self, name: impl Into<String>, path: &Path) -> String {
+        if let Some((existing, _)) = self.0.iter().find(|(_, value)| value == path) {
+            return existing.clone();
+        }
+        let name = name.into();
+        debug_assert!(self.0.iter().all(|(existing, _)| existing != &name));
+        self.0.push((name.clone(), path.to_path_buf()));
+        name
+    }
+}
+
+/// The session id reaches the profile text itself (deny message and log-tag
+/// comment) where Seatbelt parameters are not available, so restrict it to a
+/// conservative charset instead of trusting `--session` input.
+fn sandbox_log_tag(session_id: &str) -> String {
+    session_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        .collect()
+}
+
 /// Generate a sandbox-exec profile for AgentFS.
 ///
 /// The profile allows most operations but restricts file writes to the NFS
 /// mountpoint, temp directories, and explicitly allowed paths, and file
 /// reads to the session paths, allowed paths, and `PLATFORM_READ_ROOTS`.
-pub(super) fn generate_sandbox_profile(config: &SandboxConfig) -> String {
+/// Every dynamic path is emitted as a `(param "NAME")` reference; the values
+/// travel out-of-band in [`SandboxProfile::params`].
+pub(super) fn generate_sandbox_profile(config: &SandboxConfig) -> SandboxProfile {
     let mut profile = Vec::new();
-    let log_tag = format!("agentfs-{}", config.session_id);
+    let mut params = SandboxParams::default();
+    let log_tag = format!("agentfs-{}", sandbox_log_tag(&config.session_id));
 
     profile.push("(version 1)".to_string());
     profile.push(format!(
-        r#"(deny default (with message "agentfs-{}: access denied"))"#,
-        config.session_id
+        r#"(deny default (with message "{log_tag}: access denied"))"#
     ));
     profile.push(format!("; Log tag: {}", log_tag));
 
@@ -128,14 +176,25 @@ pub(super) fn generate_sandbox_profile(config: &SandboxConfig) -> String {
         "; Readable paths: session and allow-listed roots (reads are default-deny)".to_string(),
     );
     let mut read_roots = vec![config.mountpoint.clone()];
+    let mountpoint_param = params.define("MOUNTPOINT", &config.mountpoint);
+    let mut read_root_params = vec![mountpoint_param.clone()];
+    let mut run_dir_param = None;
     if let Some(parent) = config.mountpoint.parent() {
         read_roots.push(parent.to_path_buf());
+        let name = params.define("RUN_DIR", parent);
+        read_root_params.push(name.clone());
+        run_dir_param = Some(name);
     }
-    read_roots.extend(config.allow_paths.iter().cloned());
-    for path in &read_roots {
+    let mut allow_path_params = Vec::new();
+    for (index, path) in config.allow_paths.iter().enumerate() {
+        read_roots.push(path.clone());
+        let name = params.define(format!("ALLOW_PATH_{index}"), path);
+        read_root_params.push(name.clone());
+        allow_path_params.push(name);
+    }
+    for name in &read_root_params {
         profile.push(format!(
-            r#"(allow file-read* file-map-executable file-test-existence (subpath "{}"))"#,
-            path.to_string_lossy()
+            r#"(allow file-read* file-map-executable file-test-existence (subpath (param "{name}")))"#
         ));
     }
 
@@ -159,26 +218,20 @@ pub(super) fn generate_sandbox_profile(config: &SandboxConfig) -> String {
             r#"(allow file-read-metadata file-test-existence (literal "{path}"))"#
         ));
     }
-    for ancestor in read_root_ancestors(&read_roots) {
+    for (index, ancestor) in read_root_ancestors(&read_roots).iter().enumerate() {
+        let name = params.define(format!("ANCESTOR_{index}"), ancestor);
         profile.push(format!(
-            r#"(allow file-read-metadata file-test-existence (literal "{}"))"#,
-            ancestor.to_string_lossy()
+            r#"(allow file-read-metadata file-test-existence (literal (param "{name}")))"#
         ));
     }
 
     profile.push("; Writable paths".to_string());
-    let mountpoint_str = config.mountpoint.to_string_lossy();
     profile.push(format!(
-        r#"(allow file-write* (subpath "{}"))"#,
-        mountpoint_str
+        r#"(allow file-write* (subpath (param "{mountpoint_param}")))"#
     ));
 
-    if let Some(parent) = config.mountpoint.parent() {
-        let run_dir_str = parent.to_string_lossy();
-        profile.push(format!(
-            r#"(allow file-write* (subpath "{}"))"#,
-            run_dir_str
-        ));
+    if let Some(name) = &run_dir_param {
+        profile.push(format!(r#"(allow file-write* (subpath (param "{name}")))"#));
     }
 
     profile.push(r#"(allow file-write* (subpath "/private/tmp"))"#.to_string());
@@ -188,9 +241,8 @@ pub(super) fn generate_sandbox_profile(config: &SandboxConfig) -> String {
     profile.push(r#"(allow file-write* (subpath "/dev"))"#.to_string());
     profile.push(r#"(allow file-ioctl (subpath "/dev"))"#.to_string());
 
-    for path in &config.allow_paths {
-        let path_str = path.to_string_lossy();
-        profile.push(format!(r#"(allow file-write* (subpath "{}"))"#, path_str));
+    for name in &allow_path_params {
+        profile.push(format!(r#"(allow file-write* (subpath (param "{name}")))"#));
     }
 
     profile.push("; Network".to_string());
@@ -209,11 +261,8 @@ pub(super) fn generate_sandbox_profile(config: &SandboxConfig) -> String {
     profile
         .push(r#"(allow file-write* (regex #"^/private/var/folders/[^/]+/[^/]+/T/"))"#.to_string());
     if let Some(home) = dirs::home_dir() {
-        let home_str = home.to_string_lossy();
-        profile.push(format!(
-            r#"(allow file-write* (subpath "{}/Library"))"#,
-            home_str
-        ));
+        let name = params.define("HOME_LIBRARY", &home.join("Library"));
+        profile.push(format!(r#"(allow file-write* (subpath (param "{name}")))"#));
     }
     profile.push(r#"(allow file-write* (subpath "/Library/Preferences"))"#.to_string());
     profile.push(r#"(allow file-write* (subpath "/Library/Keychains"))"#.to_string());
@@ -221,7 +270,19 @@ pub(super) fn generate_sandbox_profile(config: &SandboxConfig) -> String {
     profile.push("(allow user-preference-write)".to_string());
     profile.push("(allow user-preference-read)".to_string());
 
-    profile.join("\n")
+    SandboxProfile {
+        policy: profile.join("\n"),
+        params: params.0,
+    }
+}
+
+/// Missing / non-executable commands pass through as 127/126 like the
+/// shared exec path (VAL-CLI-019 exception); every other supervision error
+/// goes to the unified reporter.
+pub(super) fn spawn_error_exit_code(error: &anyhow::Error) -> Option<i32> {
+    error
+        .downcast_ref::<std::io::Error>()
+        .and_then(exit_code_for_spawn_error)
 }
 
 /// Run the command in a Darwin sandbox.
@@ -300,9 +361,7 @@ pub async fn run(options: RunOptions) -> Result<()> {
 
     let command_display = command.display().to_string();
     let child_command = command_in_mount(&session, command, args);
-    let status = run_supervised(mount_handle, child_command)
-        .await
-        .with_context(|| format!("Darwin/NFS run supervision failed for {command_display}"));
+    let status = run_supervised(mount_handle, child_command).await;
     if let Err(e) = std::fs::remove_dir(&session.mountpoint) {
         eprintln!(
             "Warning: Failed to clean up mountpoint {}: {}",
@@ -322,7 +381,18 @@ pub async fn run(options: RunOptions) -> Result<()> {
     eprintln!("  agentfs diff {}", session.session_id);
 
     crate::profiling::emit_cli_report();
-    std::process::exit(exit_code_for_status(status?));
+    match status {
+        Ok(status) => std::process::exit(exit_code_for_status(status)),
+        Err(error) => {
+            if let Some(code) = spawn_error_exit_code(&error) {
+                eprintln!("Error: Failed to execute: {command_display}: {error}");
+                std::process::exit(code);
+            }
+            Err(error.context(format!(
+                "Darwin/NFS run supervision failed for {command_display}"
+            )))
+        }
+    }
 }
 
 fn exit_code_for_outcome(outcome: ChildOutcome) -> i32 {
@@ -465,11 +535,16 @@ fn command_in_mount(
     let profile = generate_sandbox_profile(&config);
 
     // Wrap the command with sandbox-exec, pinned to the system binary so a
-    // PATH-injected replacement cannot supplant the sandbox.
+    // PATH-injected replacement cannot supplant the sandbox. Dynamic paths
+    // travel as -D parameter definitions, never inside the profile text.
     let mut cmd = tokio::process::Command::new("/usr/bin/sandbox-exec");
-    cmd.arg("-p")
-        .arg(&profile)
-        .arg(&command)
+    cmd.arg("-p").arg(&profile.policy);
+    for (name, value) in &profile.params {
+        let mut definition = std::ffi::OsString::from(format!("{name}="));
+        definition.push(value.as_os_str());
+        cmd.arg("-D").arg(definition);
+    }
+    cmd.arg(&command)
         .args(&args)
         .current_dir(&session.mountpoint)
         .env("AGENTFS", "1")
@@ -492,7 +567,15 @@ async fn run_command_in_mount(
 ) -> Result<ChildOutcome> {
     let command_display = command.display().to_string();
     let child_command = command_in_mount(session, command, args);
-    supervise_command(child_command)
-        .await
-        .with_context(|| format!("Failed to execute command: {command_display}"))
+    match supervise_command(child_command).await {
+        Ok(outcome) => Ok(outcome),
+        Err(error) => {
+            if let Some(code) = spawn_error_exit_code(&error) {
+                eprintln!("Error: Failed to execute: {command_display}: {error}");
+                crate::profiling::emit_cli_report();
+                std::process::exit(code);
+            }
+            Err(error).with_context(|| format!("Failed to execute command: {command_display}"))
+        }
+    }
 }

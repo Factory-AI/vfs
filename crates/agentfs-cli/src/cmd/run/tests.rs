@@ -154,8 +154,10 @@ mod read_scoping {
 
 #[cfg(target_os = "macos")]
 mod darwin_read_scoping {
-    use super::super::darwin::{generate_sandbox_profile, SandboxConfig, PLATFORM_READ_ROOTS};
-    use std::path::PathBuf;
+    use super::super::darwin::{
+        generate_sandbox_profile, SandboxConfig, SandboxProfile, PLATFORM_READ_ROOTS,
+    };
+    use std::path::{Path, PathBuf};
 
     fn config() -> SandboxConfig {
         SandboxConfig {
@@ -169,18 +171,29 @@ mod darwin_read_scoping {
         }
     }
 
+    fn param_for<'a>(profile: &'a SandboxProfile, path: &str) -> &'a str {
+        profile
+            .params
+            .iter()
+            .find(|(_, value)| value == Path::new(path))
+            .map(|(name, _)| name.as_str())
+            .unwrap_or_else(|| panic!("no -D param defined for {path}"))
+    }
+
     #[test]
     fn reads_are_default_deny_with_no_blanket_allow() {
         let profile = generate_sandbox_profile(&config());
 
         assert!(
             profile
+                .policy
                 .lines()
                 .any(|line| line.starts_with("(deny default")),
             "profile must keep the deny-default posture"
         );
         assert!(
             profile
+                .policy
                 .lines()
                 .all(|line| line.trim() != "(allow file-read*)"),
             "a bare (allow file-read*) reopens unscoped reads"
@@ -195,14 +208,19 @@ mod darwin_read_scoping {
             let rule = format!(
                 r#"(allow file-read* file-map-executable file-test-existence (subpath "{root}"))"#
             );
-            assert!(profile.contains(&rule), "missing platform read root {root}");
+            assert!(
+                profile.policy.contains(&rule),
+                "missing platform read root {root}"
+            );
         }
         assert!(
-            profile.contains(r#"(allow file-read* file-test-existence (literal "/"))"#),
+            profile
+                .policy
+                .contains(r#"(allow file-read* file-test-existence (literal "/"))"#),
             "getcwd needs a metadata-capable read of the root directory"
         );
         assert!(
-            profile.contains(
+            profile.policy.contains(
                 r#"(require-all (subpath "/System") (require-not (subpath "/System/Volumes")))"#
             ),
             "/System must exclude the /System/Volumes firmlinks back into the data volume"
@@ -210,7 +228,7 @@ mod darwin_read_scoping {
     }
 
     #[test]
-    fn session_and_allow_paths_expand_from_config() {
+    fn session_and_allow_paths_expand_from_config_as_params() {
         let profile = generate_sandbox_profile(&config());
 
         for path in [
@@ -219,10 +237,14 @@ mod darwin_read_scoping {
             "/Users/tester/.codex",
             "/Users/tester/.claude.json",
         ] {
+            let name = param_for(&profile, path);
             let rule = format!(
-                r#"(allow file-read* file-map-executable file-test-existence (subpath "{path}"))"#
+                r#"(allow file-read* file-map-executable file-test-existence (subpath (param "{name}")))"#
             );
-            assert!(profile.contains(&rule), "missing read allow for {path}");
+            assert!(
+                profile.policy.contains(&rule),
+                "missing read allow for {path}"
+            );
         }
     }
 
@@ -237,20 +259,48 @@ mod darwin_read_scoping {
             "/Users/tester/.agentfs/run",
             "/Users/tester/.agentfs/run/sess-1",
         ] {
-            let rule =
-                format!(r#"(allow file-read-metadata file-test-existence (literal "{parent}"))"#);
-            assert!(profile.contains(&rule), "missing metadata parent {parent}");
+            let name = param_for(&profile, parent);
+            let rule = format!(
+                r#"(allow file-read-metadata file-test-existence (literal (param "{name}")))"#
+            );
+            assert!(
+                profile.policy.contains(&rule),
+                "missing metadata parent {parent}"
+            );
         }
+        let home_param = param_for(&profile, "/Users/tester");
         assert!(
-            !profile.contains(r#"(subpath "/Users/tester")"#),
+            !profile
+                .policy
+                .contains(&format!(r#"(subpath (param "{home_param}"))"#)),
             "home outside the session/allow paths must stay data-unreadable"
         );
         for link in ["/etc", "/tmp", "/var", "/System/Volumes/Data"] {
             let rule =
                 format!(r#"(allow file-read-metadata file-test-existence (literal "{link}"))"#);
             assert!(
-                profile.contains(&rule),
+                profile.policy.contains(&rule),
                 "missing symlink metadata for {link}"
+            );
+        }
+    }
+
+    #[test]
+    fn dyld_cryptex_chain_has_metadata_ancestors() {
+        let profile = generate_sandbox_profile(&config());
+
+        assert!(
+            profile.policy.contains(
+                r#"(allow file-read* file-map-executable file-test-existence (subpath "/System/Volumes/Preboot/Cryptexes"))"#
+            ),
+            "dyld shared cache cryptex must stay a data read root"
+        );
+        for ancestor in ["/System/Volumes", "/System/Volumes/Preboot"] {
+            let rule =
+                format!(r#"(allow file-read-metadata file-test-existence (literal "{ancestor}"))"#);
+            assert!(
+                profile.policy.contains(&rule),
+                "path resolution to the cryptex root must be able to stat {ancestor}"
             );
         }
     }
@@ -259,18 +309,127 @@ mod darwin_read_scoping {
     fn write_scoping_is_unchanged() {
         let profile = generate_sandbox_profile(&config());
 
+        let mountpoint = param_for(&profile, "/Users/tester/.agentfs/run/sess-1/mnt");
+        let run_dir = param_for(&profile, "/Users/tester/.agentfs/run/sess-1");
+        let codex = param_for(&profile, "/Users/tester/.codex");
         for rule in [
-            r#"(allow file-write* (subpath "/Users/tester/.agentfs/run/sess-1/mnt"))"#,
-            r#"(allow file-write* (subpath "/Users/tester/.agentfs/run/sess-1"))"#,
-            r#"(allow file-write* (subpath "/Users/tester/.codex"))"#,
-            r#"(allow file-write* (subpath "/private/tmp"))"#,
-            r#"(allow file-write* (subpath "/tmp"))"#,
-            r#"(allow file-write* (subpath "/var/tmp"))"#,
-            r#"(allow file-write* (subpath "/private/var/folders"))"#,
-            r#"(allow file-write* (subpath "/dev"))"#,
+            format!(r#"(allow file-write* (subpath (param "{mountpoint}")))"#),
+            format!(r#"(allow file-write* (subpath (param "{run_dir}")))"#),
+            format!(r#"(allow file-write* (subpath (param "{codex}")))"#),
+            r#"(allow file-write* (subpath "/private/tmp"))"#.to_string(),
+            r#"(allow file-write* (subpath "/tmp"))"#.to_string(),
+            r#"(allow file-write* (subpath "/var/tmp"))"#.to_string(),
+            r#"(allow file-write* (subpath "/private/var/folders"))"#.to_string(),
+            r#"(allow file-write* (subpath "/dev"))"#.to_string(),
         ] {
-            assert!(profile.contains(rule), "missing write rule {rule}");
+            assert!(profile.policy.contains(&rule), "missing write rule {rule}");
         }
+    }
+
+    #[test]
+    fn dynamic_paths_never_appear_in_the_policy_text() {
+        let mut config = config();
+        config.allow_paths.push(PathBuf::from(
+            r#"/Users/tester/pwn") (allow file-read* (subpath "/"#,
+        ));
+
+        let profile = generate_sandbox_profile(&config);
+
+        assert!(
+            !profile.policy.contains("pwn"),
+            "a user-controlled path leaked into the SBPL text:\n{}",
+            profile.policy
+        );
+        // A dynamic path can only be interpolated raw as a quoted string, so
+        // no quote in the policy may be followed by a /Users-rooted path
+        // (static literals like /System/Volumes/Data/Users are fine).
+        assert!(
+            !profile.policy.contains(r#""/Users"#),
+            "a session/allow/home path was interpolated instead of parameterized:\n{}",
+            profile.policy
+        );
+        assert!(
+            profile
+                .params
+                .iter()
+                .any(|(_, value)| value.to_string_lossy().contains("pwn")),
+            "the quote-bearing path must still be granted, via a -D param"
+        );
+
+        let mut names: Vec<&str> = profile.params.iter().map(|(n, _)| n.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            profile.params.len(),
+            "sandbox-exec -D definitions must not repeat a param name"
+        );
+    }
+
+    #[test]
+    fn session_id_is_sanitized_in_the_policy_text() {
+        let mut config = config();
+        config.session_id = r#"evil")(allow file-read*)(deny signal "x"#.to_string();
+
+        let profile = generate_sandbox_profile(&config);
+
+        assert!(
+            profile.policy.contains(
+                r#"(deny default (with message "agentfs-evilallowfile-readdenysignalx: access denied"))"#
+            ),
+            "session id must be reduced to a conservative charset:\n{}",
+            profile.policy
+        );
+        assert!(
+            profile
+                .policy
+                .lines()
+                .all(|line| line.trim() != "(allow file-read*)"),
+            "an injected session id must not open unscoped reads"
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod darwin_spawn_exit_codes {
+    use super::super::darwin::spawn_error_exit_code;
+    use anyhow::Context;
+
+    fn spawn_error(kind: std::io::ErrorKind) -> anyhow::Error {
+        anyhow::Error::from(std::io::Error::new(kind, "spawn failed"))
+    }
+
+    #[test]
+    fn missing_command_maps_to_127() {
+        assert_eq!(
+            spawn_error_exit_code(&spawn_error(std::io::ErrorKind::NotFound)),
+            Some(127)
+        );
+    }
+
+    #[test]
+    fn non_executable_command_maps_to_126() {
+        assert_eq!(
+            spawn_error_exit_code(&spawn_error(std::io::ErrorKind::PermissionDenied)),
+            Some(126)
+        );
+    }
+
+    #[test]
+    fn mapping_survives_anyhow_context_wrapping() {
+        let error: anyhow::Error = Err::<(), _>(spawn_error(std::io::ErrorKind::NotFound))
+            .context("Darwin/NFS run supervision failed for cmd")
+            .unwrap_err();
+        assert_eq!(spawn_error_exit_code(&error), Some(127));
+    }
+
+    #[test]
+    fn other_errors_go_to_the_reporter() {
+        assert_eq!(
+            spawn_error_exit_code(&spawn_error(std::io::ErrorKind::BrokenPipe)),
+            None
+        );
+        assert_eq!(spawn_error_exit_code(&anyhow::anyhow!("not io")), None);
     }
 }
 

@@ -216,3 +216,15 @@ workspace job; this script is the runtime check. A passing run ends with
 or missing prerequisites exit `77`; on Linux that skip is expected, not a
 failure. A release SHOULD NOT ship without a passing run of this script on
 real hardware.
+
+Beyond the script, the manual hardware run must also confirm three behaviors
+the Linux toolchain cannot exercise: dynamic profile paths now travel as
+Seatbelt `(param "NAME")` references with `-D NAME=value` definitions on the
+`/usr/bin/sandbox-exec` command line (spot-check that a session under a
+directory with spaces or quotes in its name still mounts and runs);
+`/System/Volumes/Preboot` has a metadata literal so path resolution down to
+the dyld cryptex root (`/System/Volumes/Preboot/Cryptexes`) can stat every
+component (spot-check that dynamically linked binaries start under the
+sandbox); and `agentfs run <missing-command>` must exit `127` (`126` for a
+present but non-executable file), matching `agentfs exec` and the Linux run
+path.
