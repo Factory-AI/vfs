@@ -135,6 +135,35 @@ grep -q "exec-ok" "$ROOT/exec.log" || fail "exec output missing"
 run_agentfs exec "$DB" sh -c 'chmod 700 smoke.txt' >"$ROOT/exec-chmod.log" 2>&1 ||
     fail "chmod of an fs-write-created file failed inside exec: $(cat "$ROOT/exec-chmod.log")"
 
+# --- exec/run command-not-found conventions (VAL-CLI-019/020) ----------------------
+# Missing commands exit 127 and found-but-not-executable commands exit 126 via
+# child-status passthrough; ordinary child exit codes still pass through. exec
+# used to route these through the unified reporter and exit 1.
+printf '#!/bin/sh\nexit 0\n' >"$ROOT/nonexec.sh"
+chmod 644 "$ROOT/nonexec.sh"
+rc=0
+run_agentfs exec "$DB" /definitely/missing >"$ROOT/exec-missing.log" 2>&1 || rc=$?
+[ "$rc" -eq 127 ] || fail "exec of a missing absolute command exited $rc, want 127"
+[ "$(grep -c '^Error:' "$ROOT/exec-missing.log")" -eq 1 ] ||
+    fail "exec missing-command should print exactly one Error: line: $(cat "$ROOT/exec-missing.log")"
+rc=0
+run_agentfs exec "$DB" definitely-missing-cmd-xyz >"$ROOT/exec-missing-path.log" 2>&1 || rc=$?
+[ "$rc" -eq 127 ] || fail "exec of a missing PATH command exited $rc, want 127"
+rc=0
+run_agentfs exec "$DB" "$ROOT/nonexec.sh" >"$ROOT/exec-nonexec.log" 2>&1 || rc=$?
+[ "$rc" -eq 126 ] || fail "exec of a non-executable command exited $rc, want 126"
+rc=0
+run_agentfs exec "$DB" sh -c 'exit 43' >"$ROOT/exec-43.log" 2>&1 || rc=$?
+[ "$rc" -eq 43 ] || fail "exec child exit status not passed through: got $rc, want 43"
+rc=0
+run_agentfs run --session smoke-exit-missing -- /definitely/missing \
+    >"$ROOT/run-missing.log" 2>&1 || rc=$?
+[ "$rc" -eq 127 ] || fail "run of a missing command exited $rc, want 127"
+rc=0
+run_agentfs run --session smoke-exit-nonexec -- "$ROOT/nonexec.sh" \
+    >"$ROOT/run-nonexec.log" 2>&1 || rc=$?
+[ "$rc" -eq 126 ] || fail "run of a non-executable command exited $rc, want 126"
+
 # --- clone a local git repo into a fresh DB ----------------------------------------
 mkdir -p "$ROOT/srcrepo"
 (

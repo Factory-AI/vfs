@@ -249,6 +249,16 @@ pub fn exit_code_for_status(status: ExitStatus) -> i32 {
     status.code().unwrap_or(1)
 }
 
+/// Map a spawn/exec failure to the shell command-not-found conventions:
+/// 127 for a missing command, 126 for one that is found but not executable.
+pub fn exit_code_for_spawn_error(error: &std::io::Error) -> Option<i32> {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => Some(127),
+        std::io::ErrorKind::PermissionDenied => Some(126),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 pub type ShutdownFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 
@@ -752,5 +762,17 @@ mod tests {
             return true;
         }
         std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+
+    #[test]
+    fn spawn_error_maps_to_command_not_found_conventions() {
+        let missing = std::io::Error::from_raw_os_error(libc::ENOENT);
+        assert_eq!(exit_code_for_spawn_error(&missing), Some(127));
+
+        let not_executable = std::io::Error::from_raw_os_error(libc::EACCES);
+        assert_eq!(exit_code_for_spawn_error(&not_executable), Some(126));
+
+        let unrelated = std::io::Error::from_raw_os_error(libc::EMFILE);
+        assert_eq!(exit_code_for_spawn_error(&unrelated), None);
     }
 }

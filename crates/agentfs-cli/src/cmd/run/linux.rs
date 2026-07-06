@@ -1175,13 +1175,11 @@ fn exec_command(command: PathBuf, args: Vec<String>, session_id: &str) -> ! {
         libc::execvp(cmd_cstr.as_ptr(), argv_ptrs.as_ptr());
     }
 
+    let error = std::io::Error::last_os_error();
     child_exit_with_code(
-        &format!(
-            "Error: Failed to execute {}: {}",
-            command.display(),
-            std::io::Error::last_os_error()
-        ),
-        EXIT_COMMAND_NOT_FOUND,
+        &format!("Error: Failed to execute {}: {}", command.display(), error),
+        agentfs_mount::supervise::exit_code_for_spawn_error(&error)
+            .unwrap_or(EXIT_COMMAND_NOT_FOUND),
     );
 }
 

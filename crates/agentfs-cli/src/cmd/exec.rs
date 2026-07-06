@@ -12,7 +12,7 @@ use turso::value::Value;
 
 use crate::cmd::init::open_agentfs;
 use crate::opts::MountBackend;
-use agentfs_mount::supervise::{exit_code_for_status, run_supervised};
+use agentfs_mount::supervise::{exit_code_for_spawn_error, exit_code_for_status, run_supervised};
 use agentfs_mount::{mount_fs, MountOpts};
 
 /// Handle the exec command.
@@ -108,13 +108,27 @@ pub async fn handle_exec_command(
     // The CLI's private spill dir is process-internal; children keep the
     // user's TMPDIR.
     crate::config::restore_original_tmpdir(&mut child);
-    let status = run_supervised(mount_handle, child)
-        .await
-        .with_context(|| format!("Failed to execute: {}", command.display()));
+    let status = run_supervised(mount_handle, child).await;
 
     let _ = std::fs::remove_dir_all(&mountpoint);
 
-    let status = status?;
+    let status = match status {
+        Ok(status) => status,
+        Err(error) => {
+            // Missing / non-executable commands pass through as 127/126 like
+            // run's child exec path (VAL-CLI-019 exception); every other
+            // failure goes to the unified reporter.
+            if let Some(code) = error
+                .downcast_ref::<std::io::Error>()
+                .and_then(exit_code_for_spawn_error)
+            {
+                eprintln!("Error: Failed to execute: {}: {}", command.display(), error);
+                crate::profiling::emit_cli_report();
+                std::process::exit(code);
+            }
+            return Err(error).with_context(|| format!("Failed to execute: {}", command.display()));
+        }
+    };
     if !status.success() {
         crate::profiling::emit_cli_report();
         std::process::exit(exit_code_for_status(status));
