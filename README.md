@@ -38,7 +38,8 @@ This repository is one Cargo workspace with five crates:
 
 Platform support: **Linux is first-tier** (FUSE and NFS backends, `agentfs
 run` sandbox, full validation gate). **macOS is second-tier**: NFS mount
-only, validated by a manual release gate
+plus a sandboxed `agentfs run` (Seatbelt/`sandbox-exec` with default-deny
+read scoping), validated by a manual release gate
 (`scripts/validation/macos-nfs-git-validation.sh`) run on real hardware —
 see [docs/TESTING.md](docs/TESTING.md). No other platforms are supported.
 
@@ -104,8 +105,21 @@ $ exit
 
 # List live sandbox sessions; inspect what a session changed
 $ agentfs ps
-$ agentfs diff ~/.agentfs/run/my-session/delta.db
+$ agentfs diff my-session
 ```
+
+Beyond these basics, the CLI covers the rest of the lifecycle:
+
+* `agentfs exec` — run a one-shot command over a temporary mount, then
+  unmount automatically.
+* `agentfs clone` — bulk-ingest a git repository straight into the database.
+* `agentfs sync` — push/pull the database to a remote Turso (libSQL) server.
+* `agentfs serve nfs` / `agentfs serve mcp` — export the filesystem over
+  NFS, or expose filesystem and KV-store tools to agents over MCP.
+* `--key` / `--cipher` — local at-rest encryption of the database.
+* `agentfs backup`, `integrity`, `migrate`, `materialize`, `prune` —
+  portable backups, corruption checks, schema migration, partial-origin
+  materialization, and mount cleanup.
 
 The **[User Manual](docs/MANUAL.md)** documents every command; its command
 reference is generated from the CLI's own argument definitions, so it cannot
