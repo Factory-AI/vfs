@@ -44,6 +44,14 @@ behavior-preserving moves are not listed individually.
 
 ### Fixed
 
+- macOS `agentfs run` left reads unscoped (a blanket `(allow file-read*)`
+  in the generated Seatbelt profile) while Linux hid home and temp dirs
+  behind namespaces. The profile is now default-deny for reads: only the
+  session paths, the allowed directories (defaults plus `--allow`), and a
+  curated set of platform read roots stay readable; write scoping is
+  unchanged. Pinned by macOS-gated unit tests; runtime behavior is covered
+  by a new read-scoping leg in the manual macOS release gate
+  (`scripts/validation/macos-nfs-git-validation.sh`).
 - FUSE teardown deadlocks on both transport legs (classic and io_uring).
 - NFS durability lie (FILE_SYNC acked without fsync) and non-graceful
   server shutdown.

@@ -152,6 +152,128 @@ mod read_scoping {
     }
 }
 
+#[cfg(target_os = "macos")]
+mod darwin_read_scoping {
+    use super::super::darwin::{generate_sandbox_profile, SandboxConfig, PLATFORM_READ_ROOTS};
+    use std::path::PathBuf;
+
+    fn config() -> SandboxConfig {
+        SandboxConfig {
+            mountpoint: PathBuf::from("/Users/tester/.agentfs/run/sess-1/mnt"),
+            allow_paths: vec![
+                PathBuf::from("/Users/tester/.codex"),
+                PathBuf::from("/Users/tester/.claude.json"),
+            ],
+            allow_network: true,
+            session_id: "sess-1".to_string(),
+        }
+    }
+
+    #[test]
+    fn reads_are_default_deny_with_no_blanket_allow() {
+        let profile = generate_sandbox_profile(&config());
+
+        assert!(
+            profile
+                .lines()
+                .any(|line| line.starts_with("(deny default")),
+            "profile must keep the deny-default posture"
+        );
+        assert!(
+            profile
+                .lines()
+                .all(|line| line.trim() != "(allow file-read*)"),
+            "a bare (allow file-read*) reopens unscoped reads"
+        );
+    }
+
+    #[test]
+    fn platform_read_roots_are_all_present() {
+        let profile = generate_sandbox_profile(&config());
+
+        for root in PLATFORM_READ_ROOTS {
+            let rule = format!(
+                r#"(allow file-read* file-map-executable file-test-existence (subpath "{root}"))"#
+            );
+            assert!(profile.contains(&rule), "missing platform read root {root}");
+        }
+        assert!(
+            profile.contains(r#"(allow file-read* file-test-existence (literal "/"))"#),
+            "getcwd needs a metadata-capable read of the root directory"
+        );
+        assert!(
+            profile.contains(
+                r#"(require-all (subpath "/System") (require-not (subpath "/System/Volumes")))"#
+            ),
+            "/System must exclude the /System/Volumes firmlinks back into the data volume"
+        );
+    }
+
+    #[test]
+    fn session_and_allow_paths_expand_from_config() {
+        let profile = generate_sandbox_profile(&config());
+
+        for path in [
+            "/Users/tester/.agentfs/run/sess-1/mnt",
+            "/Users/tester/.agentfs/run/sess-1",
+            "/Users/tester/.codex",
+            "/Users/tester/.claude.json",
+        ] {
+            let rule = format!(
+                r#"(allow file-read* file-map-executable file-test-existence (subpath "{path}"))"#
+            );
+            assert!(profile.contains(&rule), "missing read allow for {path}");
+        }
+    }
+
+    #[test]
+    fn path_resolution_parents_get_metadata_only() {
+        let profile = generate_sandbox_profile(&config());
+
+        for parent in [
+            "/Users",
+            "/Users/tester",
+            "/Users/tester/.agentfs",
+            "/Users/tester/.agentfs/run",
+            "/Users/tester/.agentfs/run/sess-1",
+        ] {
+            let rule =
+                format!(r#"(allow file-read-metadata file-test-existence (literal "{parent}"))"#);
+            assert!(profile.contains(&rule), "missing metadata parent {parent}");
+        }
+        assert!(
+            !profile.contains(r#"(subpath "/Users/tester")"#),
+            "home outside the session/allow paths must stay data-unreadable"
+        );
+        for link in ["/etc", "/tmp", "/var", "/System/Volumes/Data"] {
+            let rule =
+                format!(r#"(allow file-read-metadata file-test-existence (literal "{link}"))"#);
+            assert!(
+                profile.contains(&rule),
+                "missing symlink metadata for {link}"
+            );
+        }
+    }
+
+    #[test]
+    fn write_scoping_is_unchanged() {
+        let profile = generate_sandbox_profile(&config());
+
+        for rule in [
+            r#"(allow file-write* (subpath "/Users/tester/.agentfs/run/sess-1/mnt"))"#,
+            r#"(allow file-write* (subpath "/Users/tester/.agentfs/run/sess-1"))"#,
+            r#"(allow file-write* (subpath "/Users/tester/.codex"))"#,
+            r#"(allow file-write* (subpath "/private/tmp"))"#,
+            r#"(allow file-write* (subpath "/tmp"))"#,
+            r#"(allow file-write* (subpath "/var/tmp"))"#,
+            r#"(allow file-write* (subpath "/private/var/folders"))"#,
+            r#"(allow file-write* (subpath "/dev"))"#,
+        ] {
+            assert!(profile.contains(rule), "missing write rule {rule}");
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod skip_mount {
     use super::super::linux::skip_mount;

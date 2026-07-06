@@ -192,7 +192,7 @@ agentfs fs <ID_OR_PATH> write <FILE_PATH> <CONTENT>
 
 Run a command in the sandboxed environment.
 
-By default, uses FUSE+overlay with Linux user and mount namespaces for isolation. The overlay uses the host filesystem as a read-only base and stores all changes in an AgentFS-backed delta layer.
+By default, uses FUSE+overlay with Linux user and mount namespaces for isolation. The overlay uses the host filesystem as a read-only base and stores all changes in an AgentFS-backed delta layer. On macOS the overlay is mounted over NFS and a generated Seatbelt profile scopes writes to the sandbox and reads to the allowed directories plus required platform paths (see the Sandboxing section of docs/MANUAL.md).
 
 ```
 agentfs run [OPTIONS] [COMMAND] [ARGS]...
@@ -205,7 +205,7 @@ agentfs run [OPTIONS] [COMMAND] [ARGS]...
 
 **Options:**
 
-- `--allow <PATH>` — Allow write access to additional directories (can be specified multiple times)
+- `--allow <PATH>` — Allow read/write access to additional directories (can be specified multiple times)
 - `--no-default-allows` — Disable default allowed directories (~/.config, ~/.cache, ~/.local, ~/.claude, etc.)
 - `--session <ID>` — Session identifier for sharing delta layer across multiple runs. If not provided, a unique session ID is generated for each run. Use the same session ID to share the delta layer between runs
 - `--system` — Allow other system users to access this mount (requires /etc/fuse.conf user_allow_other; use cautiously)
@@ -503,6 +503,42 @@ agentfs migrate [OPTIONS] <ID_OR_PATH>
 - `--cipher <CIPHER>` — Encryption cipher (required with --key)
 
 <!-- END GENERATED COMMAND REFERENCE -->
+
+## Sandboxing (`agentfs run`)
+
+`agentfs run` scopes both writes and reads at the OS level; the mechanism
+differs by platform.
+
+**Linux (first-tier):** FUSE + overlay inside user and mount namespaces.
+Writes land only in the copy-on-write overlay and the allowed directories.
+Reads are scoped by hiding the home directory and temp dirs behind
+namespace-private tmpfs, re-exposing only the overlay cwd and the allowed
+paths; all other system paths are remounted read-only.
+
+**macOS (second-tier):** NFS mount + a generated `sandbox-exec` (Seatbelt)
+profile. Writes are restricted to the mountpoint, temp directories,
+`~/Library`, and the allowed paths. Reads are default-deny: only the session
+directory (`~/.agentfs/run/<ID>`), the allowed directories (the defaults plus
+`--allow`), and a curated set of platform roots are readable (system
+frameworks and libraries, the dyld shared cache cryptex, executable
+directories, `/private/etc`, terminfo/locale data under `/usr/share`, temp
+directories, `/dev` essentials, `/opt`, `/usr/local`, and `/Applications`).
+Ancestors of readable roots are stat-able (metadata only) so path resolution
+works. Notable consequences:
+
+- The rest of your home directory, including `~/Library` and credential
+  stores such as `~/.ssh` or `~/.aws`, is unreadable unless granted with
+  `--allow`. (`~/Library` remains writable for Keychain and preferences
+  compatibility, but is not readable.)
+- Tools that need read access outside the workspace must be granted it
+  explicitly with `--allow <PATH>`, which grants read and write access,
+  matching Linux.
+
+CI covers the macOS read posture only via unit tests that pin the generated
+profile; the runtime behavior is verified by the manual macOS release gate
+(`scripts/validation/macos-nfs-git-validation.sh`), which includes a
+read-scoping leg: a secret outside the allow list must be unreadable, and
+`--allow` must make it readable. See [docs/TESTING.md](TESTING.md).
 
 ## Runtime Knobs and Environment Variables
 

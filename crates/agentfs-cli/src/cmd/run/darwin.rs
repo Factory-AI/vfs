@@ -5,7 +5,10 @@
 //! copy-on-write overlay backed by AgentFS, mounted via a localhost NFS server.
 //!
 //! Sandboxing is enforced using macOS sandbox-exec with dynamically generated
-//! profiles that restrict file writes to the NFS mountpoint and allowed paths.
+//! profiles. Writes are restricted to the NFS mountpoint and allowed paths;
+//! reads are default-deny and limited to the session paths, the allowed
+//! paths, and a curated set of platform roots the runtime needs (see
+//! `PLATFORM_READ_ROOTS`).
 
 use crate::opts::RunOptions;
 use agentfs_core::{AgentFS, AgentFSOptions, FileSystem, HostFS, OverlayFS};
@@ -20,28 +23,94 @@ use agentfs_mount::{mount_fs, Backend, MountOpts};
 
 /// Configuration for the macOS sandbox profile.
 #[derive(Debug, Clone)]
-struct SandboxConfig {
+pub(super) struct SandboxConfig {
     /// The NFS mountpoint (primary read/write location).
-    mountpoint: PathBuf,
+    pub(super) mountpoint: PathBuf,
     /// Additional paths to allow read/write access.
-    allow_paths: Vec<PathBuf>,
+    pub(super) allow_paths: Vec<PathBuf>,
     /// Whether to allow network access.
-    allow_network: bool,
+    pub(super) allow_network: bool,
     /// Session ID for log filtering.
-    session_id: String,
+    pub(super) session_id: String,
+}
+
+/// System roots that stay readable under the default-deny read posture.
+///
+/// Curated from the Codex restricted platform defaults and the
+/// Chromium/Mozilla Seatbelt profiles: the dyld shared cache cryptex,
+/// system libraries, executable directories, package managers, system
+/// config (`/private/etc`), terminfo/locale data (`/usr/share`), temp
+/// directories (already writable below), and `/dev` essentials. `/System`
+/// is handled separately: `/System/Volumes` firmlinks back into the data
+/// volume, so a plain `(subpath "/System")` would reopen every read the
+/// posture is meant to deny.
+pub(super) const PLATFORM_READ_ROOTS: &[&str] = &[
+    "/Applications",
+    "/Library/Apple",
+    "/Library/Preferences",
+    "/System/Volumes/Preboot/Cryptexes",
+    "/bin",
+    "/dev",
+    "/etc",
+    "/opt",
+    "/private/etc",
+    "/private/tmp",
+    "/private/var/db",
+    "/private/var/folders",
+    "/private/var/select",
+    "/private/var/tmp",
+    "/sbin",
+    "/tmp",
+    "/usr/bin",
+    "/usr/lib",
+    "/usr/libexec",
+    "/usr/local",
+    "/usr/sbin",
+    "/usr/share",
+    "/var/tmp",
+];
+
+/// Standard symlinks and firmlink components that need metadata access for
+/// path resolution (`/var` -> `/private/var`, the `/System/Volumes/Data`
+/// firmlink chain), mirroring the Codex restricted defaults.
+const PLATFORM_METADATA_PATHS: &[&str] = &[
+    "/System/Volumes",
+    "/System/Volumes/Data",
+    "/System/Volumes/Data/Users",
+    "/System/Volumes/Data/private",
+    "/etc",
+    "/private/etc/localtime",
+    "/tmp",
+    "/var",
+];
+
+/// Proper ancestors of every read root (excluding `/`), deduplicated and
+/// sorted, so path resolution can stat each component on the way down
+/// without granting data reads outside the roots themselves.
+fn read_root_ancestors(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut ancestors = std::collections::BTreeSet::new();
+    for root in roots {
+        for ancestor in root.ancestors().skip(1) {
+            if ancestor != Path::new("/") && !ancestor.as_os_str().is_empty() {
+                ancestors.insert(ancestor.to_path_buf());
+            }
+        }
+    }
+    ancestors.into_iter().collect()
 }
 
 /// Generate a sandbox-exec profile for AgentFS.
 ///
 /// The profile allows most operations but restricts file writes to the NFS
-/// mountpoint, temp directories, and explicitly allowed paths.
-fn generate_sandbox_profile(config: &SandboxConfig) -> String {
+/// mountpoint, temp directories, and explicitly allowed paths, and file
+/// reads to the session paths, allowed paths, and `PLATFORM_READ_ROOTS`.
+pub(super) fn generate_sandbox_profile(config: &SandboxConfig) -> String {
     let mut profile = Vec::new();
     let log_tag = format!("agentfs-{}", config.session_id);
 
     profile.push("(version 1)".to_string());
     profile.push(format!(
-        r#"(deny default (with message "agentfs-{}: write denied"))"#,
+        r#"(deny default (with message "agentfs-{}: access denied"))"#,
         config.session_id
     ));
     profile.push(format!("; Log tag: {}", log_tag));
@@ -55,8 +124,47 @@ fn generate_sandbox_profile(config: &SandboxConfig) -> String {
     profile.push("(allow ipc*)".to_string());
     profile.push("(allow pseudo-tty)".to_string());
 
-    profile.push("; Allow all file reads".to_string());
-    profile.push("(allow file-read*)".to_string());
+    profile.push(
+        "; Readable paths: session and allow-listed roots (reads are default-deny)".to_string(),
+    );
+    let mut read_roots = vec![config.mountpoint.clone()];
+    if let Some(parent) = config.mountpoint.parent() {
+        read_roots.push(parent.to_path_buf());
+    }
+    read_roots.extend(config.allow_paths.iter().cloned());
+    for path in &read_roots {
+        profile.push(format!(
+            r#"(allow file-read* file-map-executable file-test-existence (subpath "{}"))"#,
+            path.to_string_lossy()
+        ));
+    }
+
+    profile
+        .push("; Platform read roots (loader, frameworks, executables, config, temp)".to_string());
+    profile.push(r#"(allow file-read* file-test-existence (literal "/"))"#.to_string());
+    profile.push(
+        r#"(allow file-read* file-map-executable file-test-existence (require-all (subpath "/System") (require-not (subpath "/System/Volumes"))))"#
+            .to_string(),
+    );
+    for root in PLATFORM_READ_ROOTS {
+        profile.push(format!(
+            r#"(allow file-read* file-map-executable file-test-existence (subpath "{root}"))"#
+        ));
+    }
+
+    profile
+        .push("; Metadata for path resolution (symlinks, firmlinks, root ancestors)".to_string());
+    for path in PLATFORM_METADATA_PATHS {
+        profile.push(format!(
+            r#"(allow file-read-metadata file-test-existence (literal "{path}"))"#
+        ));
+    }
+    for ancestor in read_root_ancestors(&read_roots) {
+        profile.push(format!(
+            r#"(allow file-read-metadata file-test-existence (literal "{}"))"#,
+            ancestor.to_string_lossy()
+        ));
+    }
 
     profile.push("; Writable paths".to_string());
     let mountpoint_str = config.mountpoint.to_string_lossy();
@@ -239,7 +347,8 @@ fn print_welcome_banner(session: &RunSession, encrypted: bool) {
         eprintln!("  - {}", grouped_path);
     }
     eprintln!();
-    eprintln!("🔒 Everything else is read-only.");
+    eprintln!("🔒 System paths are read-only.");
+    eprintln!("🙈 Everything else (including the rest of your home directory) is unreadable.");
     if encrypted {
         eprintln!("🔐 Delta layer is encrypted.");
     }
@@ -355,8 +464,9 @@ fn command_in_mount(
     };
     let profile = generate_sandbox_profile(&config);
 
-    // Wrap the command with sandbox-exec
-    let mut cmd = tokio::process::Command::new("sandbox-exec");
+    // Wrap the command with sandbox-exec, pinned to the system binary so a
+    // PATH-injected replacement cannot supplant the sandbox.
+    let mut cmd = tokio::process::Command::new("/usr/bin/sandbox-exec");
     cmd.arg("-p")
         .arg(&profile)
         .arg(&command)

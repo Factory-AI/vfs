@@ -189,9 +189,12 @@ pub enum Command {
     ///
     /// By default, uses FUSE+overlay with Linux user and mount namespaces for isolation.
     /// The overlay uses the host filesystem as a read-only base and stores
-    /// all changes in an AgentFS-backed delta layer.
+    /// all changes in an AgentFS-backed delta layer. On macOS the overlay is
+    /// mounted over NFS and a generated Seatbelt profile scopes writes to the
+    /// sandbox and reads to the allowed directories plus required platform
+    /// paths (see the Sandboxing section of docs/MANUAL.md).
     Run {
-        /// Allow write access to additional directories (can be specified multiple times)
+        /// Allow read/write access to additional directories (can be specified multiple times)
         #[arg(long = "allow", value_name = "PATH")]
         allow: Vec<PathBuf>,
 

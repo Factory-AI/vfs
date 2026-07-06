@@ -205,8 +205,14 @@ scripts/validation/macos-nfs-git-validation.sh \
 The harness is temp-directory scoped, initializes a fresh AgentFS database,
 mounts it with `agentfs mount --backend nfs`, then runs `git init`,
 `git add`, `git commit`, and `git fsck --strict`, and verifies at least one
-loose object was written. A passing run ends with
-`macOS NFS git validation passed`. Unsupported platforms or missing
-prerequisites exit `77`; on Linux that skip is expected, not a failure. A
-release SHOULD NOT ship without a passing run of this script on real
-hardware.
+loose object was written. It then verifies the `agentfs run` Seatbelt
+read-scoping posture: a secret file in an unallowed directory under `$HOME`
+must be unreadable from inside the sandbox (permission error, no content
+leak), and re-running with `--allow <dir>` must make it readable. The
+generated profile itself is pinned by macOS-gated unit tests
+(`cmd::run::tests::darwin_read_scoping`) that run in the CI macos-latest
+workspace job; this script is the runtime check. A passing run ends with
+`macOS NFS git + run read-scoping validation passed`. Unsupported platforms
+or missing prerequisites exit `77`; on Linux that skip is expected, not a
+failure. A release SHOULD NOT ship without a passing run of this script on
+real hardware.
