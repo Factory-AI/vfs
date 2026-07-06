@@ -210,13 +210,13 @@ mkdir -p bounded/repo/src
 printf "bounded teardown payload\n" > bounded/payload.txt
 cat bounded/payload.txt >/dev/null
 cd bounded/repo
-git init -q
-git config user.email "bounded@example.invalid"
-git config user.name "Bounded Teardown"
+"${GIT_REAL:-git}" init -q
+"${GIT_REAL:-git}" config user.email "bounded@example.invalid"
+"${GIT_REAL:-git}" config user.name "Bounded Teardown"
 printf "hello\n" > src/file.txt
-git add .
-git commit -q -m init
-git fsck --strict --no-progress
+"${GIT_REAL:-git}" add .
+"${GIT_REAL:-git}" commit -q -m init
+"${GIT_REAL:-git}" fsck --strict --no-progress
 '
     ) >"$JOINER_LOG" 2>&1
 }
@@ -249,8 +249,8 @@ verify_session_after_teardown() {
             /bin/bash -c '
 set -euo pipefail
 test "$(cat bounded/payload.txt)" = "bounded teardown payload"
-git -C bounded/repo fsck --strict --no-progress
-test -z "$(git -C bounded/repo status --porcelain)"
+"${GIT_REAL:-git}" -C bounded/repo fsck --strict --no-progress
+test -z "$("${GIT_REAL:-git}" -C bounded/repo status --porcelain)"
 '
     ) >"$verify_log" 2>&1 || {
         dump_failure_context "$leg remount verification failed after SIGTERM teardown"
@@ -320,7 +320,9 @@ run_leg() {
     ln -sf "$GIT_REAL" "$TEST_HOME/bin/git"
     printf '[core]\n\thooksPath = %s\n' "$TEST_HOME/git-hooks-none" >"$TEST_HOME/.gitconfig"
     PATH="$TEST_HOME/bin:$PATH"
-    export PATH
+    # The PATH shim only holds host-side: inside `agentfs run` temp dirs are
+    # hidden, so sandboxed workloads must call "$GIT_REAL" by absolute path.
+    export PATH GIT_REAL
 
     (
         cd "$WORKDIR"

@@ -199,7 +199,9 @@ done
 ln -sf "$GIT_REAL" "$TEST_HOME/bin/git"
 printf '[core]\n\thooksPath = %s\n' "$TEST_HOME/git-hooks-none" >"$TEST_HOME/.gitconfig"
 PATH="$TEST_HOME/bin:$PATH"
-export PATH
+# The PATH shim only holds host-side: inside `agentfs run` temp dirs are
+# hidden, so sandboxed workloads must call "$GIT_REAL" by absolute path.
+export PATH GIT_REAL
 
 SESSION_ID="corruption-torture-$$"
 RUN_DIR="$TEST_HOME/.agentfs/run/$SESSION_ID"
@@ -428,18 +430,18 @@ while [ "$i" -le "$iterations" ]; do
 done
 
 cd "$base/repo"
-git init -q
-git config user.email "worker-$worker@example.invalid"
-git config user.name "Worker $worker"
+"${GIT_REAL:-git}" init -q
+"${GIT_REAL:-git}" config user.email "worker-$worker@example.invalid"
+"${GIT_REAL:-git}" config user.name "Worker $worker"
 
 i=1
 while [ "$i" -le "$iterations" ]; do
     mkdir -p "src/iter-$i"
     printf "repo worker=%s iteration=%s\n" "$worker" "$i" > "src/iter-$i/file.txt"
     printf "commit worker=%s iteration=%s\n" "$worker" "$i" >> journal.txt
-    git add .
-    git commit -q -m "worker $worker iteration $i"
-    git fsck --strict --no-progress
+    "${GIT_REAL:-git}" add .
+    "${GIT_REAL:-git}" commit -q -m "worker $worker iteration $i"
+    "${GIT_REAL:-git}" fsck --strict --no-progress
     i=$((i + 1))
 done
 ' worker "$worker" "$ITERATIONS"
@@ -534,8 +536,8 @@ while [ "$w" -le "$workers" ]; do
         i=$((i + 1))
     done
 
-    git -C "$base/repo" fsck --strict --no-progress
-    commits="$(git -C "$base/repo" rev-list --count HEAD)"
+    "${GIT_REAL:-git}" -C "$base/repo" fsck --strict --no-progress
+    commits="$("${GIT_REAL:-git}" -C "$base/repo" rev-list --count HEAD)"
     test "$commits" -eq "$iterations"
 
     w=$((w + 1))

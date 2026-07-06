@@ -327,6 +327,8 @@ def main(argv: list[str]) -> int:
     exit_code = 0
     result: dict[str, Any]
     try:
+        git_ai_before = common.git_ai_processes()
+        pinned_git = common.pin_distro_git(os.environ, output_dir)
         agentfs_bin = common.resolve_agentfs_bin(args.agentfs_bin, repo_root)
         env = child_env(agentfs_bin, output_dir)
         scripts = repo_root / "scripts" / "validation"
@@ -481,6 +483,16 @@ def main(argv: list[str]) -> int:
             coherence_wall_timeout,
             output_dir,
         )
+
+        leaked_git_ai = common.git_ai_leaks(git_ai_before, common.git_ai_processes())
+        gates["git_ai_process_census"] = {
+            "name": "git-ai-process-census",
+            "status": "failed" if leaked_git_ai else "passed",
+            "required": True,
+            "pinned_git": str(pinned_git),
+            "pre_existing_count": len(git_ai_before),
+            "leaked": leaked_git_ai,
+        }
 
         failed_gates = [name for name, gate in gates.items() if not gate_passed(gate)]
         threshold_failures = []

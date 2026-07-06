@@ -23,6 +23,9 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lib import common  # noqa: E402
+
 
 OUTPUT_TAIL_CHARS = 8000
 HASH_BLOCK_BYTES = 1024 * 1024
@@ -59,9 +62,13 @@ def git_env():
 
 
 def run_git(label, argv, cwd):
+    # Honor the harness's pinned-git override: PATH shims are invisible inside
+    # the agentfs sandbox, so only an absolute system-path GIT avoids the
+    # daemonizing hook-manager shim (scripts/validation/lib/common.py).
+    git = os.environ.get("GIT", "git")
     started = time.perf_counter()
     proc = subprocess.run(
-        ["git"] + argv,
+        [git] + argv,
         cwd=str(cwd),
         env=git_env(),
         text=True,
@@ -77,7 +84,7 @@ def run_git(label, argv, cwd):
     digest.update(stdout.encode("utf-8", errors="replace"))
     return {
         "label": label,
-        "argv": ["git"] + argv,
+        "argv": [git] + argv,
         "returncode": proc.returncode,
         "duration_seconds": time.perf_counter() - started,
         "stdout_sha256": hashlib.sha256(stdout.encode("utf-8", errors="replace")).hexdigest(),
@@ -99,7 +106,7 @@ def mutate_fixture(root, edit_files, append_bytes):
     ls_files = run_git("ls_files_for_mutation", ["ls-files", "-z"], root)
     require_ok(ls_files, "git ls-files")
     proc = subprocess.run(
-        ["git", "ls-files", "-z"],
+        [os.environ.get("GIT", "git"), "ls-files", "-z"],
         cwd=str(root),
         env=git_env(),
         text=True,
@@ -365,7 +372,7 @@ def resolve_agentfs_bin(agentfs_bin: Optional[str], repo_root: Path) -> str:
 
 def git_commit(repo_root: Path) -> Optional[str]:
     proc = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
+        [os.environ.get("GIT", "git"), "rev-parse", "HEAD"],
         cwd=str(repo_root),
         text=True,
         stdout=subprocess.PIPE,
@@ -390,10 +397,11 @@ def git_env() -> dict[str, str]:
 
 
 def run_git(argv: list[str], cwd: Path, *, env: Optional[dict[str, str]] = None, timeout: float = 60) -> subprocess.CompletedProcess[str]:
+    resolved_env = env or git_env()
     return subprocess.run(
-        ["git"] + argv,
+        [resolved_env.get("GIT", "git")] + argv,
         cwd=str(cwd),
-        env=env or git_env(),
+        env=resolved_env,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -479,6 +487,7 @@ def prepare_environment(temp_root: Path, profile: bool) -> dict[str, str]:
     env["XDG_CONFIG_HOME"] = str(home / ".config")
     env["XDG_CACHE_HOME"] = str(home / ".cache")
     env["XDG_DATA_HOME"] = str(home / ".local" / "share")
+    common.pin_distro_git(env, home, home=home)
 
     tmp = temp_root / "tmp"
     tmp.mkdir(parents=True, exist_ok=True)
@@ -647,7 +656,8 @@ def main(argv: list[str]) -> int:
     exit_code = 0
     result: dict[str, Any]
     try:
-        if shutil.which("git") is None:
+        common.pin_distro_git(os.environ, temp_root)
+        if shutil.which(os.environ.get("GIT", "git")) is None:
             raise RuntimeError("git executable is required")
         agentfs_bin = resolve_agentfs_bin(args.agentfs_bin, repo_root)
         env = prepare_environment(temp_root, args.profile)

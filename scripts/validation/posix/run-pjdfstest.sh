@@ -81,7 +81,10 @@ skip_missing() {
 resolve_agentfs() {
     if [[ "$AGENTFS_BIN" == */* ]]; then
         [[ -x "$AGENTFS_BIN" ]] || return 1
-        AGENTFS_RESOLVED="$AGENTFS_BIN"
+        # Absolutize: the harness cd's into its work and mount dirs before
+        # invoking the binary, which silently breaks a relative path (the
+        # exit-127 error only lands in init.log).
+        AGENTFS_RESOLVED="$(cd "$(dirname "$AGENTFS_BIN")" && pwd)/$(basename "$AGENTFS_BIN")"
     else
         AGENTFS_RESOLVED="$(command -v "$AGENTFS_BIN" 2>/dev/null)" || return 1
     fi
