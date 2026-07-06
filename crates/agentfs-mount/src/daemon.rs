@@ -21,15 +21,26 @@ const MAX_ERROR_MSG_LEN: usize = 4096;
 /// # Returns
 /// * `Ok(())` in the parent process if the daemon started successfully
 /// * Never returns in the child process (exits with appropriate code)
+///
+/// # Caller contract
+/// No tokio runtime may be alive anywhere in the process when this is
+/// called: `fork()` copies only the calling thread, so locks held by
+/// runtime worker threads at fork time (allocator, runtime internals) stay
+/// locked forever in the child. The guard below cannot enforce this fully —
+/// `Handle::try_current()` is thread-local, so it only catches a runtime
+/// context *entered on the calling thread* (inside `block_on` or an
+/// `EnterGuard`). A runtime whose workers live on other threads, or one
+/// constructed on this thread but not entered, evades it, and tokio's
+/// public API offers no process-wide probe. Callers must therefore fork
+/// first and build their runtime inside `daemon_fn`, dropping any
+/// short-lived pre-check runtimes beforehand (see `agentfs mount`, whose
+/// two call sites both follow this shape).
 pub fn daemonize<F, R>(daemon_fn: F, ready_check: R, timeout: Duration) -> Result<()>
 where
     F: FnOnce() -> Result<()> + Send + 'static,
     R: Fn() -> bool,
 {
-    // fork() from inside a live multi-threaded runtime can deadlock the
-    // child on locks (allocator, runtime internals) held by runtime worker
-    // threads at fork time. Callers must daemonize first and build their
-    // runtime in `daemon_fn` (see `agentfs mount`).
+    // Best-effort guard; thread-local only (see the caller contract above).
     if tokio::runtime::Handle::try_current().is_ok() {
         anyhow::bail!(
             "daemonize called from inside a tokio runtime; fork before any runtime exists \

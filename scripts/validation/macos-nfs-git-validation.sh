@@ -77,7 +77,7 @@ safe_rm_run_session() {
     [[ -n "$session" ]] || return 0
     case "$session" in
         macos-read-scope-*)
-            rm -rf -- "$HOME/.agentfs/run/$session"
+            rm -rf -- "${HOME:?}/.agentfs/run/$session"
             ;;
         *)
             printf 'Refusing to remove non-harness run session: %s\n' "$session" >&2

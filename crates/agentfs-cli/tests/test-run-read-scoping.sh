@@ -27,9 +27,9 @@ shm_secret_dir="$(mktemp -d /dev/shm/agentfs-scope-test.XXXXXX)"
 
 cleanup() {
     rm -rf "$tmp_secret_dir" "$home_secret_dir" "$shm_secret_dir"
-    rm -rf "${HOME}/.agentfs/run/${session_prefix}-denied" \
-        "${HOME}/.agentfs/run/${session_prefix}-write" \
-        "${HOME}/.agentfs/run/${session_prefix}-allowed"
+    rm -rf "${HOME:?}/.agentfs/run/${session_prefix}-denied" \
+        "${HOME:?}/.agentfs/run/${session_prefix}-write" \
+        "${HOME:?}/.agentfs/run/${session_prefix}-allowed"
 }
 trap cleanup EXIT
 

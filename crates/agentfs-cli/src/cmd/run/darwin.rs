@@ -137,12 +137,19 @@ impl SandboxParams {
 
 /// The session id reaches the profile text itself (deny message and log-tag
 /// comment) where Seatbelt parameters are not available, so restrict it to a
-/// conservative charset instead of trusting `--session` input.
+/// conservative charset instead of trusting `--session` input. A session id
+/// with no surviving characters falls back to a fixed placeholder so the
+/// deny message never degrades to a bare `agentfs-:` tag.
 fn sandbox_log_tag(session_id: &str) -> String {
-    session_id
+    let tag: String = session_id
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-        .collect()
+        .collect();
+    if tag.is_empty() {
+        "session".to_string()
+    } else {
+        tag
+    }
 }
 
 /// Generate a sandbox-exec profile for AgentFS.

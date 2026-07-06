@@ -25,9 +25,9 @@ cleanup() {
         wait "$NFS_PID" 2>/dev/null || true
     fi
     rm -rf "$ROOT" \
-        "${HOME}/.agentfs/run/${SESSION_PREFIX}-run" \
-        "${HOME}/.agentfs/run/${SESSION_PREFIX}-exit-missing" \
-        "${HOME}/.agentfs/run/${SESSION_PREFIX}-exit-nonexec"
+        "${HOME:?}/.agentfs/run/${SESSION_PREFIX}-run" \
+        "${HOME:?}/.agentfs/run/${SESSION_PREFIX}-exit-missing" \
+        "${HOME:?}/.agentfs/run/${SESSION_PREFIX}-exit-nonexec"
 }
 trap cleanup EXIT INT TERM
 

@@ -10,7 +10,7 @@ ROOT="$(mktemp -d "${TMPDIR:-/tmp}/agentfs-run-bash.XXXXXX")"
 SESSION_ID="run-bash-$$"
 
 cleanup() {
-    rm -rf "$ROOT" "${HOME}/.agentfs/run/${SESSION_ID}"
+    rm -rf "$ROOT" "${HOME:?}/.agentfs/run/${SESSION_ID}"
 }
 trap cleanup EXIT INT TERM
 

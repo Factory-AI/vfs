@@ -235,6 +235,38 @@ def run_one(
     return result
 
 
+def cleanup_run_session_dir(session_id: str) -> None:
+    """Remove exactly the session dir a run leg created.
+
+    Never sweeps ~/.agentfs/run wholesale (the user may have real sessions
+    there), and never raises: this runs in a finally block, so an exception
+    here would mask the leg's real failure. If the leg died with its FUSE
+    mount still live or wedged, stats under the mountpoint fail (ENOTCONN)
+    and a bare rmtree would silently leave the dir behind — detach the mount
+    first so the dir actually goes away.
+    """
+    session_dir = Path.home() / ".agentfs" / "run" / session_id
+    mountpoint = session_dir / "mnt"
+    try:
+        os.stat(mountpoint)
+        needs_unmount = os.path.ismount(mountpoint)
+    except FileNotFoundError:
+        needs_unmount = False
+    except OSError:
+        needs_unmount = True
+    if needs_unmount:
+        try:
+            subprocess.run(
+                ["fusermount3", "-uz", str(mountpoint)],
+                check=False,
+                capture_output=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+    shutil.rmtree(session_dir, ignore_errors=True)
+
+
 def base_env(extra: dict[str, str]) -> dict[str, str]:
     env = os.environ.copy()
     env["AGENTFS_PROFILE"] = "1"
@@ -314,13 +346,7 @@ def main() -> int:
                     run_one(argv, base_root, base_env(extra), args.timeout, label, noopen)
                 )
             finally:
-                # Remove exactly the session dir this leg created; the user
-                # may have real sessions in ~/.agentfs/run, so never sweep
-                # that directory wholesale.
-                shutil.rmtree(
-                    Path.home() / ".agentfs" / "run" / session_id,
-                    ignore_errors=True,
-                )
+                cleanup_run_session_dir(session_id)
 
     resolutions = sum(r.get("fuse_ino_file_resolutions") or 0 for r in runs if r["noopen"])
     upgrades = sum(r.get("fuse_ino_file_upgrades") or 0 for r in runs if r["noopen"])

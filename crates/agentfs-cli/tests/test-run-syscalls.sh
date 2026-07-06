@@ -18,7 +18,7 @@ ROOT="$(mktemp -d "${TMPDIR:-/tmp}/agentfs-run-syscalls.XXXXXX")"
 SESSION_ID="run-syscalls-$$"
 
 cleanup() {
-    rm -rf "$ROOT" "${HOME}/.agentfs/run/${SESSION_ID}"
+    rm -rf "$ROOT" "${HOME:?}/.agentfs/run/${SESSION_ID}"
 }
 trap cleanup EXIT INT TERM
 

@@ -65,10 +65,7 @@ pub async fn run_supervised_with_opts(
 
     let mut child = match command.spawn() {
         Ok(child) => child,
-        Err(error) => {
-            handle.unmount().await?;
-            return Err(error.into());
-        }
+        Err(error) => return Err(spawn_failure_error(error, handle.unmount().await)),
     };
 
     let status = wait_for_supervised_child(&mut child, opts).await;
@@ -247,6 +244,23 @@ pub fn exit_code_for_status(status: ExitStatus) -> i32 {
 #[cfg(not(unix))]
 pub fn exit_code_for_status(status: ExitStatus) -> i32 {
     status.code().unwrap_or(1)
+}
+
+/// Build the error for a spawn failure followed by the teardown unmount.
+///
+/// The spawn `io::Error` must stay the downcast root even when the unmount
+/// also fails: callers map it to the 127/126 shell conventions via
+/// [`exit_code_for_spawn_error`], and an unmount error that shadowed it
+/// would reroute a missing-command run to the generic error reporter. The
+/// unmount failure rides along as context instead.
+fn spawn_failure_error(spawn_error: std::io::Error, unmount_result: Result<()>) -> anyhow::Error {
+    let error = anyhow::Error::from(spawn_error);
+    match unmount_result {
+        Ok(()) => error,
+        Err(unmount_error) => error.context(format!(
+            "unmount after spawn failure also failed: {unmount_error:#}"
+        )),
+    }
 }
 
 /// Map a spawn/exec failure to the shell command-not-found conventions:
@@ -762,6 +776,36 @@ mod tests {
             return true;
         }
         std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+
+    #[test]
+    fn spawn_error_survives_a_failing_unmount() {
+        let spawn = std::io::Error::from_raw_os_error(libc::ENOENT);
+        let error = spawn_failure_error(spawn, Err(anyhow::anyhow!("unmount blew up")));
+
+        let io_error = error
+            .downcast_ref::<std::io::Error>()
+            .expect("spawn io::Error must stay downcastable through the unmount context");
+        assert_eq!(
+            exit_code_for_spawn_error(io_error),
+            Some(127),
+            "double fault must still map a missing command to 127"
+        );
+        assert!(
+            format!("{error:#}").contains("unmount blew up"),
+            "the unmount failure must be preserved as context: {error:#}"
+        );
+    }
+
+    #[test]
+    fn spawn_error_passes_through_when_unmount_succeeds() {
+        let spawn = std::io::Error::from_raw_os_error(libc::EACCES);
+        let error = spawn_failure_error(spawn, Ok(()));
+
+        let io_error = error
+            .downcast_ref::<std::io::Error>()
+            .expect("spawn io::Error must be the error root");
+        assert_eq!(exit_code_for_spawn_error(io_error), Some(126));
     }
 
     #[test]

@@ -388,6 +388,27 @@ mod darwin_read_scoping {
             "an injected session id must not open unscoped reads"
         );
     }
+
+    #[test]
+    fn fully_hostile_session_id_falls_back_to_a_fixed_log_tag() {
+        let mut config = config();
+        config.session_id = r#""()[]{}<>#;$!"#.to_string();
+
+        let profile = generate_sandbox_profile(&config);
+
+        assert!(
+            profile
+                .policy
+                .contains(r#"(deny default (with message "agentfs-session: access denied"))"#),
+            "a session id sanitized to nothing must fall back to a fixed tag:\n{}",
+            profile.policy
+        );
+        assert!(
+            !profile.policy.contains("agentfs-:"),
+            "the log tag must never be empty:\n{}",
+            profile.policy
+        );
+    }
 }
 
 #[cfg(target_os = "macos")]

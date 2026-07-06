@@ -12,7 +12,7 @@ SESSION_PREFIX="symlinks-$$"
 cleanup() {
     rm -rf "$ROOT"
     for leg in 1 2 3 4 5; do
-        rm -rf "${HOME}/.agentfs/run/${SESSION_PREFIX}-${leg}"
+        rm -rf "${HOME:?}/.agentfs/run/${SESSION_PREFIX}-${leg}"
     done
 }
 trap cleanup EXIT INT TERM
