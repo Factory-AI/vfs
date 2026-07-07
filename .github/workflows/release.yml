@@ -281,36 +281,6 @@ jobs:
 
           gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
 
-  # Publish TypeScript SDK to npm
-  publish-npm:
-    needs:
-      - plan
-      - host
-    if: ${{ needs.plan.outputs.publishing == 'true' && needs.host.result == 'success' }}
-    runs-on: "ubuntu-22.04"
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-          submodules: recursive
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-      - name: Update npm
-        run: npm install -g npm@11
-      - name: Install dependencies
-        working-directory: sdk/typescript
-        run: npm install
-      - name: Build SDK
-        working-directory: sdk/typescript
-        run: npm run build
-      - name: Publish to npm
-        working-directory: sdk/typescript
-        env:
-          TAG_FLAG: "${{ fromJson(needs.host.outputs.val).announcement_is_prerelease && '--tag next' || '' }}"
-        run: npm publish --provenance --access public $TAG_FLAG
-
   # Publish Rust SDK to crates.io
   publish-cargo:
     needs:
@@ -331,42 +301,13 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
-  # Publish Python SDK to PyPI
-  publish-pypi:
-    needs:
-      - plan
-      - host
-    if: ${{ needs.plan.outputs.publishing == 'true' && needs.host.result == 'success' }}
-    runs-on: "ubuntu-22.04"
-    env:
-      UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-          submodules: recursive
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Build package
-        run: uv build --directory sdk/python
-      - name: Publish to PyPI
-        run: uv publish --directory sdk/python
-
   announce:
     needs:
       - plan
       - host
-      - publish-npm
       - publish-cargo
-      - publish-pypi
     # use "always() && ..." to allow us to wait for all publish jobs while
-    # still allowing individual publish jobs to skip themselves (for prereleases).
+    # still allowing publish jobs to skip themselves (for prereleases).
     # "host" however must run to completion, no skipping allowed!
     if: ${{ always() && needs.host.result == 'success' }}
     runs-on: "ubuntu-22.04"

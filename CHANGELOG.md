@@ -1,5 +1,83 @@
 # Changelog
 
+## [Unreleased] - Fork-era: VFS Right-Thing Restructure
+
+This fork restructured the post-0.6.4 tree around a five-crate Rust
+workspace. The changes below are the user-visible summary of that campaign;
+behavior-preserving moves are not listed individually.
+
+### Removed
+
+- Deleted SDKs: the Go, Python, and TypeScript SDKs and their CI workflows;
+  the Rust library survives as the `agentfs-core` crate.
+- The standalone example projects (built against the deleted SDKs).
+- The experimental ptrace sandbox and the `--experimental-sandbox` flag;
+  `agentfs run` is FUSE+overlay in Linux user/mount namespaces (NFS +
+  Sandbox on macOS).
+- Windows stubs and the Windows dist target; supported platforms are Linux
+  (first-tier) and macOS (second-tier: NFS mount plus a sandboxed
+  `agentfs run`).
+- The `abi-7-*` FUSE feature matrix (17 features collapsed into the one
+  compiled ABI level) and the dead vendored fuser/nfsserve surface.
+- The legacy path-based SDK API and the `AGENTFS_OVERLAY_PARTIAL_ORIGIN`
+  env opt-in (superseded by the first-class `--partial-origin` policy).
+- `migrate-v0-5`: one `agentfs migrate` now lands any supported old schema
+  (v0.0, v0.2, v0.4) at the current version, in place by default or with
+  `--copy`-based re-chunking.
+
+### Changed
+
+- One root workspace after the crate split, five crates in a clean DAG —
+  `agentfs-core` (storage engine, overlay, schema authority, typed config,
+  telemetry, semantics), `agentfs-fuse` and `agentfs-nfs` (sealed transport
+  + adapter crates), `agentfs-mount` (one mount/supervision lifecycle), and
+  `agentfs-cli` (thin edge with a single error reporter).
+- Config: every runtime knob is a typed declaration parsed at the crate
+  edge with one truthy grammar; the generated `docs/KNOBS.md` ledger is
+  parity-checked in CI, as is the `docs/MANUAL.md` command reference
+  (generated from clap). User docs moved under `docs/`.
+- Telemetry: one macro registry and a single report sink replace the
+  hand-rolled six-way counter boilerplate.
+- Semantics: one `Semantics` layer under both adapters — a single
+  permission implementation, explicit ack durability on every write path
+  (NFS WRITE acks FILE_SYNC only after commit), and one handle/lifecycle
+  authority.
+
+### Fixed
+
+- macOS `agentfs run` left reads unscoped (a blanket `(allow file-read*)`
+  in the generated Seatbelt profile) while Linux hid home and temp dirs
+  behind namespaces. The profile is now default-deny for reads: only the
+  session paths, the allowed directories (defaults plus `--allow`), and a
+  curated set of platform read roots stay readable; write scoping is
+  unchanged. Pinned by macOS-gated unit tests; runtime behavior is covered
+  by a new read-scoping leg in the manual macOS release gate
+  (`scripts/validation/macos-nfs-git-validation.sh`).
+- FUSE teardown deadlocks on both transport legs (classic and io_uring).
+- NFS durability lie (FILE_SYNC acked without fsync) and non-graceful
+  server shutdown.
+- Overlay base-directory rename silently emptying the source: now `EXDEV`.
+- Stale-overlay reads after external base mutation are rejected.
+- Schema `ALTER`s no longer swallow errors blanket-`.ok()`-style.
+- Mounts racing the kernel-side drain of a just-closed FUSE-over-io_uring
+  connection are bounded (retry, then a clear error) instead of wedging
+  inside `mount(2)` forever (kernel constraint, see docs/MANUAL.md).
+- `tursodb-ephemeral-*` sort-spill litter from the turso_core 0.5.3
+  dependency (never unlinked upstream, `vdbe/execute.rs:10096`): the CLI
+  now scopes `TMPDIR` to a per-process spill dir cleaned on exit, without
+  leaking the override into `run`/`exec` children. Track the upstream
+  unlink fix before removing this workaround.
+
+### Validation
+
+- Honest CI gate (`scripts/gate.sh`): strict shell suite where SKIP is
+  red, corruption torture on both uring legs, Phase 8 smoke, and the
+  no-open/no-flush coherence gates.
+- Local-only perf gate: serialized median-of-5 codex workload benchmark
+  against a pinned baseline; any per-phase median regression >5% is red.
+- The macOS NFS git validation script is documented as a manual release
+  gate to run on real hardware.
+
 ## [0.6.4] - 2026-03-25
 
 ### Fixed

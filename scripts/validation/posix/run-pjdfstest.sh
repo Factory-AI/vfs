@@ -12,7 +12,6 @@
 #   AGENTFS_BIN    agentfs executable to invoke (default: agentfs).
 #   PJDFSTEST_PROFILE   test profile to run (default: full).
 #   PJDFSTEST_MANIFEST  explicit manifest overriding --profile.
-#   AGENTFS_OVERLAY_PARTIAL_ORIGIN  enable partial-origin overlay mode when true/1.
 #   REPORT_DIR     directory where logs should be written.
 #   SKIP_CODE      exit code for missing prerequisites (default: 77).
 #
@@ -24,7 +23,7 @@ PJDFSTEST_DIR="${PJDFSTEST_DIR:-}"
 PJDFSTEST_PROFILE="${PJDFSTEST_PROFILE:-full}"
 PJDFSTEST_MANIFEST="${PJDFSTEST_MANIFEST:-}"
 PJDFSTEST_KNOWN_UNSUPPORTED="${PJDFSTEST_KNOWN_UNSUPPORTED:-}"
-PARTIAL_ORIGIN="${AGENTFS_OVERLAY_PARTIAL_ORIGIN:-}"
+PARTIAL_ORIGIN=""
 REPORT_DIR="${REPORT_DIR:-}"
 KEEP_WORK=0
 
@@ -47,7 +46,7 @@ usage() {
 print_testing_guidance() {
     cat >&2 <<'EOF'
 
-Relevant setup guidance from TESTING.md:
+Relevant setup guidance from docs/TESTING.md:
 
 ## pjdfstest
 
@@ -62,11 +61,11 @@ command -v prove
 command -v pjdfstest
 ```
 
-AgentFS harness command from TESTING.md:
+AgentFS harness command from docs/TESTING.md:
 
 ```bash
 scripts/validation/posix/run-pjdfstest.sh \
-  --agentfs-bin "$PWD/cli/target/debug/agentfs" \
+  --agentfs-bin "$PWD/target/debug/agentfs" \
   --pjdfstest-dir /path/to/pjdfstest \
   --profile phase45-ci
 ```
@@ -82,7 +81,10 @@ skip_missing() {
 resolve_agentfs() {
     if [[ "$AGENTFS_BIN" == */* ]]; then
         [[ -x "$AGENTFS_BIN" ]] || return 1
-        AGENTFS_RESOLVED="$AGENTFS_BIN"
+        # Absolutize: the harness cd's into its work and mount dirs before
+        # invoking the binary, which silently breaks a relative path (the
+        # exit-127 error only lands in init.log).
+        AGENTFS_RESOLVED="$(cd "$(dirname "$AGENTFS_BIN")" && pwd)/$(basename "$AGENTFS_BIN")"
     else
         AGENTFS_RESOLVED="$(command -v "$AGENTFS_BIN" 2>/dev/null)" || return 1
     fi
@@ -378,16 +380,14 @@ printf 'pjdfstest binary: %s\n' "$PJDFSTEST_RESOLVED"
 printf 'pjdfstest tests: %s\n' "$PJDFSTEST_TESTS"
 printf 'pjdfstest profile: %s\n' "$PJDFSTEST_PROFILE"
 if env_flag_enabled "$PARTIAL_ORIGIN"; then
-    export AGENTFS_OVERLAY_PARTIAL_ORIGIN=1
-    printf 'partial-origin overlay: enabled\n'
+    printf 'partial-origin overlay: enabled via --partial-origin on\n'
 else
-    unset AGENTFS_OVERLAY_PARTIAL_ORIGIN
     printf 'partial-origin overlay: disabled\n'
 fi
 printf 'Report directory: %s\n' "$REPORT_DIR"
 
 printf '%s\n' "$PJDFSTEST_PROFILE" >"$REPORT_DIR/selected-profile.txt"
-printf '%s\n' "${AGENTFS_OVERLAY_PARTIAL_ORIGIN:-}" >"$REPORT_DIR/partial-origin-env.txt"
+printf '%s\n' "$(env_flag_enabled "$PARTIAL_ORIGIN" && printf 'on' || printf 'off')" >"$REPORT_DIR/partial-origin-cli.txt"
 if [[ -n "$PJDFSTEST_RESOLVED_MANIFEST" ]]; then
     {
         printf 'path\t%s\n' "$PJDFSTEST_RESOLVED_MANIFEST"
@@ -422,7 +422,11 @@ if [[ ! -f "$DB_PATH" ]]; then
     exit 1
 fi
 
-"$AGENTFS_RESOLVED" mount "$DB_PATH" "$MOUNT_DIR" --foreground >"$REPORT_DIR/mount.log" 2>&1 &
+MOUNT_CMD=("$AGENTFS_RESOLVED" mount "$DB_PATH" "$MOUNT_DIR" --foreground)
+if env_flag_enabled "$PARTIAL_ORIGIN"; then
+    MOUNT_CMD+=(--partial-origin on)
+fi
+"${MOUNT_CMD[@]}" >"$REPORT_DIR/mount.log" 2>&1 &
 MOUNT_PID=$!
 
 mounted=0

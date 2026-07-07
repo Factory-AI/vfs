@@ -4,7 +4,8 @@
 __MACOSX/
 .AppleDouble
 .LSOverride
-Icon[]
+Icon[
+]
 
 # Thumbnails
 ._*
@@ -26,9 +27,11 @@ Temporary Items
 .apdisk
 
 .agentfs
+target/
 
 # Python bytecode cache
 __pycache__/
 
 # Large benchmark fixtures - regenerate via 'git clone --bare openai/codex'
 .agents/benchmarks/fixtures/
+.agents/missions/

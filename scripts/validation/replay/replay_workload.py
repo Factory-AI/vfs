@@ -541,7 +541,7 @@ def resolve_agentfs(agentfs_bin: str) -> str:
     if not resolved:
         raise PrerequisiteSkip(
             "agentfs binary not found. Build/install it first, or pass --agentfs-bin PATH "
-            "(TESTING.md: cd cli && cargo build --release && cp target/release/agentfs /usr/local/bin)."
+            "(for example: cargo build --release -p agentfs-cli --bins && cp target/release/agentfs /usr/local/bin)."
         )
     return resolved
 

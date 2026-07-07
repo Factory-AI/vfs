@@ -19,6 +19,9 @@ from pathlib import Path
 from statistics import mean
 from typing import Any, Optional
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lib import common  # noqa: E402
+
 
 OUTPUT_TAIL_CHARS = 20000
 HASH_BLOCK_BYTES = 1024 * 1024
@@ -91,9 +94,13 @@ def git_env():
 
 
 def run_git(argv, cwd):
+    # Honor the harness's pinned-git override: PATH shims are invisible inside
+    # the agentfs sandbox, so only an absolute system-path GIT avoids the
+    # daemonizing hook-manager shim (scripts/validation/lib/common.py).
+    git = os.environ.get("GIT", "git")
     started = time.perf_counter()
     proc = subprocess.run(
-        ["git"] + argv,
+        [git] + argv,
         cwd=str(cwd),
         env=git_env(),
         text=True,
@@ -101,7 +108,7 @@ def run_git(argv, cwd):
         stderr=subprocess.PIPE,
     )
     return {
-        "argv": ["git"] + argv,
+        "argv": [git] + argv,
         "cwd": str(cwd),
         "duration_seconds": time.perf_counter() - started,
         "returncode": proc.returncode,
@@ -588,6 +595,11 @@ def run_subprocess(argv: list[str], cwd: Path, env: dict[str, str], timeout: flo
         "duration_seconds": time.perf_counter() - started,
         "returncode": proc.returncode,
         "timed_out": timed_out,
+        # Full stdout is kept for JSON extraction and stripped before the
+        # record is embedded in the report: the workload's single-line JSON
+        # can exceed OUTPUT_TAIL_CHARS once temp paths grow (phase8 nests its
+        # TMPDIR several levels deep), and a truncated tail is unparseable.
+        "stdout": stdout,
         "stdout_tail": tail_text(stdout),
         "stderr_tail": tail_text(stderr),
         "stdout_bytes": len((stdout or "").encode("utf-8", errors="replace")),
@@ -596,8 +608,12 @@ def run_subprocess(argv: list[str], cwd: Path, env: dict[str, str], timeout: flo
     }
 
 
+def strip_stdout(run: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in run.items() if key != "stdout"}
+
+
 def parse_json_stdout(run: dict[str, Any]) -> Optional[dict[str, Any]]:
-    text = str(run.get("stdout_tail", "")).strip()
+    text = str(run.get("stdout") or run.get("stdout_tail", "")).strip()
     if text:
         try:
             value = json.loads(text)
@@ -633,9 +649,9 @@ def resolve_agentfs_bin(agentfs_bin: Optional[str], repo_root: Path) -> str:
     # measuring (debug is unoptimized and can be 10x slower), AND release tends
     # to be rebuilt more often than debug during active development, so we are
     # more likely to pick up recent source changes. Debug-first ordering bit us
-    # in Tier One (see RCA in the notes file): a stale debug binary missing the
-    # `fuse-modern` feature kept returning ENOSYS while the just-built release
-    # binary worked fine.
+    # in Tier One (see RCA in the notes file): a stale debug binary from the
+    # pre-ABI-collapse workspace kept returning ENOSYS while the just-built
+    # release binary worked fine.
     for candidate_path in (
         repo_root / "cli" / "target" / "release" / "agentfs",
         repo_root / "cli" / "target" / "debug" / "agentfs",
@@ -665,7 +681,7 @@ def resolve_agentfs_bin(agentfs_bin: Optional[str], repo_root: Path) -> str:
 
 def git_commit(repo_root: Path) -> Optional[str]:
     proc = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
+        [os.environ.get("GIT", "git"), "rev-parse", "HEAD"],
         cwd=str(repo_root),
         text=True,
         stdout=subprocess.PIPE,
@@ -690,10 +706,11 @@ def git_env() -> dict[str, str]:
 
 
 def run_git(argv: list[str], cwd: Path, *, env: Optional[dict[str, str]] = None, timeout: float = 60) -> subprocess.CompletedProcess[str]:
+    resolved_env = env or git_env()
     return subprocess.run(
-        ["git"] + argv,
+        [resolved_env.get("GIT", "git")] + argv,
         cwd=str(cwd),
-        env=env or git_env(),
+        env=resolved_env,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -702,7 +719,7 @@ def run_git(argv: list[str], cwd: Path, *, env: Optional[dict[str, str]] = None,
 
 
 def require_git() -> None:
-    if shutil.which("git") is None:
+    if shutil.which(os.environ.get("GIT", "git")) is None:
         raise RuntimeError("git executable is required")
 
 
@@ -843,6 +860,7 @@ def prepare_environment(temp_root: Path, profile: bool) -> dict[str, str]:
     env["XDG_CONFIG_HOME"] = str(home / ".config")
     env["XDG_CACHE_HOME"] = str(home / ".cache")
     env["XDG_DATA_HOME"] = str(home / ".local" / "share")
+    common.pin_distro_git(env, home, home=home)
 
     temp_dir = temp_root / "tmp"
     temp_dir.mkdir(parents=True, exist_ok=True)
@@ -1134,6 +1152,7 @@ def main(argv: list[str]) -> int:
     exit_code = 0
     result: dict[str, Any]
     try:
+        common.pin_distro_git(os.environ, temp_root)
         require_git()
         agentfs_bin = resolve_agentfs_bin(args.agentfs_bin, repo_root)
         env = prepare_environment(temp_root, args.profile)
@@ -1311,11 +1330,11 @@ def main(argv: list[str]) -> int:
                 "correctness_passed": correctness["passed"],
             },
             "native": {
-                "run": native_run,
+                "run": strip_stdout(native_run),
                 "workload": native_workload,
             },
             "agentfs_overlay": {
-                "run": agentfs_run,
+                "run": strip_stdout(agentfs_run),
                 "workload": agentfs_workload,
                 "profile_summaries": profile_summaries,
             },
@@ -1329,12 +1348,12 @@ def main(argv: list[str]) -> int:
                 "inspect_after": inspect_after,
                 "nonempty_sidecars": not no_sidecars,
                 "integrity": {
-                    "run": integrity_run,
+                    "run": strip_stdout(integrity_run),
                     "result": integrity_payload,
                 },
                 "backup": {
                     "path": str(backup_path),
-                    "run": backup_run,
+                    "run": strip_stdout(backup_run),
                     "inspect": backup_inspect,
                     "artifacts": backup_artifacts,
                 },

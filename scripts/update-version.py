@@ -1,433 +1,91 @@
 #!/usr/bin/env python3
 """
-Update version numbers across all AgentFS components.
+Update the Rust workspace version.
 
-Usage:
-    python scripts/update-version.py 0.1.0-pre.1
+Rust crates inherit their version from the root [workspace.package] table, so
+there is no per-crate Cargo.toml or per-crate Cargo.lock sync job anymore.
+This script updates the single workspace version and refreshes the root lockfile.
 """
 
+from __future__ import annotations
+
 import argparse
-import json
 import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import List
+
+SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$")
+WORKSPACE_VERSION_RE = re.compile(
+    r'(^\[workspace\.package\]\s*(?:(?!^\[).)*?^version\s*=\s*)"[^"]*"',
+    re.MULTILINE | re.DOTALL,
+)
 
 
 def parse_version(version: str) -> str:
-    """Validate and normalize version string."""
-    # Basic semver validation (supports pre-release versions)
-    pattern = r'^\d+\.\d+\.\d+(-[a-zA-Z0-9.-]+)?$'
-    if not re.match(pattern, version):
+    if not SEMVER_RE.match(version):
         raise ValueError(
-            f"Invalid version format: {version}. "
-            "Expected format: X.Y.Z or X.Y.Z-pre.N"
+            f"Invalid version format: {version}. Expected X.Y.Z or X.Y.Z-pre.N"
         )
     return version
 
 
-def update_cargo_toml(file_path: Path, new_version: str) -> bool:
-    """Update version in a Cargo.toml file."""
-    try:
-        content = file_path.read_text()
-
-        # Find and replace the version line under [package]
-        # Match version = "..." with proper spacing
-        pattern = r'(^\[package\].*?^version\s*=\s*)"[^"]*"'
-        replacement = rf'\1"{new_version}"'
-
-        new_content = re.sub(
-            pattern,
-            replacement,
-            content,
-            count=1,
-            flags=re.MULTILINE | re.DOTALL
-        )
-
-        if new_content == content:
-            print(f"Warning: No version field found in {file_path}")
-            return False
-
-        file_path.write_text(new_content)
-        print(f" Updated {file_path.relative_to(file_path.parents[3])}")
-        return True
-
-    except Exception as e:
-        print(f"Error updating {file_path}: {e}", file=sys.stderr)
-        return False
-
-
-def update_package_json(file_path: Path, new_version: str) -> bool:
-    """Update version in a package.json file."""
-    try:
-        with open(file_path, 'r') as f:
-            data = json.load(f)
-
-        if 'version' not in data:
-            print(f"Warning: No version field found in {file_path}")
-            return False
-
-        data['version'] = new_version
-
-        with open(file_path, 'w') as f:
-            json.dump(data, f, indent=2)
-            f.write('\n')  # Add trailing newline
-
-        print(f" Updated {file_path.relative_to(file_path.parents[3])}")
-        return True
-
-    except Exception as e:
-        print(f"Error updating {file_path}: {e}", file=sys.stderr)
-        return False
-
-
-def update_pyproject_toml(file_path: Path, new_version: str) -> bool:
-    """Update version in a pyproject.toml file."""
-    try:
-        content = file_path.read_text()
-
-        # Find and replace the version line under [project]
-        # Match version = "..." with proper spacing
-        pattern = r'(^\[project\].*?^version\s*=\s*)"[^"]*"'
-        replacement = rf'\1"{new_version}"'
-
-        new_content = re.sub(
-            pattern,
-            replacement,
-            content,
-            count=1,
-            flags=re.MULTILINE | re.DOTALL
-        )
-
-        if new_content == content:
-            print(f"Warning: No version field found in {file_path}")
-            return False
-
-        file_path.write_text(new_content)
-        print(f" Updated {file_path.relative_to(file_path.parents[3])}")
-        return True
-
-    except Exception as e:
-        print(f"Error updating {file_path}: {e}", file=sys.stderr)
-        return False
-
-def update_py_init(file_path: Path, new_version: str) -> bool:
-    """Update version in a __init__.py file."""
-    try:
-        content = file_path.read_text()
-
-        # Find and replace the version line under [project]
-        # Match version = "..." with proper spacing
-        pattern = r'__version__ = "[^"]+"'
-        replacement = rf'__version__ = "{new_version}"'
-
-        new_content = re.sub(
-            pattern,
-            replacement,
-            content,
-            count=1,
-            flags=re.MULTILINE | re.DOTALL
-        )
-
-        if new_content == content:
-            print(f"Warning: No version field found in {file_path}")
-            return False
-
-        file_path.write_text(new_content)
-        print(f" Updated {file_path.relative_to(file_path.parents[3])}")
-        return True
-
-    except Exception as e:
-        print(f"Error updating {file_path}: {e}", file=sys.stderr)
-        return False
-
-
-def update_cargo_lock(crate_dir: Path) -> bool:
-    """Update Cargo.lock by regenerating it in the crate directory."""
-    try:
-        # Use cargo generate-lockfile to force regeneration of Cargo.lock
-        # This ensures path dependencies get their versions updated
-        result = subprocess.run(
-            ['cargo', 'generate-lockfile'],
-            cwd=crate_dir,
-            capture_output=True,
-            text=True
-        )
-
-        if result.returncode == 0:
-            return True
-        else:
-            print(f"Error updating Cargo.lock: {result.stderr}", file=sys.stderr)
-            return False
-
-    except Exception as e:
-        print(f"Error updating Cargo.lock: {e}", file=sys.stderr)
-        return False
-
-
-def update_package_lock(package_dir: Path) -> bool:
-    """Update package-lock.json by running npm install."""
-    try:
-        result = subprocess.run(
-            ['npm', 'install'],
-            cwd=package_dir,
-            capture_output=True,
-            text=True
-        )
-
-        if result.returncode == 0:
-            return True
-        else:
-            print(f"Error updating package-lock.json: {result.stderr}", file=sys.stderr)
-            return False
-
-    except Exception as e:
-        print(f"Error updating package-lock.json: {e}", file=sys.stderr)
-        return False
-
-
-def update_uv_lock(package_dir: Path) -> bool:
-    """Update uv.lock by running uv lock."""
-    try:
-        result = subprocess.run(
-            ['uv', 'lock'],
-            cwd=package_dir,
-            capture_output=True,
-            text=True
-        )
-
-        if result.returncode == 0:
-            return True
-        else:
-            print(f"Error updating uv.lock: {result.stderr}", file=sys.stderr)
-            return False
-
-    except Exception as e:
-        print(f"Error updating uv.lock: {e}", file=sys.stderr)
-        return False
-
-
-def git_commit_and_tag(root: Path, version: str, components: list) -> bool:
-    """Create a git commit and tag for the version update."""
-    try:
-        print("\nCreating git commit and tag...")
-
-        # Stage only the files we modified
-        files_to_add = []
-        for component in components:
-            # Add version file (Cargo.toml, package.json, or pyproject.toml)
-            files_to_add.append(str(component['version_file'].relative_to(root)))
-
-            # Add lock file (Cargo.lock, package-lock.json, or uv.lock)
-            version_file_str = str(component['version_file'])
-            if 'Cargo.toml' in version_file_str:
-                lock_file = component['lock_dir'] / 'Cargo.lock'
-            elif 'pyproject.toml' in version_file_str:
-                lock_file = component['lock_dir'] / 'uv.lock'
-            else:
-                lock_file = component['lock_dir'] / 'package-lock.json'
-
-            if lock_file.exists():
-                files_to_add.append(str(lock_file.relative_to(root)))
-
-        result = subprocess.run(
-            ['git', 'add'] + files_to_add,
-            cwd=root,
-            capture_output=True,
-            text=True
-        )
-
-        if result.returncode != 0:
-            print(f"Error staging changes: {result.stderr}", file=sys.stderr)
-            return False
-
-        # Commit
-        commit_message = f"AgentFS {version}"
-        result = subprocess.run(
-            ['git', 'commit', '-m', commit_message],
-            cwd=root,
-            capture_output=True,
-            text=True
-        )
-
-        if result.returncode != 0:
-            print(f"Error creating commit: {result.stderr}", file=sys.stderr)
-            return False
-
-        print(f"✓ Created commit: {commit_message}")
-
-        # Create tag
-        tag_name = f"v{version}"
-        result = subprocess.run(
-            ['git', 'tag', tag_name],
-            cwd=root,
-            capture_output=True,
-            text=True
-        )
-
-        if result.returncode != 0:
-            print(f"Error creating tag: {result.stderr}", file=sys.stderr)
-            return False
-
-        print(f"✓ Created tag: {tag_name}")
-
-        return True
-
-    except Exception as e:
-        print(f"Error in git operations: {e}", file=sys.stderr)
-        return False
-
-
 def find_project_root() -> Path:
-    """Find the project root directory."""
     current = Path(__file__).resolve().parent
-    # Go up until we find the root (where cli, sdk, sandbox directories are)
     while current.parent != current:
-        if (current / 'cli').exists() and (current / 'sdk').exists():
+        if (current / "Cargo.toml").is_file() and (current / "cli").is_dir():
             return current
         current = current.parent
     raise RuntimeError("Could not find project root")
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description='Update version numbers across all AgentFS components'
-    )
-    parser.add_argument(
-        'version',
-        help='Version number (e.g., 0.1.0 or 0.1.0-pre.1)'
-    )
-    parser.add_argument(
-        '--dry-run',
-        action='store_true',
-        help='Show what would be updated without making changes'
-    )
+def update_workspace_version(root: Path, version: str, dry_run: bool) -> bool:
+    manifest = root / "Cargo.toml"
+    content = manifest.read_text()
+    new_content, count = WORKSPACE_VERSION_RE.subn(rf'\1"{version}"', content, count=1)
+    if count != 1:
+        raise RuntimeError("Could not find [workspace.package] version in root Cargo.toml")
+    if new_content == content:
+        print(f"Workspace version already {version}")
+        return False
+    if dry_run:
+        print(f"Would update {manifest.relative_to(root)} to {version}")
+    else:
+        manifest.write_text(new_content)
+        print(f"Updated {manifest.relative_to(root)} to {version}")
+    return True
 
+
+def refresh_lockfile(root: Path, dry_run: bool) -> None:
+    if dry_run:
+        print("Would run: cargo generate-lockfile")
+        return
+    result = subprocess.run(
+        ["cargo", "generate-lockfile"],
+        cwd=root,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("cargo generate-lockfile failed")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Update the AgentFS workspace version")
+    parser.add_argument("version", help="Version number, for example 0.6.5 or 0.7.0-pre.1")
+    parser.add_argument("--dry-run", action="store_true", help="Print changes without writing files")
     args = parser.parse_args()
 
     try:
         version = parse_version(args.version)
-    except ValueError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    # Find project root
-    try:
         root = find_project_root()
-    except RuntimeError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    print(f"Updating version to: {version}")
-    print(f"Project root: {root}\n")
-
-    # Define all components to update
-    components = [
-        # Rust crates
-        {
-            'version_file': root / 'cli' / 'Cargo.toml',
-            'version_func': update_cargo_toml,
-            'lock_dir': root / 'cli',
-            'lock_func': update_cargo_lock,
-            'name': 'cli'
-        },
-        {
-            'version_file': root / 'sandbox' / 'Cargo.toml',
-            'version_func': update_cargo_toml,
-            'lock_dir': root / 'sandbox',
-            'lock_func': update_cargo_lock,
-            'name': 'sandbox'
-        },
-        {
-            'version_file': root / 'sdk' / 'rust' / 'Cargo.toml',
-            'version_func': update_cargo_toml,
-            'lock_dir': root / 'sdk' / 'rust',
-            'lock_func': update_cargo_lock,
-            'name': 'sdk/rust'
-        },
-        # TypeScript SDK
-        {
-            'version_file': root / 'sdk' / 'typescript' / 'package.json',
-            'version_func': update_package_json,
-            'lock_dir': root / 'sdk' / 'typescript',
-            'lock_func': update_package_lock,
-            'name': 'sdk/typescript'
-        },
-        # Python SDK: pyproject.toml
-        {
-            'version_file': root / 'sdk' / 'python' / 'pyproject.toml',
-            'version_func': update_pyproject_toml,
-            'lock_dir': root / 'sdk' / 'python',
-            'lock_func': update_uv_lock,
-            'name': 'sdk/python'
-        },
-        # Python SDK: __init__.py
-        {
-            'version_file': root / 'sdk' / 'python' / 'agentfs_sdk' / '__init__.py',
-            'version_func': update_py_init,
-            'lock_dir': root / 'sdk' / 'python',
-            'lock_func': lambda _: True,
-            'name': 'sdk/python'
-        },
-    ]
-
-    if args.dry_run:
-        print("DRY RUN - No files will be modified\n")
-        for component in components:
-            if component['version_file'].exists():
-                print(f"Would update: {component['version_file'].relative_to(root)}")
-                print(f"  and lock file in {component['name']}/")
-            else:
-                print(f"Warning: File not found: {component['version_file'].relative_to(root)}")
-        print("\nWould also:")
-        print(f"  - Create git commit: 'AgentFS {version}'")
-        print(f"  - Create git tag: 'v{version}'")
-        sys.exit(0)
-
-    # Update all components
-    all_success = True
-
-    for component in components:
-        version_file = component['version_file']
-        if not version_file.exists():
-            print(f"Warning: File not found: {version_file.relative_to(root)}")
-            all_success = False
-            continue
-
-        # Update version file
-        if component['version_func'](version_file, version):
-            # Update lock file
-            if component['lock_func'](component['lock_dir']):
-                print(f"✓ Updated {component['name']} lock file")
-            else:
-                all_success = False
-        else:
-            all_success = False
-
-    if not all_success:
-        print("\n❌ Some files failed to update", file=sys.stderr)
-        sys.exit(1)
-
-    # Update Cargo.lock files again to pick up new versions of workspace dependencies
-    # (sandbox and cli both depend on sdk/rust which was updated after their initial lock update)
-    print("\nUpdating Cargo.lock files to pick up new dependency versions...")
-    for crate_name in ['sandbox', 'cli']:
-        if update_cargo_lock(root / crate_name):
-            print(f"✓ Updated {crate_name}/Cargo.lock with new dependency versions")
-        else:
-            print(f"❌ Failed to update {crate_name}/Cargo.lock", file=sys.stderr)
-            sys.exit(1)
-
-    print("\n✅ All files and lock files updated successfully!")
-
-    # Create git commit and tag
-    if not git_commit_and_tag(root, version, components):
-        print("\n❌ Git operations failed", file=sys.stderr)
-        sys.exit(1)
-
-    print("\n✅ Version update complete! Don't forget to push the commit and tag.")
+        changed = update_workspace_version(root, version, args.dry_run)
+        if changed:
+            refresh_lockfile(root, args.dry_run)
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    return 0
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,131 @@
+{
+  "attestation": "VFS right-thing restructure final gate (VAL-GATE-012, VAL-CROSS-012)",
+  "commit": "230c30a6f2e7184b0578eb2dec087b79c0f78078",
+  "generated_at": "2026-07-06T03:06:36+00:00",
+  "runner": {
+    "kernel": "Linux 7.1.2-3-cachyos x86_64 GNU/Linux",
+    "toolchain": "cargo 1.97.0-nightly (4f9b52075 2026-05-01)"
+  },
+  "gate": {
+    "entrypoint": "scripts/gate.sh",
+    "started_at": "2026-07-06T02:57:30Z",
+    "ended_at": "2026-07-06T03:01:09Z",
+    "exit_code": 0,
+    "stages": [
+      {
+        "stage": "cargo fmt --all -- --check",
+        "ran": true
+      },
+      {
+        "stage": "cargo clippy --workspace --all-targets -- -D warnings",
+        "ran": true
+      },
+      {
+        "stage": "cargo test --workspace",
+        "ran": true
+      },
+      {
+        "stage": "cargo build --release --workspace --bins",
+        "ran": true
+      },
+      {
+        "stage": "crates/agentfs-cli/tests/all.sh (strict)",
+        "ran": true
+      },
+      {
+        "stage": "phase8-validation.py --smoke",
+        "ran": true
+      },
+      {
+        "stage": "consistency-canon.sh",
+        "ran": true
+      }
+    ],
+    "cargo_test_suite_passed_counts": [
+      96,
+      1,
+      1,
+      236,
+      1,
+      1,
+      1,
+      75,
+      3,
+      31,
+      0,
+      1,
+      0,
+      0,
+      0
+    ],
+    "shell_suite": {
+      "strict": true,
+      "summary": "PASS=24 SKIP=0 FAIL=0",
+      "results": {
+        "init": "PASS",
+        "cli-smoke": "PASS",
+        "linux-syscalls": "PASS",
+        "run-syscalls": "PASS",
+        "run-bash": "PASS",
+        "run-git": "PASS",
+        "run-read-scoping": "PASS",
+        "profile-error-summary": "PASS",
+        "ephemeral-sidecar-cleanup": "PASS",
+        "teardown-bounded": "PASS",
+        "fuse-sigint-panic-census": "PASS",
+        "sigkill-recovery": "PASS",
+        "signal-teardown": "PASS",
+        "corruption-torture-legacy": "PASS",
+        "corruption-torture-uring": "PASS",
+        "mount": "PASS",
+        "second-opener": "PASS",
+        "migrate-consolidation": "PASS",
+        "mcp-server": "PASS",
+        "overlay-whiteout": "PASS",
+        "overlay-delta-in-base-dir": "PASS",
+        "overlay-base-dir-rename-exdev": "PASS",
+        "fuse-cache-invalidation": "PASS",
+        "symlinks": "PASS"
+      }
+    },
+    "phase8": {
+      "failed_gates": [],
+      "gates": {
+        "base_read_repeated_read_threshold": "passed",
+        "external_base_mutation_coherence": "passed",
+        "flush_coherence": "passed",
+        "fuse_serialization_parallelism": "passed",
+        "git_ai_process_census": "passed",
+        "git_workload_phase8_thresholds": "passed",
+        "noopen_coherence": "passed",
+        "phase7_validation_smoke": "passed",
+        "phase8_concurrent_git_stress": "passed",
+        "phase8_writeback_durability": "passed",
+        "phase8_writeback_no_fsync_crash": "passed"
+      }
+    },
+    "consistency_canon": "PASS"
+  },
+  "pjdfstest_phase5_ci": {
+    "command": "scripts/validation/posix/run-pjdfstest.sh --profile phase5-ci --agentfs-bin target/release/agentfs",
+    "result": "PASS",
+    "tests": "311",
+    "note": "run standalone at the attested HEAD"
+  },
+  "cross_surface_flows": {
+    "result": "PASS",
+    "checks_ok": 30,
+    "checks_fail": 0,
+    "assertions": [
+      "VAL-CROSS-001",
+      "VAL-CROSS-002",
+      "VAL-CROSS-003",
+      "VAL-CROSS-004",
+      "VAL-CROSS-005",
+      "VAL-CROSS-006",
+      "VAL-CROSS-011",
+      "VAL-CROSS-013"
+    ]
+  },
+  "failed_gates": []
+}

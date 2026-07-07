@@ -1,0 +1,77 @@
+{
+  "contract": "library/perf-contract.md: median-of-5 per phase; red iff >5% relative AND >10ms absolute vs the active baseline",
+  "baseline_artifact": ".agents/benchmarks/restructure-baseline/medians.json",
+  "baseline_commit": "2b811f03493e861e5a7786592d25ac73b39e1aba (post-M3 rebaseline, orchestrator-signed; archived M1 artifact: medians-m1.json)",
+  "candidate_label": "m7-opt-sandbox-bringup-repeat",
+  "candidate_commit": "dae8aa61ac648125d6f0ff3172c16764581eea84",
+  "attested_commit": "230c30a6f2e7184b0578eb2dec087b79c0f78078",
+  "citation_note": "Official quiet-window candidate/sentinel pair plus mandated brittle-phase repeat recorded at dae8aa6 (m7-opt-sandbox-bringup; same-window sentinel green, first-run clone red evaporated on the repeat per the round-2 brittle-phase rule). Cited at the attested HEAD per the orchestrator round-3 ruling: the only later commit (230c30a, darwin seatbelt read scoping) changes cfg(target_os=macos) code, docs, and clap help text only - Linux binary perf semantics are unchanged.",
+  "iterations": 5,
+  "invocation": "python3 scripts/validation/git-workload-benchmark-multi.py --label m7-opt-sandbox-bringup-repeat --iterations 5 --warmup 1 --agentfs-bin $PWD/target/release/agentfs --output <out.json> --keep-iterations --source .agents/benchmarks/fixtures/codex --read-files 64 --read-bytes 4096 --edit-files 8",
+  "phases": {
+    "checkout": {
+      "baseline_median_ms": 56.684,
+      "baseline_median": 56.684,
+      "current_median_ms": 56.912,
+      "current_median": 56.912,
+      "delta_ms": 0.228,
+      "regression_percent": 0.4,
+      "passed": true
+    },
+    "clone": {
+      "baseline_median_ms": 2800.892,
+      "baseline_median": 2800.892,
+      "current_median_ms": 2882.772,
+      "current_median": 2882.772,
+      "delta_ms": 81.88,
+      "regression_percent": 2.92,
+      "passed": true
+    },
+    "diff": {
+      "baseline_median_ms": 65.644,
+      "baseline_median": 65.644,
+      "current_median_ms": 25.852,
+      "current_median": 25.852,
+      "delta_ms": -39.791,
+      "regression_percent": -60.62,
+      "passed": true
+    },
+    "edit": {
+      "baseline_median_ms": 4.994,
+      "baseline_median": 4.994,
+      "current_median_ms": 4.912,
+      "current_median": 4.912,
+      "delta_ms": -0.081,
+      "regression_percent": -1.63,
+      "passed": true
+    },
+    "fsck": {
+      "baseline_median_ms": 214.968,
+      "baseline_median": 214.968,
+      "current_median_ms": 177.918,
+      "current_median": 177.918,
+      "delta_ms": -37.05,
+      "regression_percent": -17.24,
+      "passed": true
+    },
+    "read_search": {
+      "baseline_median_ms": 8.786,
+      "baseline_median": 8.786,
+      "current_median_ms": 8.03,
+      "current_median": 8.03,
+      "delta_ms": -0.756,
+      "regression_percent": -8.6,
+      "passed": true
+    },
+    "status": {
+      "baseline_median_ms": 177.976,
+      "baseline_median": 177.976,
+      "current_median_ms": 145.761,
+      "current_median": 145.761,
+      "delta_ms": -32.214,
+      "regression_percent": -18.1,
+      "passed": true
+    }
+  },
+  "all_phases_passed": true
+}

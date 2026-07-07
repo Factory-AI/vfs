@@ -382,7 +382,6 @@ def child_env(agentfs_bin: str, output_dir: Path) -> dict[str, str]:
     env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
     env.setdefault("NO_COLOR", "1")
     env["AGENTFS_BIN"] = agentfs_bin
-    env.pop("AGENTFS_OVERLAY_PARTIAL_ORIGIN", None)
     child_tmp = output_dir / "child-tmp"
     child_tmp.mkdir(parents=True, exist_ok=True)
     env["TMPDIR"] = str(child_tmp)

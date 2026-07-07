@@ -41,7 +41,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional
 
-OUTPUT_TAIL_CHARS = 8000
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lib.common import resolve_agentfs_bin, tail_text  # noqa: E402
 
 EXEC_WORKLOAD = r'''
 import ctypes
@@ -160,29 +161,6 @@ print(json.dumps({"mismatches": mismatches}))
 '''
 
 
-def tail_text(text: str) -> str:
-    return text if len(text) <= OUTPUT_TAIL_CHARS else text[-OUTPUT_TAIL_CHARS:]
-
-
-def resolve_agentfs_bin(agentfs_bin: Optional[str], repo_root: Path) -> str:
-    if agentfs_bin:
-        candidate = Path(agentfs_bin).expanduser()
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return str(candidate.resolve())
-        if os.sep not in agentfs_bin:
-            found = shutil.which(agentfs_bin)
-            if found:
-                return found
-        raise RuntimeError(f"agentfs binary not found or not executable: {agentfs_bin}")
-    for candidate in (
-        repo_root / "cli" / "target" / "release" / "agentfs",
-        repo_root / "cli" / "target" / "debug" / "agentfs",
-    ):
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return str(candidate)
-    raise RuntimeError("no agentfs binary found; pass --agentfs-bin or set AGENTFS_BIN")
-
-
 def parse_workload_json(stdout: str) -> Optional[dict[str, Any]]:
     for line in reversed(stdout.splitlines()):
         line = line.strip()
@@ -199,7 +177,7 @@ def parse_workload_json(stdout: str) -> Optional[dict[str, Any]]:
 
 def parse_fuse_counters(output: str) -> Optional[dict[str, Any]]:
     for line in reversed(output.splitlines()):
-        if '"agentfs_profile_summary"' not in line or '"fuse_session"' not in line:
+        if '"agentfs_profile_summary"' not in line:
             continue
         start = line.find("{")
         if start < 0:
@@ -209,7 +187,7 @@ def parse_fuse_counters(output: str) -> Optional[dict[str, Any]]:
         except json.JSONDecodeError:
             continue
         counters = value.get("counters")
-        if isinstance(counters, dict):
+        if isinstance(counters, dict) and any(key.startswith("fuse_") for key in counters):
             return counters
     return None
 
@@ -255,6 +233,38 @@ def run_one(
         )
     result["passed"] = passed
     return result
+
+
+def cleanup_run_session_dir(session_id: str) -> None:
+    """Remove exactly the session dir a run leg created.
+
+    Never sweeps ~/.agentfs/run wholesale (the user may have real sessions
+    there), and never raises: this runs in a finally block, so an exception
+    here would mask the leg's real failure. If the leg died with its FUSE
+    mount still live or wedged, stats under the mountpoint fail (ENOTCONN)
+    and a bare rmtree would silently leave the dir behind — detach the mount
+    first so the dir actually goes away.
+    """
+    session_dir = Path.home() / ".agentfs" / "run" / session_id
+    mountpoint = session_dir / "mnt"
+    try:
+        os.stat(mountpoint)
+        needs_unmount = os.path.ismount(mountpoint)
+    except FileNotFoundError:
+        needs_unmount = False
+    except OSError:
+        needs_unmount = True
+    if needs_unmount:
+        try:
+            subprocess.run(
+                ["fusermount3", "-uz", str(mountpoint)],
+                check=False,
+                capture_output=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+    shutil.rmtree(session_dir, ignore_errors=True)
 
 
 def base_env(extra: dict[str, str]) -> dict[str, str]:
@@ -319,20 +329,24 @@ def main() -> int:
             base_root = temp_root / f"{label}-base"
             base_root.mkdir()
             (base_root / "base.txt").write_bytes(b"base-content\n")
+            session_id = f"noopen-coh-{uuid.uuid4().hex[:8]}"
             argv = [
                 agentfs_bin,
                 "run",
                 "--session",
-                f"noopen-coh-{uuid.uuid4().hex[:8]}",
+                session_id,
                 "--no-default-allows",
                 "--",
                 sys.executable,
                 "-c",
                 OVERLAY_WORKLOAD,
             ]
-            runs.append(
-                run_one(argv, base_root, base_env(extra), args.timeout, label, noopen)
-            )
+            try:
+                runs.append(
+                    run_one(argv, base_root, base_env(extra), args.timeout, label, noopen)
+                )
+            finally:
+                cleanup_run_session_dir(session_id)
 
     resolutions = sum(r.get("fuse_ino_file_resolutions") or 0 for r in runs if r["noopen"])
     upgrades = sum(r.get("fuse_ino_file_upgrades") or 0 for r in runs if r["noopen"])

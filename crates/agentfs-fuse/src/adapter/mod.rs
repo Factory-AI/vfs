@@ -1,0 +1,3073 @@
+mod cache;
+pub(crate) mod config;
+mod ino_files;
+mod write_buffer;
+
+use self::cache::{AdapterCaches, CachedDirEntry, KeepCacheFingerprint, NotifyPolicy};
+use self::config::{FuseConfig, FuseKernelCacheConfig, ReaddirPlusMode, UringConfig};
+use self::ino_files::InoFile;
+use self::write_buffer::{
+    flush_pending_batched_out_of_lock, OpenFile, PendingDrain, WriteBuffer,
+    FUSE_COALESCE_FLUSH_BYTES,
+};
+use crate::transport::{
+    consts::{
+        FOPEN_CACHE_DIR, FOPEN_KEEP_CACHE, FUSE_ASYNC_READ, FUSE_AUTO_INVAL_DATA,
+        FUSE_CACHE_SYMLINKS, FUSE_DO_READDIRPLUS, FUSE_NO_OPENDIR_SUPPORT, FUSE_NO_OPEN_SUPPORT,
+        FUSE_OVER_IO_URING, FUSE_PARALLEL_DIROPS, FUSE_READDIRPLUS_AUTO, FUSE_WRITEBACK_CACHE,
+    },
+    fuse_forget_one, FileAttr, FileType, Filesystem, KernelConfig, MountOption, ReplyAttr,
+    ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen,
+    ReplyStatfs, ReplyWrite, Request,
+};
+use agentfs_core::error::Error as SdkError;
+use agentfs_core::fs::{
+    KernelCachePolicy, WriteRange, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFSOCK,
+};
+use agentfs_core::semantics::Semantics;
+use agentfs_core::{BoxedFile, DirEntry, FileSystem, FsError, Stats, TimeChange};
+use parking_lot::Mutex;
+use std::{
+    collections::{HashMap, HashSet},
+    ffi::OsStr,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+use tokio::runtime::Runtime;
+
+/// Convert an SDK error to an errno code for FUSE replies.
+///
+/// If the error is a filesystem-specific FsError, returns the appropriate
+/// errno code (ENOENT, EEXIST, ENOTDIR, etc.). Database busy errors and
+/// connection pool timeouts return EAGAIN to signal the caller should retry.
+/// Otherwise falls back to EIO.
+fn error_to_errno(e: &SdkError) -> i32 {
+    let errno = match e {
+        SdkError::Fs(fs_err) => fs_err.to_errno(),
+        SdkError::Io(io_err) => io_err.raw_os_error().unwrap_or(libc::EIO),
+        SdkError::Database(turso::Error::Busy(_)) => libc::EAGAIN,
+        SdkError::ConnectionPoolTimeout => libc::EAGAIN,
+        _ => libc::EIO,
+    };
+    // Debug capture: SdkError Display no longer carries the source cause
+    // (source-only chaining), and this trace needs the full detail.
+    tracing::debug!(target: "agentfs_errno", error = ?e, errno, "FUSE error reply");
+    errno
+}
+
+/// Maximize the file descriptor limit by raising the soft limit to the hard limit.
+///
+/// This helps avoid "too many open files" errors when passthrough filesystems
+/// cache O_PATH file descriptors for inode handles. Unlike raising the hard limit,
+/// this does not require root privileges.
+fn maximize_fd_limit() {
+    let mut lim: libc::rlimit = unsafe { std::mem::zeroed() };
+    let result = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) };
+    if result == 0 {
+        let old_soft = lim.rlim_cur;
+        lim.rlim_cur = lim.rlim_max;
+        let result = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) };
+        if result == 0 {
+            tracing::debug!("Raised fd limit from {} to {}", old_soft, lim.rlim_max);
+        } else {
+            tracing::warn!(
+                "Failed to raise fd limit: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    } else {
+        tracing::warn!(
+            "Failed to get fd limit: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+/// Options for mounting an agent filesystem via FUSE.
+#[derive(Debug, Clone)]
+pub struct FuseMountOptions {
+    /// The mountpoint path.
+    pub mountpoint: PathBuf,
+    /// Automatically unmount when the process exits.
+    pub auto_unmount: bool,
+    /// Allow root to access the mount.
+    pub allow_root: bool,
+    /// Allow other system users to access the mount.
+    /// Requires 'user_allow_other' in /etc/fuse.conf for non-root users.
+    pub allow_other: bool,
+    /// Filesystem name shown in mount output.
+    pub fsname: String,
+    /// User ID to report for all files (defaults to current user).
+    pub uid: Option<u32>,
+    /// Group ID to report for all files (defaults to current group).
+    pub gid: Option<u32>,
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static MUTATION_INVALIDATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Records that an invalidation flowed through this thread for the active
+/// mutation. Zero overhead in release builds.
+#[inline(always)]
+fn record_mutation_invalidation() {
+    #[cfg(debug_assertions)]
+    MUTATION_INVALIDATIONS.with(|c| c.set(c.get().saturating_add(1)));
+}
+
+/// RAII audit guard: captures the per-thread invalidation count at the start of
+/// a mutation. Calling [`MutationAudit::assert_invalidated`] on the success path
+/// asserts (debug builds only) that at least one kernel-cache invalidation was
+/// recorded between construction and the assertion. Compiles to a ZST with
+/// no instructions in release builds.
+struct MutationAudit {
+    #[cfg(debug_assertions)]
+    start: u64,
+}
+
+impl MutationAudit {
+    #[inline(always)]
+    fn new() -> Self {
+        Self {
+            #[cfg(debug_assertions)]
+            start: MUTATION_INVALIDATIONS.with(|c| c.get()),
+        }
+    }
+
+    /// Consumes the audit for a handler that turned out not to mutate
+    /// anything (e.g. a FLUSH with no buffered writes), so no invalidation
+    /// is required.
+    #[inline(always)]
+    fn discard_no_mutation(self) {}
+
+    /// Asserts that the success branch of a mutation called
+    /// `invalidate_inode_cache` or `invalidate_entry_cache` at least once.
+    /// No-op in release; intentionally takes `self` so the audit can only be
+    /// asserted once per mutation.
+    #[inline(always)]
+    fn assert_invalidated(self, _op: &'static str) {
+        #[cfg(debug_assertions)]
+        {
+            let end = MUTATION_INVALIDATIONS.with(|c| c.get());
+            debug_assert!(
+                end > self.start,
+                "FUSE mutation `{}` must call invalidate_inode_cache or invalidate_entry_cache before replying with success",
+                _op
+            );
+        }
+    }
+}
+
+struct AgentFSFuse {
+    fs: Arc<dyn FileSystem>,
+    semantics: Semantics,
+    runtime: Runtime,
+    /// Env-backed kernel cache safety configuration for this mount.
+    cache_config: FuseKernelCacheConfig,
+    /// Env-backed FUSE-over-io_uring settings for this mount.
+    uring: UringConfig,
+    /// Maps file handle -> open file state
+    open_files: Arc<Mutex<HashMap<u64, OpenFile>>>,
+    /// Adapter cache state and the epoch/reply-lock coherence protocol.
+    caches: AdapterCaches,
+    /// Next file handle to allocate
+    next_fh: AtomicU64,
+    /// Whether kernel cache invalidations are sent synchronously before replies.
+    sync_inval: bool,
+    /// Whether kernel-cache notifications are sent even for mutations the
+    /// kernel itself initiated and whose FUSE reply already carries the fresh
+    /// state (setattr's attr reply, create/mknod/mkdir/symlink/link's entry
+    /// reply). Default false: the kernel's own caches are coherent for its own
+    /// mutations, and notifying purges the just-established dentry, attrs and
+    /// page cache, forcing re-LOOKUP/GETATTR/READ storms (~19.9k notifications
+    /// per codex clone). Server-initiated divergence (deferred commits) stays
+    /// bounded by the entry/attr TTLs exactly as deferred notification latency
+    /// already was. Set `AGENTFS_FUSE_SELF_INVAL=1` to restore the old
+    /// notify-on-every-mutation behaviour. Adapter-internal caches (epoch,
+    /// attr/entry/dir maps) are invalidated regardless.
+    self_inval: bool,
+    /// When true, force a synchronous SDK drain (SQLite commit) on flush/release.
+    /// Default false: under the Tier-4 overlay, reads are served from pending
+    /// writes, so close-time commits are unnecessary work that serialise the
+    /// clone critical path. Durability is preserved by fsync, the batcher
+    /// timer/bytes/global triggers, and finalize-on-unmount. Set
+    /// `AGENTFS_DRAIN_ON_RELEASE=1` to restore the legacy commit-on-close.
+    drain_on_release: bool,
+    /// When true, FLUSH invalidates the inode even when the handle had no
+    /// buffered writes. Default false: a read-only close mutates nothing, and
+    /// the unconditional invalidation permanently destroyed keep-cache
+    /// eligibility (the drift guard's `dropped` set is sticky), forcing every
+    /// re-open of an unchanged base file back into FUSE READ round trips.
+    /// Set `AGENTFS_FUSE_FLUSH_INVAL=1` to restore the old behaviour.
+    flush_inval_always: bool,
+    /// When true, `opendir` grants `FOPEN_CACHE_DIR | FOPEN_KEEP_CACHE` so
+    /// warm getdents are served from the kernel page cache. Requires the same
+    /// kernel-cache safety as keep-cache (non-serial workers for notify).
+    /// Set `AGENTFS_FUSE_CACHE_DIR=0` to disable.
+    cache_dir_enabled: bool,
+    /// When true, force a synchronous SDK drain (SQLite commit) when the
+    /// kernel FORGETs an inode. Default false: a FORGET only drops the
+    /// kernel's reference — pending writes stay readable through the Tier-4
+    /// overlay and are committed by the batcher timer/bytes triggers, fsync,
+    /// and finalize-on-unmount. Set `AGENTFS_DRAIN_ON_FORGET=1` to restore
+    /// the legacy commit-on-forget.
+    drain_on_forget: bool,
+    /// When true (default), the first FLUSH performs its normal drain work
+    /// and then replies ENOSYS, latching the kernel's connection-wide
+    /// `no_flush` so every later close() skips the FLUSH round trip entirely
+    /// (the kernel still pushes dirty writeback pages synchronously at close
+    /// via `write_inode_now` before checking `no_flush`; buffered tails are
+    /// picked up by the async RELEASE and the pending-tail drains on
+    /// attr-bearing paths). Halves the per-open/close round trips: measured
+    /// 61.7us -> 31.2us per open/read/close cycle. Forced off when
+    /// `drain_on_release` is set: legacy commit-on-close needs the FLUSH.
+    /// Set `AGENTFS_FUSE_NOFLUSH=0` to restore close-time FLUSH replies.
+    noflush: bool,
+    /// Mirror of the SDK's `AGENTFS_KEEPCACHE_DELTA` gate: when off, the
+    /// adapter's cached-stats keep-cache fast path must defer to the SDK
+    /// (only the SDK knows whether an inode is base- or delta-backed).
+    keepcache_delta_enabled: bool,
+    /// ENOSYS-OPEN, default on; set `AGENTFS_FUSE_NOOPEN=0` to restore
+    /// per-handle opens. The open handler only replies ENOSYS once
+    /// `noopen_active` is also latched, which requires the kernel to have
+    /// offered `FUSE_NO_OPEN_SUPPORT` in INIT.
+    noopen: bool,
+    /// Latched in `init()` when `noopen` is requested and the kernel
+    /// supports zero-message opens. Once the first OPEN gets ENOSYS the
+    /// kernel sets its connection-wide `no_open`: every open(2)/close(2)
+    /// completes with no FUSE request at all (the default fuse_file carries
+    /// `fh = 0` and `FOPEN_KEEP_CACHE`), and FUSE_RELEASE is skipped for
+    /// every file — including CREATE-opened ones, which is why CREATE also
+    /// stores its file per-inode and replies `fh = 0` in this mode.
+    noopen_active: AtomicBool,
+    /// Shared per-inode files for `fh = 0` traffic (see `InoFile`).
+    ino_files: Mutex<HashMap<u64, InoFile>>,
+    /// Soft cap on `ino_files`: clean entries are evicted (oldest first)
+    /// when the table would exceed it; dirty entries are never evicted.
+    ino_files_cap: usize,
+    /// Monotonic stamp source for `InoFile::last_used`.
+    ino_file_stamp: AtomicU64,
+    /// Number of open handles whose pending `WriteBuffer` is nonempty.
+    /// Attr-bearing read paths that must observe buffered tails (lookup,
+    /// readdirplus) check this before scanning `open_files`, keeping the hot
+    /// no-writes-in-flight case at a single atomic load.
+    pending_dirty_handles: AtomicUsize,
+    /// Whether FUSE writeback mode is enabled for this mount.
+    writeback_enabled: bool,
+}
+
+impl Filesystem for AgentFSFuse {
+    /// Initialize the filesystem and enable performance optimizations.
+    ///
+    /// - Async read: allows the kernel to issue multiple read requests in parallel,
+    ///   improving throughput for concurrent file access.
+    /// - Writeback caching is enabled only when the Phase 8 safety interlocks
+    ///   indicate non-serial workers and synchronous invalidation; batched writes
+    ///   drain on flush/fsync/release before durability replies.
+    /// - Parallel dirops: allows concurrent lookup() and readdir() on the same
+    ///   directory, improving performance for parallel file access patterns.
+    /// - Cache symlinks: caches readlink responses, avoiding repeated round-trips
+    ///   for symlink resolution.
+    /// - No opendir support: skips opendir/releasedir calls since we don't track
+    ///   directory handles, reducing round-trips for directory operations.
+    fn init(&self, _req: &Request, config: &mut KernelConfig) -> Result<(), libc::c_int> {
+        tracing::debug!("FUSE::init");
+        self.cache_config.record_profile();
+        // FUSE_NO_OPENDIR_SUPPORT skips the OPENDIR round trip, but granting
+        // FOPEN_CACHE_DIR requires replying to OPENDIR; one round trip per
+        // opendir(3) buys kernel-cached getdents for every warm re-listing.
+        let mut capabilities =
+            FUSE_ASYNC_READ | FUSE_AUTO_INVAL_DATA | FUSE_PARALLEL_DIROPS | FUSE_CACHE_SYMLINKS;
+        if !self.cache_dir_enabled {
+            capabilities |= FUSE_NO_OPENDIR_SUPPORT;
+        }
+        let _ = config.add_capabilities(capabilities);
+        // FUSE-over-io_uring, default on (kill switch AGENTFS_FUSE_URING=0):
+        // only advertised when the kernel offered it and ring setup works,
+        // since the kernel stalls requests after INIT until the ring queues
+        // register; without the root sysctl fuse.enable_uring=1 the probe
+        // fails and the legacy /dev/fuse channel is used. The max_write
+        // clamp keeps per-entry ring payload buffers at 1 MiB (the kernel
+        // caps single WRITEs at max_pages = 256 pages anyway, so >1 MiB
+        // writes never materialize on Linux).
+        if self.uring.enabled {
+            if crate::transport::uring::probe_ring_setup()
+                && config.add_capabilities(FUSE_OVER_IO_URING).is_ok()
+            {
+                let _ = config.set_max_write(crate::transport::uring::URING_MAX_WRITE);
+                let _ = config.set_max_readahead(crate::transport::uring::URING_MAX_WRITE);
+                tracing::info!("advertising FUSE_OVER_IO_URING");
+            } else {
+                tracing::debug!("fuse-over-io_uring unavailable; using legacy channel");
+            }
+        }
+        if self.noopen {
+            // The latch itself is ENOSYS-driven (first OPEN reply); the INIT
+            // capability only proves the kernel knows zero-message opens, so
+            // a pre-no_open kernel never sees the ENOSYS.
+            if config.add_capabilities(FUSE_NO_OPEN_SUPPORT).is_ok() {
+                self.noopen_active.store(true, Ordering::Release);
+            } else {
+                tracing::warn!(
+                    "AGENTFS_FUSE_NOOPEN=1 but kernel lacks FUSE_NO_OPEN_SUPPORT; opens stay per-handle"
+                );
+            }
+        }
+        configure_writeback_cache(config, self.cache_config.writeback_cache_enabled);
+        configure_readdirplus(config, self.cache_config.readdirplus_mode);
+        Ok(())
+    }
+
+    fn destroy(&self) {
+        tracing::debug!("FUSE::destroy");
+        if let Err(e) = self.flush_all_pending() {
+            tracing::warn!(error = ?e, "FUSE::destroy failed to flush pending writes");
+        }
+        if let Err(e) = self.commit_barrier(None) {
+            tracing::warn!(error = ?e, "FUSE::destroy failed to commit pending writes");
+        }
+        if let Err(e) = self.finalize_filesystem() {
+            tracing::warn!(error = ?e, "FUSE::destroy failed to finalize filesystem");
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Name Resolution & Attributes
+    // ─────────────────────────────────────────────────────────────
+
+    /// Looks up a directory entry by name within a parent directory.
+    ///
+    /// Resolves `name` under the directory identified by `parent` inode.
+    fn lookup(&self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        crate::telemetry::record_fuse_lookup();
+        tracing::debug!("FUSE::lookup: parent={}, name={:?}", parent, name);
+
+        let Some(name_str) = name.to_str() else {
+            reply.error(libc::EINVAL);
+            return;
+        };
+
+        let cache_epoch = self.cache_epoch();
+        let cached_entry = if self.attrs_cacheable() {
+            self.caches
+                .entries()
+                .lock()
+                .get(&(parent, name_str.to_string()))
+                .cloned()
+        } else {
+            None
+        };
+        if let Some(stats) = cached_entry {
+            let fs = self.fs.clone();
+            let retained = self
+                .runtime
+                .block_on(async move { fs.retain_lookup(stats.ino, 1).await })
+                .is_ok();
+            let cache_reply = self.caches.try_reply_guard(cache_epoch);
+            if retained && cache_reply.is_some() {
+                crate::telemetry::record_fuse_adapter_entry_hit();
+                let attr = fillattr(&stats);
+                reply.entry_with_ttls(
+                    &self.cache_config.entry_ttl,
+                    &self.cache_config.attr_ttl,
+                    &attr,
+                    0,
+                );
+                return;
+            }
+            if retained {
+                let fs = self.fs.clone();
+                let ino = stats.ino;
+                self.runtime
+                    .block_on(async move { fs.forget(ino, 1).await });
+            }
+        }
+
+        let cache_epoch = self.cache_epoch();
+        if self
+            .caches
+            .negative_entries()
+            .lock()
+            .contains_key(&(parent, name_str.to_string()))
+        {
+            let cache_reply = self.caches.try_reply_guard(cache_epoch);
+            if cache_reply.is_some() {
+                crate::telemetry::record_negative_cache_hit();
+                crate::telemetry::record_fuse_adapter_negative_hit();
+                self.reply_negative_entry(reply);
+                return;
+            }
+        }
+        crate::telemetry::record_negative_cache_miss();
+        crate::telemetry::record_fuse_adapter_negative_miss();
+        // Neither the positive entry cache nor the negative cache satisfied this
+        // lookup; the request falls through to the backend.
+        crate::telemetry::record_fuse_adapter_entry_miss();
+
+        let mut stable = false;
+        let mut stable_epoch = 0;
+        let mut result = None;
+        for _ in 0..2 {
+            let epoch = self.cache_epoch();
+            let fs = self.fs.clone();
+            let name_owned = name_str.to_string();
+            let lookup_result = self
+                .runtime
+                .block_on(async move { fs.lookup(parent as i64, &name_owned).await });
+            stable = !self.cache_epoch_changed(epoch);
+            stable_epoch = epoch;
+            result = Some(lookup_result);
+            if stable {
+                break;
+            }
+        }
+        let result = result.expect("lookup loop always runs");
+        let cache_reply = self.caches.try_reply_guard(stable_epoch);
+        stable = stable && cache_reply.is_some();
+
+        match result {
+            Ok(Some(stats)) => {
+                let stats = match self.drain_pending_tail_for_attrs(stats.ino as u64) {
+                    Ok(false) => stats,
+                    Ok(true) => {
+                        let fs = self.fs.clone();
+                        let tail_ino = stats.ino;
+                        match self
+                            .runtime
+                            .block_on(async move { fs.getattr(tail_ino).await })
+                        {
+                            Ok(Some(fresh)) => fresh,
+                            Ok(None) => stats,
+                            Err(e) => {
+                                reply.error(error_to_errno(&e));
+                                return;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        reply.error(error_to_errno(&e));
+                        return;
+                    }
+                };
+                let external_drift = self.external_drift_sensitive(stats.ino as u64);
+                let drift_detected =
+                    external_drift && self.external_drift_detected(stats.ino as u64, &stats);
+                if drift_detected {
+                    reply.error(libc::EIO);
+                    crate::telemetry::record_base_fast_stale_rejection();
+                    return;
+                }
+                if external_drift {
+                    self.caches.set_external_read_fingerprint(
+                        stats.ino as u64,
+                        KeepCacheFingerprint::from_stats(&stats),
+                    );
+                }
+                if stable && !external_drift {
+                    self.cache_entry(parent, name_str, &stats);
+                }
+                let attr = fillattr(&stats);
+                let cacheable = stable && !external_drift;
+                reply.entry_with_ttls(
+                    if cacheable {
+                        &self.cache_config.entry_ttl
+                    } else {
+                        &Duration::ZERO
+                    },
+                    if cacheable {
+                        &self.cache_config.attr_ttl
+                    } else {
+                        &Duration::ZERO
+                    },
+                    &attr,
+                    0,
+                );
+            }
+            Ok(None) => {
+                if stable {
+                    self.cache_negative_entry(parent, name_str);
+                }
+                self.reply_negative_entry_with_ttl(reply, stable);
+            }
+            Err(e) => reply.error(error_to_errno(&e)),
+        }
+    }
+
+    /// Retrieves file attributes for a given inode.
+    ///
+    /// Returns metadata (size, permissions, timestamps, etc.) for the file or
+    /// directory identified by `ino`. Root inode (1) is handled specially.
+    fn getattr(&self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+        crate::telemetry::record_fuse_getattr();
+        tracing::debug!("FUSE::getattr: ino={}", ino);
+
+        if let Err(e) = self.flush_pending_inode(ino) {
+            reply.error(error_to_errno(&e));
+            return;
+        }
+
+        let cache_epoch = self.cache_epoch();
+        let cached_attr = if self.attrs_cacheable() {
+            self.caches.attrs().lock().get(&ino).cloned()
+        } else {
+            None
+        };
+        if let Some(stats) = cached_attr {
+            let cache_reply = self.caches.try_reply_guard(cache_epoch);
+            if cache_reply.is_some() {
+                crate::telemetry::record_fuse_adapter_attr_hit();
+                reply.attr(&self.cache_config.attr_ttl, &fillattr(&stats));
+                return;
+            }
+        }
+        crate::telemetry::record_fuse_adapter_attr_miss();
+
+        let mut stable = false;
+        let mut stable_epoch = 0;
+        let mut result = None;
+        for _ in 0..2 {
+            let epoch = self.cache_epoch();
+            let fs = self.fs.clone();
+            let getattr_result = self
+                .runtime
+                .block_on(async move { fs.getattr(ino as i64).await });
+            stable = !self.cache_epoch_changed(epoch);
+            stable_epoch = epoch;
+            result = Some(getattr_result);
+            if stable {
+                break;
+            }
+        }
+        let result = result.expect("getattr loop always runs");
+        let cache_reply = self.caches.try_reply_guard(stable_epoch);
+        stable = stable && cache_reply.is_some();
+
+        match result {
+            Ok(Some(stats)) => {
+                let external_drift = self.external_drift_sensitive(ino);
+                let drift_detected = external_drift && self.external_drift_detected(ino, &stats);
+                if drift_detected {
+                    reply.error(libc::EIO);
+                    crate::telemetry::record_base_fast_stale_rejection();
+                    return;
+                }
+                if external_drift {
+                    self.caches.set_external_read_fingerprint(
+                        ino,
+                        KeepCacheFingerprint::from_stats(&stats),
+                    );
+                }
+                let cacheable = stable && !external_drift;
+                if cacheable && self.attrs_cacheable() {
+                    self.cache_attr(&stats);
+                }
+                reply.attr(
+                    if cacheable {
+                        &self.cache_config.attr_ttl
+                    } else {
+                        &Duration::ZERO
+                    },
+                    &fillattr(&stats),
+                );
+            }
+            Ok(None) => reply.error(libc::ENOENT),
+            Err(e) => reply.error(error_to_errno(&e)),
+        }
+    }
+
+    /// Reads the target of a symbolic link.
+    ///
+    /// Returns the path that the symlink points to. This is called by operations
+    /// like `ls -l` to display symlink targets.
+    fn readlink(&self, _req: &Request, ino: u64, reply: ReplyData) {
+        tracing::debug!("FUSE::readlink: ino={}", ino);
+
+        let fs = self.fs.clone();
+        let result = self
+            .runtime
+            .block_on(async move { fs.readlink(ino as i64).await });
+
+        match result {
+            Ok(Some(target)) => reply.data(target.as_bytes()),
+            Ok(None) => reply.error(libc::ENOENT),
+            Err(e) => reply.error(error_to_errno(&e)),
+        }
+    }
+
+    /// Sets file attributes, handling truncate and chmod operations.
+    ///
+    /// Currently `size` changes (truncate) and `mode` changes (chmod) are supported.
+    /// Other attribute changes (uid, gid, timestamps) are accepted but ignored.
+    fn setattr(
+        &self,
+        req: &Request,
+        ino: u64,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<crate::transport::TimeOrNow>,
+        mtime: Option<crate::transport::TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        fh: Option<u64>,
+        reply: ReplyAttr,
+    ) {
+        tracing::debug!(
+            "FUSE::setattr: ino={}, mode={:?}, uid={:?}, gid={:?}, size={:?}",
+            ino,
+            mode,
+            uid,
+            gid,
+            size
+        );
+        let audit = MutationAudit::new();
+        let mutated = mode.is_some()
+            || uid.is_some()
+            || gid.is_some()
+            || size.is_some()
+            || atime.is_some()
+            || mtime.is_some();
+
+        // Preserve FUSE request order, not SDK enqueue order: a data write
+        // buffered in OpenFile::pending arrived BEFORE this SETATTR, so it
+        // must reach the batcher first. Otherwise its later enqueue (on
+        // FLUSH/RELEASE) resets `times_explicit` and clears the stashed
+        // mtime/ctime that writeback SETATTR just recorded, the group commit
+        // re-stamps the times, and git's stat cache no longer matches the
+        // filesystem (measured as a ~4,700-file re-read storm in checkout).
+        // Non-mutating SETATTRs reply attrs too, so they drain as well (the
+        // reply must not carry a size that misses a buffered tail).
+        if let Err(e) = self.flush_pending_inode(ino) {
+            reply.error(error_to_errno(&e));
+            return;
+        }
+
+        // Handle chmod
+        if let Some(new_mode) = mode {
+            let fs = self.fs.clone();
+            let result = self
+                .runtime
+                .block_on(async move { fs.chmod(ino as i64, new_mode).await });
+
+            if let Err(e) = result {
+                reply.error(error_to_errno(&e));
+                return;
+            }
+            self.invalidate_inode_cache_self(req, ino);
+        }
+
+        // Handle chown
+        if uid.is_some() || gid.is_some() {
+            let fs = self.fs.clone();
+            let result = self
+                .runtime
+                .block_on(async move { fs.chown(ino as i64, uid, gid).await });
+
+            if let Err(e) = result {
+                reply.error(error_to_errno(&e));
+                return;
+            }
+            self.invalidate_inode_cache_self(req, ino);
+        }
+
+        // Handle truncate. An fh-keyed handle is used when present
+        // (ftruncate via CREATE/OPEN handles); otherwise — including the
+        // `fh = 0` that zero-message opens echo — resolve the shared
+        // per-inode write file (triggering overlay copy-up as needed).
+        if let Some(new_size) = size {
+            let file = fh.and_then(|fh| {
+                self.open_files
+                    .lock()
+                    .get(&fh)
+                    .map(|open_file| open_file.file.clone())
+            });
+            let file = match file {
+                Some(file) => file,
+                None => match self.resolve_ino_file(ino, true) {
+                    Ok(file) => file,
+                    Err(e) => {
+                        reply.error(error_to_errno(&e));
+                        return;
+                    }
+                },
+            };
+            let result = self
+                .runtime
+                .block_on(async move { file.truncate(new_size).await });
+
+            if let Err(e) = result {
+                reply.error(error_to_errno(&e));
+                return;
+            }
+            self.invalidate_inode_cache_self(req, ino);
+        }
+
+        // Handle atime/mtime changes (utimensat)
+        if atime.is_some() || mtime.is_some() {
+            let new_atime = match atime {
+                Some(crate::transport::TimeOrNow::SpecificTime(t)) => {
+                    let dur = t.duration_since(UNIX_EPOCH).unwrap_or_default();
+                    TimeChange::Set(dur.as_secs() as i64, dur.subsec_nanos())
+                }
+                Some(crate::transport::TimeOrNow::Now) => TimeChange::Now,
+                None => TimeChange::Omit,
+            };
+            let new_mtime = match mtime {
+                Some(crate::transport::TimeOrNow::SpecificTime(t)) => {
+                    let dur = t.duration_since(UNIX_EPOCH).unwrap_or_default();
+                    TimeChange::Set(dur.as_secs() as i64, dur.subsec_nanos())
+                }
+                Some(crate::transport::TimeOrNow::Now) => TimeChange::Now,
+                None => TimeChange::Omit,
+            };
+            let fs = self.fs.clone();
+            let result = self
+                .runtime
+                .block_on(async move { fs.utimens(ino as i64, new_atime, new_mtime).await });
+            if let Err(e) = result {
+                reply.error(error_to_errno(&e));
+                return;
+            }
+            self.invalidate_inode_cache_self(req, ino);
+        }
+
+        // Return updated attributes
+        let fs = self.fs.clone();
+        let result = self
+            .runtime
+            .block_on(async move { fs.getattr(ino as i64).await });
+
+        match result {
+            Ok(Some(stats)) => {
+                self.cache_attr(&stats);
+                if mutated {
+                    audit.assert_invalidated("setattr");
+                } else {
+                    let _ = audit;
+                }
+                reply.attr(&self.cache_config.attr_ttl, &fillattr(&stats));
+            }
+            Ok(None) => reply.error(libc::ENOENT),
+            Err(e) => reply.error(error_to_errno(&e)),
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Directory Operations
+    // ─────────────────────────────────────────────────────────────
+
+    /// Reads directory entries for the given inode.
+    ///
+    /// Returns "." and ".." entries followed by the directory contents.
+    /// Each entry's inode is cached for subsequent lookups.
+    ///
+    /// Uses readdir_plus to fetch entries with stats in a single query,
+    /// avoiding N+1 database queries.
+    fn readdir(&self, _req: &Request, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
+        crate::telemetry::record_fuse_readdir();
+        tracing::debug!("FUSE::readdir: ino={}, offset={}", ino, offset);
+
+        let all_entries = match self.cached_readdir_entries(ino) {
+            Ok((entries, _stable, _epoch)) => entries,
+            Err(e) => {
+                reply.error(error_to_errno(&e));
+                return;
+            }
+        };
+
+        for (i, entry) in all_entries.iter().enumerate().skip(readdir_start(offset)) {
+            if reply.add(entry.attr.ino, (i + 1) as i64, entry.attr.kind, &entry.name) {
+                break;
+            }
+        }
+        reply.ok();
+    }
+
+    /// Reads directory entries with full attributes for the given inode.
+    ///
+    /// This is an optimized version that returns both directory entries and
+    /// their attributes in a single call, reducing kernel/userspace round trips.
+    /// Uses readdir_plus to fetch entries with stats in a single database query.
+    fn readdirplus(
+        &self,
+        _req: &Request,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        mut reply: ReplyDirectoryPlus,
+    ) {
+        crate::telemetry::record_fuse_readdir_plus();
+        tracing::debug!("FUSE::readdirplus: ino={}, offset={}", ino, offset);
+
+        let (all_entries, stable, stable_epoch) = match self.cached_readdir_entries(ino) {
+            Ok(entries) => entries,
+            Err(e) => {
+                reply.error(error_to_errno(&e));
+                return;
+            }
+        };
+
+        let cache_reply = self.caches.try_reply_guard(stable_epoch);
+        let stable = stable && cache_reply.is_some();
+        for (i, entry) in all_entries.iter().enumerate().skip(readdir_start(offset)) {
+            let entry_cacheable = stable && !self.external_drift_sensitive(entry.attr.ino);
+            if reply.add_with_ttls(
+                entry.attr.ino,
+                (i + 1) as i64,
+                &entry.name,
+                if entry_cacheable {
+                    &self.cache_config.entry_ttl
+                } else {
+                    &Duration::ZERO
+                },
+                if entry_cacheable {
+                    &self.cache_config.attr_ttl
+                } else {
+                    &Duration::ZERO
+                },
+                &entry.attr,
+                0,
+            ) {
+                reply.ok();
+                return;
+            }
+        }
+
+        reply.ok();
+    }
+
+    /// Creates a special file node (FIFO, device, socket, or regular file).
+    ///
+    /// Creates a file node at `name` under `parent` with the specified mode
+    /// and device number, then stats it to return proper attributes.
+    fn mknod(
+        &self,
+        req: &Request,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+        rdev: u32,
+        reply: ReplyEntry,
+    ) {
+        tracing::debug!(
+            "FUSE::mknod: parent={}, name={:?}, mode={:o}, rdev={}",
+            parent,
+            name,
+            mode,
+            rdev
+        );
+        let audit = MutationAudit::new();
+
+        let Some(name_str) = name.to_str() else {
+            reply.error(libc::EINVAL);
+            return;
+        };
+
+        let uid = req.uid();
+        let gid = req.gid();
+        let fs = self.fs.clone();
+        let name_owned = name_str.to_string();
+        let result = self.runtime.block_on(async move {
+            fs.mknod(parent as i64, &name_owned, mode, rdev as u64, uid, gid)
+                .await
+        });
+
+        match result {
+            Ok(stats) => {
+                self.invalidate_inode_cache(req, parent);
+                self.invalidate_entry_cache_self(req, parent, name);
+                let attr = fillattr(&stats);
+                audit.assert_invalidated("mknod");
+                let (entry_ttl, attr_ttl) = self.mutation_reply_ttls();
+                reply.entry_with_ttls(&entry_ttl, &attr_ttl, &attr, 0);
+            }
+            Err(e) => {
+                reply.error(error_to_errno(&e));
+            }
+        }
+    }
+
+    /// Creates a new directory.
+    ///
+    /// Creates a directory at `name` under `parent`, then stats it to return
+    /// proper attributes and cache the inode mapping.
+    fn mkdir(
+        &self,
+        req: &Request,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+        reply: ReplyEntry,
+    ) {
+        tracing::debug!(
+            "FUSE::mkdir: parent={}, name={:?}, mode={:o}",
+            parent,
+            name,
+            mode
+        );
+        let audit = MutationAudit::new();
+
+        let Some(name_str) = name.to_str() else {
+            reply.error(libc::EINVAL);
+            return;
+        };
+
+        let uid = req.uid();
+        let gid = req.gid();
+        let fs = self.fs.clone();
+        let name_owned = name_str.to_string();
+        let result = self
+            .runtime
+            .block_on(async move { fs.mkdir(parent as i64, &name_owned, mode, uid, gid).await });
+
+        match result {
+            Ok(stats) => {
+                self.invalidate_inode_cache(req, parent);
+                self.invalidate_entry_cache_self(req, parent, name);
+                let attr = fillattr(&stats);
+                audit.assert_invalidated("mkdir");
+                let (entry_ttl, attr_ttl) = self.mutation_reply_ttls();
+                reply.entry_with_ttls(&entry_ttl, &attr_ttl, &attr, 0);
+            }
+            Err(e) => {
+                reply.error(error_to_errno(&e));
+            }
+        }
+    }
+
+    /// Removes an empty directory.
+    ///
+    /// Verifies the target is a directory and is empty before removal.
+    /// Returns `ENOTDIR` if not a directory, `ENOTEMPTY` if not empty.
+    fn rmdir(&self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        tracing::debug!("FUSE::rmdir: parent={}, name={:?}", parent, name);
+        let audit = MutationAudit::new();
+
+        let Some(name_str) = name.to_str() else {
+            reply.error(libc::EINVAL);
+            return;
+        };
+
+        let removed_stats = self.lookup_child_for_invalidation(parent, name_str);
+        let fs = self.fs.clone();
+        let name_owned = name_str.to_string();
+        let result = self
+            .runtime
+            .block_on(async move { fs.rmdir(parent as i64, &name_owned).await });
+
+        match result {
+            Ok(()) => {
+                self.invalidate_inode_cache(req, parent);
+                if let Some(stats) = removed_stats {
+                    self.invalidate_inode_cache(req, stats.ino as u64);
+                }
+                self.invalidate_entry_cache(req, parent, name);
+                audit.assert_invalidated("rmdir");
+                reply.ok();
+            }
+            Err(e) => reply.error(error_to_errno(&e)),
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // File Creation & Removal
+    // ─────────────────────────────────────────────────────────────
+
+    /// Creates and opens a new file.
+    ///
+    /// Creates an empty file at `name` under `parent`, allocates a file handle,
+    /// and returns both the file attributes and handle for immediate use.
+    fn create(
+        &self,
+        req: &Request,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+        _flags: i32,
+        reply: ReplyCreate,
+    ) {
+        tracing::debug!(
+            "FUSE::create: parent={}, name={:?}, mode={:o}",
+            parent,
+            name,
+            mode
+        );
+        let audit = MutationAudit::new();
+
+        let Some(name_str) = name.to_str() else {
+            reply.error(libc::EINVAL);
+            return;
+        };
+
+        // Create file with mode, get stats and file handle in one operation
+        let uid = req.uid();
+        let gid = req.gid();
+        let fs = self.fs.clone();
+        let name_owned = name_str.to_string();
+        let result = self.runtime.block_on(async move {
+            fs.create_file(parent as i64, &name_owned, mode, uid, gid)
+                .await
+        });
+
+        match result {
+            Ok((stats, file)) => {
+                self.invalidate_inode_cache(req, parent);
+                self.invalidate_entry_cache_self(req, parent, name);
+                let attr = fillattr(&stats);
+
+                // Zero-message opens: the kernel skips FUSE_RELEASE for
+                // every file once `no_open` latches, so an fh-keyed entry
+                // would leak. Store the created file per-inode (where the
+                // fh = 0 writes will find it for free) and echo fh = 0.
+                let fh = if self.noopen_active.load(Ordering::Acquire) {
+                    let stamp = self.ino_file_stamp.fetch_add(1, Ordering::Relaxed);
+                    let mut ino_files = self.ino_files.lock();
+                    self.evict_ino_files_overflow(&mut ino_files);
+                    ino_files.insert(
+                        stats.ino as u64,
+                        InoFile {
+                            file,
+                            pending: WriteBuffer::default(),
+                            write_capable: true,
+                            last_used: stamp,
+                        },
+                    );
+                    0
+                } else {
+                    let fh = self.alloc_fh();
+                    self.open_files
+                        .lock()
+                        .insert(fh, OpenFile::new(stats.ino as u64, file));
+                    fh
+                };
+
+                audit.assert_invalidated("create");
+                let (entry_ttl, attr_ttl) = self.mutation_reply_ttls();
+                reply.created_with_ttls(&entry_ttl, &attr_ttl, &attr, 0, fh, 0);
+            }
+            Err(e) => {
+                reply.error(error_to_errno(&e));
+            }
+        }
+    }
+
+    /// Creates a symbolic link.
+    ///
+    /// Creates a symlink at `name` under `parent` pointing to `link`.
+    fn symlink(
+        &self,
+        req: &Request,
+        parent: u64,
+        link_name: &OsStr,
+        target: &std::path::Path,
+        reply: ReplyEntry,
+    ) {
+        tracing::debug!(
+            "FUSE::symlink: parent={}, link_name={:?}, target={:?}",
+            parent,
+            link_name,
+            target
+        );
+        let audit = MutationAudit::new();
+
+        let Some(name_str) = link_name.to_str() else {
+            reply.error(libc::EINVAL);
+            return;
+        };
+
+        let Some(target_str) = target.to_str() else {
+            reply.error(libc::EINVAL);
+            return;
+        };
+
+        let uid = req.uid();
+        let gid = req.gid();
+        let fs = self.fs.clone();
+        let name_owned = name_str.to_string();
+        let target_owned = target_str.to_string();
+        let result = self.runtime.block_on(async move {
+            fs.symlink(parent as i64, &name_owned, &target_owned, uid, gid)
+                .await
+        });
+
+        match result {
+            Ok(stats) => {
+                self.invalidate_inode_cache(req, parent);
+                self.invalidate_entry_cache_self(req, parent, link_name);
+                let attr = fillattr(&stats);
+                audit.assert_invalidated("symlink");
+                let (entry_ttl, attr_ttl) = self.mutation_reply_ttls();
+                reply.entry_with_ttls(&entry_ttl, &attr_ttl, &attr, 0);
+            }
+            Err(e) => {
+                reply.error(error_to_errno(&e));
+            }
+        }
+    }
+
+    /// Creates a hard link.
+    ///
+    /// Creates a new directory entry `newname` under `newparent` that refers to the
+    /// same inode as `ino`. The link count of the inode is incremented.
+    fn link(&self, req: &Request, ino: u64, newparent: u64, newname: &OsStr, reply: ReplyEntry) {
+        tracing::debug!(
+            "FUSE::link: ino={}, newparent={}, newname={:?}",
+            ino,
+            newparent,
+            newname
+        );
+        let audit = MutationAudit::new();
+
+        let Some(name_str) = newname.to_str() else {
+            reply.error(libc::EINVAL);
+            return;
+        };
+
+        // The entry reply carries this inode's attrs; drain any buffered
+        // write tail first so the kernel doesn't cache a stale size.
+        if let Err(e) = self.drain_pending_tail_for_attrs(ino) {
+            reply.error(error_to_errno(&e));
+            return;
+        }
+
+        let fs = self.fs.clone();
+        let name_owned = name_str.to_string();
+        let result = self
+            .runtime
+            .block_on(async move { fs.link(ino as i64, newparent as i64, &name_owned).await });
+
+        match result {
+            Ok(stats) => {
+                self.invalidate_inode_cache_self(req, ino);
+                self.invalidate_inode_cache(req, newparent);
+                self.invalidate_entry_cache_self(req, newparent, newname);
+                let attr = fillattr(&stats);
+                audit.assert_invalidated("link");
+                let (entry_ttl, attr_ttl) = self.mutation_reply_ttls();
+                reply.entry_with_ttls(&entry_ttl, &attr_ttl, &attr, 0);
+            }
+            Err(e) => {
+                reply.error(error_to_errno(&e));
+            }
+        }
+    }
+
+    /// Removes a file (unlinks it from the directory).
+    ///
+    /// Gets the file's inode before removal to clean up the path cache.
+    fn unlink(&self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        tracing::debug!("FUSE::unlink: parent={}, name={:?}", parent, name);
+        let audit = MutationAudit::new();
+
+        let Some(name_str) = name.to_str() else {
+            reply.error(libc::EINVAL);
+            return;
+        };
+
+        let removed_stats = self.lookup_child_for_invalidation(parent, name_str);
+        let fs = self.fs.clone();
+        let name_owned = name_str.to_string();
+        let result = self
+            .runtime
+            .block_on(async move { fs.unlink(parent as i64, &name_owned).await });
+
+        match result {
+            Ok(()) => {
+                self.invalidate_inode_cache(req, parent);
+                if let Some(stats) = removed_stats {
+                    self.invalidate_inode_cache(req, stats.ino as u64);
+                }
+                self.invalidate_entry_cache(req, parent, name);
+                audit.assert_invalidated("unlink");
+                reply.ok();
+            }
+            Err(e) => reply.error(error_to_errno(&e)),
+        }
+    }
+
+    /// Renames a file or directory.
+    ///
+    /// Moves `name` from `parent` to `newname` under `newparent`.
+    fn rename(
+        &self,
+        req: &Request,
+        parent: u64,
+        name: &OsStr,
+        newparent: u64,
+        newname: &OsStr,
+        _flags: u32,
+        reply: ReplyEmpty,
+    ) {
+        tracing::debug!(
+            "FUSE::rename: parent={}, name={:?}, newparent={}, newname={:?}",
+            parent,
+            name,
+            newparent,
+            newname
+        );
+        let audit = MutationAudit::new();
+
+        let Some(old_name_str) = name.to_str() else {
+            reply.error(libc::EINVAL);
+            return;
+        };
+
+        let Some(new_name_str) = newname.to_str() else {
+            reply.error(libc::EINVAL);
+            return;
+        };
+
+        let source_stats = self.lookup_child_for_invalidation(parent, old_name_str);
+        let replaced_stats = self.lookup_child_for_invalidation(newparent, new_name_str);
+        let fs = self.fs.clone();
+        let old_name_owned = old_name_str.to_string();
+        let new_name_owned = new_name_str.to_string();
+        let result = self.runtime.block_on(async move {
+            fs.rename(
+                parent as i64,
+                &old_name_owned,
+                newparent as i64,
+                &new_name_owned,
+            )
+            .await
+        });
+
+        match result {
+            Ok(()) => {
+                self.invalidate_inode_cache(req, parent);
+                if newparent != parent {
+                    self.invalidate_inode_cache(req, newparent);
+                }
+                if let Some(stats) = source_stats {
+                    self.invalidate_inode_cache(req, stats.ino as u64);
+                }
+                if let Some(stats) = replaced_stats {
+                    self.invalidate_inode_cache(req, stats.ino as u64);
+                }
+                self.invalidate_entry_cache(req, parent, name);
+                self.invalidate_entry_cache(req, newparent, newname);
+                audit.assert_invalidated("rename");
+                reply.ok();
+            }
+            Err(e) => reply.error(error_to_errno(&e)),
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // File I/O Lifecycle
+    // ─────────────────────────────────────────────────────────────
+
+    /// Opens a file for reading or writing.
+    ///
+    /// Allocates a file handle and opens the file in the filesystem layer.
+    fn open(&self, req: &Request, ino: u64, flags: i32, reply: ReplyOpen) {
+        crate::telemetry::record_fuse_open();
+        tracing::debug!("FUSE::open: ino={}, flags={}", ino, flags);
+
+        if self.noopen_active.load(Ordering::Acquire) {
+            // Latches the kernel's connection-wide `no_open`: this open(2)
+            // and every later one succeed with a default `fh = 0` +
+            // `FOPEN_KEEP_CACHE` fuse_file and zero FUSE requests; releases
+            // are skipped too. I/O reaches us as `fh = 0` and resolves
+            // through `ino_files`. Page-cache coherence rests on the same
+            // contract as the rest of the kernel cache: self-writes are
+            // writeback-coherent, truncates arrive as SETATTR (we never
+            // advertise FUSE_ATOMIC_O_TRUNC), and external divergence is
+            // bounded by the attr TTLs.
+            crate::telemetry::record_fuse_noopen_enosys_reply();
+            reply.error(libc::ENOSYS);
+            return;
+        }
+
+        let write_open = fuse_write_open(flags);
+        if write_open {
+            self.drop_keepcache_eligibility(ino);
+        }
+        let check_keep_cache = !write_open
+            && self.cache_config.keepcache_enabled
+            && !self.has_pending_write_for_inode(ino);
+
+        // Keep-cache fast path: the adapter attr cache already holds
+        // epoch-valid stats for almost every warm open (populated by the
+        // preceding lookup/readdirplus), and the SDK keep-cache verdict for a
+        // visible regular file reduces to `is_file()` when the delta
+        // keep-cache kill switch is off. Skipping the SDK probe here removes
+        // the dominant per-open cost on warm read paths (47.9us -> the open
+        // call alone). The fingerprint drift guard still revalidates the
+        // grant exactly as it does for SDK-derived stats.
+        let cached_fingerprint = if check_keep_cache && self.keepcache_delta_enabled {
+            let epoch = self.cache_epoch();
+            let stats = self.caches.attrs().lock().get(&ino).cloned();
+            match stats {
+                Some(stats) if stats.is_file() => {
+                    let cache_reply = self.caches.try_reply_guard(epoch);
+                    if cache_reply.is_some() {
+                        Some(KeepCacheFingerprint::from_stats(&stats))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        // One runtime hop for the keep-cache probe (when the fast path
+        // missed) and the open itself: this handler runs ~1x per open(2) on
+        // the warm read path, so extra block_on round trips and SDK queries
+        // were pure dispatch cost.
+        let fs = self.fs.clone();
+        let result = self.runtime.block_on(async move {
+            let fingerprint = match cached_fingerprint {
+                Some(fingerprint) => Some(fingerprint),
+                None if check_keep_cache => fs
+                    .keep_cache_for_read_open(ino as i64, flags)
+                    .await?
+                    .map(|stats| KeepCacheFingerprint::from_stats(&stats)),
+                None => None,
+            };
+            let file = fs.open(ino as i64, flags).await?;
+            Ok::<_, SdkError>((file, fingerprint))
+        });
+
+        match result {
+            Ok((file, keep_cache_fingerprint)) => {
+                let mut open_flags = 0;
+                let keep_cache = keep_cache_fingerprint
+                    .as_ref()
+                    .map(|fingerprint| {
+                        if self.keepcache_allows(ino, fingerprint) {
+                            true
+                        } else {
+                            crate::telemetry::record_base_fast_stale_rejection();
+                            false
+                        }
+                    })
+                    .unwrap_or(false)
+                    && !self.has_pending_write_for_inode(ino);
+                if keep_cache {
+                    open_flags |= FOPEN_KEEP_CACHE;
+                    self.mark_keepcache_eligible(
+                        ino,
+                        keep_cache_fingerprint.expect("checked before enabling keep-cache"),
+                    );
+                    crate::telemetry::record_base_fast_open_eligible();
+                    crate::telemetry::record_base_fast_open_keep_cache();
+                } else {
+                    crate::telemetry::record_base_fast_open_rejected();
+                }
+                if write_open {
+                    self.invalidate_inode_cache_self(req, ino);
+                }
+                let fh = self.alloc_fh();
+                self.open_files.lock().insert(fh, OpenFile::new(ino, file));
+                reply.opened(fh, open_flags);
+            }
+            Err(e) => reply.error(error_to_errno(&e)),
+        }
+    }
+
+    /// Opens a directory. Grants `FOPEN_CACHE_DIR | FOPEN_KEEP_CACHE` so the
+    /// kernel may serve repeated getdents from its page cache instead of a
+    /// READDIRPLUS round trip per scandir. Coherency: mutations through this
+    /// mount invalidate the parent via `invalidate_inode_cache` (kernel
+    /// notification drops the dir pages), and cross-mount divergence is
+    /// bounded by the entry/attr TTLs exactly like file attributes.
+    /// `AGENTFS_FUSE_CACHE_DIR=0` is the kill switch.
+    fn opendir(&self, _req: &Request, _ino: u64, _flags: i32, reply: ReplyOpen) {
+        let open_flags = if self.cache_dir_enabled {
+            FOPEN_CACHE_DIR | FOPEN_KEEP_CACHE
+        } else {
+            0
+        };
+        reply.opened(0, open_flags);
+    }
+
+    /// Reads data using the file handle.
+    fn read(
+        &self,
+        req: &Request,
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        size: u32,
+        _flags: i32,
+        _lock: Option<u64>,
+        reply: ReplyData,
+    ) {
+        crate::telemetry::record_fuse_read();
+        tracing::debug!("FUSE::read: fh={}, offset={}, size={}", fh, offset, size);
+        if offset < 0 {
+            reply.error(libc::EINVAL);
+            return;
+        }
+        let external_drift_read = self.external_drift_sensitive(ino);
+
+        let file = {
+            let open_files = self.open_files.lock();
+            open_files.get(&fh).map(|open_file| open_file.file.clone())
+        };
+        // `fh = 0` under zero-message opens: resolve the shared per-inode file.
+        let file = match file {
+            Some(file) => file,
+            None => match self.resolve_ino_file(ino, false) {
+                Ok(file) => file,
+                Err(e) => {
+                    reply.error(error_to_errno(&e));
+                    return;
+                }
+            },
+        };
+
+        if let Err(e) = self.flush_pending_inode(ino) {
+            reply.error(error_to_errno(&e));
+            return;
+        }
+
+        let result = self
+            .runtime
+            .block_on(async move { file.pread(offset as u64, size as u64).await });
+
+        match result {
+            Ok(data) => {
+                let notifier = external_drift_read.then(|| req.deferred_notifier().clone());
+                if external_drift_read {
+                    self.caches.mark_external_read_seen(ino);
+                }
+                reply.data(&data);
+                if let Some(notifier) = notifier {
+                    notifier.inval_inode(ino, -1, 0);
+                    crate::telemetry::record_base_fast_inode_invalidation();
+                }
+            }
+            Err(e) => reply.error(error_to_errno(&e)),
+        }
+    }
+
+    /// Writes data using the file handle.
+    fn write(
+        &self,
+        req: &Request,
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        data: &[u8],
+        _write_flags: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: ReplyWrite,
+    ) {
+        tracing::debug!(
+            "FUSE::write: fh={}, offset={}, data_len={}",
+            fh,
+            offset,
+            data.len()
+        );
+        let audit = MutationAudit::new();
+
+        if offset < 0 {
+            reply.error(libc::EINVAL);
+            return;
+        }
+
+        let data_len = data.len();
+        crate::telemetry::record_fuse_write(data_len as u64);
+        if let Err(e) = self.flush_pending_inode_except(ino, fh) {
+            reply.error(error_to_errno(&e));
+            return;
+        }
+
+        let writeback_enabled = self.writeback_enabled;
+
+        let flush_result = if writeback_enabled {
+            // Coalesce into the per-fh WriteBuffer. Sequential / adjacent
+            // FUSE_WRITEs for the same handle merge into one entry instead of
+            // taking the SDK batcher's AsyncMutex once per request. Flushing
+            // is deferred until either the buffer crosses
+            // FUSE_COALESCE_FLUSH_BYTES, or the kernel issues
+            // FLUSH / RELEASE / FSYNC for the handle.
+            //
+            // The take-then-block-on pattern is deliberate: we MUST NOT hold
+            // the parking_lot `open_files` lock across `runtime.block_on(...)`
+            // or every other FUSE handler serializes behind this fh's SQLite
+            // commit. An earlier draft of Axis A2 held the lock through the
+            // flush and regressed checkout by 2x.
+            let fh_drain = {
+                let mut open_files = self.open_files.lock();
+                match open_files.get_mut(&fh) {
+                    None => None,
+                    Some(open_file) => {
+                        let was_empty = open_file.pending.is_empty();
+                        match open_file.buffer_fuse_write(offset as u64, data) {
+                            Ok(true) => {
+                                let drain = open_file.take_pending();
+                                if !was_empty {
+                                    self.pending_dirty_handles.fetch_sub(1, Ordering::Release);
+                                }
+                                Some(drain)
+                            }
+                            Ok(false) => {
+                                if was_empty && !open_file.pending.is_empty() {
+                                    self.pending_dirty_handles.fetch_add(1, Ordering::Release);
+                                }
+                                Some(None)
+                            }
+                            Err(errno) => {
+                                reply.error(errno);
+                                return;
+                            }
+                        }
+                    }
+                }
+            };
+            // `fh = 0` under zero-message opens: coalesce into the shared
+            // per-inode buffer (write resolution triggers copy-up).
+            let drain = match fh_drain {
+                Some(drain) => drain,
+                None => match self.buffer_ino_write(ino, offset as u64, data) {
+                    Ok(drain) => drain,
+                    Err(errno) => {
+                        reply.error(errno);
+                        return;
+                    }
+                },
+            };
+            match drain {
+                Some(drain) => flush_pending_batched_out_of_lock(&self.runtime, drain),
+                None => Ok(()),
+            }
+        } else {
+            // Writeback disabled: keep the direct, immediate-commit path so
+            // each FUSE_WRITE lands in SQLite before we reply (preserves the
+            // pre-Tier-One synchronous-write semantics for users that opt out
+            // of writeback).
+            let file = {
+                let open_files = self.open_files.lock();
+                open_files.get(&fh).map(|open_file| open_file.file.clone())
+            };
+            let file = match file {
+                Some(file) => file,
+                None => match self.resolve_ino_file(ino, true) {
+                    Ok(file) => file,
+                    Err(e) => {
+                        reply.error(error_to_errno(&e));
+                        return;
+                    }
+                },
+            };
+            let data = data.to_vec();
+            self.runtime.block_on(async move {
+                file.pwrite_ranges(vec![WriteRange {
+                    offset: offset as u64,
+                    data,
+                }])
+                .await
+            })
+        };
+
+        match flush_result {
+            Ok(()) => {
+                self.invalidate_inode_cache_self(req, ino);
+                audit.assert_invalidated("write");
+                reply.written(data_len as u32);
+            }
+            Err(e) => reply.error(error_to_errno(&e)),
+        }
+    }
+
+    /// Flushes buffered data to the backend storage.
+    fn flush(&self, req: &Request, ino: u64, fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
+        tracing::debug!("FUSE::flush: fh={}", fh);
+        let audit = MutationAudit::new();
+        // Tier Three Axis E attempt was reverted: deferring the SDK
+        // `drain_writes` here caused subsequent SDK-internal `pread`/`pwrite`
+        // entry points (which each prelude with `self.drain_writes()` for
+        // read-after-write consistency) to take the drain hit synchronously
+        // and serialised reads behind a much larger commit. Keep the
+        // restoration of synchronous drain on flush/release; FUSE
+        // close-time latency is bounded.
+        let fh_state = {
+            let mut open_files = self.open_files.lock();
+            open_files.get_mut(&fh).map(|open_file| {
+                let drain = open_file.take_pending();
+                if drain.is_some() {
+                    self.pending_dirty_handles.fetch_sub(1, Ordering::Release);
+                }
+                (drain, Some(open_file.file.clone()))
+            })
+        };
+        // `fh = 0` under zero-message opens (including the very first FLUSH
+        // that races the ENOSYS-OPEN latch): drain the shared per-inode
+        // buffer instead. drain_on_release never applies here (it forces
+        // both noflush and noopen off).
+        let (drain, file) = fh_state.unwrap_or_else(|| {
+            let mut ino_files = self.ino_files.lock();
+            match ino_files.get_mut(&ino) {
+                Some(entry) => {
+                    let drain = entry.take_pending();
+                    if drain.is_some() {
+                        self.pending_dirty_handles.fetch_sub(1, Ordering::Release);
+                    }
+                    (drain, Some(entry.file.clone()))
+                }
+                None => (None, None),
+            }
+        });
+        let drain_on_release = self.drain_on_release;
+        let had_pending_writes = drain.is_some();
+        let result = (|| -> Result<(), SdkError> {
+            // Always move the per-fh FUSE write buffer into the SDK batcher so
+            // the overlay reflects this handle's writes. Only force a SQLite
+            // commit when the legacy commit-on-close kill switch is set;
+            // otherwise durability is the batcher/fsync/finalize's job.
+            if let Some(drain) = drain {
+                flush_pending_batched_out_of_lock(&self.runtime, drain)?;
+            }
+            if drain_on_release {
+                if let Some(file) = file {
+                    self.runtime
+                        .block_on(async move { file.drain_writes().await })?;
+                }
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                // A FLUSH that moved no writes mutated nothing: invalidating
+                // here would permanently revoke keep-cache eligibility for
+                // every file ever closed (the drift guard's `dropped` set is
+                // sticky), turning each re-open of an unchanged base file
+                // back into FUSE READ round trips. Each FUSE_WRITE already
+                // invalidates on its own path.
+                if had_pending_writes || self.flush_inval_always {
+                    self.invalidate_inode_cache_self(req, ino);
+                    audit.assert_invalidated("flush");
+                } else {
+                    audit.discard_no_mutation();
+                }
+                if self.noflush {
+                    // The drain work above succeeded; replying ENOSYS now
+                    // latches the kernel's connection-wide `no_flush`, so
+                    // every later close() skips this round trip. Dirty
+                    // writeback pages still arrive synchronously at close
+                    // (the kernel runs `write_inode_now` before checking
+                    // `no_flush`); the buffered tail is picked up by RELEASE
+                    // or the pending-tail guards on attr-bearing paths. On
+                    // drain errors the real errno is replied instead, which
+                    // leaves FLUSH enabled and close() still reporting them.
+                    crate::telemetry::record_fuse_noflush_enosys_reply();
+                    reply.error(libc::ENOSYS);
+                } else {
+                    reply.ok();
+                }
+            }
+            Err(e) => reply.error(error_to_errno(&e)),
+        }
+    }
+
+    /// Synchronizes file data through the shared inode commit barrier.
+    fn fsync(&self, _req: &Request, ino: u64, fh: u64, _datasync: bool, reply: ReplyEmpty) {
+        tracing::debug!("FUSE::fsync: fh={}", fh);
+        let file = {
+            let open_files = self.open_files.lock();
+            open_files.get(&fh).map(|open_file| open_file.file.clone())
+        };
+        let _file = match file {
+            Some(file) => file,
+            None => match self.resolve_ino_file(ino, false) {
+                Ok(file) => file,
+                Err(e) => {
+                    reply.error(error_to_errno(&e));
+                    return;
+                }
+            },
+        };
+
+        if let Err(e) = self.flush_pending_inode(ino) {
+            reply.error(error_to_errno(&e));
+            return;
+        }
+
+        let result = self.commit_barrier(Some(ino));
+
+        match result {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(error_to_errno(&e)),
+        }
+    }
+
+    /// Releases (closes) an open file handle.
+    ///
+    /// Flushes pending writes and removes the file handle from the open files table.
+    fn release(
+        &self,
+        _req: &Request,
+        _ino: u64,
+        fh: u64,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
+        crate::telemetry::record_fuse_release();
+        tracing::debug!("FUSE::release: fh={}", fh);
+        // Deferred-drain default: move this handle's buffered writes into the
+        // SDK batcher overlay, but do NOT force a SQLite commit on close. The
+        // overlay keeps reads consistent and the batcher's timer/bytes/global
+        // triggers + finalize-on-unmount provide durability. Set
+        // AGENTFS_DRAIN_ON_RELEASE=1 to restore the legacy commit-on-close.
+        let (drain, file) = {
+            let mut open_files = self.open_files.lock();
+            let Some(open_file) = open_files.get_mut(&fh) else {
+                reply.error(libc::EBADF);
+                return;
+            };
+            let drain = open_file.take_pending();
+            if drain.is_some() {
+                self.pending_dirty_handles.fetch_sub(1, Ordering::Release);
+            }
+            (drain, open_file.file.clone())
+        };
+        let drain_on_release = self.drain_on_release;
+        let result = (|| -> Result<(), SdkError> {
+            if let Some(drain) = drain {
+                flush_pending_batched_out_of_lock(&self.runtime, drain)?;
+            }
+            if drain_on_release {
+                self.runtime
+                    .block_on(async move { file.drain_writes().await })?;
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.open_files.lock().remove(&fh);
+                reply.ok();
+            }
+            Err(e) => reply.error(error_to_errno(&e)),
+        }
+    }
+
+    /// Returns filesystem statistics.
+    ///
+    /// Queries actual usage from the SDK and reports it to tools like `df`.
+    fn statfs(&self, _req: &Request, _ino: u64, reply: ReplyStatfs) {
+        tracing::debug!("FUSE::statfs");
+        const BLOCK_SIZE: u64 = 4096;
+        const TOTAL_INODES: u64 = 1_000_000; // Virtual limit
+        const MAX_NAMELEN: u32 = 255;
+
+        let fs = self.fs.clone();
+        let result = self.runtime.block_on(async move { fs.statfs().await });
+
+        let (used_blocks, used_inodes) = match result {
+            Ok(stats) => {
+                let used_blocks = stats.bytes_used.div_ceil(BLOCK_SIZE);
+                (used_blocks, stats.inodes)
+            }
+            Err(_) => (0, 1), // Fallback: just root inode
+        };
+
+        // Report a large virtual capacity so tools don't think we're out of space
+        const TOTAL_BLOCKS: u64 = 1024 * 1024 * 1024; // ~4TB virtual size
+        let free_blocks = TOTAL_BLOCKS.saturating_sub(used_blocks);
+        let free_inodes = TOTAL_INODES.saturating_sub(used_inodes);
+
+        reply.statfs(
+            TOTAL_BLOCKS,
+            free_blocks,
+            free_blocks,
+            TOTAL_INODES,
+            free_inodes,
+            BLOCK_SIZE as u32,
+            MAX_NAMELEN,       // namelen: maximum filename length
+            BLOCK_SIZE as u32, // frsize: fragment size
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Inode Lifecycle
+    // ─────────────────────────────────────────────────────────────
+
+    /// Forget about an inode.
+    ///
+    /// Called when the kernel removes an inode from its cache. For passthrough
+    /// filesystems (like HostFS), this allows releasing O_PATH file descriptors
+    /// that were cached for the inode, preventing file descriptor exhaustion.
+    fn forget(&self, _req: &Request, ino: u64, nlookup: u64) {
+        tracing::debug!("FUSE::forget: ino={}, nlookup={}", ino, nlookup);
+        self.drop_ino_file(ino);
+        let fs = self.fs.clone();
+        // Default: do NOT commit pending batched writes here. The kernel
+        // FORGETs every freshly-written file shortly after our post-write
+        // entry invalidation, so a drain here issues one serial SQLite commit
+        // per file and sits on the clone critical path. Pending writes remain
+        // readable via the Tier-4 overlay and are committed by the batcher
+        // timer/bytes triggers, fsync, or finalize-on-unmount.
+        let drain_on_forget = self.drain_on_forget;
+        self.runtime.block_on(async move {
+            if drain_on_forget {
+                if let Err(error) = fs.drain_inode_writes(ino as i64).await {
+                    tracing::warn!(
+                        ?error,
+                        "FUSE::forget failed to drain batched writes for inode {ino}"
+                    );
+                }
+            }
+            fs.forget(ino as i64, nlookup).await;
+        });
+    }
+
+    /// Batch forget multiple inodes at once.
+    ///
+    /// This is an optimization over calling forget() individually for each inode.
+    fn batch_forget(&self, _req: &Request, nodes: &[fuse_forget_one]) {
+        tracing::debug!("FUSE::batch_forget: {} nodes", nodes.len());
+        for node in nodes {
+            self.drop_ino_file(node.nodeid);
+        }
+        let fs = self.fs.clone();
+        let nodes_vec: Vec<(i64, u64)> =
+            nodes.iter().map(|n| (n.nodeid as i64, n.nlookup)).collect();
+        // See `forget`: no commit-on-forget by default.
+        let drain_on_forget = self.drain_on_forget;
+        self.runtime.block_on(async move {
+            for (ino, nlookup) in nodes_vec {
+                if drain_on_forget {
+                    if let Err(error) = fs.drain_inode_writes(ino).await {
+                        tracing::warn!(
+                            ?error,
+                            "FUSE::batch_forget failed to drain batched writes for inode {ino}"
+                        );
+                    }
+                }
+                fs.forget(ino, nlookup).await;
+            }
+        });
+    }
+}
+
+impl Drop for AgentFSFuse {
+    fn drop(&mut self) {
+        if let Err(e) = self.flush_all_pending() {
+            tracing::warn!(error = ?e, "FUSE drop failed to flush pending writes");
+        }
+        if let Err(e) = self.commit_barrier(None) {
+            tracing::warn!(error = ?e, "FUSE drop failed to commit pending writes");
+        }
+        if let Err(e) = self.finalize_filesystem() {
+            tracing::warn!(error = ?e, "FUSE drop failed to finalize filesystem");
+        }
+    }
+}
+
+impl AgentFSFuse {
+    fn flush_pending_inode(&self, ino: u64) -> Result<(), SdkError> {
+        // Tier Four: only flush per-fh FUSE WriteBuffer state into the SDK
+        // batcher. Do NOT call drain_inode_writes here — the SDK now serves
+        // reads from the in-memory overlay (peek_pending merge), so a
+        // synchronous SQLite commit on every read is wasted work. Durability
+        // remains via fsync/destroy/timer.
+        self.flush_open_file_pending_inode_except(ino, 0)?;
+        self.flush_ino_file_pending(ino)
+    }
+
+    /// Write-path pre-drain: moves OTHER handles' buffers for `ino` into the
+    /// batcher before this write buffers, preserving FUSE request order
+    /// across fh-keyed handles. Deliberately skips the shared per-inode
+    /// buffer — under zero-message opens that buffer IS this write's
+    /// destination, and ordering within one buffer is inherent.
+    fn flush_pending_inode_except(&self, ino: u64, except_fh: u64) -> Result<(), SdkError> {
+        self.flush_open_file_pending_inode_except(ino, except_fh)
+    }
+
+    fn flush_open_file_pending_inode_except(
+        &self,
+        ino: u64,
+        except_fh: u64,
+    ) -> Result<(), SdkError> {
+        // Collect pending buffers under the lock, then release the lock
+        // before issuing the async pwrites. See `OpenFile::take_pending` for
+        // why holding the parking_lot lock across `runtime.block_on(...)` is
+        // a hot-path foot-gun.
+        let drains = {
+            let mut open_files = self.open_files.lock();
+            let mut drains = Vec::new();
+            for (fh, open_file) in open_files.iter_mut() {
+                if *fh == except_fh || open_file.ino != ino {
+                    continue;
+                }
+                if let Some(drain) = open_file.take_pending() {
+                    drains.push(drain);
+                }
+            }
+            if !drains.is_empty() {
+                self.pending_dirty_handles
+                    .fetch_sub(drains.len(), Ordering::Release);
+            }
+            drains
+        };
+        for drain in drains {
+            flush_pending_batched_out_of_lock(&self.runtime, drain)?;
+        }
+        Ok(())
+    }
+
+    fn flush_all_pending(&self) -> Result<(), SdkError> {
+        // Same lock-release pattern as `flush_open_file_pending_inode_except`.
+        let mut drains = {
+            let mut open_files = self.open_files.lock();
+            let mut drains = Vec::new();
+            for open_file in open_files.values_mut() {
+                if let Some(drain) = open_file.take_pending() {
+                    drains.push(drain);
+                }
+            }
+            if !drains.is_empty() {
+                self.pending_dirty_handles
+                    .fetch_sub(drains.len(), Ordering::Release);
+            }
+            drains
+        };
+        {
+            let mut ino_files = self.ino_files.lock();
+            let start = drains.len();
+            for entry in ino_files.values_mut() {
+                if let Some(drain) = entry.take_pending() {
+                    drains.push(drain);
+                }
+            }
+            let drained = drains.len() - start;
+            if drained > 0 {
+                self.pending_dirty_handles
+                    .fetch_sub(drained, Ordering::Release);
+            }
+        }
+        for drain in drains {
+            flush_pending_batched_out_of_lock(&self.runtime, drain)?;
+        }
+        Ok(())
+    }
+
+    fn cache_epoch(&self) -> u64 {
+        self.caches.epoch()
+    }
+
+    fn cache_epoch_changed(&self, epoch: u64) -> bool {
+        self.caches.epoch_changed(epoch)
+    }
+
+    fn reply_negative_entry(&self, reply: ReplyEntry) {
+        if self.cache_config.neg_ttl.is_zero() {
+            reply.error(libc::ENOENT);
+        } else {
+            reply.negative(&self.cache_config.neg_ttl);
+        }
+    }
+
+    fn reply_negative_entry_with_ttl(&self, reply: ReplyEntry, stable: bool) {
+        if stable {
+            self.reply_negative_entry(reply);
+        } else {
+            reply.error(libc::ENOENT);
+        }
+    }
+
+    fn attrs_cacheable(&self) -> bool {
+        !self.cache_config.attr_ttl.is_zero()
+    }
+
+    fn kernel_cache_policy(&self, ino: u64) -> KernelCachePolicy {
+        self.fs.kernel_cache_policy(ino as i64)
+    }
+
+    fn external_drift_sensitive(&self, ino: u64) -> bool {
+        self.kernel_cache_policy(ino).has_external_drift()
+    }
+
+    fn external_drift_detected(&self, ino: u64, stats: &Stats) -> bool {
+        self.caches.external_read_was_seen(ino)
+            && self
+                .caches
+                .external_read_drifted(ino, KeepCacheFingerprint::from_stats(stats))
+    }
+
+    fn has_pending_write_for_inode(&self, ino: u64) -> bool {
+        self.open_files
+            .lock()
+            .values()
+            .any(|open_file| open_file.ino == ino && !open_file.pending.is_empty())
+            || self
+                .ino_files
+                .lock()
+                .get(&ino)
+                .is_some_and(|entry| !entry.pending.is_empty())
+    }
+
+    /// Get-or-create the shared per-inode file for `fh = 0` traffic. A
+    /// `write` resolution of a read-resolved inode re-opens with `O_RDWR`
+    /// (triggering overlay copy-up) and replaces the entry's file, so later
+    /// reads go through the delta layer instead of a stale base handle.
+    /// Never holds the `ino_files` lock across `block_on` (same contract as
+    /// `open_files`).
+    fn resolve_ino_file(&self, ino: u64, write: bool) -> Result<BoxedFile, SdkError> {
+        let stamp = self.ino_file_stamp.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut ino_files = self.ino_files.lock();
+            if let Some(entry) = ino_files.get_mut(&ino) {
+                if !write || entry.write_capable {
+                    entry.last_used = stamp;
+                    return Ok(entry.file.clone());
+                }
+            }
+        }
+        let flags = if write { libc::O_RDWR } else { libc::O_RDONLY };
+        let fs = self.fs.clone();
+        let file = self
+            .runtime
+            .block_on(async move { fs.open(ino as i64, flags).await })?;
+        crate::telemetry::record_fuse_ino_file_resolution();
+        let mut ino_files = self.ino_files.lock();
+        match ino_files.get_mut(&ino) {
+            Some(entry) if write && !entry.write_capable => {
+                entry.file = file.clone();
+                entry.write_capable = true;
+                entry.last_used = stamp;
+                crate::telemetry::record_fuse_ino_file_upgrade();
+                Ok(file)
+            }
+            Some(entry) => {
+                // Raced another resolver; keep the winner's file.
+                entry.last_used = stamp;
+                Ok(entry.file.clone())
+            }
+            None => {
+                self.evict_ino_files_overflow(&mut ino_files);
+                ino_files.insert(
+                    ino,
+                    InoFile {
+                        file: file.clone(),
+                        pending: WriteBuffer::default(),
+                        write_capable: write,
+                        last_used: stamp,
+                    },
+                );
+                Ok(file)
+            }
+        }
+    }
+
+    /// Soft-cap safety valve: when the table would exceed `ino_files_cap`,
+    /// evict the oldest clean entries. Dirty entries are never evicted —
+    /// their buffered tails drain via the guards, FORGET, or destroy.
+    fn evict_ino_files_overflow(&self, ino_files: &mut HashMap<u64, InoFile>) {
+        if ino_files.len() < self.ino_files_cap {
+            return;
+        }
+        let mut clean: Vec<(u64, u64)> = ino_files
+            .iter()
+            .filter(|(_, entry)| entry.pending.is_empty())
+            .map(|(&ino, entry)| (entry.last_used, ino))
+            .collect();
+        clean.sort_unstable();
+        let excess = ino_files.len() + 1 - self.ino_files_cap;
+        for &(_, ino) in clean.iter().take(excess) {
+            ino_files.remove(&ino);
+        }
+    }
+
+    /// Coalesce a `fh = 0` write into the shared per-inode buffer, resolving
+    /// the write-capable file first. Returns a drain tuple when the buffer
+    /// crossed the flush threshold. Loops on the narrow race where a clean
+    /// entry is evicted between resolution and re-locking.
+    fn buffer_ino_write(
+        &self,
+        ino: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<Option<PendingDrain>, i32> {
+        loop {
+            self.resolve_ino_file(ino, true)
+                .map_err(|e| error_to_errno(&e))?;
+            let mut ino_files = self.ino_files.lock();
+            let Some(entry) = ino_files.get_mut(&ino) else {
+                continue;
+            };
+            if !entry.write_capable {
+                continue;
+            }
+            let was_empty = entry.pending.is_empty();
+            entry.pending.write(offset, data)?;
+            if entry.pending.bytes >= FUSE_COALESCE_FLUSH_BYTES {
+                let drain = entry.take_pending();
+                if !was_empty {
+                    self.pending_dirty_handles.fetch_sub(1, Ordering::Release);
+                }
+                return Ok(drain);
+            }
+            if was_empty && !entry.pending.is_empty() {
+                self.pending_dirty_handles.fetch_add(1, Ordering::Release);
+            }
+            return Ok(None);
+        }
+    }
+
+    /// FORGET is the lifecycle end of a per-inode file: the kernel
+    /// guarantees no further ops for `ino` without a fresh LOOKUP, so the
+    /// entry is dropped after moving any buffered tail into the batcher.
+    fn drop_ino_file(&self, ino: u64) {
+        self.caches.prune_external_read_state(ino);
+        let drain = {
+            let mut ino_files = self.ino_files.lock();
+            let Some(mut entry) = ino_files.remove(&ino) else {
+                return;
+            };
+            let drain = entry.take_pending();
+            if drain.is_some() {
+                self.pending_dirty_handles.fetch_sub(1, Ordering::Release);
+            }
+            drain
+        };
+        if let Some(drain) = drain {
+            if let Err(error) = flush_pending_batched_out_of_lock(&self.runtime, drain) {
+                tracing::warn!(
+                    ?error,
+                    "FUSE::forget failed to flush pending writes for {ino}"
+                );
+            }
+        }
+    }
+
+    /// Drain the per-inode pending buffer for `ino` into the SDK batcher.
+    fn flush_ino_file_pending(&self, ino: u64) -> Result<(), SdkError> {
+        let drain = {
+            let mut ino_files = self.ino_files.lock();
+            match ino_files.get_mut(&ino) {
+                Some(entry) => {
+                    let drain = entry.take_pending();
+                    if drain.is_some() {
+                        self.pending_dirty_handles.fetch_sub(1, Ordering::Release);
+                    }
+                    drain
+                }
+                None => None,
+            }
+        };
+        match drain {
+            Some(drain) => flush_pending_batched_out_of_lock(&self.runtime, drain),
+            None => Ok(()),
+        }
+    }
+
+    /// Drains buffered write tails for `ino` before an attr-bearing reply
+    /// (lookup/readdirplus). A closed-but-unreleased handle (async RELEASE
+    /// still in flight) or an open handle mid-coalesce holds bytes the SDK
+    /// hasn't seen; replying SDK attrs would let the kernel cache a stale
+    /// size for the full attr TTL. Costs one atomic load when nothing is
+    /// buffered anywhere. Returns whether a drain happened.
+    fn drain_pending_tail_for_attrs(&self, ino: u64) -> Result<bool, SdkError> {
+        if self.pending_dirty_handles.load(Ordering::Acquire) == 0
+            || !self.has_pending_write_for_inode(ino)
+        {
+            return Ok(false);
+        }
+        self.flush_pending_inode(ino)?;
+        crate::telemetry::record_fuse_pending_tail_drain();
+        Ok(true)
+    }
+
+    fn keepcache_allows(&self, ino: u64, fingerprint: &KeepCacheFingerprint) -> bool {
+        self.caches.keepcache_allows(ino, fingerprint)
+    }
+
+    fn mark_keepcache_eligible(&self, ino: u64, fingerprint: KeepCacheFingerprint) {
+        self.caches.mark_keepcache_eligible(ino, fingerprint);
+    }
+
+    fn drop_keepcache_eligibility(&self, ino: u64) {
+        if self.caches.drop_keepcache_eligibility(ino) {
+            crate::telemetry::record_fuse_keepcache_eligibility_drop();
+        }
+    }
+
+    #[allow(
+        dead_code,
+        reason = "emergency pre-Tier-4 parity helper kept for one milestone"
+    )]
+    fn drain_inode_writes(&self, ino: u64) -> Result<(), SdkError> {
+        // Kept for emergency parity with pre-Tier-4 paths; not called on the
+        // hot read path because the SDK overlay handles read-after-write
+        // consistency without forcing a SQLite commit.
+        self.runtime
+            .block_on(self.semantics.commit_barrier(Some(ino as i64)))
+    }
+
+    fn commit_barrier(&self, ino: Option<u64>) -> Result<(), SdkError> {
+        self.runtime
+            .block_on(self.semantics.commit_barrier(ino.map(|ino| ino as i64)))
+    }
+
+    fn finalize_filesystem(&self) -> Result<(), SdkError> {
+        self.runtime.block_on(self.semantics.finalize())
+    }
+
+    fn invalidate_inode_cache(&self, req: &Request, ino: u64) {
+        let invalidation = self
+            .caches
+            .invalidate_inode(ino, NotifyPolicy::NotifyKernel);
+        if invalidation.dropped_keepcache {
+            crate::telemetry::record_fuse_keepcache_eligibility_drop();
+        }
+        if invalidation.notify_kernel {
+            self.notify_inval_inode(req, ino, 0, i64::MAX);
+            crate::telemetry::record_base_fast_inode_invalidation();
+        }
+        record_mutation_invalidation();
+    }
+
+    fn invalidate_entry_cache(&self, req: &Request, parent: u64, name: &OsStr) {
+        let mut notify_kernel = true;
+        if let Some(name) = name.to_str() {
+            let invalidation =
+                self.caches
+                    .invalidate_entry(parent, name, NotifyPolicy::NotifyKernel);
+            if invalidation.removed_negative {
+                crate::telemetry::record_negative_cache_invalidation();
+            }
+            notify_kernel = invalidation.notify_kernel;
+        }
+        if notify_kernel {
+            self.notify_inval_entry(req, parent, name);
+        }
+        record_mutation_invalidation();
+    }
+
+    /// Invalidation for a kernel-initiated mutation whose FUSE reply already
+    /// carries the fresh attributes for `ino` (setattr's attr reply, link's
+    /// entry reply): adapter-internal caches are always invalidated, but the
+    /// kernel notification is skipped unless `AGENTFS_FUSE_SELF_INVAL=1` —
+    /// the kernel's own caches are coherent for its own mutations, and the
+    /// notification would purge the attrs and page cache the reply just
+    /// established (see the `self_inval` field).
+    fn invalidate_inode_cache_self(&self, req: &Request, ino: u64) {
+        if self.self_inval {
+            self.invalidate_inode_cache(req, ino);
+            return;
+        }
+        let invalidation = self
+            .caches
+            .invalidate_inode(ino, NotifyPolicy::SuppressKernel);
+        if invalidation.dropped_keepcache {
+            crate::telemetry::record_fuse_keepcache_eligibility_drop();
+        }
+        if invalidation.notify_kernel {
+            self.notify_inval_inode(req, ino, 0, i64::MAX);
+            crate::telemetry::record_base_fast_inode_invalidation();
+        }
+        record_mutation_invalidation();
+    }
+
+    /// Entry/attr TTLs for mutation replies (create/mknod/mkdir/symlink/link).
+    /// Historically pinned to zero because the per-mutation kernel
+    /// invalidations would purge them anyway; with self-invalidation
+    /// suppressed the reply-established dentry+attrs are allowed to live the
+    /// standard TTLs, so the freshly created file's first lstat/open is served
+    /// from the kernel cache instead of a LOOKUP+GETATTR round trip.
+    fn mutation_reply_ttls(&self) -> (Duration, Duration) {
+        if self.self_inval {
+            (Duration::ZERO, Duration::ZERO)
+        } else {
+            (self.cache_config.entry_ttl, self.cache_config.attr_ttl)
+        }
+    }
+
+    /// Entry-cache counterpart of `invalidate_inode_cache_self` for a name the
+    /// kernel just created via this reply (create/mknod/mkdir/symlink/link):
+    /// the entry reply establishes the dentry, so the kernel notification is
+    /// skipped unless `AGENTFS_FUSE_SELF_INVAL=1`. Adapter entry/negative
+    /// caches are always invalidated.
+    fn invalidate_entry_cache_self(&self, req: &Request, parent: u64, name: &OsStr) {
+        if self.self_inval {
+            self.invalidate_entry_cache(req, parent, name);
+            return;
+        }
+        if let Some(name) = name.to_str() {
+            let invalidation =
+                self.caches
+                    .invalidate_entry(parent, name, NotifyPolicy::SuppressKernel);
+            if invalidation.removed_negative {
+                crate::telemetry::record_negative_cache_invalidation();
+            }
+            if invalidation.notify_kernel {
+                self.notify_inval_entry(req, parent, OsStr::new(name));
+            }
+        }
+        record_mutation_invalidation();
+    }
+
+    fn notify_inval_inode(&self, req: &Request, ino: u64, offset: i64, len: i64) {
+        crate::telemetry::record_fuse_adapter_inval_inode_notification();
+        if !self.sync_inval {
+            req.deferred_notifier().inval_inode(ino, offset, len);
+            return;
+        }
+        self.notify_inval_inode_sync(req, ino, offset, len);
+    }
+
+    fn notify_inval_inode_sync(&self, req: &Request, ino: u64, offset: i64, len: i64) {
+        let start = Instant::now();
+        let result = req.notifier().inval_inode(ino, offset, len);
+        crate::telemetry::record_fuse_sync_inval_latency(start.elapsed());
+
+        match result {
+            Ok(()) => crate::telemetry::record_fuse_sync_inval_inode_ok(),
+            Err(e) => {
+                tracing::warn!(
+                    "synchronous FUSE inval_inode failed ino={}, offset={}, len={}: {}",
+                    ino,
+                    offset,
+                    len,
+                    e
+                );
+                crate::telemetry::record_fuse_sync_inval_inode_err();
+            }
+        }
+    }
+
+    fn notify_inval_entry(&self, req: &Request, parent: u64, name: &OsStr) {
+        crate::telemetry::record_fuse_adapter_inval_entry_notification();
+        if !self.sync_inval {
+            req.deferred_notifier().inval_entry(parent, name);
+            return;
+        }
+
+        let start = Instant::now();
+        let result = req.notifier().inval_entry(parent, name);
+        crate::telemetry::record_fuse_sync_inval_latency(start.elapsed());
+
+        match result {
+            Ok(()) => crate::telemetry::record_fuse_sync_inval_entry_ok(),
+            Err(e) => {
+                tracing::warn!(
+                    "synchronous FUSE inval_entry failed parent={}, name={:?}: {}",
+                    parent,
+                    name,
+                    e
+                );
+                crate::telemetry::record_fuse_sync_inval_entry_err();
+            }
+        }
+    }
+
+    fn invalidate_cached_entry(&self, parent: u64, name: &str) {
+        let key = (parent, name.to_string());
+        self.caches.entries().lock().remove(&key);
+        if self.caches.negative_entries().lock().remove(&key).is_some() {
+            crate::telemetry::record_negative_cache_invalidation();
+        }
+    }
+
+    fn cache_negative_entry(&self, parent: u64, name: &str) {
+        let key = (parent, name.to_string());
+        self.caches.entries().lock().remove(&key);
+        self.caches.negative_entries().lock().insert(key, ());
+    }
+
+    fn lookup_child_for_invalidation(&self, parent: u64, name: &str) -> Option<Stats> {
+        if let Some(stats) = self
+            .caches
+            .entries()
+            .lock()
+            .get(&(parent, name.to_string()))
+            .cloned()
+        {
+            return Some(stats);
+        }
+
+        let fs = self.fs.clone();
+        self.runtime
+            .block_on(async move { fs.lookup(parent as i64, name).await })
+            .ok()
+            .flatten()
+    }
+
+    fn cache_attr(&self, stats: &Stats) {
+        if !self.attrs_cacheable() || self.external_drift_sensitive(stats.ino as u64) {
+            return;
+        }
+        self.caches
+            .attrs()
+            .lock()
+            .insert(stats.ino as u64, stats.clone());
+    }
+
+    fn cache_entry(&self, parent: u64, name: &str, stats: &Stats) {
+        if !self.attrs_cacheable() || self.external_drift_sensitive(stats.ino as u64) {
+            return;
+        }
+        self.cache_attr(stats);
+        self.invalidate_cached_entry(parent, name);
+        self.caches
+            .entries()
+            .lock()
+            .insert((parent, name.to_string()), stats.clone());
+    }
+
+    fn cached_attr(&self, ino: u64) -> Result<Option<Stats>, SdkError> {
+        let cache_epoch = self.cache_epoch();
+        let cached_attr = if self.attrs_cacheable() {
+            self.caches.attrs().lock().get(&ino).cloned()
+        } else {
+            None
+        };
+        if let Some(stats) = cached_attr {
+            let cache_reply = self.caches.try_reply_guard(cache_epoch);
+            if cache_reply.is_some() {
+                return Ok(Some(stats));
+            }
+        }
+
+        let cache_epoch = self.cache_epoch();
+        let fs = self.fs.clone();
+        let stats = self
+            .runtime
+            .block_on(async move { fs.getattr(ino as i64).await })?;
+
+        let cache_reply = self.caches.try_reply_guard(cache_epoch);
+        if let Some(ref stats) = stats {
+            if cache_reply.is_some() && self.attrs_cacheable() {
+                self.cache_attr(stats);
+            }
+        }
+
+        Ok(stats)
+    }
+
+    fn cached_readdir_entries(
+        &self,
+        ino: u64,
+    ) -> Result<(Arc<Vec<CachedDirEntry>>, bool, u64), SdkError> {
+        let dir_cacheable = self.attrs_cacheable() && !self.external_drift_sensitive(ino);
+        let cache_epoch = self.cache_epoch();
+        let cached_entries = if dir_cacheable {
+            self.caches.dir_entries().lock().get(&ino).cloned()
+        } else {
+            None
+        };
+        if let Some(entries) = cached_entries {
+            let cache_reply = self.caches.try_reply_guard(cache_epoch);
+            if cache_reply.is_some() {
+                return Ok((entries, true, cache_epoch));
+            }
+        }
+
+        let mut stable = false;
+        let mut stable_epoch = 0;
+        let mut entries_result = None;
+        for _ in 0..2 {
+            let epoch = self.cache_epoch();
+            let fs = self.fs.clone();
+            let result = self
+                .runtime
+                .block_on(async move { fs.readdir_plus(ino as i64).await });
+            stable = !self.cache_epoch_changed(epoch);
+            stable_epoch = epoch;
+            entries_result = Some(result);
+            if stable {
+                break;
+            }
+        }
+        let entries_result = entries_result.expect("readdir loop always runs");
+
+        let entries = match entries_result {
+            Ok(Some(entries)) => entries,
+            Ok(None) => return Err(FsError::NotFound.into()),
+            Err(e) => return Err(e),
+        };
+
+        // Buffered-tail coherence: any entry whose inode still has per-fh
+        // buffered writes (closed handle awaiting async RELEASE, or an open
+        // handle mid-coalesce) would reply a stale size that the kernel and
+        // the adapter entry caches then hold for the full TTL. Drain the
+        // affected inodes and refetch once.
+        let entries = if self.pending_dirty_handles.load(Ordering::Acquire) > 0 {
+            let affected: HashSet<u64> = {
+                let open_files = self.open_files.lock();
+                let pending: HashSet<u64> = open_files
+                    .values()
+                    .filter(|open_file| !open_file.pending.is_empty())
+                    .map(|open_file| open_file.ino)
+                    .collect();
+                entries
+                    .iter()
+                    .map(|entry| entry.stats.ino as u64)
+                    .filter(|entry_ino| pending.contains(entry_ino))
+                    .collect()
+            };
+            if affected.is_empty() {
+                entries
+            } else {
+                for tail_ino in affected {
+                    self.flush_pending_inode(tail_ino)?;
+                    crate::telemetry::record_fuse_pending_tail_drain();
+                }
+                let fs = self.fs.clone();
+                match self
+                    .runtime
+                    .block_on(async move { fs.readdir_plus(ino as i64).await })
+                {
+                    Ok(Some(fresh)) => fresh,
+                    Ok(None) => return Err(FsError::NotFound.into()),
+                    Err(e) => return Err(e),
+                }
+            }
+        } else {
+            entries
+        };
+
+        let dir_stats = self
+            .cached_attr(ino)?
+            .ok_or_else(|| SdkError::from(FsError::NotFound))?;
+
+        // In the inode-based API we do not track parent relationships directly.
+        // Use root's stats for non-root ".." entries as the existing fallback;
+        // the kernel handles proper path resolution for parent traversal.
+        let parent_stats = if ino == 1 {
+            dir_stats.clone()
+        } else {
+            self.cached_attr(1)?
+                .ok_or_else(|| SdkError::from(FsError::NotFound))?
+        };
+        let cache_reply = self.caches.try_reply_guard(stable_epoch);
+        stable = stable && cache_reply.is_some();
+
+        if stable && dir_cacheable {
+            for entry in &entries {
+                self.cache_entry(ino, &entry.name, &entry.stats);
+            }
+        }
+
+        let all_entries = build_cached_readdir_entries(&dir_stats, &parent_stats, entries);
+        let entries = Arc::new(all_entries);
+        if stable && dir_cacheable {
+            self.caches
+                .dir_entries()
+                .lock()
+                .insert(ino, entries.clone());
+        }
+        Ok((entries, stable, stable_epoch))
+    }
+
+    /// Create a new FUSE filesystem adapter wrapping a FileSystem instance.
+    ///
+    /// The provided Tokio runtime is used to execute async FileSystem operations
+    /// from within synchronous FUSE callbacks via `block_on`.
+    fn new(fs: Arc<dyn FileSystem>, runtime: Runtime, config: FuseConfig) -> Self {
+        let keepcache_delta_enabled = fs.delta_keep_cache_fast_path();
+        let cache_config = config.kernel_cache();
+        cache_config.record_profile();
+        let cache_dir_enabled = config.cache_dir_enabled();
+        let writeback_enabled = cache_config.writeback_cache_enabled;
+        let uring = config.uring;
+        Self {
+            semantics: Semantics::new(fs.clone()),
+            fs,
+            runtime,
+            cache_config,
+            uring,
+            open_files: Arc::new(Mutex::new(HashMap::new())),
+            caches: AdapterCaches::new(config.keepcache_sticky_drop),
+            next_fh: AtomicU64::new(1),
+            sync_inval: config.sync_inval,
+            self_inval: config.self_inval,
+            drain_on_release: config.drain_on_release,
+            drain_on_forget: config.drain_on_forget,
+            flush_inval_always: config.flush_inval_always,
+            noflush: config.noflush,
+            keepcache_delta_enabled,
+            noopen: config.noopen,
+            noopen_active: AtomicBool::new(false),
+            ino_files: Mutex::new(HashMap::new()),
+            ino_files_cap: config.ino_files_cap,
+            ino_file_stamp: AtomicU64::new(0),
+            pending_dirty_handles: AtomicUsize::new(0),
+            cache_dir_enabled,
+            writeback_enabled,
+        }
+    }
+
+    /// Allocate a new file handle for tracking open files.
+    ///
+    /// Similar to the Linux kernel's `get_unused_fd()`, this returns a unique
+    /// handle that identifies an open file throughout its lifetime.
+    fn alloc_fh(&self) -> u64 {
+        self.next_fh.fetch_add(1, Ordering::SeqCst)
+    }
+}
+
+fn readdir_start(offset: i64) -> usize {
+    usize::try_from(offset).unwrap_or(0)
+}
+
+fn fuse_write_open(flags: i32) -> bool {
+    (flags & libc::O_ACCMODE) != libc::O_RDONLY || (flags & libc::O_TRUNC) != 0
+}
+
+fn configure_writeback_cache(config: &mut KernelConfig, enabled: bool) {
+    if !enabled {
+        crate::telemetry::set_fuse_writeback_cache_enabled(false);
+        return;
+    }
+
+    match config.add_capabilities(FUSE_WRITEBACK_CACHE) {
+        Ok(()) => crate::telemetry::set_fuse_writeback_cache_enabled(true),
+        Err(_) => {
+            tracing::warn!("Kernel does not support FUSE_WRITEBACK_CACHE; leaving it disabled");
+            crate::telemetry::set_fuse_writeback_cache_enabled(false);
+        }
+    }
+}
+
+fn configure_readdirplus(config: &mut KernelConfig, mode: ReaddirPlusMode) {
+    crate::telemetry::set_fuse_readdirplus_mode(mode.profile_value());
+
+    match mode {
+        ReaddirPlusMode::Off => {}
+        ReaddirPlusMode::Auto => {
+            crate::telemetry::record_fuse_readdirplus_auto_requested();
+            match config.add_capabilities(FUSE_DO_READDIRPLUS) {
+                Ok(()) => crate::telemetry::record_fuse_readdirplus_do_enabled(),
+                Err(_) => {
+                    tracing::warn!("Kernel does not support FUSE_DO_READDIRPLUS");
+                    crate::telemetry::record_fuse_readdirplus_unsupported();
+                }
+            }
+            match config.add_capabilities(FUSE_READDIRPLUS_AUTO) {
+                Ok(()) => crate::telemetry::record_fuse_readdirplus_auto_enabled(),
+                Err(_) => {
+                    tracing::warn!("Kernel does not support FUSE_READDIRPLUS_AUTO");
+                    crate::telemetry::record_fuse_readdirplus_unsupported();
+                }
+            }
+        }
+        ReaddirPlusMode::Always => {
+            crate::telemetry::record_fuse_readdirplus_do_requested();
+            match config.add_capabilities(FUSE_DO_READDIRPLUS) {
+                Ok(()) => crate::telemetry::record_fuse_readdirplus_do_enabled(),
+                Err(_) => crate::telemetry::record_fuse_readdirplus_unsupported(),
+            }
+        }
+    }
+}
+
+fn build_cached_readdir_entries(
+    dir_stats: &Stats,
+    parent_stats: &Stats,
+    entries: Vec<DirEntry>,
+) -> Vec<CachedDirEntry> {
+    let mut all_entries = Vec::with_capacity(entries.len() + 2);
+
+    all_entries.push(cached_dir_entry(".", dir_stats));
+    all_entries.push(cached_dir_entry("..", parent_stats));
+
+    for entry in entries {
+        all_entries.push(cached_dir_entry(entry.name, &entry.stats));
+    }
+
+    all_entries
+}
+
+fn cached_dir_entry(name: impl Into<String>, stats: &Stats) -> CachedDirEntry {
+    CachedDirEntry {
+        name: name.into(),
+        attr: fillattr(stats),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Attribute Conversion
+// ─────────────────────────────────────────────────────────────
+
+/// Fill a `FileAttr` from AgentFS stats.
+///
+/// Similar to the Linux kernel's `generic_fillattr()`, this converts
+/// filesystem-specific stat information into the VFS attribute structure.
+///
+/// The uid and gid parameters override the stored values to ensure proper
+/// file ownership reporting (avoids "dubious ownership" errors from git).
+fn fillattr(stats: &Stats) -> FileAttr {
+    let file_type = stats.mode & S_IFMT;
+    let kind = match file_type {
+        S_IFDIR => FileType::Directory,
+        S_IFLNK => FileType::Symlink,
+        S_IFIFO => FileType::NamedPipe,
+        S_IFCHR => FileType::CharDevice,
+        S_IFBLK => FileType::BlockDevice,
+        S_IFSOCK => FileType::Socket,
+        _ => FileType::RegularFile,
+    };
+
+    let size = if file_type == S_IFDIR {
+        4096_u64 // Standard directory size
+    } else {
+        stats.size as u64
+    };
+
+    FileAttr {
+        ino: stats.ino as u64,
+        size,
+        blocks: size.div_ceil(512),
+        atime: UNIX_EPOCH + Duration::new(stats.atime as u64, stats.atime_nsec),
+        mtime: UNIX_EPOCH + Duration::new(stats.mtime as u64, stats.mtime_nsec),
+        ctime: UNIX_EPOCH + Duration::new(stats.ctime as u64, stats.ctime_nsec),
+        crtime: UNIX_EPOCH,
+        kind,
+        perm: (stats.mode & 0o7777) as u16,
+        nlink: stats.nlink,
+        uid: stats.uid,
+        gid: stats.gid,
+        rdev: stats.rdev as u32,
+        flags: 0,
+        blksize: 512,
+    }
+}
+
+/// Check if allow_other is supported for FUSE mounts.
+///
+/// Returns true if the current user is root or if user_allow_other is enabled
+/// in /etc/fuse.conf.
+fn allow_other_supported() -> bool {
+    // Root can always use allow_other
+    if unsafe { libc::getuid() } == 0 {
+        return true;
+    }
+
+    // Check if user_allow_other is enabled in /etc/fuse.conf
+    if let Ok(contents) = std::fs::read_to_string("/etc/fuse.conf") {
+        for line in contents.lines() {
+            let line = line.trim();
+            // Skip comments and empty lines
+            if line.starts_with('#') || line.is_empty() {
+                continue;
+            }
+            if line == "user_allow_other" {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+pub struct SessionHandle {
+    thread: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
+    unmounter: crate::transport::SessionUnmounter,
+}
+
+impl SessionHandle {
+    pub fn unmount(&mut self) -> std::io::Result<()> {
+        self.unmounter.unmount()
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.thread
+            .as_ref()
+            .map(std::thread::JoinHandle::is_finished)
+            .unwrap_or(true)
+    }
+
+    pub fn join(mut self) -> anyhow::Result<()> {
+        let Some(thread) = self.thread.take() else {
+            return Ok(());
+        };
+        match thread.join() {
+            Ok(result) => result,
+            Err(panic) => Err(anyhow::anyhow!("FUSE session thread panicked: {panic:?}")),
+        }
+    }
+}
+
+pub fn mount(
+    fs: Arc<dyn FileSystem>,
+    opts: FuseMountOptions,
+    runtime: Runtime,
+) -> anyhow::Result<SessionHandle> {
+    crate::telemetry::register_sections();
+    // Raise fd limit to hard limit to prevent "too many open files" errors
+    // when passthrough filesystems cache O_PATH file descriptors
+    maximize_fd_limit();
+
+    let fuse_config = FuseConfig::from_env();
+    let dispatch_mode = fuse_config.dispatch_mode;
+    let uring_config = fuse_config.uring;
+    let fs = AgentFSFuse::new(fs, runtime, fuse_config);
+    let mount_opts = build_mount_options(&opts)?;
+
+    let mut session = crate::transport::Session::new(
+        fs,
+        &opts.mountpoint,
+        &mount_opts,
+        dispatch_mode,
+        uring_config,
+    )?;
+    let unmounter = session.unmount_callable();
+    let thread = std::thread::spawn(move || session.run().map_err(anyhow::Error::from));
+
+    Ok(SessionHandle {
+        thread: Some(thread),
+        unmounter,
+    })
+}
+
+fn build_mount_options(opts: &FuseMountOptions) -> anyhow::Result<Vec<MountOption>> {
+    let mut mount_opts = vec![
+        MountOption::FSName(opts.fsname.clone()),
+        // Enable kernel-level permission checking based on file mode/uid/gid
+        MountOption::DefaultPermissions,
+    ];
+
+    // Allow users other than the one who mounted the filesystem to access it.
+    // This requires either running as root or having user_allow_other enabled
+    // in /etc/fuse.conf.
+    if opts.allow_other {
+        if allow_other_supported() {
+            mount_opts.push(MountOption::AllowOther);
+        } else {
+            anyhow::bail!(
+                "FUSE allow_other not supported. Add 'user_allow_other' to /etc/fuse.conf or run as root."
+            );
+        }
+    }
+
+    if opts.auto_unmount {
+        mount_opts.push(MountOption::AutoUnmount);
+    }
+    if opts.allow_root {
+        mount_opts.push(MountOption::AllowRoot);
+    }
+
+    crate::transport::check_option_conflicts(&mount_opts)?;
+    Ok(mount_opts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_cached_readdir_entries, build_mount_options, fuse_write_open, readdir_start,
+        FuseMountOptions,
+    };
+    use agentfs_core::fs::{DirEntry, Stats, S_IFDIR, S_IFLNK, S_IFREG};
+    use agentfs_core::semantics::access;
+    use smallvec::smallvec;
+    use std::path::PathBuf;
+
+    fn stats(ino: i64, mode: u32) -> Stats {
+        Stats {
+            ino,
+            mode,
+            nlink: 1,
+            uid: 1000,
+            gid: 1000,
+            size: 123,
+            atime: 1,
+            mtime: 2,
+            ctime: 3,
+            atime_nsec: 4,
+            mtime_nsec: 5,
+            ctime_nsec: 6,
+            rdev: 0,
+        }
+    }
+
+    fn stats_with_owner(ino: i64, mode: u32, uid: u32, gid: u32) -> Stats {
+        Stats {
+            uid,
+            gid,
+            ..stats(ino, mode)
+        }
+    }
+
+    #[test]
+    fn fuse_mount_keeps_kernel_default_permissions_enabled() {
+        let opts = FuseMountOptions {
+            mountpoint: PathBuf::from("/tmp/agentfs-test"),
+            auto_unmount: false,
+            allow_root: false,
+            allow_other: false,
+            fsname: "agentfs-test".to_string(),
+            uid: None,
+            gid: None,
+        };
+
+        let options = build_mount_options(&opts).expect("mount options build");
+
+        assert!(
+            options.contains(&crate::transport::MountOption::DefaultPermissions),
+            "FUSE adapter must keep kernel default_permissions as the access authority"
+        );
+    }
+
+    #[test]
+    fn fuse_default_permissions_cases_match_shared_access() {
+        let owner = access::Credentials {
+            uid: 1000,
+            gid: 1000,
+            groups: smallvec![],
+        };
+        let other = access::Credentials {
+            uid: 3000,
+            gid: 3000,
+            groups: smallvec![],
+        };
+        let root = access::Credentials {
+            uid: 0,
+            gid: 0,
+            groups: smallvec![],
+        };
+        let cases = [
+            (
+                "fuse owner file rw",
+                stats_with_owner(20, S_IFREG | 0o600, 1000, 1000),
+                owner.clone(),
+                true,
+                true,
+                false,
+            ),
+            (
+                "fuse other denied",
+                stats_with_owner(21, S_IFREG | 0o600, 1000, 1000),
+                other.clone(),
+                false,
+                false,
+                false,
+            ),
+            (
+                "fuse auxiliary group execute directory",
+                stats_with_owner(22, S_IFDIR | 0o010, 1000, 2000),
+                access::Credentials {
+                    uid: 3000,
+                    gid: 3000,
+                    groups: smallvec![2000],
+                },
+                false,
+                false,
+                true,
+            ),
+            (
+                "fuse primary group write without search directory",
+                stats_with_owner(23, S_IFDIR | 0o020, 1000, 2000),
+                access::Credentials {
+                    uid: 3000,
+                    gid: 2000,
+                    groups: smallvec![],
+                },
+                false,
+                true,
+                false,
+            ),
+            (
+                "fuse other execute-only file",
+                stats_with_owner(24, S_IFREG | 0o001, 1000, 1000),
+                other,
+                false,
+                false,
+                true,
+            ),
+            (
+                "fuse root directory search",
+                stats_with_owner(25, S_IFDIR, 1000, 1000),
+                root,
+                true,
+                true,
+                true,
+            ),
+        ];
+
+        println!("adapter=fuse authority=kernel_default_permissions surface=semantics::access");
+        let mut mismatches = 0usize;
+        for (name, stats, creds, read, write, search) in cases {
+            let got = (
+                access::may_read(&stats, &creds),
+                access::may_write(&stats, &creds),
+                access::may_search(&stats, &creds),
+            );
+            println!(
+                "{name}: fuse=({read},{write},{search}) access=({},{},{})",
+                got.0, got.1, got.2
+            );
+            if got != (read, write, search) {
+                mismatches += 1;
+            }
+        }
+        println!("adapter=fuse access_conformance mismatches={mismatches}");
+        assert_eq!(mismatches, 0);
+    }
+
+    #[test]
+    fn readdir_start_clamps_negative_offsets_to_beginning() {
+        assert_eq!(readdir_start(-1), 0);
+        assert_eq!(readdir_start(0), 0);
+        assert_eq!(readdir_start(2), 2);
+    }
+
+    #[test]
+    fn fuse_write_open_detects_mutating_flags() {
+        assert!(!fuse_write_open(libc::O_RDONLY));
+        assert!(fuse_write_open(libc::O_WRONLY));
+        assert!(fuse_write_open(libc::O_RDWR));
+        assert!(fuse_write_open(libc::O_RDONLY | libc::O_TRUNC));
+    }
+
+    #[test]
+    fn cached_readdir_entries_include_attrs_for_dot_dotdot_and_children() {
+        let dir = stats(10, S_IFDIR | 0o755);
+        let parent = stats(1, S_IFDIR | 0o755);
+        let child = stats(11, S_IFREG | 0o644);
+        let symlink = stats(12, S_IFLNK | 0o777);
+
+        let entries = build_cached_readdir_entries(
+            &dir,
+            &parent,
+            vec![
+                DirEntry {
+                    name: "file.txt".to_string(),
+                    stats: child,
+                    cookie: 1,
+                },
+                DirEntry {
+                    name: "link".to_string(),
+                    stats: symlink,
+                    cookie: 2,
+                },
+            ],
+        );
+
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0].name, ".");
+        assert_eq!(entries[0].attr.ino, 10);
+        assert_eq!(entries[0].attr.kind, crate::transport::FileType::Directory);
+        assert_eq!(entries[1].name, "..");
+        assert_eq!(entries[1].attr.ino, 1);
+        assert_eq!(entries[1].attr.kind, crate::transport::FileType::Directory);
+        assert_eq!(entries[2].name, "file.txt");
+        assert_eq!(entries[2].attr.ino, 11);
+        assert_eq!(
+            entries[2].attr.kind,
+            crate::transport::FileType::RegularFile
+        );
+        assert_eq!(entries[3].name, "link");
+        assert_eq!(entries[3].attr.ino, 12);
+        assert_eq!(entries[3].attr.kind, crate::transport::FileType::Symlink);
+    }
+}

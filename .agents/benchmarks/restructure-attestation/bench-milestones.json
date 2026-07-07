@@ -1,0 +1,150 @@
+{
+  "record": "Per-milestone BENCH compliance (VAL-GATE-015)",
+  "contract": "library/perf-contract.md: median-of-5 per phase via git-workload-benchmark-multi.py; red iff >5% relative AND >10ms absolute vs the active baseline; single runs never gate; serialized on a quiet machine.",
+  "baselines": {
+    "m1": {
+      "artifact": ".agents/benchmarks/restructure-baseline/medians-m1.json",
+      "recorded_at_commit": "ae1e13f (benchmarked), 809d684 (artifact commit)",
+      "status": "archived; superseded by the post-M3 rebaseline after three independent drift adjudications proved it brittle on this machine for diff/fsck/clone/checkout"
+    },
+    "active_post_m3": {
+      "artifact": ".agents/benchmarks/restructure-baseline/medians.json",
+      "recorded_at_commit": "2b811f03493e861e5a7786592d25ac73b39e1aba",
+      "recorded_at": "2026-07-04T01:14:37Z",
+      "authorized_by": "orchestrator sign-off for misc-a-bench-rebaseline",
+      "provenance": ".agents/benchmarks/restructure-baseline/provenance-post-m3.md"
+    }
+  },
+  "milestones": [
+    {
+      "milestone": "M2 (dead-surface)",
+      "runs": [
+        {
+          "source": "m2-perf-triage-bench-red (HEAD 4e37c41, 2026-07-03)",
+          "verdict": "in band after adjudication",
+          "detail": "Stored-M1 compare red on fsck (+20.6ms/+11.0%; repeat +23.7ms/+12.7%). Rebuilt baseline code ae1e13f was red against its OWN stored artifact under identical conditions (diff +37.5%, fsck +11.5%), proving ambient drift, not a HEAD regression. Adjudication accepted by M2 scrutiny (PASS) and recorded in library/perf-contract.md."
+        }
+      ]
+    },
+    {
+      "milestone": "M3 (config/telemetry)",
+      "runs": [
+        {
+          "source": "m3-telemetry-registry feature BENCH",
+          "verdict": "in band (0 red phases)",
+          "detail": "checkout -18.0%, clone -9.7%, diff -53.7%, edit -3.9%, fsck -0.9%, read_search +1.9%, status -7.6%."
+        },
+        {
+          "source": "M3 user-testing VAL-CONF-013 (HEAD bc1753f)",
+          "verdict": "in band after adjudication",
+          "detail": "Moving red set across two stored-artifact runs (run1 clone +5.1%/fsck +8.3%; run2 diff/fsck/status); rebuilt ae1e13f sentinel red against its own artifact (clone +7.9%/+241ms, fsck +8.3%); direct HEAD-vs-sentinel showed HEAD equal or faster on the stored-red phases. Adjudicated noise; led to the orchestrator-signed post-M3 rebaseline (misc-a)."
+        },
+        {
+          "source": "misc-a-bench-rebaseline (post-M3 2b811f0)",
+          "verdict": "baseline re-recorded",
+          "detail": "Accepted run pair agreed 0-red in both directions; current-HEAD confirmation vs the new baseline: 0 red phases."
+        }
+      ]
+    },
+    {
+      "milestone": "M4a (core hot path)",
+      "runs": [
+        {
+          "source": "m4a-store-extraction feature BENCH",
+          "verdict": "in band (0 red phases)",
+          "detail": "checkout -14.2%, clone +2.2%, diff -41.5%, edit +1.0%, fsck +4.7%, read_search -9.5%, status -15.9%."
+        },
+        {
+          "source": "m4a-batcher-split feature BENCH (HEAD a687a84)",
+          "verdict": "in band after adjudication",
+          "detail": "Stored compare red on checkout/clone; rebuilt 2b811f0 sentinel equally red vs the same stored artifact under the same load; direct candidate-vs-sentinel: checkout +3.9ms, clone +3.9%, edit -0.8ms. Adjudicated ambient drift per perf-contract."
+        },
+        {
+          "source": "M4a user-testing VAL-CORE-008 (HEAD 9454886, load ~3.9)",
+          "verdict": "in band (0 red phases)",
+          "detail": "bench-compare exit 0; edit 5.2ms vs 5.0ms baseline (+3.8%, +0.2ms)."
+        }
+      ]
+    },
+    {
+      "milestone": "M4b (schema/overlay)",
+      "runs": [
+        {
+          "source": "m4b-overlay-directoryize feature BENCH",
+          "verdict": "in band (0 red phases)",
+          "detail": "bench-compare exit 0, 7 within band."
+        },
+        {
+          "source": "m4b-overlay-partial-store feature BENCH",
+          "verdict": "in band (0 red phases)",
+          "detail": "checkout +9.4ms stayed below the >10ms absolute red threshold; all other phases faster than baseline."
+        },
+        {
+          "source": "m4b-agentfs-directoryize feature BENCH",
+          "verdict": "in band (0 red phases)",
+          "detail": "clone -641.5ms / -22.9%; all other phases OK."
+        },
+        {
+          "source": "M4b user-testing VAL-CORE-018 (HEAD a62b0a1, load ~1.9-2.5)",
+          "verdict": "in band (0 red phases)",
+          "detail": "clone 2800.9ms -> 2741.3ms (-2.1%); diff +6.8ms and read_search +1.6ms sub-10ms absolute."
+        }
+      ]
+    },
+    {
+      "milestone": "M5 (crate split)",
+      "runs": [
+        {
+          "source": "m5-fuse-crate feature BENCH",
+          "verdict": "in band (0 red phases)",
+          "detail": "checkout 49.0ms, clone 2037.0ms, diff 31.1ms, edit 4.4ms, fsck 157.6ms, read_search 7.2ms, status 142.2ms."
+        },
+        {
+          "source": "m5-mount-crate feature BENCH",
+          "verdict": "in band (0 red phases)",
+          "detail": "checkout 43.1ms, clone 1872.2ms, diff 42.4ms, edit 3.7ms, fsck 180.3ms, read_search 7.7ms, status 121.1ms."
+        },
+        {
+          "source": "m5-fix-base-drift-coherence feature BENCH",
+          "verdict": "in band (0 red phases)",
+          "detail": "All candidate medians faster than the active baseline (checkout 50.1ms, clone 1879.4ms, diff 33.2ms, edit 3.0ms, fsck 169.8ms, read_search 6.5ms, status 118.5ms)."
+        }
+      ]
+    },
+    {
+      "milestone": "M6 (semantics)",
+      "runs": [
+        {
+          "source": "m6-fix-readdir-scaling feature BENCH",
+          "verdict": "in band (0 red phases)",
+          "detail": "checkout 54.6ms, clone 2605.7ms, diff 33.1ms, edit 4.5ms, fsck 206.4ms, read_search 8.1ms, status 172.3ms; bench-compare 0 red, 7 within band."
+        }
+      ]
+    },
+    {
+      "milestone": "M7 (cli/docs + attestation)",
+      "runs": [
+        {
+          "source": "m7-attestation round 1 (HEAD ff91302, quiet load 1.4-2.1)",
+          "verdict": "red (checkout) — superseded by the round-3 closure",
+          "detail": "Stored compare red on checkout only (56.7 -> 133.5ms, +135%); same-window sentinel did NOT clear it (sentinel 70.3ms vs HEAD 133.5ms), so it could not be adjudicated as noise; all other phases in band or faster. Deferred to a wall-time bisect."
+        },
+        {
+          "source": "m7-attestation round 2 wall-time bisect (HEAD 5535368, quiet load 2.0-3.5)",
+          "verdict": "red reproduced; bisected to ea416c8 — superseded by the round-3 closure",
+          "detail": "Checkout red reproduced (104.5ms vs same-window sentinel 77.2ms). Median-of-5 wall bisect c1937a3..3669c7b in a detached worktree, alternating probe order: first bad commit ea416c8 (scope run reads; fork before tokio). Checkout-phase FUSE profile counters identical parent-vs-culprit, locating the tax in the run-sandbox environment, not the FUSE hot path. Round 2 also established the brittle-phase repeat rule after a first-run diff red (+45%) evaporated on repeat."
+        },
+        {
+          "source": "m7-opt-sandbox-bringup closure (HEAD dae8aa6, quiet load 3.4-4.2)",
+          "verdict": "in band (0 red phases) — checkout red CLOSED with zero code change",
+          "detail": "Root cause: the bisect-era workload ran PATH git = the ~/.git-ai/bin/git shim inside the sandbox namespace; ea416c8's namespace pushed the shim's daemon/state logic onto a slow path per git call. dae8aa6 pins /usr/bin/git through the sandbox and harnesses, removing the tax from both legs. Official candidate/sentinel pair plus mandated brittle-phase repeat vs the stored post-M3 baseline: repeat 0 red, all 7 phases in band (checkout 56.7 -> 56.9ms +0.4%, clone +2.9%; the first candidate run's clone +24.3% red evaporated on the repeat). Same-window sentinel green; candidate checkout beat the sentinel by 17%. Exact-bench-shape zone attribution showed no measurable sandbox cost on any variant. Evidence: evidence/m7-cli-docs/m7-opt-sandbox-bringup/, library/perf-contract.md CLOSED entry."
+        },
+        {
+          "source": "m7-attestation final (attested HEAD 230c30a)",
+          "verdict": "in band (0 red phases, cited pair)",
+          "detail": "medians.json records the dae8aa6 official repeat pair vs the active post-M3 baseline: all 7 phases passed (checkout +0.4%, clone +2.9%, every other phase faster than baseline). Cited at 230c30a per the orchestrator round-3 ruling: the only commit after dae8aa6 changes cfg(target_os=macos) code, docs, and clap help text only — Linux binary perf semantics unchanged."
+        }
+      ]
+    }
+  ]
+}

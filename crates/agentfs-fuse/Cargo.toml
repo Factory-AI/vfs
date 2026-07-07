@@ -1,0 +1,27 @@
+[package]
+name = "agentfs-fuse"
+version.workspace = true
+edition.workspace = true
+description = "Linux FUSE adapter for AgentFS"
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+agentfs-core = { workspace = true }
+anyhow = { workspace = true }
+libc = { workspace = true }
+memchr = { workspace = true }
+nix = { workspace = true }
+page_size = { workspace = true }
+parking_lot = { workspace = true }
+smallvec = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+turso = { workspace = true }
+zerocopy = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+tempfile = { workspace = true }

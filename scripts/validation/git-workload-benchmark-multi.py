@@ -24,6 +24,9 @@ import time
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lib import common  # noqa: E402
+
 
 def percentile(values: list[float], q: float) -> float:
     if not values:
@@ -226,6 +229,9 @@ def main(argv: list[str]) -> int:
     with tempfile.TemporaryDirectory(prefix="gw-bench-multi-") as tmpdir:
         tmp_root = Path(tmpdir)
 
+        git_ai_before = common.git_ai_processes()
+        common.pin_distro_git(os.environ, tmp_root)
+
         warmup_runs: list[dict[str, Any]] = []
         for i in range(args.warmup):
             out_path = (persist_dir / f"warmup-{i:02d}.json") if persist_dir else (tmp_root / f"warmup-{i:02d}.json")
@@ -248,6 +254,8 @@ def main(argv: list[str]) -> int:
                 flush=True,
             )
 
+        leaked_git_ai = common.git_ai_leaks(git_ai_before, common.git_ai_processes())
+
         runs_for_aggregation = [r.get("result") or {} for r in runs]
         aggregation = aggregate(runs_for_aggregation)
         aggregation["label"] = args.label
@@ -256,6 +264,10 @@ def main(argv: list[str]) -> int:
         aggregation["agentfs_bin"] = args.agentfs_bin
         aggregation["iteration_returncodes"] = [r["returncode"] for r in runs]
         aggregation["iteration_wall_seconds"] = [r["wall_seconds"] for r in runs]
+        aggregation["git_ai_census"] = {
+            "pre_existing": len(git_ai_before),
+            "leaked": leaked_git_ai,
+        }
 
         human = render_human(args.label, aggregation)
         print(human, file=sys.stderr, flush=True)
@@ -265,6 +277,14 @@ def main(argv: list[str]) -> int:
             output_path.write_text(payload)
         else:
             sys.stdout.write(payload)
+
+        if leaked_git_ai:
+            print(
+                f"ERROR: benchmark run leaked {len(leaked_git_ai)} git-ai process(es); "
+                "the pinned-git shim must cover every git invocation",
+                file=sys.stderr,
+            )
+            return 1
 
     return 0
 
