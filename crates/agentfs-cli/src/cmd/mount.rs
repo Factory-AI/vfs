@@ -1,21 +1,18 @@
 use agentfs_core::{
-    error::Error as SdkError, AgentFSOptions, EncryptionConfig, FileSystem, HostFS, OverlayFS,
-    PartialOriginPolicy,
+    AgentFSOptions, EncryptionConfig, FileSystem, HostFS, OverlayFS, PartialOriginPolicy,
 };
 use agentfs_mount::{mount_fs, Backend, MountOpts};
 use anyhow::Result;
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{path::PathBuf, sync::Arc};
 use turso::value::Value;
 
 #[cfg(target_os = "linux")]
-use agentfs_core::{get_mounts, Mount};
+use agentfs_core::{error::Error as SdkError, get_mounts, Mount};
 #[cfg(target_os = "linux")]
 use std::{
     io::{self, Write},
     os::unix::fs::MetadataExt,
+    path::Path,
 };
 
 #[cfg(target_os = "linux")]

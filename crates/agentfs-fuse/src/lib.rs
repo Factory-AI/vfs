@@ -20,6 +20,10 @@
 //!   semantics and bounded teardown; unmount joins all transport threads.
 //! - No lock guard is held across an `.await` or `block_on` boundary.
 
+// The transport and adapter are Linux-only (/dev/fuse, io_uring, mount(2));
+// compile to an empty crate elsewhere so workspace-wide checks pass on macOS.
+#![cfg(target_os = "linux")]
+
 mod adapter;
 pub(crate) mod telemetry;
 pub(crate) mod transport;

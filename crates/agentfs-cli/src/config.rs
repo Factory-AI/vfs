@@ -15,6 +15,7 @@ const FUSE_WRITEBACK_ENV: &str = "AGENTFS_FUSE_WRITEBACK";
 pub(crate) const DEFAULT_CLONE_TIMINGS_ENABLED: bool = false;
 
 pub(crate) fn core_config_from_env() -> CoreConfig {
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     let mut config = CoreConfig::from_env();
 
     #[cfg(target_os = "linux")]
@@ -135,6 +136,7 @@ pub(crate) fn restore_original_tmpdir(command: &mut tokio::process::Command) {
 
 /// Restore the user's TMPDIR into this process's own environment. Used by the
 /// `run` sandbox child between `fork()` and `execvp()`.
+#[cfg(target_os = "linux")]
 pub(crate) fn restore_original_tmpdir_env() {
     match ORIGINAL_TMPDIR.get() {
         Some(Some(original)) => std::env::set_var("TMPDIR", original),

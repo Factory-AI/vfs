@@ -46,6 +46,7 @@ use std::time::Duration;
 const DEFAULT_MOUNT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_UNMOUNT_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[cfg(target_os = "linux")]
 pub(crate) fn get_runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Runtime::new().expect("internal error: failed to initialize runtime")
 }

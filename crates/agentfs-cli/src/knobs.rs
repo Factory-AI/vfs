@@ -293,6 +293,7 @@ impl Knob {
         }
     }
 
+    #[cfg(target_os = "linux")]
     const fn kill_switch(
         name: &'static str,
         default: DefaultValue,
@@ -336,6 +337,7 @@ impl Knob {
 }
 
 const CORE_OWNER: &str = "agentfs-core config";
+#[cfg(target_os = "linux")]
 const FUSE_OWNER: &str = "agentfs FUSE config";
 const CLI_OWNER: &str = "agentfs CLI edge";
 #[cfg(all(test, target_os = "linux"))]

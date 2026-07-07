@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{FromRawFd, OwnedFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -143,7 +143,7 @@ impl HostFS {
     }
 
     /// Perform lstat on a path
-    fn lstat_path(path: &PathBuf) -> Result<libc::stat> {
+    fn lstat_path(path: &Path) -> Result<libc::stat> {
         let c_path = CString::new(path.as_os_str().as_bytes())
             .map_err(|_| Error::Internal("invalid path".to_string()))?;
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
@@ -155,7 +155,7 @@ impl HostFS {
     }
 
     /// Open a file by path
-    fn open_path(path: &PathBuf, flags: libc::c_int) -> Result<OwnedFd> {
+    fn open_path(path: &Path, flags: libc::c_int) -> Result<OwnedFd> {
         let c_path = CString::new(path.as_os_str().as_bytes())
             .map_err(|_| Error::Internal("invalid path".to_string()))?;
         let fd = unsafe { libc::open(c_path.as_ptr(), flags) };
