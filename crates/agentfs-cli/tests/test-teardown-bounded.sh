@@ -264,7 +264,12 @@ test -z "$("${GIT_REAL:-git}" -C bounded/repo status --porcelain)"
     }
 }
 
+# Must run in the main shell, not a command substitution: the owner is this
+# shell's child, and a subshell poller pins `kill -0` on the unreaped zombie
+# forever under dash, where the blocked parent reaps nothing until the
+# substitution pipe closes. Reports the teardown latency via `elapsed_ms`.
 wait_for_owner_exit() {
+    elapsed_ms=""
     start_ms="$(date +%s%3N)"
     deadline_ms=$((start_ms + TEARDOWN_TIMEOUT * 1000))
     while kill -0 "$OWNER_PID" 2>/dev/null; do
@@ -277,7 +282,7 @@ wait_for_owner_exit() {
     wait "$OWNER_PID" 2>/dev/null || true
     OWNER_PID=""
     end_ms="$(date +%s%3N)"
-    echo $((end_ms - start_ms))
+    elapsed_ms=$((end_ms - start_ms))
     return 0
 }
 
@@ -371,8 +376,7 @@ run_leg() {
     fi
 
     kill "$OWNER_PID" 2>/dev/null || true
-    elapsed_ms=""
-    if ! elapsed_ms="$(wait_for_owner_exit)"; then
+    if ! wait_for_owner_exit; then
         dump_failure_context "$label owner did not exit within ${TEARDOWN_TIMEOUT}s after SIGTERM"
         cleanup_current
         return 1

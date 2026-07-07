@@ -408,6 +408,7 @@ pub(crate) struct UringQueueControl {
     starter: Mutex<Option<JoinHandle<()>>>,
     handles: Mutex<Vec<JoinHandle<()>>>,
     queues: Mutex<Vec<Arc<QueueShared>>>,
+    legacy_fallback_logged: AtomicBool,
 }
 
 impl UringQueueControl {
@@ -417,11 +418,26 @@ impl UringQueueControl {
             starter: Mutex::new(None),
             handles: Mutex::new(Vec::new()),
             queues: Mutex::new(Vec::new()),
+            legacy_fallback_logged: AtomicBool::new(false),
         })
     }
 
     fn is_shutdown(&self) -> bool {
         self.shutdown.load(Ordering::Acquire)
+    }
+
+    /// The "starting fuse-over-io_uring queues" INFO line precedes kernel
+    /// acceptance of the REGISTER commands, so a rejected registration needs
+    /// its own INFO counterpart or the log claims a transport that never ran.
+    /// Every per-CPU queue hits the same rejection; log the session-level
+    /// fallback once.
+    fn log_legacy_fallback_once(&self) {
+        if !self.legacy_fallback_logged.swap(true, Ordering::AcqRel) {
+            tracing::info!(
+                "kernel rejected fuse-over-io_uring registration; \
+                 serving this mount on the legacy /dev/fuse channel"
+            );
+        }
     }
 
     fn set_starter(&self, handle: JoinHandle<()>) {
@@ -787,6 +803,7 @@ fn queue_thread<FS: Filesystem>(
                         queue.pending_submit.fetch_add(1, Ordering::AcqRel);
                     }
                     libc::EOPNOTSUPP => {
+                        control.log_legacy_fallback_once();
                         debug!("fuse-uring: not supported for this connection (qid={qid})");
                         return;
                     }

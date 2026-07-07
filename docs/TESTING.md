@@ -36,14 +36,17 @@ on Linux and macOS, build+test on Linux arm64), the honest milestone gate
 The gate job first sets `kernel.apparmor_restrict_unprivileged_userns=0` so
 the `agentfs run` suites exercise the sandbox instead of skipping on the
 Ubuntu 24.04 runner image. FUSE-over-io_uring coverage stays local-only: the
-CI kernel does not expose `/sys/module/fuse/parameters/enable_uring`, so the
-panic-census uring leg can never run there and the gate job allowlists that
-one skip with `AGENTFS_GATE_ALLOWED_SKIPS=fuse-sigint-panic-census`. The
-`corruption-torture-uring` leg needs no allowlist entry: without
-`enable_uring` the mount falls back to the legacy channel and the leg passes,
-exercising uring only on kernels that offer it. The uring legs are therefore
-honest only on a local machine whose kernel exposes and enables
-`enable_uring`.
+CI kernel exposes `/sys/module/fuse/parameters/enable_uring` but ships it
+disabled (`N`), so the kernel refuses ring registration, the panic-census
+uring leg can never run there, and the gate job allowlists that one skip with
+`AGENTFS_GATE_ALLOWED_SKIPS=fuse-sigint-panic-census`. The
+`corruption-torture-uring` leg needs no allowlist entry: with `enable_uring=N`
+the mount falls back to the legacy channel (the fallback is logged at INFO)
+and the leg passes, exercising uring only on kernels that enable it. A
+"starting fuse-over-io_uring queues" line in CI logs therefore does not mean
+uring served requests; it precedes kernel acceptance of the ring
+registration. The uring legs are honest only on a local machine whose kernel
+sets `enable_uring=Y`.
 
 ## Workspace tests and generated-docs parity
 

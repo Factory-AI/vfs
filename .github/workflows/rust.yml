@@ -113,12 +113,13 @@ jobs:
 
     - name: Run shell and Python gate
       env:
-        # The runner kernel does not ship FUSE-over-io_uring
-        # (/sys/module/fuse/parameters/enable_uring is absent), so the
-        # panic-census uring leg can never run here. That one SKIP is
-        # allowlisted; every other SKIP still fails the strict gate. The
-        # corruption-torture uring leg needs no entry: without enable_uring
-        # the mount falls back to the legacy channel and the leg passes.
+        # The runner kernel ships FUSE-over-io_uring disabled
+        # (/sys/module/fuse/parameters/enable_uring reads N), so the kernel
+        # refuses ring registration and the panic-census uring leg can never
+        # run here. That one SKIP is allowlisted; every other SKIP still
+        # fails the strict gate. The corruption-torture uring leg needs no
+        # entry: with enable_uring=N the mount falls back to the legacy
+        # channel and the leg passes.
         AGENTFS_GATE_ALLOWED_SKIPS: fuse-sigint-panic-census
       run: |
         # scripts/gate.sh runs crates/agentfs-cli/tests/all.sh with
