@@ -3,6 +3,11 @@ set -u
 
 # Set AGENTFS_GATE_FORCE_SKIP=<label|all> to force a synthetic SKIP without
 # running the selected test. This hook exists only to validate SKIP accounting.
+#
+# Set AGENTFS_GATE_ALLOWED_SKIPS=<label[,label...]> to name tests whose SKIP
+# stays green under AGENTFS_GATE_STRICT=1. This is for runner kernels that
+# cannot provide a prerequisite at all (e.g. no FUSE-over-io_uring module
+# parameter); every other SKIP remains red on the strict runner.
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(cd "$DIR/.." && pwd)"
@@ -26,6 +31,7 @@ export TMPDIR TMP TEMP
 
 PASS_COUNT=0
 SKIP_COUNT=0
+DISALLOWED_SKIP_COUNT=0
 FAIL_COUNT=0
 RESULTS=""
 
@@ -40,23 +46,43 @@ truthy() {
     esac
 }
 
+skip_allowed() {
+    allowed_list="${AGENTFS_GATE_ALLOWED_SKIPS:-}"
+    [ -n "$allowed_list" ] || return 1
+    old_ifs="${IFS-}"
+    IFS=', '
+    for allowed in $allowed_list; do
+        if [ "$allowed" = "$1" ]; then
+            IFS="$old_ifs"
+            return 0
+        fi
+    done
+    IFS="$old_ifs"
+    return 1
+}
+
 record_result() {
     label="$1"
     result="$2"
 
-    RESULTS="${RESULTS}${label}: ${result}
-"
     case "$result" in
         PASS)
             PASS_COUNT=$((PASS_COUNT + 1))
             ;;
         SKIP)
             SKIP_COUNT=$((SKIP_COUNT + 1))
+            if skip_allowed "$label"; then
+                result="SKIP (allowed by AGENTFS_GATE_ALLOWED_SKIPS)"
+            else
+                DISALLOWED_SKIP_COUNT=$((DISALLOWED_SKIP_COUNT + 1))
+            fi
             ;;
         FAIL)
             FAIL_COUNT=$((FAIL_COUNT + 1))
             ;;
     esac
+    RESULTS="${RESULTS}${label}: ${result}
+"
     printf 'RESULT %s: %s\n' "$label" "$result"
 }
 
@@ -152,8 +178,9 @@ if [ "$FAIL_COUNT" -ne 0 ]; then
     exit 1
 fi
 
-if [ "$SKIP_COUNT" -ne 0 ] && truthy "${AGENTFS_GATE_STRICT:-0}"; then
-    printf 'FAILED: AGENTFS_GATE_STRICT=1 treats SKIP as a gate failure\n'
+if [ "$DISALLOWED_SKIP_COUNT" -ne 0 ] && truthy "${AGENTFS_GATE_STRICT:-0}"; then
+    printf 'FAILED: AGENTFS_GATE_STRICT=1 treats SKIP as a gate failure (disallowed skips: %s, AGENTFS_GATE_ALLOWED_SKIPS=%s)\n' \
+        "$DISALLOWED_SKIP_COUNT" "${AGENTFS_GATE_ALLOWED_SKIPS:-}"
     exit 1
 fi
 

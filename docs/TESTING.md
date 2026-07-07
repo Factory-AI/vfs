@@ -25,16 +25,25 @@ first failing command and runs, in order:
 
 Knobs: `AGENTFS_BIN` (defaults to `target/release/agentfs`),
 `AGENTFS_GATE_SHELL_TIMEOUT` (default 900 s), `AGENTFS_GATE_PHASE8_TIMEOUT`
-(default 20 s), and the `CORRUPTION_TORTURE_*` variables forwarded to the
+(default 20 s), `AGENTFS_GATE_ALLOWED_SKIPS` (forwarded to the shell suite,
+see below), and the `CORRUPTION_TORTURE_*` variables forwarded to the
 shell suite. The gate pins `TMPDIR` to a per-run scratch dir cleaned on exit
 so dependency temp-file litter cannot accumulate on the host.
 
 CI (`.github/workflows/rust.yml`) runs the workspace job (fmt/clippy/build/test
 on Linux and macOS, build+test on Linux arm64), the honest milestone gate
 (`scripts/gate.sh` plus pjdfstest `phase5-ci`), and the release workflow.
-FUSE-over-io_uring coverage is local-only: CI kernels do not expose
-`/sys/module/fuse/parameters/enable_uring`, so the uring legs below are honest
-only on a local machine that does.
+The gate job first sets `kernel.apparmor_restrict_unprivileged_userns=0` so
+the `agentfs run` suites exercise the sandbox instead of skipping on the
+Ubuntu 24.04 runner image. FUSE-over-io_uring coverage stays local-only: the
+CI kernel does not expose `/sys/module/fuse/parameters/enable_uring`, so the
+panic-census uring leg can never run there and the gate job allowlists that
+one skip with `AGENTFS_GATE_ALLOWED_SKIPS=fuse-sigint-panic-census`. The
+`corruption-torture-uring` leg needs no allowlist entry: without
+`enable_uring` the mount falls back to the legacy channel and the leg passes,
+exercising uring only on kernels that offer it. The uring legs are therefore
+honest only on a local machine whose kernel exposes and enables
+`enable_uring`.
 
 ## Workspace tests and generated-docs parity
 
@@ -63,8 +72,12 @@ user-level command surface (init, run, exec, clone, fs, timeline,
 backup/materialize, integrity, migrate, MCP, ps, completions, and the
 deprecated `nfs`/`mcp-server` aliases), and prints a PASS/SKIP/FAIL
 summary. Every test runs out of its own `mktemp -d` root with trap cleanup
-and honors `AGENTFS_BIN` (falling back to `cargo run`). In strict mode a SKIP is red; `AGENTFS_GATE_FORCE_SKIP=<label|all>`
-synthesizes a SKIP for testing the runner itself. Never run the corruption
+and honors `AGENTFS_BIN` (falling back to `cargo run`). In strict mode a SKIP
+is red unless its test label is named in
+`AGENTFS_GATE_ALLOWED_SKIPS=<label[,label...]>`, the escape hatch for runner
+kernels that cannot provide a prerequisite at all;
+`AGENTFS_GATE_FORCE_SKIP=<label|all>` synthesizes a SKIP for testing the
+runner itself. Never run the corruption
 torture test concurrently with another mount, test suite, or benchmark.
 
 ## Python validation gates

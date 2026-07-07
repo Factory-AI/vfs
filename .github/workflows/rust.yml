@@ -94,6 +94,13 @@ jobs:
         path: target
         key: ${{ runner.os }}-cargo-build-target-gate-${{ hashFiles('Cargo.lock') }}
 
+    - name: Allow unprivileged user namespaces
+      run: |
+        # Ubuntu 24.04 runner images gate unprivileged user namespaces behind
+        # AppArmor; without this the agentfs run suites SKIP and the strict
+        # gate goes red instead of exercising the sandbox for real.
+        sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
     - name: Build pjdfstest
       run: |
         sudo apt-get update
@@ -105,6 +112,14 @@ jobs:
         make pjdfstest
 
     - name: Run shell and Python gate
+      env:
+        # The runner kernel does not ship FUSE-over-io_uring
+        # (/sys/module/fuse/parameters/enable_uring is absent), so the
+        # panic-census uring leg can never run here. That one SKIP is
+        # allowlisted; every other SKIP still fails the strict gate. The
+        # corruption-torture uring leg needs no entry: without enable_uring
+        # the mount falls back to the legacy channel and the leg passes.
+        AGENTFS_GATE_ALLOWED_SKIPS: fuse-sigint-panic-census
       run: |
         # scripts/gate.sh runs crates/agentfs-cli/tests/all.sh with
         # AGENTFS_GATE_STRICT=1, then phase8-validation.py --smoke (which
