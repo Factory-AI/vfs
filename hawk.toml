@@ -1,0 +1,4 @@
+[[production]]
+package = "agentfs-cli"
+bin = "agentfs"
+reason = "shipped CLI binary"

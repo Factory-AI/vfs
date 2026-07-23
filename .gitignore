@@ -35,3 +35,6 @@ __pycache__/
 # Large benchmark fixtures - regenerate via 'git clone --bare openai/codex'
 .agents/benchmarks/fixtures/
 .agents/missions/
+
+# agent session notes
+.agents/
