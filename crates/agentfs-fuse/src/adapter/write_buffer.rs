@@ -31,7 +31,7 @@ impl OpenFile {
     }
 
     #[cfg(test)]
-    pub(super) fn buffer_write(&mut self, offset: u64, data: &[u8]) -> Result<(), i32> {
+    fn buffer_write(&mut self, offset: u64, data: &[u8]) -> Result<(), i32> {
         self.pending.write(offset, data)?;
         Ok(())
     }
@@ -71,7 +71,7 @@ impl OpenFile {
     /// remains as a test-only convenience so the OpenFile unit tests stay
     /// readable.
     #[cfg(test)]
-    pub(super) fn flush_pending(&mut self, runtime: &Runtime) -> Result<(), SdkError> {
+    fn flush_pending(&mut self, runtime: &Runtime) -> Result<(), SdkError> {
         let Some((file, ranges, range_count, byte_count)) = self.take_pending() else {
             return Ok(());
         };
@@ -108,7 +108,7 @@ pub(super) fn flush_pending_batched_out_of_lock(
 /// filesystem-layer `pwrite` when the handle is flushed.
 #[derive(Default)]
 pub(super) struct WriteBuffer {
-    pub(super) ranges: BTreeMap<u64, Vec<u8>>,
+    ranges: BTreeMap<u64, Vec<u8>>,
     pub(super) bytes: usize,
 }
 
@@ -118,7 +118,7 @@ impl WriteBuffer {
     }
 
     #[cfg(test)]
-    pub(super) fn bytes(&self) -> usize {
+    fn bytes(&self) -> usize {
         self.bytes
     }
 

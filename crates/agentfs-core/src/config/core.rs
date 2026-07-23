@@ -23,8 +23,8 @@ const KEEPCACHE_DELTA_ENV: &str = "AGENTFS_KEEPCACHE_DELTA";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Geometry {
-    pub chunk_size: usize,
-    pub inline_threshold: usize,
+    pub(crate) chunk_size: usize,
+    pub(crate) inline_threshold: usize,
 }
 
 impl Default for Geometry {
@@ -39,11 +39,11 @@ impl Default for Geometry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatcherConfig {
     pub enabled: bool,
-    pub window: Duration,
-    pub inode_bytes: usize,
-    pub global_bytes: usize,
-    pub txn_max_inodes: usize,
-    pub txn_max_bytes: usize,
+    pub(crate) window: Duration,
+    pub(crate) inode_bytes: usize,
+    pub(crate) global_bytes: usize,
+    pub(crate) txn_max_inodes: usize,
+    pub(crate) txn_max_bytes: usize,
 }
 
 impl Default for BatcherConfig {
@@ -60,7 +60,7 @@ impl Default for BatcherConfig {
 }
 
 impl BatcherConfig {
-    pub fn from_env(reader: EnvReader) -> Self {
+    fn from_env(reader: EnvReader) -> Self {
         let default = Self::default();
         Self {
             enabled: default.enabled,
@@ -80,7 +80,7 @@ impl BatcherConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoreConfig {
-    pub geometry: Geometry,
+    pub(crate) geometry: Geometry,
     pub batcher: BatcherConfig,
     pub overlay_reads: bool,
     pub drain_on_setattr: bool,

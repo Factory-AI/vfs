@@ -68,7 +68,7 @@ impl AlignedRequestBuf {
         unsafe { std::slice::from_raw_parts_mut(ptr, cap) }
     }
 
-    pub(crate) fn capacity_bytes(&self) -> usize {
+    fn capacity_bytes(&self) -> usize {
         self.storage.len() * std::mem::size_of::<u64>()
     }
 
@@ -77,7 +77,7 @@ impl AlignedRequestBuf {
         self.len = len;
     }
 
-    pub(crate) fn as_slice(&self) -> &[u8] {
+    fn as_slice(&self) -> &[u8] {
         let ptr = self.storage.as_ptr() as *const u8;
         unsafe { std::slice::from_raw_parts(ptr, self.len) }
     }

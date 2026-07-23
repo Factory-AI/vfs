@@ -136,11 +136,11 @@ pub fn pending_migrations(from: SchemaVersion) -> Vec<&'static Migration> {
 }
 
 /// Single production DDL source.
-pub mod ddl {
+mod ddl {
     use super::SchemaVersion;
 
     /// Returns all DDL statements needed for the requested schema version.
-    pub fn create_all(_version: SchemaVersion) -> &'static [&'static str] {
+    pub(crate) fn create_all(_version: SchemaVersion) -> &'static [&'static str] {
         CURRENT_DDL
     }
 
@@ -445,7 +445,7 @@ pub async fn ensure_current(conn: &Connection) -> Result<()> {
 }
 
 /// Set or update the overlay base-path marker without owning any DDL locally.
-pub async fn set_overlay_base_path(conn: &Connection, base_path: &str) -> Result<()> {
+pub(crate) async fn set_overlay_base_path(conn: &Connection, base_path: &str) -> Result<()> {
     ensure_current(conn).await?;
     conn.execute(
         "INSERT OR REPLACE INTO fs_overlay_config (key, value) VALUES ('base_path', ?1)",

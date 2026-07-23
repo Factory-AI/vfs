@@ -80,7 +80,7 @@ impl ReplyRaw {
     }
 
     /// Reply to a request with the given error code
-    pub(crate) fn error(self, err: c_int) {
+    fn error(self, err: c_int) {
         assert_ne!(err, 0);
         self.send_ll(&ll::Response::new_error(ll::Errno::from_i32(err)));
     }

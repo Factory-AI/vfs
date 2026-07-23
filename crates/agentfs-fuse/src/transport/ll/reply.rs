@@ -268,7 +268,7 @@ impl<'a> Response<'a> {
         Self::from_struct(&r)
     }
 
-    pub(crate) fn new_directory(list: EntListBuf) -> Self {
+    fn new_directory(list: EntListBuf) -> Self {
         assert!(list.buf.len() <= list.max_size);
         Self::Data(list.buf)
     }
@@ -291,12 +291,12 @@ impl<'a> Response<'a> {
         Self::from_struct(&r)
     }
 
-    pub(crate) fn from_struct<T: IntoBytes + Immutable + ?Sized>(data: &T) -> Self {
+    fn from_struct<T: IntoBytes + Immutable + ?Sized>(data: &T) -> Self {
         Self::Data(SmallVec::from_slice(data.as_bytes()))
     }
 }
 
-pub(crate) fn time_from_system_time(system_time: &SystemTime) -> (i64, u32) {
+fn time_from_system_time(system_time: &SystemTime) -> (i64, u32) {
     // Convert to signed 64-bit time with epoch at 0
     match system_time.duration_since(UNIX_EPOCH) {
         Ok(duration) => (duration.as_secs() as i64, duration.subsec_nanos()),
@@ -310,7 +310,7 @@ pub(crate) fn time_from_system_time(system_time: &SystemTime) -> (i64, u32) {
 #[allow(trivial_numeric_casts)]
 #[allow(clippy::unnecessary_cast)]
 /// Returns the mode for a given file kind and permission
-pub(crate) fn mode_from_kind_and_perm(kind: FileType, perm: u16) -> u32 {
+fn mode_from_kind_and_perm(kind: FileType, perm: u16) -> u32 {
     (match kind {
         FileType::NamedPipe => libc::S_IFIFO,
         FileType::CharDevice => libc::S_IFCHR,
@@ -323,7 +323,7 @@ pub(crate) fn mode_from_kind_and_perm(kind: FileType, perm: u16) -> u32 {
         | u32::from(perm)
 }
 /// Returns a `fuse_attr` from `FileAttr`
-pub(crate) fn fuse_attr_from_attr(attr: &super::super::FileAttr) -> abi::fuse_attr {
+fn fuse_attr_from_attr(attr: &super::super::FileAttr) -> abi::fuse_attr {
     let (atime_secs, atime_nanos) = time_from_system_time(&attr.atime);
     let (mtime_secs, mtime_nanos) = time_from_system_time(&attr.mtime);
     let (ctime_secs, ctime_nanos) = time_from_system_time(&attr.ctime);
@@ -351,7 +351,7 @@ pub(crate) fn fuse_attr_from_attr(attr: &super::super::FileAttr) -> abi::fuse_at
 // TODO: Add methods for creating this without making a `FileAttr` first.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Attr {
-    pub(crate) attr: abi::fuse_attr,
+    attr: abi::fuse_attr,
 }
 impl From<&super::super::FileAttr> for Attr {
     fn from(attr: &super::super::FileAttr) -> Self {
@@ -375,7 +375,7 @@ pub(crate) struct EntListBuf {
     buf: ResponseBuf,
 }
 impl EntListBuf {
-    pub(crate) fn new(max_size: usize) -> Self {
+    fn new(max_size: usize) -> Self {
         Self {
             max_size,
             buf: ResponseBuf::new(),
@@ -386,7 +386,7 @@ impl EntListBuf {
     /// A transparent offset value can be provided for each entry. The kernel uses these
     /// value to request the next entries in further readdir calls
     #[must_use]
-    pub(crate) fn push(&mut self, ent: [&[u8]; 2]) -> bool {
+    fn push(&mut self, ent: [&[u8]; 2]) -> bool {
         let entlen = ent[0].len() + ent[1].len();
         let entsize = (entlen + size_of::<u64>() - 1) & !(size_of::<u64>() - 1); // 64bit align
         if self.buf.len() + entsize > self.max_size {

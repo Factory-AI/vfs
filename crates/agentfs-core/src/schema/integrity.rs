@@ -25,9 +25,9 @@ struct PartialOriginRow {
 /// Options controlling read-only integrity checks.
 #[derive(Debug, Clone)]
 pub struct CheckOpts {
-    pub database: PathBuf,
-    pub require_portable: bool,
-    pub check_base: bool,
+    database: PathBuf,
+    require_portable: bool,
+    check_base: bool,
 }
 
 impl CheckOpts {
@@ -56,8 +56,8 @@ pub struct Report {
     pub database: String,
     pub ok: bool,
     pub portable: bool,
-    pub origin_backed: bool,
-    pub partial_origin_rows: i64,
+    origin_backed: bool,
+    partial_origin_rows: i64,
     pub checks: Vec<Check>,
 }
 
@@ -66,7 +66,7 @@ pub struct Check {
     pub name: String,
     pub ok: bool,
     pub detail: String,
-    pub violating_rows: Option<i64>,
+    violating_rows: Option<i64>,
 }
 
 impl Report {

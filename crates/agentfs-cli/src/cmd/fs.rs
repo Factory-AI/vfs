@@ -382,7 +382,7 @@ mod tests {
     const S_IFREG: u32 = 0o100000;
 
     #[tokio::test]
-    pub async fn cat_file_not_found() {
+    async fn cat_file_not_found() {
         let (_agentfs, path, _file) = agentfs().await;
         let mut buf = Vec::new();
         let err = cat_filesystem(&mut buf, path, "test.md", None)
@@ -392,7 +392,7 @@ mod tests {
     }
 
     #[tokio::test]
-    pub async fn cat_file_found() {
+    async fn cat_file_found() {
         let (agentfs, path, _file) = agentfs().await;
         let content = b"hello, agentfs";
         write_file(&agentfs.fs, "test.md", content, 0, 0)
@@ -406,7 +406,7 @@ mod tests {
     }
 
     #[tokio::test]
-    pub async fn cat_big_file_found() {
+    async fn cat_big_file_found() {
         let (agentfs, path, _file) = agentfs().await;
         let content = vec![100u8; 4 * 1024 * 1024];
         write_file(&agentfs.fs, "test.md", &content, 0, 0)
@@ -420,7 +420,7 @@ mod tests {
     }
 
     #[tokio::test]
-    pub async fn ls_empty() {
+    async fn ls_empty() {
         let (_agentfs, path, _file) = agentfs().await;
         let mut buf = Vec::new();
         ls_filesystem(&mut buf, path, "/", None).await.unwrap();
@@ -428,7 +428,7 @@ mod tests {
     }
 
     #[tokio::test]
-    pub async fn ls_files_only() {
+    async fn ls_files_only() {
         let (agentfs, path, _file) = agentfs().await;
         write_file(&agentfs.fs, "1.md", b"1", 0, 0).await.unwrap();
         write_file(&agentfs.fs, "2.md", b"11", 0, 0).await.unwrap();
@@ -446,7 +446,7 @@ f 3.md
     }
 
     #[tokio::test]
-    pub async fn ls_dirs() {
+    async fn ls_dirs() {
         let (agentfs, path, _file) = agentfs().await;
         agentfs.fs.mkdir("a", 0, 0).await.unwrap();
         agentfs.fs.mkdir("a/b", 0, 0).await.unwrap();
@@ -480,7 +480,7 @@ f d/e/3.md
     }
 
     #[tokio::test]
-    pub async fn ls_subdir_lists_only_subtree() {
+    async fn ls_subdir_lists_only_subtree() {
         let (agentfs, path, _file) = agentfs().await;
         agentfs.fs.mkdir("a", 0, 0).await.unwrap();
         agentfs.fs.mkdir("a/b", 0, 0).await.unwrap();
@@ -517,7 +517,7 @@ f c/2.md
     }
 
     #[tokio::test]
-    pub async fn ls_missing_path_errors() {
+    async fn ls_missing_path_errors() {
         let (_agentfs, path, _file) = agentfs().await;
         let mut buf = Vec::new();
         let err = ls_filesystem(&mut buf, path, "/missing", None)
@@ -530,7 +530,7 @@ f c/2.md
     }
 
     #[tokio::test]
-    pub async fn ls_file_path_errors() {
+    async fn ls_file_path_errors() {
         let (agentfs, path, _file) = agentfs().await;
         write_file(&agentfs.fs, "file.md", b"1", 0, 0)
             .await
@@ -546,7 +546,7 @@ f c/2.md
     }
 
     #[tokio::test]
-    pub async fn read_commands_leave_no_wal_sidecar() {
+    async fn read_commands_leave_no_wal_sidecar() {
         let (agentfs, path, _file) = agentfs().await;
         write_file(&agentfs.fs, "test.md", b"1", 0, 0)
             .await
@@ -585,7 +585,7 @@ f c/2.md
     // Encryption tests
 
     #[tokio::test]
-    pub async fn encrypted_write_and_cat() {
+    async fn encrypted_write_and_cat() {
         let (agentfs, path, _file) = encrypted_agentfs().await;
         let content = b"encrypted content";
         write_file(&agentfs.fs, "secret.txt", content, 0, 0)
@@ -602,7 +602,7 @@ f c/2.md
     }
 
     #[tokio::test]
-    pub async fn encrypted_ls() {
+    async fn encrypted_ls() {
         let (agentfs, path, _file) = encrypted_agentfs().await;
         write_file(&agentfs.fs, "file1.txt", b"1", 0, 0)
             .await
@@ -621,7 +621,7 @@ f c/2.md
     }
 
     #[tokio::test]
-    pub async fn write_filesystem_owns_entries_as_invoking_user() {
+    async fn write_filesystem_owns_entries_as_invoking_user() {
         let (_agentfs, path, _file) = agentfs().await;
         write_filesystem(path.clone(), "/subdir/owned.txt", "content", None)
             .await
@@ -649,7 +649,7 @@ f c/2.md
     }
 
     #[tokio::test]
-    pub async fn encrypted_write_filesystem() {
+    async fn encrypted_write_filesystem() {
         let (_agentfs, path, _file) = encrypted_agentfs().await;
 
         let encryption = Some((TEST_KEY.to_string(), TEST_CIPHER.to_string()));

@@ -148,7 +148,7 @@ pub fn setattr_allowed(
 }
 
 /// Mode bits to clear when file contents, size, or ownership change.
-pub fn killpriv_mask(stats: &Stats, _creds: &Credentials) -> u32 {
+fn killpriv_mask(stats: &Stats, _creds: &Credentials) -> u32 {
     if !stats.is_file() {
         return 0;
     }
@@ -177,22 +177,22 @@ pub fn without_killpriv(stats: &Stats, creds: &Credentials, mode: u32) -> u32 {
 }
 
 /// Return whether `creds` is root.
-pub fn is_root(creds: &Credentials) -> bool {
+fn is_root(creds: &Credentials) -> bool {
     creds.uid == 0
 }
 
 /// Return whether `creds` owns `stats`.
-pub fn is_owner(stats: &Stats, creds: &Credentials) -> bool {
+fn is_owner(stats: &Stats, creds: &Credentials) -> bool {
     creds.uid == stats.uid
 }
 
 /// Return whether `creds` owns `stats` or is root.
-pub fn is_owner_or_root(stats: &Stats, creds: &Credentials) -> bool {
+fn is_owner_or_root(stats: &Stats, creds: &Credentials) -> bool {
     is_root(creds) || is_owner(stats, creds)
 }
 
 /// Return whether `creds` belongs to `gid`.
-pub fn is_in_group(creds: &Credentials, gid: u32) -> bool {
+fn is_in_group(creds: &Credentials, gid: u32) -> bool {
     creds.gid == gid || creds.groups.contains(&gid)
 }
 

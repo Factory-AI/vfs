@@ -124,7 +124,7 @@ pub(crate) struct KernelConfig {
 }
 
 impl KernelConfig {
-    pub(crate) fn new(capabilities: u64, max_readahead: u32) -> Self {
+    fn new(capabilities: u64, max_readahead: u32) -> Self {
         Self {
             capabilities,
             requested: default_init_flags(capabilities),
@@ -172,14 +172,14 @@ impl KernelConfig {
         Ok(())
     }
 
-    pub(crate) fn congestion_threshold(&self) -> u16 {
+    fn congestion_threshold(&self) -> u16 {
         match self.congestion_threshold {
             None => (u32::from(self.max_background) * 3 / 4) as u16,
             Some(value) => min(value, self.max_background),
         }
     }
 
-    pub(crate) fn max_pages(&self) -> u16 {
+    fn max_pages(&self) -> u16 {
         ((std::cmp::max(self.max_write, self.max_readahead) - 1) / page_size::get() as u32) as u16
             + 1
     }

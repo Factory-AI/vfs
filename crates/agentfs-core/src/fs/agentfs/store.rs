@@ -41,7 +41,7 @@ pub(super) struct NormalizedWriteRange {
 }
 
 impl NormalizedWriteRange {
-    pub(super) fn end(&self) -> u64 {
+    fn end(&self) -> u64 {
         self.offset + self.data.len() as u64
     }
 }

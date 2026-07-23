@@ -33,9 +33,9 @@ pub enum SupervisedTaskOutcome<T> {
 #[derive(Debug, Clone, Copy)]
 pub struct SuperviseOpts {
     /// Time to wait after TERM before escalating to KILL.
-    pub term_grace: Duration,
+    term_grace: Duration,
     /// Put the child in a new process group and signal the whole group.
-    pub kill_process_group: bool,
+    kill_process_group: bool,
 }
 
 impl Default for SuperviseOpts {
@@ -56,7 +56,7 @@ pub async fn run_supervised(
 }
 
 /// Run a command with custom supervision options and always unmount afterward.
-pub async fn run_supervised_with_opts(
+async fn run_supervised_with_opts(
     handle: MountHandle,
     mut command: tokio::process::Command,
     opts: SuperviseOpts,
@@ -167,18 +167,6 @@ pub async fn run_supervised_pid_with_hooks(
     status
 }
 
-/// Run an already-forked child with default supervision and a mounted filesystem.
-#[cfg(unix)]
-pub async fn run_supervised_pid(handle: MountHandle, pid: libc::pid_t) -> Result<ExitStatus> {
-    run_supervised_pid_with_hooks(
-        handle,
-        pid,
-        SuperviseOpts::default(),
-        SuperviseHooks::default(),
-    )
-    .await
-}
-
 /// Supervise an already-forked child without owning a mount.
 #[cfg(unix)]
 pub async fn supervise_pid_with_hooks(
@@ -274,10 +262,10 @@ pub fn exit_code_for_spawn_error(error: &std::io::Error) -> Option<i32> {
 }
 
 #[cfg(test)]
-pub type ShutdownFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+type ShutdownFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 
 #[cfg(test)]
-pub trait MountedCommandBackend {
+trait MountedCommandBackend {
     fn mountpoint(&self) -> &Path;
     fn unmount(&mut self) -> Result<()>;
     fn shutdown_server(&mut self) -> ShutdownFuture<'_>;
@@ -285,7 +273,7 @@ pub trait MountedCommandBackend {
 }
 
 #[cfg(test)]
-pub async fn supervise_mounted_command<B>(
+async fn supervise_mounted_command<B>(
     command: tokio::process::Command,
     mut backend: B,
 ) -> Result<ChildOutcome>
@@ -456,16 +444,6 @@ fn tracing_signal_teardown(parent_signal: i32, child_signal: i32) {
         "supervised child exited after process-group teardown"
     );
 }
-
-#[cfg(target_os = "linux")]
-pub fn set_parent_death_signal(command: &mut tokio::process::Command) {
-    unsafe {
-        command.pre_exec(move || supervised_child_pre_exec(false));
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn set_parent_death_signal(_command: &mut tokio::process::Command) {}
 
 #[cfg(target_os = "linux")]
 pub fn set_parent_death_signal_std(command: &mut std::process::Command) {

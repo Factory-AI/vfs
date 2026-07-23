@@ -3,8 +3,6 @@
 //! Adapter-specific counters register from their owning crates when those
 //! adapters are constructed; the CLI owns only the process report lifecycle.
 
-pub use agentfs_core::telemetry::ProfileSnapshot;
-
 const PROFILE_SUMMARY_EVENT: &str = "agentfs_profile_summary";
 
 /// Drop guard installed by the CLI binary for a single process summary.
@@ -18,7 +16,7 @@ impl ProfileReportGuard {
         Self { source }
     }
 
-    pub fn emit_now(&self) {
+    fn emit_now(&self) {
         emit_profile_summary(self.source);
     }
 }
@@ -37,7 +35,7 @@ pub fn emit_cli_report() {
     emit_profile_summary("cli");
 }
 
-pub fn report_checkpoint() {
+pub(crate) fn report_checkpoint() {
     if let Some(payload) = agentfs_core::telemetry::checkpoint_payload(PROFILE_SUMMARY_EVENT) {
         eprintln!("{payload}");
     }
@@ -49,8 +47,4 @@ fn emit_profile_summary(source: &str) {
     {
         eprintln!("{payload}");
     }
-}
-
-pub fn snapshot() -> ProfileSnapshot {
-    agentfs_core::telemetry::snapshot()
 }

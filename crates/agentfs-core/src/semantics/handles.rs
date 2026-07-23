@@ -44,17 +44,12 @@ impl Authority {
 #[derive(Clone)]
 pub struct Handle {
     ino: i64,
-    authority: Authority,
     file: BoxedFile,
 }
 
 impl Handle {
     pub fn ino(&self) -> i64 {
         self.ino
-    }
-
-    pub fn authority(&self) -> Authority {
-        self.authority
     }
 
     pub fn file(&self) -> &BoxedFile {
@@ -155,7 +150,7 @@ impl Default for HandleTable {
 }
 
 impl HandleTable {
-    pub fn with_limits(token_capacity: usize, open_capacity: usize) -> Self {
+    fn with_limits(token_capacity: usize, open_capacity: usize) -> Self {
         assert!(token_capacity > 0, "token capacity must be non-zero");
         assert!(open_capacity > 0, "open capacity must be non-zero");
         Self {
@@ -171,7 +166,7 @@ impl HandleTable {
     /// Returns `false` when the token already exists in this table so the
     /// caller can retry with new randomness without replacing another handle's
     /// authority.
-    pub fn try_grant_write_authority_with_token(&self, ino: i64, token: u64) -> bool {
+    pub(crate) fn try_grant_write_authority_with_token(&self, ino: i64, token: u64) -> bool {
         let mut inner = self.inner.lock();
         if inner.tokens.peek(&token).is_some() {
             return false;
@@ -180,7 +175,7 @@ impl HandleTable {
         true
     }
 
-    pub fn has_write_authority(&self, ino: i64, token: u64) -> bool {
+    pub(crate) fn has_write_authority(&self, ino: i64, token: u64) -> bool {
         let mut inner = self.inner.lock();
         let has_authority = inner
             .tokens
@@ -196,7 +191,7 @@ impl HandleTable {
     /// Return a live authority token for `ino`, if one exists, and mark it
     /// recently used. READDIRPLUS uses this to refresh client node handles
     /// without stripping CREATE-captured write authority.
-    pub fn authority_token_for_ino(&self, ino: i64) -> Option<u64> {
+    pub(crate) fn authority_token_for_ino(&self, ino: i64) -> Option<u64> {
         let mut inner = self.inner.lock();
         let token = inner.tokens_by_ino.get(&ino).and_then(|tokens| {
             tokens
@@ -222,7 +217,7 @@ impl HandleTable {
     /// file with an `O_RDWR` open. Overlay copy-up happens during that write
     /// open, so later reads must reuse the upgraded file rather than a stale
     /// base-layer read handle.
-    pub async fn open_cached(
+    pub(crate) async fn open_cached(
         &self,
         fs: &Arc<dyn FileSystem>,
         ino: i64,
@@ -239,11 +234,7 @@ impl HandleTable {
         }
 
         let file = fs.open(ino, authority.open_flags()).await?;
-        let handle = Handle {
-            ino,
-            authority,
-            file,
-        };
+        let handle = Handle { ino, file };
 
         let mut inner = self.inner.lock();
         if let Some(entry) = inner.open_handles.get(&ino).cloned() {
@@ -262,7 +253,7 @@ impl HandleTable {
         Ok(handle)
     }
 
-    pub fn invalidate_ino(&self, ino: i64) {
+    pub(crate) fn invalidate_ino(&self, ino: i64) {
         self.inner.lock().invalidate_ino(ino);
     }
 
@@ -355,10 +346,8 @@ mod tests {
         let table = HandleTable::with_limits(4, 4);
 
         let read = table.open_cached(&fs, stats.ino, Authority::Read).await?;
-        assert_eq!(read.authority(), Authority::Read);
 
         let write = table.open_cached(&fs, stats.ino, Authority::Write).await?;
-        assert_eq!(write.authority(), Authority::Write);
         assert!(
             !Arc::ptr_eq(read.file(), write.file()),
             "write open must replace a previously read-only cached file"

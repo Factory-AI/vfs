@@ -180,7 +180,7 @@ impl AgentFS {
         Self::from_pool_with_path_and_config(pool, None, config).await
     }
 
-    pub(crate) async fn from_pool_with_path_and_config(
+    async fn from_pool_with_path_and_config(
         pool: ConnectionPool,
         db_path: Option<PathBuf>,
         config: CoreConfig,
@@ -271,7 +271,7 @@ impl AgentFS {
     }
 
     /// Get the configured inline threshold.
-    pub fn inline_threshold(&self) -> usize {
+    pub(crate) fn inline_threshold(&self) -> usize {
         self.inline_threshold
     }
 
@@ -279,11 +279,11 @@ impl AgentFS {
         self.core_config.as_ref()
     }
 
-    pub fn partial_origin_policy(&self) -> crate::fs::PartialOriginPolicy {
+    pub(crate) fn partial_origin_policy(&self) -> crate::fs::PartialOriginPolicy {
         self.core_config.partial_origin
     }
 
-    pub fn register_reap_hook(&self, hook: Arc<dyn ReapHook>) -> bool {
+    pub(crate) fn register_reap_hook(&self, hook: Arc<dyn ReapHook>) -> bool {
         self.lifecycle.register_reap_hook(hook)
     }
 
@@ -293,7 +293,7 @@ impl AgentFS {
     }
 
     /// Get a database connection from the pool
-    pub async fn get_connection(&self) -> Result<crate::pool::PooledConnection> {
+    pub(crate) async fn get_connection(&self) -> Result<crate::pool::PooledConnection> {
         self.pool.get_connection().await
     }
 
@@ -303,7 +303,7 @@ impl AgentFS {
     }
 
     /// Initialize the database schema
-    pub async fn initialize_schema(conn: &Connection) -> Result<()> {
+    async fn initialize_schema(conn: &Connection) -> Result<()> {
         schema::require_current(conn).await?;
 
         // Ensure root directory exists with correct ownership
@@ -519,7 +519,7 @@ impl AgentFS {
     }
 
     /// Drain pending batched writes for one inode.
-    pub async fn drain_inode_writes(&self, ino: i64) -> Result<()> {
+    async fn drain_inode_writes(&self, ino: i64) -> Result<()> {
         if let Some(drain) = &self.write_drain {
             drain.drain_inode(ino).await?;
         }
@@ -607,7 +607,7 @@ impl AgentFS {
     /// handles existed (POSIX unlink-while-open). Runs opportunistically at
     /// namespace mutations and at finalize; a crash is covered by the
     /// nlink=0 sweep at mount.
-    pub async fn process_deferred_reaps(&self) -> Result<()> {
+    pub(crate) async fn process_deferred_reaps(&self) -> Result<()> {
         let reaped = self
             .lifecycle
             .process_deferred_reaps(&self.pool, |ino| {
@@ -850,7 +850,7 @@ impl AgentFS {
     /// Get filesystem statistics
     ///
     /// Returns the total number of inodes and bytes used by file contents.
-    pub async fn statfs(&self) -> Result<FilesystemStats> {
+    async fn statfs(&self) -> Result<FilesystemStats> {
         self.drain_all().await?;
         let conn = self.pool.get_connection().await?;
         // Count total inodes

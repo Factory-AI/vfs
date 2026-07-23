@@ -36,17 +36,17 @@ pub struct AgentFSOptions {
     /// Optional unique identifier for the agent.
     /// - If Some(id): Creates persistent storage at `.agentfs/{id}.db`
     /// - If None: Uses ephemeral in-memory database
-    pub id: Option<String>,
+    pub(crate) id: Option<String>,
     /// Optional custom path to the database file.
     /// Takes precedence over `id` if both are set.
-    pub path: Option<String>,
+    pub(crate) path: Option<String>,
     /// Optional base directory for overlay filesystem (copy-on-write).
     /// When set, the filesystem operates as an overlay on top of this directory.
-    pub base: Option<PathBuf>,
+    pub(crate) base: Option<PathBuf>,
     /// Sync options for remote database synchronization
     pub sync: SyncOptions,
     /// Encryption configuration for database at rest
-    pub encryption: Option<EncryptionConfig>,
+    pub(crate) encryption: Option<EncryptionConfig>,
     /// Typed core runtime configuration. When omitted, [`CoreConfig::from_env`]
     /// is evaluated once by [`AgentFS::open`](crate::AgentFS::open).
     pub core_config: Option<CoreConfig>,

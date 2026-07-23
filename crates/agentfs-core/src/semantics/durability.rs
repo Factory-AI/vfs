@@ -21,7 +21,7 @@ pub enum AckDurability {
 /// Receipt returned by [`Semantics::write`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WriteReceipt {
-    pub count: usize,
+    pub(crate) count: usize,
     pub durability: AckDurability,
 }
 
@@ -38,7 +38,7 @@ impl Semantics {
         Self::new_with_handle_table(fs, HandleTable::default())
     }
 
-    pub fn new_with_handle_table(fs: Arc<dyn FileSystem>, handles: HandleTable) -> Self {
+    fn new_with_handle_table(fs: Arc<dyn FileSystem>, handles: HandleTable) -> Self {
         fs.register_reap_hook(Arc::new(handles.clone()));
         Self { fs, handles }
     }
@@ -55,7 +55,7 @@ impl Semantics {
 
     /// Write bytes through an already-open file handle with an explicit ack
     /// durability declaration.
-    pub async fn write(
+    pub(crate) async fn write(
         &self,
         file: &BoxedFile,
         offset: u64,

@@ -35,7 +35,7 @@ pub(super) struct PendingGeneration(u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct OverlayHit {
-    pub(super) applied: bool,
+    applied: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -104,7 +104,7 @@ pub(super) struct PendingTimeChange {
 }
 
 impl PendingTimeChange {
-    pub(super) fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.atime.is_none() && self.mtime.is_none() && self.ctime.is_none()
     }
 
@@ -133,7 +133,7 @@ impl PendingTimeChange {
     /// Overlay the stashed values onto a `Stats` row read from SQLite, so
     /// `getattr`/`lookup` surface explicit `utimens` results immediately even
     /// though the row UPDATE is deferred to the next batched drain.
-    pub(super) fn merge_into(&self, stats: &mut Stats) {
+    fn merge_into(&self, stats: &mut Stats) {
         if let Some((secs, nsec)) = self.atime {
             stats.atime = secs;
             stats.atime_nsec = nsec as u32;
@@ -555,7 +555,7 @@ impl AgentFSWriteBatcher {
         Ok(())
     }
 
-    pub(super) async fn drain_all_reason(
+    async fn drain_all_reason(
         self: &Arc<Self>,
         reason: AgentFSWriteBatchDrainReason,
     ) -> Result<()> {
@@ -592,7 +592,7 @@ impl AgentFSWriteBatcher {
     /// concurrent drain and the contract is already met. If it IS pending, it
     /// is always selected into this transaction regardless of the
     /// per-transaction bounds.
-    pub(super) async fn drain_pending_batched(
+    async fn drain_pending_batched(
         self: &Arc<Self>,
         reason: AgentFSWriteBatchDrainReason,
         required_ino: Option<i64>,
@@ -1069,7 +1069,7 @@ impl AgentFSWriteBatcher {
     /// file-size view exposed to readers (so a write that grows the file is
     /// visible to subsequent `getattr` even before the timer drain commits
     /// it to SQLite).
-    pub(super) fn pending_max_end_raw(&self, ino: i64) -> Option<u64> {
+    fn pending_max_end_raw(&self, ino: i64) -> Option<u64> {
         let state = self.state.read();
         let batch = state.pending.get(&ino)?;
         batch
@@ -1102,7 +1102,7 @@ impl AgentFSWriteBatcher {
     /// entry both removes the per-file fallback transaction and guarantees a
     /// scheduled drain applies the times. `merge_pending_view` keeps the
     /// change visible to getattr/lookup immediately.
-    pub(super) fn stash_pending_times(self: &Arc<Self>, ino: i64, change: PendingTimeChange) {
+    fn stash_pending_times(self: &Arc<Self>, ino: i64, change: PendingTimeChange) {
         if change.is_empty() {
             return;
         }
@@ -1130,12 +1130,12 @@ impl AgentFSWriteBatcher {
     /// lock and clear exactly what they applied once the commit succeeds
     /// (commit-then-remove, mirroring the data-range discipline). Readers use
     /// it to overlay not-yet-committed times onto fs_inode rows.
-    pub(super) fn pending_times_raw(&self, ino: i64) -> Option<PendingTimeChange> {
+    fn pending_times_raw(&self, ino: i64) -> Option<PendingTimeChange> {
         let state = self.state.read();
         state.pending.get(&ino).and_then(|b| b.pending_times)
     }
 
-    pub(super) fn pending_generation_raw(&self, ino: i64) -> PendingGeneration {
+    fn pending_generation_raw(&self, ino: i64) -> PendingGeneration {
         let state = self.state.read();
         state.generation(ino)
     }

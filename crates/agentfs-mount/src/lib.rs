@@ -47,7 +47,7 @@ const DEFAULT_MOUNT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_UNMOUNT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[cfg(target_os = "linux")]
-pub(crate) fn get_runtime() -> tokio::runtime::Runtime {
+fn get_runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Runtime::new().expect("internal error: failed to initialize runtime")
 }
 
@@ -114,7 +114,7 @@ pub struct MountOpts {
 
 impl MountOpts {
     /// Create default options for the given mountpoint and backend.
-    pub fn new(mountpoint: PathBuf, backend: Backend) -> Self {
+    fn new(mountpoint: PathBuf, backend: Backend) -> Self {
         Self {
             mountpoint,
             backend,
@@ -136,16 +136,13 @@ impl Default for MountOpts {
     }
 }
 
-/// Alias for the architecture-level mount specification.
-pub type MountSpec = MountOpts;
-
 /// Options for serving AgentFS over NFS without mounting it locally.
 #[derive(Debug, Clone)]
 pub struct NfsServerOptions {
     /// IP address or hostname to bind.
-    pub bind: String,
+    bind: String,
     /// TCP port to bind. Use `0` to request an ephemeral port.
-    pub port: u32,
+    port: u32,
 }
 
 impl NfsServerOptions {
@@ -183,11 +180,6 @@ impl NfsServerHandle {
     /// Request cooperative server shutdown.
     pub fn cancel(&self) {
         self.inner.cancel();
-    }
-
-    /// Whether the background server task has finished.
-    pub fn is_finished(&self) -> bool {
-        self.inner.is_finished()
     }
 
     /// Wait for the server task to stop and surface shutdown errors.
@@ -240,7 +232,7 @@ impl MountHandle {
     }
 
     /// Whether the backend-owned serving task has stopped.
-    pub fn is_finished(&self) -> bool {
+    fn is_finished(&self) -> bool {
         match &self.inner {
             #[cfg(target_os = "linux")]
             MountHandleInner::Fuse { session } => session
@@ -448,7 +440,7 @@ impl Drop for MountHandle {
 ///
 /// This function handles unmounting for both FUSE and NFS backends.
 /// If `lazy` is true, uses lazy unmount which detaches immediately even if busy.
-pub fn unmount(mountpoint: &Path, backend: Backend, lazy: bool) -> Result<()> {
+fn unmount(mountpoint: &Path, backend: Backend, lazy: bool) -> Result<()> {
     match backend {
         #[cfg(target_os = "linux")]
         Backend::Fuse => fuse::unmount_fuse(mountpoint, lazy),
@@ -502,7 +494,7 @@ fn remember_error(slot: &mut Option<anyhow::Error>, error: anyhow::Error) {
 /// signal disposition: dying without unmounting leaves a dead mount table
 /// entry (ENOTCONN for every later visitor) and skips `MountHandle`'s Drop.
 #[cfg(unix)]
-pub async fn termination_signal() -> std::io::Result<i32> {
+async fn termination_signal() -> std::io::Result<i32> {
     use tokio::signal::unix::{signal, SignalKind};
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
@@ -517,12 +509,12 @@ pub async fn termination_signal() -> std::io::Result<i32> {
 
 /// Resolve when SIGTERM, SIGINT, or SIGHUP is delivered.
 #[cfg(unix)]
-pub async fn shutdown_signal() -> std::io::Result<()> {
+async fn shutdown_signal() -> std::io::Result<()> {
     termination_signal().await.map(|_| ())
 }
 
 /// Wait for a path to become a mountpoint.
-pub fn wait_for_mount(path: &Path, timeout: Duration) -> bool {
+pub(crate) fn wait_for_mount(path: &Path, timeout: Duration) -> bool {
     let start = std::time::Instant::now();
     let interval = Duration::from_millis(50);
 

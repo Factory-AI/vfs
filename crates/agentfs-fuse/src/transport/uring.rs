@@ -455,7 +455,7 @@ impl UringQueueControl {
         self.queues.lock().unwrap().push(queue);
     }
 
-    pub(crate) fn shutdown(&self) {
+    fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
         let queues = self.queues.lock().unwrap().clone();
         for queue in queues {

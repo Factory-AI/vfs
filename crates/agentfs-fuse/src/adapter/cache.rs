@@ -171,7 +171,7 @@ impl AdapterCaches {
         Some(CacheReplyGuard { _guard: guard })
     }
 
-    pub(super) fn mutate(&self, policy: NotifyPolicy, f: impl FnOnce(&Self)) -> bool {
+    fn mutate(&self, policy: NotifyPolicy, f: impl FnOnce(&Self)) -> bool {
         let _reply = self.reply_lock.lock();
         self.epoch.fetch_add(1, Ordering::AcqRel);
         f(self);

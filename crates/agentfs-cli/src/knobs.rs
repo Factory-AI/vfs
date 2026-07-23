@@ -96,7 +96,7 @@ pub enum KnobClass {
 }
 
 impl KnobClass {
-    pub const fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             Self::ProductConfig => "product-config",
             Self::KillSwitch => "kill-switch",
@@ -108,7 +108,6 @@ impl KnobClass {
 /// Code-backed default renderer for generated docs.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum DefaultValue {
-    Literal(&'static str),
     Unset,
     Removed,
     CloneTimingsEnabled,
@@ -170,9 +169,8 @@ pub enum DefaultValue {
 }
 
 impl DefaultValue {
-    pub fn render(self) -> String {
+    fn render(self) -> String {
         match self {
-            Self::Literal(value) => value.to_string(),
             Self::Unset => "unset".to_string(),
             Self::Removed => "removed".to_string(),
             Self::CloneTimingsEnabled => render_bool(DEFAULT_CLONE_TIMINGS_ENABLED).to_string(),
@@ -262,14 +260,14 @@ fn partial_origin_mode_as_str(mode: agentfs_core::PartialOriginMode) -> &'static
 /// One row in the canonical knob ledger.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct Knob {
-    pub name: &'static str,
-    pub surface: &'static str,
-    pub class: KnobClass,
-    pub default: DefaultValue,
-    pub owner: &'static str,
-    pub description: &'static str,
-    pub removal_criteria: &'static str,
-    pub gate: &'static str,
+    name: &'static str,
+    surface: &'static str,
+    class: KnobClass,
+    default: DefaultValue,
+    owner: &'static str,
+    description: &'static str,
+    removal_criteria: &'static str,
+    gate: &'static str,
 }
 
 impl Knob {
@@ -675,7 +673,7 @@ const DELETED_COMPAT_KNOBS: &[Knob] = &[Knob::sunset(
 )];
 
 /// Active runtime knobs declared in one table.
-pub fn active_knobs() -> Vec<Knob> {
+fn active_knobs() -> Vec<Knob> {
     let mut knobs = Vec::with_capacity(ACTIVE_COMMON_KNOBS.len() + LINUX_FUSE_KNOBS.len());
     knobs.extend_from_slice(ACTIVE_COMMON_KNOBS);
     knobs.extend_from_slice(LINUX_FUSE_KNOBS);
@@ -683,12 +681,12 @@ pub fn active_knobs() -> Vec<Knob> {
 }
 
 /// Deleted compatibility knobs retained only as sunset documentation.
-pub fn deleted_compat_knobs() -> &'static [Knob] {
+fn deleted_compat_knobs() -> &'static [Knob] {
     DELETED_COMPAT_KNOBS
 }
 
 /// Generate the checked-in docs/KNOBS.md contents.
-pub fn generated_knobs_doc() -> String {
+fn generated_knobs_doc() -> String {
     let active = active_knobs();
     let mut out = String::new();
     out.push_str("# AgentFS Runtime Knobs\n\n");
@@ -785,22 +783,6 @@ mod tests {
         assert!(
             message.contains(KNOBS_DOC_REGEN_COMMAND),
             "drift failure message must name the regeneration command"
-        );
-    }
-
-    #[test]
-    fn knob_ledger_defaults_are_code_backed() {
-        let literal_defaults = active_knobs()
-            .iter()
-            .chain(deleted_compat_knobs())
-            .filter_map(|knob| match knob.default {
-                DefaultValue::Literal(value) => Some(format!("{}={value}", knob.name)),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert!(
-            literal_defaults.is_empty(),
-            "knob defaults must render from code Default impls or constants, not hand-written literals: {literal_defaults:?}"
         );
     }
 

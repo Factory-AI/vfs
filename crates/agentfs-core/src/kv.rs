@@ -1,7 +1,10 @@
 use crate::error::Result;
-use crate::pool::{ConnectionPool, DatabaseType};
+use crate::pool::ConnectionPool;
+#[cfg(test)]
+use crate::pool::DatabaseType;
 use crate::schema;
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use turso::Builder;
 
 /// A key-value store backed by SQLite
@@ -11,8 +14,8 @@ pub struct KvStore {
 }
 
 impl KvStore {
-    /// Create a new KV store
-    pub async fn new(db_path: &str) -> Result<Self> {
+    #[cfg(test)]
+    pub(crate) async fn new(db_path: &str) -> Result<Self> {
         let db = Builder::new_local(db_path).build().await?;
         let options = if db_path == ":memory:" {
             crate::fs::agentfs::memory_connection_pool_options()
@@ -26,7 +29,7 @@ impl KvStore {
     }
 
     /// Create a KV store from a connection pool
-    pub async fn from_pool(pool: ConnectionPool) -> Result<Self> {
+    pub(crate) async fn from_pool(pool: ConnectionPool) -> Result<Self> {
         let kv = Self { pool };
         kv.initialize().await?;
         Ok(kv)

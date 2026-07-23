@@ -20,7 +20,7 @@ pub(crate) enum FuseWorkersDefault {
 }
 
 impl FuseWorkersDefault {
-    pub(crate) const fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             Self::Auto => "auto",
         }
@@ -46,7 +46,7 @@ pub(crate) enum FuseQueueDefault {
 }
 
 impl FuseQueueDefault {
-    pub(crate) const fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             Self::Derived => "derived",
         }
@@ -72,29 +72,29 @@ impl FuseQueueDefault {
 /// session DB (`agentfs run --session` from another terminal), which now see
 /// attribute/namespace changes within 10s. Override with
 /// `AGENTFS_FUSE_ENTRY_TTL_MS` / `AGENTFS_FUSE_ATTR_TTL_MS`.
-pub(crate) const DEFAULT_FUSE_POSITIVE_TTL_MS: u64 = 10_000;
+const DEFAULT_FUSE_POSITIVE_TTL_MS: u64 = 10_000;
 /// Default kernel TTL for negative dentries. Kept at 1s: a file created by a
 /// second mount stays invisible to this mount for the negative TTL, and
 /// lookup-miss caching is the most surprising staleness to debug. Override
 /// with `AGENTFS_FUSE_NEG_TTL_MS`.
-pub(crate) const DEFAULT_FUSE_NEG_TTL_MS: u64 = 1000;
-pub(crate) const DEFAULT_AUTO_PERCENT: u8 = 50;
-pub(crate) const DEFAULT_QUEUE_MEMORY_PERCENT: u8 = 25;
-pub(crate) const DEFAULT_INO_FILES_CAP: usize = 65_536;
-pub(crate) const DEFAULT_URING_DEPTH: usize = 4;
-pub(crate) const DEFAULT_FUSE_WORKERS: FuseWorkersDefault = FuseWorkersDefault::Auto;
-pub(crate) const DEFAULT_FUSE_QUEUE: FuseQueueDefault = FuseQueueDefault::Derived;
-pub(crate) const DEFAULT_FUSE_WRITEBACK: bool = true;
-pub(crate) const DEFAULT_FUSE_KEEPCACHE: bool = true;
-pub(crate) const DEFAULT_FUSE_SYNC_INVAL: bool = false;
-pub(crate) const DEFAULT_FUSE_SELF_INVAL: bool = false;
-pub(crate) const DEFAULT_DRAIN_ON_RELEASE: bool = false;
-pub(crate) const DEFAULT_DRAIN_ON_FORGET: bool = false;
-pub(crate) const DEFAULT_FUSE_FLUSH_INVAL: bool = false;
-pub(crate) const DEFAULT_FUSE_NOFLUSH: bool = true;
-pub(crate) const DEFAULT_FUSE_NOOPEN: bool = true;
-pub(crate) const DEFAULT_FUSE_CACHE_DIR: bool = true;
-pub(crate) const DEFAULT_FUSE_STICKY_KEEPCACHE_DROP: bool = false;
+const DEFAULT_FUSE_NEG_TTL_MS: u64 = 1000;
+const DEFAULT_AUTO_PERCENT: u8 = 50;
+const DEFAULT_QUEUE_MEMORY_PERCENT: u8 = 25;
+const DEFAULT_INO_FILES_CAP: usize = 65_536;
+const DEFAULT_URING_DEPTH: usize = 4;
+const DEFAULT_FUSE_WORKERS: FuseWorkersDefault = FuseWorkersDefault::Auto;
+const DEFAULT_FUSE_QUEUE: FuseQueueDefault = FuseQueueDefault::Derived;
+const DEFAULT_FUSE_WRITEBACK: bool = true;
+const DEFAULT_FUSE_KEEPCACHE: bool = true;
+const DEFAULT_FUSE_SYNC_INVAL: bool = false;
+const DEFAULT_FUSE_SELF_INVAL: bool = false;
+const DEFAULT_DRAIN_ON_RELEASE: bool = false;
+const DEFAULT_DRAIN_ON_FORGET: bool = false;
+const DEFAULT_FUSE_FLUSH_INVAL: bool = false;
+const DEFAULT_FUSE_NOFLUSH: bool = true;
+const DEFAULT_FUSE_NOOPEN: bool = true;
+const DEFAULT_FUSE_CACHE_DIR: bool = true;
+const DEFAULT_FUSE_STICKY_KEEPCACHE_DROP: bool = false;
 const MAX_URING_DEPTH: usize = 64;
 const MAX_URING_SPIN_US: u64 = 1000;
 
@@ -166,7 +166,7 @@ impl DispatchMode {
         }
     }
 
-    pub(crate) const fn is_serial(self) -> bool {
+    const fn is_serial(self) -> bool {
         matches!(self, Self::Serial)
     }
 }
@@ -196,9 +196,9 @@ pub struct FuseKernelCacheConfig {
     pub(crate) entry_ttl: Duration,
     pub(crate) attr_ttl: Duration,
     pub(crate) neg_ttl: Duration,
-    pub(crate) entry_ttl_ms: u64,
-    pub(crate) attr_ttl_ms: u64,
-    pub(crate) neg_ttl_ms: u64,
+    entry_ttl_ms: u64,
+    attr_ttl_ms: u64,
+    neg_ttl_ms: u64,
     pub(crate) writeback_cache_enabled: bool,
     pub(crate) keepcache_enabled: bool,
     pub(crate) readdirplus_mode: ReaddirPlusMode,
@@ -257,12 +257,12 @@ impl UringConfig {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct FuseConfig {
     pub(crate) dispatch_mode: DispatchMode,
-    pub(crate) entry_ttl_ms: u64,
-    pub(crate) attr_ttl_ms: u64,
-    pub(crate) neg_ttl_ms: u64,
-    pub(crate) writeback_cache_requested: bool,
-    pub(crate) keepcache_requested: bool,
-    pub(crate) readdirplus_requested: ReaddirPlusMode,
+    entry_ttl_ms: u64,
+    attr_ttl_ms: u64,
+    neg_ttl_ms: u64,
+    writeback_cache_requested: bool,
+    keepcache_requested: bool,
+    readdirplus_requested: ReaddirPlusMode,
     pub(crate) sync_inval: bool,
     pub(crate) self_inval: bool,
     pub(crate) drain_on_release: bool,
@@ -271,7 +271,7 @@ pub struct FuseConfig {
     pub(crate) noflush: bool,
     pub(crate) noopen: bool,
     pub(crate) ino_files_cap: usize,
-    pub(crate) cache_dir_requested: bool,
+    cache_dir_requested: bool,
     pub(crate) keepcache_sticky_drop: bool,
     pub(crate) uring: UringConfig,
 }
@@ -339,7 +339,7 @@ impl FuseConfig {
 /// Pure cache-safety interlock: serial dispatch cannot safely use kernel
 /// TTLs, writeback, keepcache, or readdirplus because invalidation progress
 /// depends on a worker distinct from the request reader.
-pub(crate) fn cache_safety_interlock(config: &FuseConfig) -> FuseKernelCacheConfig {
+fn cache_safety_interlock(config: &FuseConfig) -> FuseKernelCacheConfig {
     if config.dispatch_mode.is_serial() {
         return FuseKernelCacheConfig {
             entry_ttl: Duration::ZERO,

@@ -507,7 +507,7 @@ pub(crate) enum MountOptionGroup {
     Fusermount,
 }
 
-pub(crate) fn option_group(option: &MountOption) -> MountOptionGroup {
+fn option_group(option: &MountOption) -> MountOptionGroup {
     match option {
         MountOption::FSName(_) => MountOptionGroup::Fusermount,
         MountOption::AutoUnmount => MountOptionGroup::Fusermount,

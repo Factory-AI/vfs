@@ -20,11 +20,11 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Clone, Debug)]
 pub struct PoolOptions {
     /// Maximum number of connections that may be checked out concurrently.
-    pub max_connections: usize,
+    pub(crate) max_connections: usize,
     /// Timeout for acquiring a connection when the pool is exhausted.
-    pub timeout: Duration,
+    pub(crate) timeout: Duration,
     /// SQL statements applied once to every newly-created connection.
-    pub setup_sql: Vec<String>,
+    pub(crate) setup_sql: Vec<String>,
 }
 
 impl Default for PoolOptions {
@@ -39,21 +39,15 @@ impl Default for PoolOptions {
 
 impl PoolOptions {
     /// Options for a strictly serialized single-connection pool.
-    pub fn single_connection() -> Self {
+    pub(crate) fn single_connection() -> Self {
         Self {
             max_connections: 1,
             ..Self::default()
         }
     }
 
-    /// Override the acquisition timeout.
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
-        self
-    }
-
     /// Override the setup SQL applied to every newly-created connection.
-    pub fn with_setup_sql<I, S>(mut self, setup_sql: I) -> Self
+    pub(crate) fn with_setup_sql<I, S>(mut self, setup_sql: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
@@ -95,7 +89,7 @@ struct ConnectionPoolInner {
 
 impl ConnectionPool {
     /// Create a connection pool with explicit database type and options.
-    pub fn with_options(db: DatabaseType, options: PoolOptions) -> Self {
+    pub(crate) fn with_options(db: DatabaseType, options: PoolOptions) -> Self {
         Self {
             inner: Arc::new(ConnectionPoolInner {
                 db,
@@ -118,7 +112,7 @@ impl ConnectionPool {
     ///
     /// Returns `Error::ConnectionPoolTimeout` if no connection becomes
     /// available within the timeout period.
-    pub async fn get_connection(&self) -> Result<PooledConnection> {
+    pub(crate) async fn get_connection(&self) -> Result<PooledConnection> {
         // Try to acquire a permit with timeout
         let permit = {
             let _wait_timer =
@@ -204,7 +198,7 @@ pub struct PooledConnection {
 
 impl PooledConnection {
     /// Get a reference to the underlying connection.
-    pub fn connection(&self) -> &Connection {
+    fn connection(&self) -> &Connection {
         self.conn.as_ref().expect("connection already taken")
     }
 
@@ -213,20 +207,20 @@ impl PooledConnection {
     /// Callers that observe a fatal database error can keep the pool from
     /// handing the same connection to the next borrower. The semaphore permit
     /// is still released normally when the pooled wrapper drops.
-    pub fn mark_unhealthy(&mut self) {
+    fn mark_unhealthy(&mut self) {
         self.discard_on_drop = true;
     }
 
     /// Mark this connection unhealthy when `error` indicates the connection
     /// should not be returned to the reusable pool.
-    pub fn mark_unhealthy_if_fatal(&mut self, error: &Error) {
+    pub(crate) fn mark_unhealthy_if_fatal(&mut self, error: &Error) {
         if is_fatal_connection_error(error) {
             self.mark_unhealthy();
         }
     }
 }
 
-pub(crate) fn is_fatal_connection_error(error: &Error) -> bool {
+fn is_fatal_connection_error(error: &Error) -> bool {
     matches!(
         error,
         Error::Database(
@@ -310,7 +304,10 @@ mod tests {
         let db = Builder::new_local(":memory:").build().await.unwrap();
         let pool = ConnectionPool::with_options(
             DatabaseType::Local(db),
-            PoolOptions::single_connection().with_timeout(Duration::from_millis(50)),
+            PoolOptions {
+                timeout: Duration::from_millis(50),
+                ..PoolOptions::single_connection()
+            },
         );
 
         // Get the one allowed connection
@@ -333,7 +330,10 @@ mod tests {
         let db = Builder::new_local(":memory:").build().await.unwrap();
         let pool = ConnectionPool::with_options(
             DatabaseType::Local(db),
-            PoolOptions::single_connection().with_timeout(Duration::from_millis(50)),
+            PoolOptions {
+                timeout: Duration::from_millis(50),
+                ..PoolOptions::single_connection()
+            },
         );
 
         // Hold the one connection

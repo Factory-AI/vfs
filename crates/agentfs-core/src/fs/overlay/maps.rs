@@ -27,9 +27,9 @@ pub(super) struct InodeInfo {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct OverlayMapCounts {
     pub(super) inode_entries: usize,
-    pub(super) reverse_entries: usize,
-    pub(super) path_entries: usize,
-    pub(super) lookup_ref_entries: usize,
+    reverse_entries: usize,
+    path_entries: usize,
+    lookup_ref_entries: usize,
 }
 
 /// All overlay inode maps protected by a single mutex.

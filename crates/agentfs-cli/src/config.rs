@@ -113,7 +113,7 @@ pub(crate) fn adopt_private_spill_dir() {
 }
 
 /// The temp dir the user actually configured, independent of the override.
-pub(crate) fn original_temp_dir() -> PathBuf {
+fn original_temp_dir() -> PathBuf {
     match ORIGINAL_TMPDIR.get() {
         Some(Some(dir)) if !dir.is_empty() => PathBuf::from(dir),
         Some(None) => PathBuf::from("/tmp"),

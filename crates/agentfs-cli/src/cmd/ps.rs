@@ -11,19 +11,19 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ProcInfo {
     /// Process ID.
-    pub pid: u32,
+    pid: u32,
     /// Whether this process is the session owner (created the FUSE mount).
-    pub owner: bool,
+    owner: bool,
     /// Command being run.
-    pub command: String,
+    command: String,
     /// When the process started.
-    pub started_at: DateTime<Utc>,
+    started_at: DateTime<Utc>,
     /// Working directory when the session was started.
-    pub cwd: PathBuf,
+    cwd: PathBuf,
 }
 
 /// Get the path to the procs directory for a session.
-pub fn procs_dir(session_id: &str) -> PathBuf {
+pub(crate) fn procs_dir(session_id: &str) -> PathBuf {
     let home = dirs::home_dir().expect("home directory");
     home.join(".agentfs")
         .join("run")
@@ -32,12 +32,12 @@ pub fn procs_dir(session_id: &str) -> PathBuf {
 }
 
 /// Get the path to a proc file.
-pub fn proc_file(session_id: &str, pid: u32) -> PathBuf {
+fn proc_file(session_id: &str, pid: u32) -> PathBuf {
     procs_dir(session_id).join(format!("{}.json", pid))
 }
 
 /// Write a proc file for the current process.
-pub fn write_proc_file(session_id: &str, owner: bool, command: &str, cwd: &Path) -> Result<()> {
+pub(crate) fn write_proc_file(session_id: &str, owner: bool, command: &str, cwd: &Path) -> Result<()> {
     let pid = std::process::id();
     let procs_dir = procs_dir(session_id);
     std::fs::create_dir_all(&procs_dir)?;
@@ -58,7 +58,7 @@ pub fn write_proc_file(session_id: &str, owner: bool, command: &str, cwd: &Path)
 }
 
 /// Remove the proc file for the current process.
-pub fn remove_proc_file(session_id: &str) {
+pub(crate) fn remove_proc_file(session_id: &str) {
     let pid = std::process::id();
     let path = proc_file(session_id, pid);
     let _ = std::fs::remove_file(path);
@@ -88,7 +88,7 @@ struct SessionInfo {
 }
 
 /// Get the set of active session IDs.
-pub fn active_session_ids() -> std::collections::HashSet<String> {
+pub(crate) fn active_session_ids() -> std::collections::HashSet<String> {
     list_sessions().into_iter().map(|s| s.session_id).collect()
 }
 

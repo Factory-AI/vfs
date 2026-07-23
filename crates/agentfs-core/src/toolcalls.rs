@@ -1,12 +1,16 @@
 use crate::error::{Error, Result};
-use crate::pool::{ConnectionPool, DatabaseType};
+use crate::pool::ConnectionPool;
+#[cfg(test)]
+use crate::pool::DatabaseType;
 use crate::schema;
 use serde::{Deserialize, Serialize};
 use std::{
     fmt,
     time::{SystemTime, UNIX_EPOCH},
 };
-use turso::{Builder, Value};
+#[cfg(test)]
+use turso::Builder;
+use turso::Value;
 
 /// Status of a tool call
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -64,11 +68,11 @@ pub struct ToolCall {
 /// Statistics for a specific tool
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallStats {
-    pub name: String,
+    name: String,
     pub total_calls: i64,
     pub successful: i64,
     pub failed: i64,
-    pub avg_duration_ms: f64,
+    avg_duration_ms: f64,
 }
 
 /// Tool calls tracker backed by SQLite
@@ -78,8 +82,8 @@ pub struct ToolCalls {
 }
 
 impl ToolCalls {
-    /// Create a new tool calls tracker
-    pub async fn new(db_path: &str) -> Result<Self> {
+    #[cfg(test)]
+    pub(crate) async fn new(db_path: &str) -> Result<Self> {
         let db = Builder::new_local(db_path).build().await?;
         let options = if db_path == ":memory:" {
             crate::fs::agentfs::memory_connection_pool_options()

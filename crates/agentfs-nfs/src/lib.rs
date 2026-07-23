@@ -37,9 +37,9 @@ use server::tcp::{NFSTcp, NFSTcpListener};
 #[derive(Debug, Clone)]
 pub struct NfsServeOptions {
     /// IP address or hostname to bind.
-    pub bind: String,
+    bind: String,
     /// TCP port to bind. Use `0` to request an ephemeral port.
-    pub port: u32,
+    port: u32,
 }
 
 impl NfsServeOptions {

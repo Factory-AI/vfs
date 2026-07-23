@@ -20,8 +20,10 @@
 
 pub mod cmd;
 pub mod config;
-pub mod docs;
-pub mod knobs;
+#[cfg(test)]
+mod docs;
+#[cfg(test)]
+mod knobs;
 pub mod logging;
 pub mod opts;
 

@@ -13,8 +13,8 @@ use crate::error::Error;
 
 use super::*;
 
-/// One node for [`AgentFS::import_entries`]. `path` is relative to the import
-/// root and '/'-separated; parent directories must precede their children.
+/// One node accepted by [`ImportSession::import_chunk`]. `path` is relative to
+/// the import root and '/'-separated; parents must precede their children.
 #[derive(Debug, Clone)]
 pub struct ImportEntry {
     pub path: String,
@@ -48,9 +48,8 @@ pub struct ImportOptions {
 /// pooled connection plus the directory-path -> ino map across
 /// [`ImportSession::import_chunk`] calls, so a producer can feed entries as
 /// they become available (e.g. as `git cat-file --batch` emits blobs)
-/// instead of buffering the whole tree in memory. The ordering contract
-/// matches [`AgentFS::import_entries`]: every parent directory must appear
-/// in some chunk before (or in the same chunk as) its children.
+/// instead of buffering the whole tree in memory. Every parent directory must
+/// appear in an earlier chunk or before its children in the same chunk.
 pub struct ImportSession {
     fs: AgentFS,
     conn: crate::pool::PooledConnection,
@@ -86,21 +85,8 @@ impl ImportSession {
 }
 
 impl AgentFS {
-    /// Bulk-import a tree of nodes under `dest_parent` using large
-    /// multi-inode transactions instead of one transaction per node, sized by
-    /// the write batcher's txn limits (`AGENTFS_BATCH_TXN_INODES` /
-    /// `AGENTFS_BATCH_TXN_BYTES`). This is the fast path for populating the
-    /// database without per-file FUSE round trips (`agentfs clone` / `fs
-    /// import`): a 4.7k-file worktree pays a handful of commits instead of
-    /// ~9.4k per-file create+write transaction boundaries.
-    ///
-    /// Entries must be ordered parents-before-children; every parent
-    /// directory of a nested path must itself appear as an entry (or be the
-    /// import root). All inodes are stamped with `opts.timestamp`, and the
-    /// returned rows echo the exact `ino`/`mode`/`size` the filesystem will
-    /// serve, so callers can fabricate externally-consistent stat metadata
-    /// (e.g. a git index) without re-reading anything.
-    pub async fn import_entries(
+    #[cfg(test)]
+    pub(super) async fn import_entries(
         &self,
         dest_parent: i64,
         entries: &[ImportEntry],
@@ -112,8 +98,7 @@ impl AgentFS {
     }
 
     /// Begin a streaming bulk import under `dest_parent`; see
-    /// [`ImportSession`]. [`AgentFS::import_entries`] is the buffered
-    /// one-shot form.
+    /// [`ImportSession`].
     pub async fn begin_import(
         &self,
         dest_parent: i64,

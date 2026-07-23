@@ -30,11 +30,7 @@ impl OverlayFS {
             .is_some_and(|stats| stats.is_directory()))
     }
 
-    pub(super) fn validate_partial_origin(
-        &self,
-        origin: &PartialOrigin,
-        stats: &Stats,
-    ) -> Result<()> {
+    fn validate_partial_origin(&self, origin: &PartialOrigin, stats: &Stats) -> Result<()> {
         if stats.size != origin.base_fingerprint_size {
             return Err(Error::Internal(format!(
                 "partial-origin base changed for {} (stored size={}, current size={})",
@@ -92,7 +88,7 @@ impl OverlayFS {
     /// corresponding directory created in delta (via ensure_parent_dirs),
     /// we need to update the overlay inode to point to delta. This ensures
     /// that operations like readdir and unlink will check the delta layer.
-    pub(super) fn promote_to_delta(&self, path: &str, delta_ino: i64) {
+    fn promote_to_delta(&self, path: &str, delta_ino: i64) {
         self.promote_mapping_to_delta(path, delta_ino);
     }
 
@@ -445,11 +441,7 @@ impl OverlayFS {
     /// This is the cheap "is this file unmodified?" check that Tier Two Axis
     /// C uses to decide whether `partial_file_for_delta` can short-circuit to
     /// a HostFS fd.
-    pub(super) async fn delta_has_no_content_overrides(
-        &self,
-        delta_ino: i64,
-        base_size: i64,
-    ) -> Result<bool> {
+    async fn delta_has_no_content_overrides(&self, delta_ino: i64, base_size: i64) -> Result<bool> {
         let conn = self.delta.get_connection().await?;
 
         // Any per-chunk override?

@@ -53,11 +53,11 @@ fn registry_sections() -> &'static Mutex<Vec<&'static dyn TelemetrySection>> {
 /// A point-in-time telemetry snapshot grouped by domain.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
 pub struct ProfileSnapshot {
-    pub sections: BTreeMap<String, BTreeMap<String, u64>>,
+    sections: BTreeMap<String, BTreeMap<String, u64>>,
 }
 
 impl ProfileSnapshot {
-    pub fn flat(&self) -> BTreeMap<String, u64> {
+    fn flat(&self) -> BTreeMap<String, u64> {
         let mut counters = BTreeMap::new();
         for section in self.sections.values() {
             counters.extend(section.iter().map(|(key, value)| (key.clone(), *value)));
@@ -65,11 +65,8 @@ impl ProfileSnapshot {
         counters
     }
 
-    pub fn section(&self, name: &str) -> Option<&BTreeMap<String, u64>> {
-        self.sections.get(name)
-    }
-
-    pub fn counter(&self, name: &str) -> u64 {
+    #[cfg(test)]
+    pub(crate) fn counter(&self, name: &str) -> u64 {
         self.flat().get(name).copied().unwrap_or(0)
     }
 }
@@ -229,7 +226,7 @@ pub struct TimerGuard {
 }
 
 impl TimerGuard {
-    pub fn disarmed() -> Self {
+    fn disarmed() -> Self {
         Self::default()
     }
 }
@@ -374,98 +371,92 @@ pub fn is_enabled() -> bool {
     }
 }
 
-pub fn record_connection_wait(duration: Duration) {
-    if is_enabled() {
-        CORE_COUNTERS.connection_wait.record(duration);
-    }
-}
-
-pub fn record_connection_create() {
+pub(crate) fn record_connection_create() {
     if is_enabled() {
         CORE_COUNTERS.connection_create.increment();
     }
 }
 
-pub fn record_connection_reuse() {
+pub(crate) fn record_connection_reuse() {
     if is_enabled() {
         CORE_COUNTERS.connection_reuse.increment();
     }
 }
 
-pub fn record_connection_drop_discard() {
+pub(crate) fn record_connection_drop_discard() {
     if is_enabled() {
         CORE_COUNTERS.connection_drop_discards.increment();
     }
 }
 
-pub fn record_connection_health_eviction() {
+pub(crate) fn record_connection_health_eviction() {
     if is_enabled() {
         CORE_COUNTERS.connection_health_evictions.increment();
     }
 }
 
-pub fn record_lookup() {
+pub(crate) fn record_lookup() {
     if is_enabled() {
         CORE_COUNTERS.lookup_count.increment();
     }
 }
 
-pub fn record_lookup_delta() {
+pub(crate) fn record_lookup_delta() {
     if is_enabled() {
         CORE_COUNTERS.lookup_delta_count.increment();
     }
 }
 
-pub fn record_lookup_base() {
+pub(crate) fn record_lookup_base() {
     if is_enabled() {
         CORE_COUNTERS.lookup_base_count.increment();
     }
 }
 
-pub fn record_lookup_whiteout() {
+pub(crate) fn record_lookup_whiteout() {
     if is_enabled() {
         CORE_COUNTERS.lookup_whiteout_count.increment();
     }
 }
 
-pub fn record_getattr() {
+pub(crate) fn record_getattr() {
     if is_enabled() {
         CORE_COUNTERS.getattr_count.increment();
     }
 }
 
-pub fn record_readdir() {
+pub(crate) fn record_readdir() {
     if is_enabled() {
         CORE_COUNTERS.readdir_count.increment();
     }
 }
 
-pub fn record_readdir_plus() {
+pub(crate) fn record_readdir_plus() {
     if is_enabled() {
         CORE_COUNTERS.readdir_plus_count.increment();
     }
 }
 
-pub fn record_path_resolution(components: u64) {
+pub(crate) fn record_path_resolution(components: u64) {
     if is_enabled() {
         CORE_COUNTERS.path_resolution_count.increment();
         CORE_COUNTERS.path_component_count.add(components);
     }
 }
 
-pub fn record_path_cache_hit() {
+pub(crate) fn record_path_cache_hit() {
     if is_enabled() {
         CORE_COUNTERS.path_cache_hits.increment();
     }
 }
 
-pub fn record_path_cache_miss() {
+pub(crate) fn record_path_cache_miss() {
     if is_enabled() {
         CORE_COUNTERS.path_cache_misses.increment();
     }
 }
 
-pub fn record_negative_lookup() {
+pub(crate) fn record_negative_lookup() {
     if is_enabled() {
         CORE_COUNTERS.negative_lookup_count.increment();
     }
@@ -489,73 +480,73 @@ pub fn record_negative_cache_invalidation() {
     }
 }
 
-pub fn record_attr_cache_hit() {
+pub(crate) fn record_attr_cache_hit() {
     if is_enabled() {
         CORE_COUNTERS.attr_cache_hits.increment();
     }
 }
 
-pub fn record_attr_cache_miss() {
+pub(crate) fn record_attr_cache_miss() {
     if is_enabled() {
         CORE_COUNTERS.attr_cache_misses.increment();
     }
 }
 
-pub fn record_dentry_cache_hit() {
+pub(crate) fn record_dentry_cache_hit() {
     if is_enabled() {
         CORE_COUNTERS.dentry_cache_hits.increment();
     }
 }
 
-pub fn record_dentry_cache_miss() {
+pub(crate) fn record_dentry_cache_miss() {
     if is_enabled() {
         CORE_COUNTERS.dentry_cache_misses.increment();
     }
 }
 
-pub fn record_chunk_read_query() {
+pub(crate) fn record_chunk_read_query() {
     if is_enabled() {
         CORE_COUNTERS.chunk_read_queries.increment();
     }
 }
 
-pub fn record_chunk_read_chunks(chunks: u64) {
+pub(crate) fn record_chunk_read_chunks(chunks: u64) {
     if is_enabled() {
         CORE_COUNTERS.chunk_read_chunks.add(chunks);
     }
 }
 
-pub fn record_chunk_write_chunks(chunks: u64) {
+pub(crate) fn record_chunk_write_chunks(chunks: u64) {
     if is_enabled() {
         CORE_COUNTERS.chunk_write_chunks.add(chunks);
     }
 }
 
-pub fn record_agentfs_batcher_enqueue() {
+pub(crate) fn record_agentfs_batcher_enqueue() {
     if is_enabled() {
         CORE_COUNTERS.agentfs_batcher_enqueues.increment();
     }
 }
 
-pub fn record_agentfs_batcher_drain_timer() {
+pub(crate) fn record_agentfs_batcher_drain_timer() {
     if is_enabled() {
         CORE_COUNTERS.agentfs_batcher_drains_timer.increment();
     }
 }
 
-pub fn record_agentfs_batcher_drain_bytes() {
+pub(crate) fn record_agentfs_batcher_drain_bytes() {
     if is_enabled() {
         CORE_COUNTERS.agentfs_batcher_drains_bytes.increment();
     }
 }
 
-pub fn record_agentfs_batcher_drain_explicit() {
+pub(crate) fn record_agentfs_batcher_drain_explicit() {
     if is_enabled() {
         CORE_COUNTERS.agentfs_batcher_drains_explicit.increment();
     }
 }
 
-pub fn record_agentfs_batcher_pending_bytes(pending_bytes: u64) {
+pub(crate) fn record_agentfs_batcher_pending_bytes(pending_bytes: u64) {
     if is_enabled() {
         CORE_COUNTERS
             .agentfs_batcher_pending_max_bytes
@@ -563,13 +554,13 @@ pub fn record_agentfs_batcher_pending_bytes(pending_bytes: u64) {
     }
 }
 
-pub fn record_agentfs_batcher_coalesced_ranges(ranges: u64) {
+pub(crate) fn record_agentfs_batcher_coalesced_ranges(ranges: u64) {
     if is_enabled() && ranges > 0 {
         CORE_COUNTERS.agentfs_batcher_coalesced_ranges.add(ranges);
     }
 }
 
-pub fn record_agentfs_batcher_commit_latency(duration: Duration) {
+pub(crate) fn record_agentfs_batcher_commit_latency(duration: Duration) {
     if is_enabled() {
         CORE_COUNTERS
             .agentfs_batcher_commit_latency_ns_total
@@ -578,17 +569,11 @@ pub fn record_agentfs_batcher_commit_latency(duration: Duration) {
 }
 
 /// Record one batcher SQLite commit transaction that covered `inodes` inodes.
-pub fn record_agentfs_batcher_commit_txn(inodes: u64) {
+pub(crate) fn record_agentfs_batcher_commit_txn(inodes: u64) {
     if is_enabled() {
         CORE_COUNTERS.agentfs_batcher_commit_txns.increment();
         CORE_COUNTERS.agentfs_batcher_txn_inodes_total.add(inodes);
         CORE_COUNTERS.agentfs_batcher_txn_inodes_max.update(inodes);
-    }
-}
-
-pub fn record_wal_checkpoint(duration: Duration) {
-    if is_enabled() {
-        CORE_COUNTERS.wal_checkpoint.record(duration);
     }
 }
 
@@ -604,7 +589,7 @@ pub fn record_base_fast_open_keep_cache() {
     }
 }
 
-pub fn record_base_fast_open_passthrough_attempted() {
+pub(crate) fn record_base_fast_open_passthrough_attempted() {
     if is_enabled() {
         BASE_COUNTERS
             .base_fast_open_passthrough_attempted
@@ -612,7 +597,7 @@ pub fn record_base_fast_open_passthrough_attempted() {
     }
 }
 
-pub fn record_base_fast_open_passthrough_succeeded() {
+pub(crate) fn record_base_fast_open_passthrough_succeeded() {
     if is_enabled() {
         BASE_COUNTERS
             .base_fast_open_passthrough_succeeded
@@ -620,7 +605,7 @@ pub fn record_base_fast_open_passthrough_succeeded() {
     }
 }
 
-pub fn record_base_fast_open_passthrough_fallback() {
+pub(crate) fn record_base_fast_open_passthrough_fallback() {
     if is_enabled() {
         BASE_COUNTERS
             .base_fast_open_passthrough_fallback
@@ -656,15 +641,15 @@ pub fn snapshot() -> ProfileSnapshot {
     ProfileSnapshot { sections }
 }
 
-pub const fn passthrough_supported() -> bool {
+const fn passthrough_supported() -> bool {
     false
 }
 
-pub const fn passthrough_fallback_read_path() -> &'static str {
+const fn passthrough_fallback_read_path() -> &'static str {
     "hostfs"
 }
 
-pub fn summary_payload(event: &str, source: &str, snapshot: &ProfileSnapshot) -> String {
+fn summary_payload(event: &str, source: &str, snapshot: &ProfileSnapshot) -> String {
     serde_json::json!({
         "event": event,
         "source": source,
@@ -743,13 +728,15 @@ mod tests {
 
     #[test]
     fn snapshot_has_core_and_base_sections() {
-        record_connection_wait(Duration::from_nanos(7));
+        CORE_COUNTERS
+            .connection_wait
+            .record(Duration::from_nanos(7));
         record_connection_create();
         record_base_fast_open_eligible();
 
         let snapshot = snapshot();
-        assert!(snapshot.section("core").is_some());
-        assert!(snapshot.section("base").is_some());
+        assert!(snapshot.sections.contains_key("core"));
+        assert!(snapshot.sections.contains_key("base"));
         assert!(snapshot.counter("connection_wait_count") >= 1);
         assert!(snapshot.counter("connection_wait_nanos") >= 7);
         assert!(snapshot.counter("connection_create") >= 1);

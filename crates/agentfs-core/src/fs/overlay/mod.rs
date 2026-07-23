@@ -32,7 +32,7 @@ use partial::{OverlayPartialFile, PartialOrigin};
 
 /// Root inode number (matches FUSE convention)
 pub(super) const ROOT_INO: i64 = 1;
-pub(super) const STORAGE_CHUNKED: i64 = 0;
+const STORAGE_CHUNKED: i64 = 0;
 pub const DEFAULT_PARTIAL_ORIGIN_THRESHOLD_BYTES: u64 = 1024 * 1024;
 
 /// Explicit policy for partial-origin copy-up of regular base files.
@@ -50,7 +50,7 @@ pub enum PartialOriginMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PartialOriginPolicy {
     pub mode: PartialOriginMode,
-    pub threshold_bytes: u64,
+    threshold_bytes: u64,
 }
 
 impl Default for PartialOriginPolicy {
@@ -90,16 +90,16 @@ impl PartialOriginPolicy {
     }
 }
 
-pub(super) fn current_timestamp() -> Result<(i64, i64)> {
+fn current_timestamp() -> Result<(i64, i64)> {
     let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
     Ok((dur.as_secs() as i64, dur.subsec_nanos() as i64))
 }
 
-pub(super) fn is_write_open(flags: i32) -> bool {
+fn is_write_open(flags: i32) -> bool {
     (flags & libc::O_ACCMODE) != libc::O_RDONLY || (flags & libc::O_TRUNC) != 0
 }
 
-pub(super) fn mount_visible_file(inner: BoxedFile, overlay_ino: i64) -> BoxedFile {
+fn mount_visible_file(inner: BoxedFile, overlay_ino: i64) -> BoxedFile {
     Arc::new(MountVisibleFile { inner, overlay_ino })
 }
 
@@ -324,7 +324,8 @@ impl OverlayFS {
     }
 
     /// Get a reference to the delta layer
-    pub fn delta(&self) -> &AgentFS {
+    #[cfg(test)]
+    fn delta(&self) -> &AgentFS {
         &self.delta
     }
 }

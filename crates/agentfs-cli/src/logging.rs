@@ -4,7 +4,7 @@
 //! cover every first-party AgentFS crate so warnings are visible even when
 //! `RUST_LOG` is unset.
 
-pub const DEFAULT_ENV_FILTER: &str = concat!(
+const DEFAULT_ENV_FILTER: &str = concat!(
     "agentfs=info,",
     "agentfs_cli=info,",
     "agentfs_core=info,",

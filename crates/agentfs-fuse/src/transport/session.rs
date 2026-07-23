@@ -56,9 +56,9 @@ pub(crate) enum SessionACL {
 #[derive(Debug)]
 pub(crate) struct Session<FS: Filesystem> {
     /// Shared session state and filesystem operation implementations.
-    pub(crate) shared: Arc<SessionShared<FS>>,
+    shared: Arc<SessionShared<FS>>,
     /// Communication channel to the kernel driver
-    pub(crate) ch: Channel,
+    ch: Channel,
     /// Handle to the mount.  Dropping this unmounts.
     mount: Arc<Mutex<Option<(PathBuf, Mount)>>>,
     /// Sender half of the deferred notification queue
@@ -480,7 +480,7 @@ impl<FS: Filesystem> Session<FS> {
     }
 
     /// Returns an object that can be used to send notifications to the kernel
-    pub(crate) fn notifier(&self) -> Notifier {
+    fn notifier(&self) -> Notifier {
         Notifier::new(self.ch.sender())
     }
 }

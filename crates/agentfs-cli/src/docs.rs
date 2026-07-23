@@ -18,7 +18,7 @@ const GENERATED_END: &str = "<!-- END GENERATED COMMAND REFERENCE -->";
 
 /// Render the generated command-reference region of docs/MANUAL.md,
 /// markers included.
-pub fn generated_manual_commands() -> String {
+fn generated_manual_commands() -> String {
     let cmd = Args::command();
     let mut out = String::new();
     out.push_str(GENERATED_BEGIN);

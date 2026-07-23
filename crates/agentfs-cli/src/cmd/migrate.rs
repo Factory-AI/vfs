@@ -30,7 +30,7 @@ const S_IFREG: i64 = 0o100000;
 /// Names a command that actually finishes the job: supported old versions get
 /// `agentfs migrate <id-or-path>` (which lands at CURRENT in one invocation);
 /// anything else is from a newer agentfs and no local command can help.
-pub fn schema_upgrade_guidance(found: &str, expected: &str, id_or_path: &str) -> String {
+fn schema_upgrade_guidance(found: &str, expected: &str, id_or_path: &str) -> String {
     match SchemaVersion::parse(found) {
         Some(version) if version < schema::CURRENT => format!(
             "Filesystem `{id_or_path}` requires migration\n\n\
@@ -47,7 +47,7 @@ pub fn schema_upgrade_guidance(found: &str, expected: &str, id_or_path: &str) ->
 
 /// Convert an SDK open error into an anyhow error, attaching migrate guidance
 /// when the failure is a schema-version mismatch.
-pub fn open_error_with_guidance(err: SdkError, id_or_path: &str) -> anyhow::Error {
+pub(crate) fn open_error_with_guidance(err: SdkError, id_or_path: &str) -> anyhow::Error {
     match &err {
         SdkError::SchemaVersionMismatch { found, expected } => {
             anyhow::anyhow!("{}", schema_upgrade_guidance(found, expected, id_or_path))

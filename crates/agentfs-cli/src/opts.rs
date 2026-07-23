@@ -106,15 +106,15 @@ pub struct Args {
 #[derive(Debug, Parser)]
 pub struct SyncCommandOptions {
     #[arg(long)]
-    pub sync_remote_url: Option<String>,
+    pub(crate) sync_remote_url: Option<String>,
     #[arg(long)]
-    pub sync_partial_prefetch: Option<bool>,
+    pub(crate) sync_partial_prefetch: Option<bool>,
     #[arg(long)]
-    pub sync_partial_segment_size: Option<usize>,
+    pub(crate) sync_partial_segment_size: Option<usize>,
     #[arg(long)]
-    pub sync_partial_bootstrap_query: Option<String>,
+    pub(crate) sync_partial_bootstrap_query: Option<String>,
     #[arg(long)]
-    pub sync_partial_bootstrap_length: Option<usize>,
+    pub(crate) sync_partial_bootstrap_length: Option<usize>,
 }
 
 #[derive(Subcommand, Debug)]

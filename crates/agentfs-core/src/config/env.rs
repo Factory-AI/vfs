@@ -21,7 +21,7 @@ impl EnvReader {
 
     /// Parse the shared boolean grammar:
     /// true = {1,true,yes,on}, false = {0,false,no,off}.
-    pub fn parse_bool(value: &str) -> Option<bool> {
+    pub(crate) fn parse_bool(value: &str) -> Option<bool> {
         match value.trim() {
             "1" => Some(true),
             "0" => Some(false),
@@ -67,7 +67,7 @@ impl EnvReader {
         }
     }
 
-    pub fn duration_millis(self, name: &str, default_ms: u64) -> Duration {
+    pub(crate) fn duration_millis(self, name: &str, default_ms: u64) -> Duration {
         match std::env::var(name) {
             Ok(value) => match value.parse::<u64>() {
                 Ok(ms) => Duration::from_millis(ms),
@@ -94,7 +94,7 @@ impl EnvReader {
         }
     }
 
-    pub fn positive_usize(self, name: &str, default_value: usize) -> usize {
+    pub(crate) fn positive_usize(self, name: &str, default_value: usize) -> usize {
         match std::env::var(name) {
             Ok(value) => match value.parse::<usize>().ok().filter(|value| *value > 0) {
                 Some(parsed) => parsed,

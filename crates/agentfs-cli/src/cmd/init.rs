@@ -16,7 +16,7 @@ pub struct EncryptionOptions {
     pub cipher: String,
 }
 
-pub async fn open_agentfs(options: AgentFSOptions) -> Result<AgentFS, agentfs_core::error::Error> {
+pub(crate) async fn open_agentfs(options: AgentFSOptions) -> Result<AgentFS, agentfs_core::error::Error> {
     let mut options = options;
     if options.core_config.is_none() {
         options = options.with_core_config(crate::config::core_config_from_env());
@@ -34,13 +34,13 @@ pub async fn open_agentfs(options: AgentFSOptions) -> Result<AgentFS, agentfs_co
 /// the owning session performed (invariant I1). Best-effort — a finalize
 /// failure (e.g. a concurrent holder of the database) must not fail a
 /// command whose real work already succeeded.
-pub async fn finalize_readonly(agentfs: &AgentFS) {
+pub(crate) async fn finalize_readonly(agentfs: &AgentFS) {
     if let Err(error) = agentfs.fs.finalize().await {
         eprintln!("Warning: Failed to restore the single-file database family: {error:#}");
     }
 }
 
-pub fn build_sync_options(sync_cmd_options: &SyncCommandOptions) -> SyncOptions {
+fn build_sync_options(sync_cmd_options: &SyncCommandOptions) -> SyncOptions {
     let mut sync = SyncOptions {
         remote_url: sync_cmd_options.sync_remote_url.clone(),
         auth_token: crate::config::turso_db_auth_token(),
