@@ -45,6 +45,17 @@ behavior-preserving moves are not listed individually.
 
 ### Fixed
 
+- The FUSE mount surface accepted `--uid`/`--gid` ("User ID to report for
+  all files") but never consumed them: attributes always reported the
+  stored inode ownership. A delta created by one user and resumed by
+  another (e.g. a session database moved to a different machine) surfaced
+  every file as an unmappable foreign uid — `nobody` inside the `agentfs
+  run` user namespace — making owner-only (0600) files unreadable. The
+  adapter now squashes reported ownership to the configured uid/gid; since
+  `agentfs run` already mounts with the current user, resumed foreign
+  deltas are fully readable. Modes are untouched, and stored ownership in
+  the database is preserved.
+
 - macOS `agentfs run` left reads unscoped (a blanket `(allow file-read*)`
   in the generated Seatbelt profile) while Linux hid home and temp dirs
   behind namespaces. The profile is now default-deny for reads: only the

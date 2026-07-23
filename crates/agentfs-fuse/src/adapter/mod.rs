@@ -167,6 +167,13 @@ struct AgentFSFuse {
     fs: Arc<dyn FileSystem>,
     semantics: Semantics,
     runtime: Runtime,
+    /// When set, reported instead of the stored uid for every file (ownership
+    /// squash). Makes deltas portable across users/machines: the kernel's
+    /// default_permissions check then evaluates modes against the mounting
+    /// user rather than a possibly-unmappable foreign uid.
+    report_uid: Option<u32>,
+    /// Group counterpart of `report_uid`.
+    report_gid: Option<u32>,
     /// Env-backed kernel cache safety configuration for this mount.
     cache_config: FuseKernelCacheConfig,
     /// Env-backed FUSE-over-io_uring settings for this mount.
@@ -371,7 +378,7 @@ impl Filesystem for AgentFSFuse {
             let cache_reply = self.caches.try_reply_guard(cache_epoch);
             if retained && cache_reply.is_some() {
                 crate::telemetry::record_fuse_adapter_entry_hit();
-                let attr = fillattr(&stats);
+                let attr = self.fillattr(&stats);
                 reply.entry_with_ttls(
                     &self.cache_config.entry_ttl,
                     &self.cache_config.attr_ttl,
@@ -471,7 +478,7 @@ impl Filesystem for AgentFSFuse {
                 if stable && !external_drift {
                     self.cache_entry(parent, name_str, &stats);
                 }
-                let attr = fillattr(&stats);
+                let attr = self.fillattr(&stats);
                 let cacheable = stable && !external_drift;
                 reply.entry_with_ttls(
                     if cacheable {
@@ -521,7 +528,7 @@ impl Filesystem for AgentFSFuse {
             let cache_reply = self.caches.try_reply_guard(cache_epoch);
             if cache_reply.is_some() {
                 crate::telemetry::record_fuse_adapter_attr_hit();
-                reply.attr(&self.cache_config.attr_ttl, &fillattr(&stats));
+                reply.attr(&self.cache_config.attr_ttl, &self.fillattr(&stats));
                 return;
             }
         }
@@ -572,7 +579,7 @@ impl Filesystem for AgentFSFuse {
                     } else {
                         &Duration::ZERO
                     },
-                    &fillattr(&stats),
+                    &self.fillattr(&stats),
                 );
             }
             Ok(None) => reply.error(libc::ENOENT),
@@ -750,7 +757,7 @@ impl Filesystem for AgentFSFuse {
                 } else {
                     let _ = audit;
                 }
-                reply.attr(&self.cache_config.attr_ttl, &fillattr(&stats));
+                reply.attr(&self.cache_config.attr_ttl, &self.fillattr(&stats));
             }
             Ok(None) => reply.error(libc::ENOENT),
             Err(e) => reply.error(error_to_errno(&e)),
@@ -882,7 +889,7 @@ impl Filesystem for AgentFSFuse {
             Ok(stats) => {
                 self.invalidate_inode_cache(req, parent);
                 self.invalidate_entry_cache_self(req, parent, name);
-                let attr = fillattr(&stats);
+                let attr = self.fillattr(&stats);
                 audit.assert_invalidated("mknod");
                 let (entry_ttl, attr_ttl) = self.mutation_reply_ttls();
                 reply.entry_with_ttls(&entry_ttl, &attr_ttl, &attr, 0);
@@ -931,7 +938,7 @@ impl Filesystem for AgentFSFuse {
             Ok(stats) => {
                 self.invalidate_inode_cache(req, parent);
                 self.invalidate_entry_cache_self(req, parent, name);
-                let attr = fillattr(&stats);
+                let attr = self.fillattr(&stats);
                 audit.assert_invalidated("mkdir");
                 let (entry_ttl, attr_ttl) = self.mutation_reply_ttls();
                 reply.entry_with_ttls(&entry_ttl, &attr_ttl, &attr, 0);
@@ -1021,7 +1028,7 @@ impl Filesystem for AgentFSFuse {
             Ok((stats, file)) => {
                 self.invalidate_inode_cache(req, parent);
                 self.invalidate_entry_cache_self(req, parent, name);
-                let attr = fillattr(&stats);
+                let attr = self.fillattr(&stats);
 
                 // Zero-message opens: the kernel skips FUSE_RELEASE for
                 // every file once `no_open` latches, so an fh-keyed entry
@@ -1102,7 +1109,7 @@ impl Filesystem for AgentFSFuse {
             Ok(stats) => {
                 self.invalidate_inode_cache(req, parent);
                 self.invalidate_entry_cache_self(req, parent, link_name);
-                let attr = fillattr(&stats);
+                let attr = self.fillattr(&stats);
                 audit.assert_invalidated("symlink");
                 let (entry_ttl, attr_ttl) = self.mutation_reply_ttls();
                 reply.entry_with_ttls(&entry_ttl, &attr_ttl, &attr, 0);
@@ -1149,7 +1156,7 @@ impl Filesystem for AgentFSFuse {
                 self.invalidate_inode_cache_self(req, ino);
                 self.invalidate_inode_cache(req, newparent);
                 self.invalidate_entry_cache_self(req, newparent, newname);
-                let attr = fillattr(&stats);
+                let attr = self.fillattr(&stats);
                 audit.assert_invalidated("link");
                 let (entry_ttl, attr_ttl) = self.mutation_reply_ttls();
                 reply.entry_with_ttls(&entry_ttl, &attr_ttl, &attr, 0);
@@ -2558,7 +2565,13 @@ impl AgentFSFuse {
             }
         }
 
-        let all_entries = build_cached_readdir_entries(&dir_stats, &parent_stats, entries);
+        let all_entries = build_cached_readdir_entries(
+            &dir_stats,
+            &parent_stats,
+            entries,
+            self.report_uid,
+            self.report_gid,
+        );
         let entries = Arc::new(all_entries);
         if stable && dir_cacheable {
             self.caches
@@ -2573,7 +2586,13 @@ impl AgentFSFuse {
     ///
     /// The provided Tokio runtime is used to execute async FileSystem operations
     /// from within synchronous FUSE callbacks via `block_on`.
-    fn new(fs: Arc<dyn FileSystem>, runtime: Runtime, config: FuseConfig) -> Self {
+    fn new(
+        fs: Arc<dyn FileSystem>,
+        runtime: Runtime,
+        config: FuseConfig,
+        report_uid: Option<u32>,
+        report_gid: Option<u32>,
+    ) -> Self {
         let keepcache_delta_enabled = fs.delta_keep_cache_fast_path();
         let cache_config = config.kernel_cache();
         cache_config.record_profile();
@@ -2584,6 +2603,8 @@ impl AgentFSFuse {
             semantics: Semantics::new(fs.clone()),
             fs,
             runtime,
+            report_uid,
+            report_gid,
             cache_config,
             uring,
             open_files: Arc::new(Mutex::new(HashMap::new())),
@@ -2605,6 +2626,11 @@ impl AgentFSFuse {
             cache_dir_enabled,
             writeback_enabled,
         }
+    }
+
+    /// [`fillattr`] with this mount's ownership squash applied.
+    fn fillattr(&self, stats: &Stats) -> FileAttr {
+        fillattr(stats, self.report_uid, self.report_gid)
     }
 
     /// Allocate a new file handle for tracking open files.
@@ -2675,23 +2701,40 @@ fn build_cached_readdir_entries(
     dir_stats: &Stats,
     parent_stats: &Stats,
     entries: Vec<DirEntry>,
+    uid_override: Option<u32>,
+    gid_override: Option<u32>,
 ) -> Vec<CachedDirEntry> {
     let mut all_entries = Vec::with_capacity(entries.len() + 2);
 
-    all_entries.push(cached_dir_entry(".", dir_stats));
-    all_entries.push(cached_dir_entry("..", parent_stats));
+    all_entries.push(cached_dir_entry(".", dir_stats, uid_override, gid_override));
+    all_entries.push(cached_dir_entry(
+        "..",
+        parent_stats,
+        uid_override,
+        gid_override,
+    ));
 
     for entry in entries {
-        all_entries.push(cached_dir_entry(entry.name, &entry.stats));
+        all_entries.push(cached_dir_entry(
+            entry.name,
+            &entry.stats,
+            uid_override,
+            gid_override,
+        ));
     }
 
     all_entries
 }
 
-fn cached_dir_entry(name: impl Into<String>, stats: &Stats) -> CachedDirEntry {
+fn cached_dir_entry(
+    name: impl Into<String>,
+    stats: &Stats,
+    uid_override: Option<u32>,
+    gid_override: Option<u32>,
+) -> CachedDirEntry {
     CachedDirEntry {
         name: name.into(),
-        attr: fillattr(stats),
+        attr: fillattr(stats, uid_override, gid_override),
     }
 }
 
@@ -2704,9 +2747,12 @@ fn cached_dir_entry(name: impl Into<String>, stats: &Stats) -> CachedDirEntry {
 /// Similar to the Linux kernel's `generic_fillattr()`, this converts
 /// filesystem-specific stat information into the VFS attribute structure.
 ///
-/// The uid and gid parameters override the stored values to ensure proper
-/// file ownership reporting (avoids "dubious ownership" errors from git).
-fn fillattr(stats: &Stats) -> FileAttr {
+/// The uid and gid overrides, when set, replace the stored values for every
+/// file (ownership squash). This keeps deltas portable across users and
+/// machines — a foreign stored uid would otherwise surface as `nobody` and
+/// make owner-only files unreadable — and avoids "dubious ownership" errors
+/// from git.
+fn fillattr(stats: &Stats, uid_override: Option<u32>, gid_override: Option<u32>) -> FileAttr {
     let file_type = stats.mode & S_IFMT;
     let kind = match file_type {
         S_IFDIR => FileType::Directory,
@@ -2735,8 +2781,8 @@ fn fillattr(stats: &Stats) -> FileAttr {
         kind,
         perm: (stats.mode & 0o7777) as u16,
         nlink: stats.nlink,
-        uid: stats.uid,
-        gid: stats.gid,
+        uid: uid_override.unwrap_or(stats.uid),
+        gid: gid_override.unwrap_or(stats.gid),
         rdev: stats.rdev as u32,
         flags: 0,
         blksize: 512,
@@ -2811,7 +2857,7 @@ pub fn mount(
     let fuse_config = FuseConfig::from_env();
     let dispatch_mode = fuse_config.dispatch_mode;
     let uring_config = fuse_config.uring;
-    let fs = AgentFSFuse::new(fs, runtime, fuse_config);
+    let fs = AgentFSFuse::new(fs, runtime, fuse_config, opts.uid, opts.gid);
     let mount_opts = build_mount_options(&opts)?;
 
     let mut session = crate::transport::Session::new(
@@ -3015,6 +3061,22 @@ mod tests {
     }
 
     #[test]
+    fn fillattr_squashes_ownership_when_overrides_are_set() {
+        let foreign = stats_with_owner(30, S_IFREG | 0o600, 1000, 1000);
+
+        // No overrides: stored (possibly foreign) ownership is reported as-is.
+        let raw = super::fillattr(&foreign, None, None);
+        assert_eq!((raw.uid, raw.gid), (1000, 1000));
+
+        // Overrides: every file reports the mounting user, so a delta created
+        // by another uid on another machine keeps owner-only files readable.
+        let squashed = super::fillattr(&foreign, Some(1002), Some(1002));
+        assert_eq!((squashed.uid, squashed.gid), (1002, 1002));
+        assert_eq!(squashed.perm, 0o600, "squash must not alter the mode");
+        assert_eq!(squashed.ino, raw.ino);
+    }
+
+    #[test]
     fn readdir_start_clamps_negative_offsets_to_beginning() {
         assert_eq!(readdir_start(-1), 0);
         assert_eq!(readdir_start(0), 0);
@@ -3051,6 +3113,8 @@ mod tests {
                     cookie: 2,
                 },
             ],
+            None,
+            None,
         );
 
         assert_eq!(entries.len(), 4);
