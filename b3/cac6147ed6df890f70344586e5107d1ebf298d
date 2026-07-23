@@ -1,0 +1,25 @@
+crates/agentfs-fuse/src/adapter/mod.rs
+  041b7a019b77e77b 170-176,2568-2574,2631-2635,2704-2705,2709-2715,2718-2723,2729-2733,2737,2784-2785,2860,3064-3078,3116-3117
+CHANGELOG.md
+  041b7a019b77e77b 48-58
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.2",
+  "base_commit_sha": "b3cac6147ed6df890f70344586e5107d1ebf298d",
+  "prompts": {
+    "041b7a019b77e77b": {
+      "agent_id": {
+        "tool": "droid",
+        "id": "a76db413-c390-4602-b8a4-4e2f6adbb4e3",
+        "model": "custom:anthropic://fable-5"
+      },
+      "human_author": "factory-ain3sh",
+      "messages": [],
+      "total_additions": 73,
+      "total_deletions": 9,
+      "accepted_lines": 72,
+      "overriden_lines": 0
+    }
+  }
+}
