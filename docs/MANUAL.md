@@ -1,11 +1,11 @@
-# AgentFS Reference Guide
+# Vfs Reference Guide
 
-Command-line reference for the AgentFS CLI.
+Command-line reference for the Vfs CLI.
 
 The command and option sections between the `GENERATED COMMAND REFERENCE`
 markers are rendered from the CLI's clap definitions and checked by
 `docs::tests::manual_help_parity`, so this manual always matches
-`agentfs --help`.
+`vfs --help`.
 
 ## Installation
 
@@ -14,62 +14,62 @@ NFS mount only):
 
 ```bash
 cargo +nightly build --release --workspace --bins
-install -m 0755 target/release/agentfs ~/.local/bin/
+install -m 0755 target/release/vfs ~/.local/bin/
 ```
 
 <!-- BEGIN GENERATED COMMAND REFERENCE (do not edit by hand) -->
-<!-- Regenerate with: `AGENTFS_UPDATE_MANUAL=1 cargo +nightly test -p agentfs-cli --lib docs::tests::manual_help_parity -- --exact` -->
+<!-- Regenerate with: `VFS_UPDATE_MANUAL=1 cargo +nightly test -p vfs-cli --lib docs::tests::manual_help_parity -- --exact` -->
 
 ## Commands
 
-Every section below is generated from the clap definitions the binary actually parses; `agentfs <command> --help` and this reference cannot disagree.
+Every section below is generated from the clap definitions the binary actually parses; `vfs <command> --help` and this reference cannot disagree.
 
-### agentfs completions
+### vfs completions
 
 Manage shell completions (supported shells: bash, zsh, fish, elvish, powershell)
 
 ```
-agentfs completions <COMMAND>
+vfs completions <COMMAND>
 ```
 
-#### agentfs completions install
+#### vfs completions install
 
 Install shell completions to your shell rc file
 
 ```
-agentfs completions install [SHELL]
+vfs completions install [SHELL]
 ```
 
 **Arguments:**
 
 - `[SHELL]` — Shell to install completions for (defaults to current shell) [possible values: bash, zsh, fish, elvish, power-shell]
 
-#### agentfs completions uninstall
+#### vfs completions uninstall
 
 Uninstall shell completions from your shell rc file
 
 ```
-agentfs completions uninstall [SHELL]
+vfs completions uninstall [SHELL]
 ```
 
 **Arguments:**
 
 - `[SHELL]` — Shell to uninstall completions for (defaults to current shell) [possible values: bash, zsh, fish, elvish, power-shell]
 
-#### agentfs completions show
+#### vfs completions show
 
 Print instructions for manual installation
 
 ```
-agentfs completions show
+vfs completions show
 ```
 
-### agentfs init
+### vfs init
 
 Initialize a new agent filesystem
 
 ```
-agentfs init [OPTIONS] [ID]
+vfs init [OPTIONS] [ID]
 ```
 
 **Arguments:**
@@ -80,8 +80,8 @@ agentfs init [OPTIONS] [ID]
 
 - `--force` — Overwrite existing file if it exists
 - `--base <BASE>` — Base directory for overlay filesystem (copy-on-write)
-- `--key <KEY>` — Hex-encoded encryption key. Enables local encryption when provided [env: AGENTFS_KEY]
-- `--cipher <CIPHER>` — Cipher algorithm for encryption (required with --key). Options: aegis128l, aegis128x2, aegis128x4, aegis256, aegis256x2, aegis256x4, aes128gcm, aes256gcm [env: AGENTFS_CIPHER]
+- `--key <KEY>` — Hex-encoded encryption key. Enables local encryption when provided [env: VFS_KEY]
+- `--cipher <CIPHER>` — Cipher algorithm for encryption (required with --key). Options: aegis128l, aegis128x2, aegis128x4, aegis256, aegis256x2, aegis256x4, aes128gcm, aes256gcm [env: VFS_CIPHER]
 - `-c, --command <COMMAND>` — Command to execute after initialization (mounts the filesystem, runs command, unmounts)
 - `--backend <BACKEND>` — Backend to use for mounting when using -c (default: fuse on Linux, nfs on macOS) [possible values: fuse, nfs; default: fuse]
 - `--sync-remote-url <SYNC_REMOTE_URL>`
@@ -90,56 +90,56 @@ agentfs init [OPTIONS] [ID]
 - `--sync-partial-bootstrap-query <SYNC_PARTIAL_BOOTSTRAP_QUERY>`
 - `--sync-partial-bootstrap-length <SYNC_PARTIAL_BOOTSTRAP_LENGTH>`
 
-### agentfs sync
+### vfs sync
 
 Remote sync operations
 
 ```
-agentfs sync <ID_OR_PATH> <COMMAND>
+vfs sync <ID_OR_PATH> <COMMAND>
 ```
 
 **Arguments:**
 
 - `<ID_OR_PATH>` — Agent ID or database path
 
-#### agentfs sync pull
+#### vfs sync pull
 
-Pull remote changes (only of agentfs was initialized with remote sync)
-
-```
-agentfs sync <ID_OR_PATH> pull
-```
-
-#### agentfs sync push
-
-Push remote changes (only of agentfs was initialized with remote sync)
+Pull remote changes (only of vfs was initialized with remote sync)
 
 ```
-agentfs sync <ID_OR_PATH> push
+vfs sync <ID_OR_PATH> pull
 ```
 
-#### agentfs sync stats
+#### vfs sync push
+
+Push remote changes (only of vfs was initialized with remote sync)
+
+```
+vfs sync <ID_OR_PATH> push
+```
+
+#### vfs sync stats
 
 Print synced database stats
 
 ```
-agentfs sync <ID_OR_PATH> stats
+vfs sync <ID_OR_PATH> stats
 ```
 
-#### agentfs sync checkpoint
+#### vfs sync checkpoint
 
 Checkpoint local synced db
 
 ```
-agentfs sync <ID_OR_PATH> checkpoint
+vfs sync <ID_OR_PATH> checkpoint
 ```
 
-### agentfs fs
+### vfs fs
 
 Filesystem operations
 
 ```
-agentfs fs [OPTIONS] <ID_OR_PATH> <COMMAND>
+vfs fs [OPTIONS] <ID_OR_PATH> <COMMAND>
 ```
 
 **Arguments:**
@@ -148,39 +148,39 @@ agentfs fs [OPTIONS] <ID_OR_PATH> <COMMAND>
 
 **Options:**
 
-- `--key <KEY>` — Hex-encoded encryption key for encrypted databases [env: AGENTFS_KEY]
-- `--cipher <CIPHER>` — Cipher algorithm for encryption (required with --key). Options: aegis128l, aegis128x2, aegis128x4, aegis256, aegis256x2, aegis256x4, aes128gcm, aes256gcm [env: AGENTFS_CIPHER]
+- `--key <KEY>` — Hex-encoded encryption key for encrypted databases [env: VFS_KEY]
+- `--cipher <CIPHER>` — Cipher algorithm for encryption (required with --key). Options: aegis128l, aegis128x2, aegis128x4, aegis256, aegis256x2, aegis256x4, aes128gcm, aes256gcm [env: VFS_CIPHER]
 
-#### agentfs fs ls
+#### vfs fs ls
 
 List files in the filesystem
 
 ```
-agentfs fs <ID_OR_PATH> ls [FS_PATH]
+vfs fs <ID_OR_PATH> ls [FS_PATH]
 ```
 
 **Arguments:**
 
 - `[FS_PATH]` — Path to list (default: /) [default: /]
 
-#### agentfs fs cat
+#### vfs fs cat
 
 Display file contents
 
 ```
-agentfs fs <ID_OR_PATH> cat <FILE_PATH>
+vfs fs <ID_OR_PATH> cat <FILE_PATH>
 ```
 
 **Arguments:**
 
 - `<FILE_PATH>` — Path to the file in the filesystem
 
-#### agentfs fs write
+#### vfs fs write
 
 Write file content
 
 ```
-agentfs fs <ID_OR_PATH> write <FILE_PATH> <CONTENT>
+vfs fs <ID_OR_PATH> write <FILE_PATH> <CONTENT>
 ```
 
 **Arguments:**
@@ -188,14 +188,14 @@ agentfs fs <ID_OR_PATH> write <FILE_PATH> <CONTENT>
 - `<FILE_PATH>` — Path to the file in the filesystem
 - `<CONTENT>` — Content of the file
 
-### agentfs run
+### vfs run
 
 Run a command in the sandboxed environment.
 
-By default, uses FUSE+overlay with Linux user and mount namespaces for isolation. The overlay uses the host filesystem as a read-only base and stores all changes in an AgentFS-backed delta layer. On macOS the overlay is mounted over NFS and a generated Seatbelt profile scopes writes to the sandbox and reads to the allowed directories plus required platform paths (see the Sandboxing section of docs/MANUAL.md).
+By default, uses FUSE+overlay with Linux user and mount namespaces for isolation. The overlay uses the host filesystem as a read-only base and stores all changes in a Vfs-backed delta layer. On macOS the overlay is mounted over NFS and a generated Seatbelt profile scopes writes to the sandbox and reads to the allowed directories plus required platform paths (see the Sandboxing section of docs/MANUAL.md).
 
 ```
-agentfs run [OPTIONS] [COMMAND] [ARGS]...
+vfs run [OPTIONS] [COMMAND] [ARGS]...
 ```
 
 **Arguments:**
@@ -211,17 +211,17 @@ agentfs run [OPTIONS] [COMMAND] [ARGS]...
 - `--system` — Allow other system users to access this mount (requires /etc/fuse.conf user_allow_other; use cautiously)
 - `--partial-origin <MODE>` — Partial-origin policy for base-file writes: off, on, or auto [possible values: off, on, auto]
 - `--partial-origin-threshold-bytes <BYTES>` — Size threshold for --partial-origin auto
-- `--key <KEY>` — Hex-encoded encryption key for the delta layer. Enables local encryption when provided [env: AGENTFS_KEY]
-- `--cipher <CIPHER>` — Cipher algorithm for encryption (required with --key). Options: aegis128l, aegis128x2, aegis128x4, aegis256, aegis256x2, aegis256x4, aes128gcm, aes256gcm [env: AGENTFS_CIPHER]
+- `--key <KEY>` — Hex-encoded encryption key for the delta layer. Enables local encryption when provided [env: VFS_KEY]
+- `--cipher <CIPHER>` — Cipher algorithm for encryption (required with --key). Options: aegis128l, aegis128x2, aegis128x4, aegis256, aegis256x2, aegis256x4, aes128gcm, aes256gcm [env: VFS_CIPHER]
 
-### agentfs exec
+### vfs exec
 
-Execute a command with an AgentFS filesystem mounted.
+Execute a command with a Vfs filesystem mounted.
 
-Mounts the specified AgentFS to a temporary directory, runs the command with that directory as the working directory, then automatically unmounts. This is useful for running tools that need filesystem access without a persistent mount.
+Mounts the specified Vfs to a temporary directory, runs the command with that directory as the working directory, then automatically unmounts. This is useful for running tools that need filesystem access without a persistent mount.
 
 ```
-agentfs exec [OPTIONS] <ID_OR_PATH> <COMMAND> [ARGS]...
+vfs exec [OPTIONS] <ID_OR_PATH> <COMMAND> [ARGS]...
 ```
 
 **Arguments:**
@@ -233,17 +233,17 @@ agentfs exec [OPTIONS] <ID_OR_PATH> <COMMAND> [ARGS]...
 **Options:**
 
 - `--backend <BACKEND>` — Backend to use for mounting (default: fuse on Linux, nfs on macOS) [possible values: fuse, nfs; default: fuse]
-- `--key <KEY>` — Hex-encoded encryption key for encrypted databases [env: AGENTFS_KEY]
-- `--cipher <CIPHER>` — Cipher algorithm for encryption (required with --key) [env: AGENTFS_CIPHER]
+- `--key <KEY>` — Hex-encoded encryption key for encrypted databases [env: VFS_KEY]
+- `--cipher <CIPHER>` — Cipher algorithm for encryption (required with --key) [env: VFS_CIPHER]
 
-### agentfs clone
+### vfs clone
 
-Clone a git repository into an AgentFS database (fast bulk ingest).
+Clone a git repository into a Vfs database (fast bulk ingest).
 
 Runs `git clone --no-checkout` through a temporary mount (pack files are large sequential writes), then materializes the worktree by bulk-importing blobs straight into the database in large transactions and fabricating a matching git index, skipping the per-file FUSE round trips of a regular checkout. The resulting repository lives entirely inside the database; nothing is written to the host filesystem. Submodules and smudge/clean filters are not supported.
 
 ```
-agentfs clone [OPTIONS] <ID_OR_PATH> <SOURCE> [NAME]
+vfs clone [OPTIONS] <ID_OR_PATH> <SOURCE> [NAME]
 ```
 
 **Arguments:**
@@ -257,12 +257,12 @@ agentfs clone [OPTIONS] <ID_OR_PATH> <SOURCE> [NAME]
 - `--backend <BACKEND>` — Backend to use for mounting (default: fuse on Linux, nfs on macOS) [possible values: fuse, nfs; default: fuse]
 - `--verify` — Verify `git status` is clean through the mount before finishing
 
-### agentfs mount
+### vfs mount
 
 Mount an agent filesystem using FUSE (or list mounts if no args)
 
 ```
-agentfs mount [OPTIONS] [ID_OR_PATH] [MOUNTPOINT]
+vfs mount [OPTIONS] [ID_OR_PATH] [MOUNTPOINT]
 ```
 
 **Arguments:**
@@ -281,27 +281,27 @@ agentfs mount [OPTIONS] [ID_OR_PATH] [MOUNTPOINT]
 - `--backend <BACKEND>` — Backend to use for mounting [possible values: fuse, nfs; default: fuse]
 - `--partial-origin <MODE>` — Partial-origin policy for base-file writes: off, on, or auto [possible values: off, on, auto]
 - `--partial-origin-threshold-bytes <BYTES>` — Size threshold for --partial-origin auto
-- `--key <KEY>` — Hex-encoded encryption key for encrypted databases [env: AGENTFS_KEY]
-- `--cipher <CIPHER>` — Cipher algorithm for encryption (required with --key). Options: aegis128l, aegis128x2, aegis128x4, aegis256, aegis256x2, aegis256x4, aes128gcm, aes256gcm [env: AGENTFS_CIPHER]
+- `--key <KEY>` — Hex-encoded encryption key for encrypted databases [env: VFS_KEY]
+- `--cipher <CIPHER>` — Cipher algorithm for encryption (required with --key). Options: aegis128l, aegis128x2, aegis128x4, aegis256, aegis256x2, aegis256x4, aes128gcm, aes256gcm [env: VFS_CIPHER]
 
-### agentfs diff
+### vfs diff
 
 Show differences between base filesystem and delta (overlay mode only)
 
 ```
-agentfs diff <ID_OR_PATH>
+vfs diff <ID_OR_PATH>
 ```
 
 **Arguments:**
 
 - `<ID_OR_PATH>` — Agent ID or database path
 
-### agentfs timeline
+### vfs timeline
 
 Display agent action timeline from tool call audit log
 
 ```
-agentfs timeline [OPTIONS] <ID_OR_PATH>
+vfs timeline [OPTIONS] <ID_OR_PATH>
 ```
 
 **Arguments:**
@@ -315,12 +315,12 @@ agentfs timeline [OPTIONS] <ID_OR_PATH>
 - `--status <STATUS>` — Filter by status (pending/success/error) [possible values: pending, success, error]
 - `--format <FORMAT>` — Output format [possible values: table, json; default: table]
 
-### agentfs nfs
+### vfs nfs
 
-Start an NFS server to export an AgentFS filesystem over the network (deprecated: use `agentfs serve nfs` instead)
+Start an NFS server to export a Vfs filesystem over the network (deprecated: use `vfs serve nfs` instead)
 
 ```
-agentfs nfs [OPTIONS] <ID_OR_PATH>
+vfs nfs [OPTIONS] <ID_OR_PATH>
 ```
 
 **Arguments:**
@@ -331,15 +331,15 @@ agentfs nfs [OPTIONS] <ID_OR_PATH>
 
 - `--bind <BIND>` — IP address to bind to [default: 127.0.0.1]
 - `--port <PORT>` — Port to listen on [default: 11111]
-- `--key <KEY>` — Hex-encoded encryption key for encrypted databases [env: AGENTFS_KEY]
-- `--cipher <CIPHER>` — Cipher algorithm for encryption (required with --key). Options: aegis128l, aegis128x2, aegis128x4, aegis256, aegis256x2, aegis256x4, aes128gcm, aes256gcm [env: AGENTFS_CIPHER]
+- `--key <KEY>` — Hex-encoded encryption key for encrypted databases [env: VFS_KEY]
+- `--cipher <CIPHER>` — Cipher algorithm for encryption (required with --key). Options: aegis128l, aegis128x2, aegis128x4, aegis256, aegis256x2, aegis256x4, aes128gcm, aes256gcm [env: VFS_CIPHER]
 
-### agentfs mcp-server
+### vfs mcp-server
 
-Start an MCP server exposing filesystem and KV-store tools (deprecated: use `agentfs serve mcp` instead)
+Start an MCP server exposing filesystem and KV-store tools (deprecated: use `vfs serve mcp` instead)
 
 ```
-agentfs mcp-server [OPTIONS] <ID_OR_PATH>
+vfs mcp-server [OPTIONS] <ID_OR_PATH>
 ```
 
 **Arguments:**
@@ -350,20 +350,20 @@ agentfs mcp-server [OPTIONS] <ID_OR_PATH>
 
 - `--tools <TOOLS>` — Tools to expose (comma-separated). If not provided, all tools are exposed. Available tools: read_file, write_file, readdir, mkdir, remove, rename, stat, access, kv_get, kv_set, kv_delete, kv_list
 
-### agentfs serve
+### vfs serve
 
-Serve an AgentFS filesystem via different protocols
-
-```
-agentfs serve <COMMAND>
-```
-
-#### agentfs serve nfs
-
-Start an NFS server to export an AgentFS filesystem over the network
+Serve a Vfs filesystem via different protocols
 
 ```
-agentfs serve nfs [OPTIONS] <ID_OR_PATH>
+vfs serve <COMMAND>
+```
+
+#### vfs serve nfs
+
+Start an NFS server to export a Vfs filesystem over the network
+
+```
+vfs serve nfs [OPTIONS] <ID_OR_PATH>
 ```
 
 **Arguments:**
@@ -374,15 +374,15 @@ agentfs serve nfs [OPTIONS] <ID_OR_PATH>
 
 - `--bind <BIND>` — IP address to bind to [default: 127.0.0.1]
 - `--port <PORT>` — Port to listen on [default: 11111]
-- `--key <KEY>` — Hex-encoded encryption key for encrypted databases [env: AGENTFS_KEY]
-- `--cipher <CIPHER>` — Cipher algorithm for encryption (required with --key). Options: aegis128l, aegis128x2, aegis128x4, aegis256, aegis256x2, aegis256x4, aes128gcm, aes256gcm [env: AGENTFS_CIPHER]
+- `--key <KEY>` — Hex-encoded encryption key for encrypted databases [env: VFS_KEY]
+- `--cipher <CIPHER>` — Cipher algorithm for encryption (required with --key). Options: aegis128l, aegis128x2, aegis128x4, aegis256, aegis256x2, aegis256x4, aes128gcm, aes256gcm [env: VFS_CIPHER]
 
-#### agentfs serve mcp
+#### vfs serve mcp
 
 Start an MCP server exposing filesystem and KV-store tools
 
 ```
-agentfs serve mcp [OPTIONS] <ID_OR_PATH>
+vfs serve mcp [OPTIONS] <ID_OR_PATH>
 ```
 
 **Arguments:**
@@ -393,40 +393,40 @@ agentfs serve mcp [OPTIONS] <ID_OR_PATH>
 
 - `--tools <TOOLS>` — Tools to expose (comma-separated). If not provided, all tools are exposed. Available tools: read_file, write_file, readdir, mkdir, remove, rename, stat, access, kv_get, kv_set, kv_delete, kv_list
 
-### agentfs ps
+### vfs ps
 
-List active agentfs run sessions
+List active vfs run sessions
 
 ```
-agentfs ps
+vfs ps
 ```
 
-### agentfs prune
+### vfs prune
 
 Prune unused resources
 
 ```
-agentfs prune <COMMAND>
+vfs prune <COMMAND>
 ```
 
-#### agentfs prune mounts
+#### vfs prune mounts
 
-Unmount unused agentfs mount points
+Unmount unused vfs mount points
 
 ```
-agentfs prune mounts [OPTIONS]
+vfs prune mounts [OPTIONS]
 ```
 
 **Options:**
 
 - `--force` — Skip confirmation prompt and unmount immediately
 
-### agentfs integrity
+### vfs integrity
 
-Check a local AgentFS database for SQLite and schema corruption
+Check a local Vfs database for SQLite and schema corruption
 
 ```
-agentfs integrity [OPTIONS] <ID_OR_PATH>
+vfs integrity [OPTIONS] <ID_OR_PATH>
 ```
 
 **Arguments:**
@@ -442,12 +442,12 @@ agentfs integrity [OPTIONS] <ID_OR_PATH>
 - `--key <KEY>` — Hex-encoded encryption key for encrypted databases
 - `--cipher <CIPHER>` — Encryption cipher (required with --key)
 
-### agentfs backup
+### vfs backup
 
-Create a portable local AgentFS database backup
+Create a portable local Vfs database backup
 
 ```
-agentfs backup [OPTIONS] <ID_OR_PATH> <TARGET>
+vfs backup [OPTIONS] <ID_OR_PATH> <TARGET>
 ```
 
 **Arguments:**
@@ -462,12 +462,12 @@ agentfs backup [OPTIONS] <ID_OR_PATH> <TARGET>
 - `--key <KEY>` — Hex-encoded encryption key for encrypted databases
 - `--cipher <CIPHER>` — Encryption cipher (required with --key)
 
-### agentfs materialize
+### vfs materialize
 
 Create a portable database by materializing partial-origin files
 
 ```
-agentfs materialize [OPTIONS] <ID_OR_PATH>
+vfs materialize [OPTIONS] <ID_OR_PATH>
 ```
 
 **Arguments:**
@@ -481,12 +481,12 @@ agentfs materialize [OPTIONS] <ID_OR_PATH>
 - `--key <KEY>` — Hex-encoded encryption key for encrypted databases
 - `--cipher <CIPHER>` — Encryption cipher (required with --key)
 
-### agentfs migrate
+### vfs migrate
 
 Migrate database schema to the current version
 
 ```
-agentfs migrate [OPTIONS] <ID_OR_PATH>
+vfs migrate [OPTIONS] <ID_OR_PATH>
 ```
 
 **Arguments:**
@@ -504,14 +504,14 @@ agentfs migrate [OPTIONS] <ID_OR_PATH>
 
 <!-- END GENERATED COMMAND REFERENCE -->
 
-## MCP Server (`agentfs serve mcp`)
+## MCP Server (`vfs serve mcp`)
 
 The `write_file` tool overwrites existing files in place and keeps their
 mode; files it creates get the default mode `0644` (`rw-r--r--`).
 
-## Sandboxing (`agentfs run`)
+## Sandboxing (`vfs run`)
 
-`agentfs run` scopes both writes and reads at the OS level; the mechanism
+`vfs run` scopes both writes and reads at the OS level; the mechanism
 differs by platform.
 
 **Linux (first-tier):** FUSE + overlay inside user and mount namespaces.
@@ -527,7 +527,7 @@ the session is resumed with `--session`.
 **macOS (second-tier):** NFS mount + a generated `sandbox-exec` (Seatbelt)
 profile. Writes are restricted to the mountpoint, temp directories,
 `~/Library`, and the allowed paths. Reads are default-deny: only the session
-directory (`~/.agentfs/run/<ID>`), the allowed directories (the defaults plus
+directory (`~/.vfs/run/<ID>`), the allowed directories (the defaults plus
 `--allow`), and a curated set of platform roots are readable (system
 frameworks and libraries, the dyld shared cache cryptex, executable
 directories, `/private/etc`, terminfo/locale data under `/usr/share`, temp
@@ -553,20 +553,20 @@ read-scoping leg: a secret outside the allow list must be unreadable, and
 
 Every runtime knob (env var or first-class flag) is declared in the generated
 [docs/KNOBS.md](KNOBS.md) ledger with its class, default, owner, and gate.
-`AGENTFS_KEY` / `AGENTFS_CIPHER` provide default encryption credentials for
+`VFS_KEY` / `VFS_CIPHER` provide default encryption credentials for
 the commands whose `--key` / `--cipher` options declare them (see the
 generated sections above); `TURSO_DB_AUTH_TOKEN` authenticates cloud sync.
 
 ### FUSE-over-io_uring and rapid remounts
 
-On Linux kernels with `fuse.enable_uring=1` (the `AGENTFS_FUSE_URING` knob
-controls whether AgentFS uses the transport), the kernel drains a just-closed
+On Linux kernels with `fuse.enable_uring=1` (the `VFS_FUSE_URING` knob
+controls whether Vfs uses the transport), the kernel drains a just-closed
 FUSE connection for roughly two seconds, and a new mount racing that drain can
-block inside `mount(2)` indefinitely (observed on kernel 7.1.2). AgentFS
+block inside `mount(2)` indefinitely (observed on kernel 7.1.2). Vfs
 bounds this: the mount is retried for a few seconds and then fails with a
 clear error instead of hanging. If rapid unmount-then-mount cycles keep
 hitting the error, wait a couple of seconds between cycles or set
-`AGENTFS_FUSE_URING=0` on the mount-owning processes. A mount left wedged by
+`VFS_FUSE_URING=0` on the mount-owning processes. A mount left wedged by
 other tooling can be recovered with
 `echo 1 > /sys/fs/fuse/connections/<id>/abort` (verify the connection id
 first).
@@ -577,21 +577,21 @@ The `turso_core` dependency (0.5.3) leaks `tursodb-ephemeral-*` sort-spill
 files into the temp dir and never unlinks them (`vdbe/execute.rs:10096`). The
 CLI therefore points its own `TMPDIR` at a private per-process directory that
 is removed on exit, so hosts do not accumulate spill litter. This override is
-process-internal: commands spawned by `agentfs run`, `agentfs exec`, and
-`agentfs init -c` see the original `TMPDIR`. Stale spill directories from
+process-internal: commands spawned by `vfs run`, `vfs exec`, and
+`vfs init -c` see the original `TMPDIR`. Stale spill directories from
 `SIGKILL`ed processes are garbage-collected on the next CLI start.
 
-Variables set inside an `agentfs run` sandbox:
+Variables set inside an `vfs run` sandbox:
 
 | Variable | Description |
 |----------|-------------|
-| `AGENTFS` | Set to `1` inside the AgentFS sandbox |
-| `AGENTFS_SANDBOX` | Sandbox type: `linux-namespace` or `macos-sandbox` |
-| `AGENTFS_SESSION` | Current session ID |
+| `VFS` | Set to `1` inside the Vfs sandbox |
+| `VFS_SANDBOX` | Sandbox type: `linux-namespace` or `macos-sandbox` |
+| `VFS_SESSION` | Current session ID |
 
 ## Local Encryption
 
-AgentFS supports encrypting the local SQLite database at rest.
+Vfs supports encrypting the local SQLite database at rest.
 
 **Supported ciphers:**
 
@@ -608,26 +608,26 @@ AgentFS supports encrypting the local SQLite database at rest.
 KEY=$(openssl rand -hex 32)
 
 # Initialize with encryption
-agentfs init --key $KEY --cipher aes256gcm my-secure-agent
+vfs init --key $KEY --cipher aes256gcm my-secure-agent
 
 # Access the filesystem
-agentfs fs my-secure-agent --key $KEY --cipher aes256gcm ls /
+vfs fs my-secure-agent --key $KEY --cipher aes256gcm ls /
 ```
 
 **Example: Encrypted sandbox session**
 
 ```bash
-agentfs run --key $KEY --cipher aes256gcm -- bash
+vfs run --key $KEY --cipher aes256gcm -- bash
 ```
 
 **Using environment variables:**
 
 ```bash
-export AGENTFS_KEY=$(openssl rand -hex 32)
-export AGENTFS_CIPHER=aes256gcm
+export VFS_KEY=$(openssl rand -hex 32)
+export VFS_CIPHER=aes256gcm
 
-agentfs init my-secure-agent
-agentfs fs my-secure-agent ls /
+vfs init my-secure-agent
+vfs fs my-secure-agent ls /
 ```
 
 **Limitations:**
@@ -636,9 +636,9 @@ agentfs fs my-secure-agent ls /
 
 ## Files
 
-- `.agentfs/<ID>.db` - Agent filesystem database (relative to the working
-  directory where `agentfs init` ran)
-- `~/.agentfs/run/` - `agentfs run` session state (listed by `agentfs ps`)
+- `.vfs/<ID>.db` - Agent filesystem database (relative to the working
+  directory where `vfs init` ran)
+- `~/.vfs/run/` - `vfs run` session state (listed by `vfs ps`)
 
 ## Unmounting
 

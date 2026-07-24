@@ -1,4 +1,4 @@
-# Testing AgentFS
+# Testing Vfs
 
 Linux is the first-tier platform: every gate below runs on Linux. macOS is
 second-tier (NFS mount only) and is covered by the manual release gate at the
@@ -13,8 +13,8 @@ first failing command and runs, in order:
 2. `cargo +nightly clippy --workspace --all-targets -- -D warnings`
 3. `cargo +nightly test --workspace`
 4. `cargo +nightly build --release --workspace --bins`
-5. `crates/agentfs-cli/tests/all.sh` with `AGENTFS_GATE_STRICT=1` and
-   `AGENTFS_BIN` pointing at the release binary
+5. `crates/vfs-cli/tests/all.sh` with `VFS_GATE_STRICT=1` and
+   `VFS_BIN` pointing at the release binary
    (a SKIP is a failure on the designated runner)
 6. `scripts/validation/phase8-validation.py --smoke` — the top-level Python
    gate; it runs the noopen/flush/base-drift coherence harnesses internally
@@ -23,9 +23,9 @@ first failing command and runs, in order:
    logging, env-reads-at-the-config-edge, `await_holding_lock`, lock-order
    headers, docs layout, changelog)
 
-Knobs: `AGENTFS_BIN` (defaults to `target/release/agentfs`),
-`AGENTFS_GATE_SHELL_TIMEOUT` (default 900 s), `AGENTFS_GATE_PHASE8_TIMEOUT`
-(default 20 s), `AGENTFS_GATE_ALLOWED_SKIPS` (forwarded to the shell suite,
+Knobs: `VFS_BIN` (defaults to `target/release/vfs`),
+`VFS_GATE_SHELL_TIMEOUT` (default 900 s), `VFS_GATE_PHASE8_TIMEOUT`
+(default 20 s), `VFS_GATE_ALLOWED_SKIPS` (forwarded to the shell suite,
 see below), and the `CORRUPTION_TORTURE_*` variables forwarded to the
 shell suite. The gate pins `TMPDIR` to a per-run scratch dir cleaned on exit
 so dependency temp-file litter cannot accumulate on the host.
@@ -34,12 +34,12 @@ CI (`.github/workflows/rust.yml`) runs the workspace job (fmt/clippy/build/test
 on Linux and macOS, build+test on Linux arm64), the honest milestone gate
 (`scripts/gate.sh` plus pjdfstest `phase5-ci`), and the release workflow.
 The gate job first sets `kernel.apparmor_restrict_unprivileged_userns=0` so
-the `agentfs run` suites exercise the sandbox instead of skipping on the
+the `vfs run` suites exercise the sandbox instead of skipping on the
 Ubuntu 24.04 runner image. FUSE-over-io_uring coverage stays local-only: the
 CI kernel exposes `/sys/module/fuse/parameters/enable_uring` but ships it
 disabled (`N`), so the kernel refuses ring registration, the panic-census
 uring leg can never run there, and the gate job allowlists that one skip with
-`AGENTFS_GATE_ALLOWED_SKIPS=fuse-sigint-panic-census`. The
+`VFS_GATE_ALLOWED_SKIPS=fuse-sigint-panic-census`. The
 `corruption-torture-uring` leg needs no allowlist entry: with `enable_uring=N`
 the mount falls back to the legacy channel (the fallback is logged at INFO)
 and the leg passes, exercising uring only on kernels that enable it. A
@@ -58,50 +58,50 @@ Two documentation files are generated from code and pinned by unit tests, so
 doc drift fails the gate:
 
 - `docs/KNOBS.md` — regenerate with
-  `AGENTFS_UPDATE_KNOBS=1 cargo +nightly test -p agentfs-cli --lib knobs::tests::generated_knobs_doc_matches_declarations -- --exact`
+  `VFS_UPDATE_KNOBS=1 cargo +nightly test -p vfs-cli --lib knobs::tests::generated_knobs_doc_matches_declarations -- --exact`
 - `docs/MANUAL.md` command reference — regenerate with
-  `AGENTFS_UPDATE_MANUAL=1 cargo +nightly test -p agentfs-cli --lib docs::tests::manual_help_parity -- --exact`
+  `VFS_UPDATE_MANUAL=1 cargo +nightly test -p vfs-cli --lib docs::tests::manual_help_parity -- --exact`
 
 ## Shell integration suite
 
 ```bash
-AGENTFS_GATE_STRICT=1 crates/agentfs-cli/tests/all.sh
+VFS_GATE_STRICT=1 crates/vfs-cli/tests/all.sh
 ```
 
 The suite covers init/mount/run/exec flows, syscall coverage, signal
-teardown, corruption torture (both `AGENTFS_FUSE_URING=1` and `=0` legs),
+teardown, corruption torture (both `VFS_FUSE_URING=1` and `=0` legs),
 sidecar cleanup, MCP server behavior, and a `cli-smoke` pass over the whole
 user-level command surface (init, run, exec, clone, fs, timeline,
 backup/materialize, integrity, migrate, MCP, ps, completions, and the
 deprecated `nfs`/`mcp-server` aliases), and prints a PASS/SKIP/FAIL
 summary. Every test runs out of its own `mktemp -d` root with trap cleanup
-and honors `AGENTFS_BIN` (falling back to `cargo run`). In strict mode a SKIP
+and honors `VFS_BIN` (falling back to `cargo run`). In strict mode a SKIP
 is red unless its test label is named in
-`AGENTFS_GATE_ALLOWED_SKIPS=<label[,label...]>`, the escape hatch for runner
+`VFS_GATE_ALLOWED_SKIPS=<label[,label...]>`, the escape hatch for runner
 kernels that cannot provide a prerequisite at all;
-`AGENTFS_GATE_FORCE_SKIP=<label|all>` synthesizes a SKIP for testing the
+`VFS_GATE_FORCE_SKIP=<label|all>` synthesizes a SKIP for testing the
 runner itself. Never run the corruption
 torture test concurrently with another mount, test suite, or benchmark.
 
 ## Python validation gates
 
-All harnesses take `--agentfs-bin` (or `AGENTFS_BIN`); build a release binary
+All harnesses take `--vfs-bin` (or `VFS_BIN`); build a release binary
 first for anything timing-sensitive.
 
 ```bash
 # Orchestrated Phase 8 policy gate (smoke profile is the milestone gate).
 # Includes the noopen/flush/base-drift coherence harnesses as named gates.
 python3 scripts/validation/phase8-validation.py --smoke --timeout 20 \
-  --agentfs-bin "$PWD/target/release/agentfs" --output /tmp/vfs-val/phase8.json
+  --vfs-bin "$PWD/target/release/vfs" --output /tmp/vfs-val/phase8.json
 
 # Focused standalone runs of the coherence harnesses:
 # Default-on FUSE semantics coherence (no-open and no-flush legs)
-python3 scripts/validation/noopen-coherence.py --agentfs-bin "$PWD/target/release/agentfs"
-python3 scripts/validation/flush-coherence.py --agentfs-bin "$PWD/target/release/agentfs"
+python3 scripts/validation/noopen-coherence.py --vfs-bin "$PWD/target/release/vfs"
+python3 scripts/validation/flush-coherence.py --vfs-bin "$PWD/target/release/vfs"
 
 # Overlay base-drift rejection
 python3 scripts/validation/external-base-mutation-coherence.py \
-  --agentfs-bin "$PWD/target/release/agentfs" \
+  --vfs-bin "$PWD/target/release/vfs" \
   --output /tmp/vfs-val/external-base-mutation.json
 ```
 
@@ -117,7 +117,7 @@ parallelism), `phase8-writeback-durability.py` (fsynced data survives
 SIGKILL + remount), and `phase8-writeback-no-fsync-crash.py` (no-fsync crash
 consistency: missing/prefix data allowed, corruption rejected).
 
-`AGENTFS_PROFILE=1` makes AgentFS emit `agentfs_profile_summary` counter
+`VFS_PROFILE=1` makes Vfs emit `vfs_profile_summary` counter
 lines on exit; most harnesses parse and attach them to their JSON reports.
 
 ## Benchmarks (local-only policy)
@@ -130,7 +130,7 @@ per-phase medians of 5 runs; single runs are noise:
 cargo +nightly build --release --workspace --bins
 python3 scripts/validation/git-workload-benchmark-multi.py \
   --label bench --iterations 5 --warmup 1 \
-  --agentfs-bin "$PWD/target/release/agentfs" \
+  --vfs-bin "$PWD/target/release/vfs" \
   --source <local benchmark fixture checkout> \
   --read-files 64 --read-bytes 4096 --edit-files 8 \
   --output /tmp/vfs-val/bench-multi.json --keep-iterations
@@ -143,11 +143,11 @@ Focused local benchmarks: `git-workload-benchmark.py` (single run with
 `--profile` phase breakdown), `read-path-benchmark.py`,
 `large-edit-benchmark.py` (one-byte edit to a large base file must grow the
 delta DB by O(changed chunks), with `--partial-origin` / `--no-partial-origin`
-legs), `base-read-benchmark.py`, and `agentfs-clone-benchmark.py`.
+legs), `base-read-benchmark.py`, and `vfs-clone-benchmark.py`.
 
 ## pjdfstest
 
-AgentFS keeps three pjdfstest modes:
+Vfs keeps three pjdfstest modes:
 
 - `phase45-ci`: a conservative, unprivileged supported subset.
 - `phase5-ci`: the expanded unprivileged supported subset (CI-wired in the
@@ -175,7 +175,7 @@ Run the supported gate against a workspace build:
 ```bash
 cargo +nightly build --workspace
 scripts/validation/posix/run-pjdfstest.sh \
-  --agentfs-bin "$PWD/target/debug/agentfs" \
+  --vfs-bin "$PWD/target/debug/vfs" \
   --pjdfstest-dir /path/to/pjdfstest \
   --profile phase5-ci
 ```
@@ -192,22 +192,22 @@ Do not treat `full` as a required gate while known gaps remain.
 ## Production safety checks
 
 ```bash
-# SQLite + AgentFS schema invariants (exit nonzero on any failed check)
-agentfs integrity .agentfs/my-agent.db --json
+# SQLite + Vfs schema invariants (exit nonzero on any failed check)
+vfs integrity .vfs/my-agent.db --json
 
 # Portable snapshot: checkpoint WAL, copy main DB, reopen, re-verify
-agentfs backup .agentfs/my-agent.db /tmp/my-agent-backup.db --verify
+vfs backup .vfs/my-agent.db /tmp/my-agent-backup.db --verify
 ```
 
 Partial-origin overlay databases are rejected by plain `backup` because
 their contents depend on an external base tree; use `backup --materialize`
-or `agentfs materialize` first, and audit the dependency with
-`agentfs integrity --require-portable --check-base`.
+or `vfs materialize` first, and audit the dependency with
+`vfs integrity --require-portable --check-base`.
 
 ## macOS: second-tier platform and the manual release gate
 
 macOS support is explicitly second-tier: mounting uses the NFS backend only
-(no FUSE, no `agentfs ps`), and NFS protocol semantics are validated by cargo
+(no FUSE, no `vfs ps`), and NFS protocol semantics are validated by cargo
 protocol/unit tests on Linux. There is no macOS coverage in the automated
 gate, so the macOS NFS git validation script is a **manual release gate**: it
 must be run on real macOS hardware before a release is cut.
@@ -215,13 +215,13 @@ must be run on real macOS hardware before a release is cut.
 ```bash
 cargo +nightly build --release --workspace --bins
 scripts/validation/macos-nfs-git-validation.sh \
-  --agentfs-bin "$PWD/target/release/agentfs"
+  --vfs-bin "$PWD/target/release/vfs"
 ```
 
-The harness is temp-directory scoped, initializes a fresh AgentFS database,
-mounts it with `agentfs mount --backend nfs`, then runs `git init`,
+The harness is temp-directory scoped, initializes a fresh Vfs database,
+mounts it with `vfs mount --backend nfs`, then runs `git init`,
 `git add`, `git commit`, and `git fsck --strict`, and verifies at least one
-loose object was written. It then verifies the `agentfs run` Seatbelt
+loose object was written. It then verifies the `vfs run` Seatbelt
 read-scoping posture: a secret file in an unallowed directory under `$HOME`
 must be unreadable from inside the sandbox (permission error, no content
 leak), and re-running with `--allow <dir>` must make it readable. The
@@ -241,6 +241,6 @@ directory with spaces or quotes in its name still mounts and runs);
 `/System/Volumes/Preboot` has a metadata literal so path resolution down to
 the dyld cryptex root (`/System/Volumes/Preboot/Cryptexes`) can stat every
 component (spot-check that dynamically linked binaries start under the
-sandbox); and `agentfs run <missing-command>` must exit `127` (`126` for a
-present but non-executable file), matching `agentfs exec` and the Linux run
+sandbox); and `vfs run <missing-command>` must exit `127` (`126` for a
+present but non-executable file), matching `vfs exec` and the Linux run
 path.

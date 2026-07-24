@@ -1,7 +1,7 @@
 {
-  "name": "agentfs sandbox",
+  "name": "vfs sandbox",
   "dockerComposeFile": ["docker-compose.yml"],
-  "service": "agentfs",
+  "service": "vfs",
   "remoteUser": "node",
   "workspaceFolder": "/workspace",
   "waitFor": "postStartCommand",
