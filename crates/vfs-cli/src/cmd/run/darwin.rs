@@ -301,13 +301,33 @@ pub async fn run(options: RunOptions) -> Result<()> {
         system: _,
         encryption,
         partial_origin_policy,
+        seed_pin,
         command,
         args,
     } = options;
     let cwd = std::env::current_dir().context("Failed to get current directory")?;
     let home = dirs::home_dir().context("Failed to get home directory")?;
 
-    let session = setup_run_directory(session, allow, no_default_allows, &cwd, &home)?;
+    let mut session = setup_run_directory(
+        session,
+        allow,
+        no_default_allows,
+        &cwd,
+        &home,
+        seed_pin.is_none(),
+    )?;
+    if let Some(pin) = seed_pin {
+        let seeded = crate::cmd::seed::seed_session(
+            &home,
+            &session.session_id,
+            &pin,
+            encryption.clone(),
+            true,
+            Some(&cwd),
+        )
+        .await?;
+        session._session_lock = Some(seeded.into_shared_lock()?);
+    }
 
     // Check if we're joining an existing session
     if is_mountpoint(&session.mountpoint) {
@@ -469,7 +489,7 @@ fn print_welcome_banner(session: &RunSession, encrypted: bool) {
 /// Configuration for a sandbox run session.
 struct RunSession {
     /// Shared advisory lock preventing pack from publishing over this run.
-    _session_lock: crate::cmd::session_lock::SessionLock,
+    _session_lock: Option<crate::cmd::session_lock::SessionLock>,
     /// Directory containing session artifacts.
     run_dir: PathBuf,
     /// Path to the delta database.
@@ -494,12 +514,20 @@ fn setup_run_directory(
     no_default_allows: bool,
     cwd: &Path,
     home: &Path,
+    acquire_lock: bool,
 ) -> Result<RunSession> {
     let run_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let run_dir = home.join(".vfs").join("run").join(&run_id);
     std::fs::create_dir_all(&run_dir).context("Failed to create run directory")?;
-    let session_lock = crate::cmd::session_lock::SessionLock::try_shared(&run_dir)
-        .with_context(|| format!("session {run_id} is being packed; retry after it finishes"))?;
+    let session_lock = if acquire_lock {
+        Some(
+            crate::cmd::session_lock::SessionLock::try_shared(&run_dir).with_context(|| {
+                format!("session {run_id} is being packed or seeded; retry after it finishes")
+            })?,
+        )
+    } else {
+        None
+    };
 
     let db_path = run_dir.join("delta.db");
     let mountpoint = run_dir.join("mnt");

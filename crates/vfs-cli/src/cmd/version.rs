@@ -31,7 +31,7 @@ pub fn handle_version_command(stdout: &mut impl Write, json: bool) -> Result<()>
         features: VersionFeatures {
             uid_squash_run: cfg!(target_os = "linux"),
             pack: true,
-            seed: false,
+            seed: true,
         },
     };
 
@@ -58,6 +58,6 @@ mod tests {
         assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(value["features"]["uidSquashRun"], cfg!(target_os = "linux"));
         assert_eq!(value["features"]["pack"], true);
-        assert_eq!(value["features"]["seed"], false);
+        assert_eq!(value["features"]["seed"], true);
     }
 }

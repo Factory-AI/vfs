@@ -213,6 +213,7 @@ vfs run [OPTIONS] [COMMAND] [ARGS]...
 - `--partial-origin-threshold-bytes <BYTES>` — Size threshold for --partial-origin auto
 - `--key <KEY>` — Hex-encoded encryption key for the delta layer. Enables local encryption when provided [env: VFS_KEY]
 - `--cipher <CIPHER>` — Cipher algorithm for encryption (required with --key). Options: aegis128l, aegis128x2, aegis128x4, aegis256, aegis256x2, aegis256x4, aes128gcm, aes256gcm [env: VFS_CIPHER]
+- `--seed-pin <COMMIT>` — Seed dirty and local-commit state against this git commit before mounting. Ignored files are not part of portable state
 
 ### vfs exec
 
@@ -412,6 +413,25 @@ vfs pack [OPTIONS] <SESSION_ID>
 - `--output <PATH>` — Copy the packed database to this path
 - `--json` — Emit machine-readable JSON (pack output is always JSON)
 
+### vfs seed
+
+Capture a run session's live git state into its portable delta.
+
+Compares the session base checkout with --pin, imports dirty files and local commits without mounting, and records deletions as whiteouts. Ignored files are not part of portable state.
+
+```
+vfs seed [OPTIONS] <SESSION_ID>
+```
+
+**Arguments:**
+
+- `<SESSION_ID>` — Run session identifier
+
+**Options:**
+
+- `--pin <COMMIT>` — Git commit used as the pristine portable base
+- `--json` — Emit machine-readable JSON (seed output is always JSON)
+
 ### vfs version
 
 Show vfs version and feature capabilities
@@ -534,6 +554,40 @@ vfs migrate [OPTIONS] <ID_OR_PATH>
 - `--cipher <CIPHER>` — Encryption cipher (required with --key)
 
 <!-- END GENERATED COMMAND REFERENCE -->
+
+## Seeding run sessions
+
+`vfs seed <session-id> --pin <commit>` captures the live checkout state that
+would otherwise be visible only through overlay base read-through. It imports
+dirty and untracked files, records paths deleted since the pin as whiteouts,
+and includes committed changes between the pin and `HEAD`. The import uses the
+core bulk-import API directly; it never requires a FUSE or NFS mount.
+
+For session creation, prefer the atomic startup form:
+
+```bash
+vfs run --session <session-id> --seed-pin <commit> -- <command>
+```
+
+`vfs run` creates and seeds the delta under the session's exclusive lock, then
+atomically downgrades that lock to the lifetime shared run lock before mounting
+or starting the wrapped process. Seed writes a private staging database and
+publishes it only after import, whiteouts, metadata, and finalization succeed,
+so a failed seed leaves the live delta retryable. The standalone `vfs seed`
+form is available when a session directory, `base_path`, and `delta.db` already
+exist and the session is inactive.
+
+Git-ignored files are not part of portable state. Seed uses
+`git status --untracked-files=all`, so ignored build outputs, dependency trees,
+and caches remain base-local. For local-only commits, seed writes a compact Git
+pack plus `HEAD` and the current branch ref into delta `.git/` paths. It also
+copies the sender's index bytes, preserving staged versus unstaged state; Git
+revalidates cached stat fields when the delta is materialized over a pristine
+checkout at the pin.
+
+Seed is a birth-time operation. A second call fails with
+`session already seeded`, and a live mount or wrapped process fails with the
+same exit-code-3 teardown gate used by `vfs pack`.
 
 ## Packing run sessions
 

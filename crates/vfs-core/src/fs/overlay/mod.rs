@@ -95,6 +95,18 @@ fn current_timestamp() -> Result<(i64, i64)> {
     Ok((dur.as_secs() as i64, dur.subsec_nanos() as i64))
 }
 
+pub(crate) fn parent_path_for_whiteout(path: &str) -> String {
+    if path == "/" {
+        return "/".to_string();
+    }
+
+    let trimmed = path.trim_end_matches('/');
+    match trimmed.rfind('/') {
+        Some(0) | None => "/".to_string(),
+        Some(index) => trimmed[..index].to_string(),
+    }
+}
+
 fn is_write_open(flags: i32) -> bool {
     (flags & libc::O_ACCMODE) != libc::O_RDONLY || (flags & libc::O_TRUNC) != 0
 }

@@ -149,6 +149,7 @@ fn dispatch(args: Args) -> anyhow::Result<()> {
             partial_origin_threshold_bytes,
             key,
             cipher,
+            seed_pin,
             command,
             args,
         } => {
@@ -164,6 +165,7 @@ fn dispatch(args: Args) -> anyhow::Result<()> {
                     partial_origin,
                     partial_origin_threshold_bytes,
                 ),
+                seed_pin,
                 command: command.unwrap_or_else(default_shell),
                 args,
             };
@@ -347,6 +349,19 @@ fn dispatch(args: Args) -> anyhow::Result<()> {
                 prune,
                 no_default_prunes,
                 output,
+                json,
+            ))
+        }
+        Command::Seed {
+            session_id,
+            pin,
+            json,
+        } => {
+            let rt = get_runtime();
+            rt.block_on(cmd::seed::handle_seed_command(
+                &mut std::io::stdout(),
+                session_id,
+                pin,
                 json,
             ))
         }
