@@ -1562,7 +1562,7 @@
             })
             .expect("schema version should be a text value");
 
-        assert_eq!(value, "0.5");
+        assert_eq!(value, "0.6");
 
         Ok(())
     }
@@ -1610,7 +1610,7 @@
             .await?;
             conn.execute(
                 "INSERT INTO fs_config (key, value) VALUES
-                    (?, '0.5'),
+                    (?, '0.6'),
                     (?, '16384')",
                 (
                     schema::CONFIG_SCHEMA_VERSION_KEY,
@@ -1635,6 +1635,14 @@
                     ctime_nsec INTEGER NOT NULL DEFAULT 0,
                     data_inline BLOB,
                     storage_kind INTEGER NOT NULL DEFAULT 0
+                )",
+                (),
+            )
+            .await?;
+            conn.execute(
+                "CREATE TABLE fs_session_metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
                 )",
                 (),
             )

@@ -20,7 +20,7 @@ use vfs_core::{
     schema, SchemaVersion, VfsOptions,
 };
 
-use super::safety::{build_local_database, ReadOnlyOpenSidecars};
+use super::safety::{build_local_database, sidecar_path, ReadOnlyOpenSidecars};
 
 const S_IFMT: i64 = 0o170000;
 const S_IFREG: i64 = 0o100000;
@@ -275,6 +275,8 @@ async fn copy_migrate_to_current(
         copy_optional_whiteouts(&source_conn, &target_conn).await?;
         copy_optional_table_common_columns(&source_conn, &target_conn, "fs_origin").await?;
         copy_optional_table_common_columns(&source_conn, &target_conn, "fs_overlay_config").await?;
+        copy_optional_table_common_columns(&source_conn, &target_conn, "fs_session_metadata")
+            .await?;
         copy_table_common_columns(&source_conn, &target_conn, "kv_store").await?;
         copy_table_common_columns(&source_conn, &target_conn, "tool_calls").await?;
         Ok(())
@@ -757,6 +759,7 @@ async fn verify_migration_equivalence(
     compare_optional_whiteouts(source, target).await?;
     compare_optional_table_rows(source, target, "fs_origin", &["delta_ino", "base_ino"]).await?;
     compare_optional_table_rows(source, target, "fs_overlay_config", &["key", "value"]).await?;
+    compare_optional_table_rows(source, target, "fs_session_metadata", &["key", "value"]).await?;
     compare_table_rows(
         source,
         target,
@@ -1293,10 +1296,6 @@ fn remove_db_family(path: &Path) -> AnyhowResult<()> {
         }
     }
     Ok(())
-}
-
-fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
-    PathBuf::from(format!("{}{}", path.display(), suffix))
 }
 
 #[cfg(test)]
@@ -2025,8 +2024,9 @@ mod tests {
             ("0.0", "my-agent"),
             ("0.2", "/tmp/old.db"),
             ("0.4", "other-agent"),
+            ("0.5", "pack-agent"),
         ] {
-            let guidance = schema_upgrade_guidance(found, "0.5", id_or_path);
+            let guidance = schema_upgrade_guidance(found, "0.6", id_or_path);
             assert!(
                 guidance.contains(&format!("vfs migrate {id_or_path}")),
                 "{found}: {guidance}"
@@ -2034,7 +2034,7 @@ mod tests {
             assert!(!guidance.contains("migrate-v0-5"), "{found}: {guidance}");
         }
 
-        let future = schema_upgrade_guidance("user_version 7", "0.5", "my-agent");
+        let future = schema_upgrade_guidance("user_version 7", "0.6", "my-agent");
         assert!(
             !future.contains("vfs migrate"),
             "future versions must not promise migrate can fix them: {future}"

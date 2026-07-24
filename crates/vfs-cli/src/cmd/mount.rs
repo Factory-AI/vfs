@@ -693,6 +693,15 @@ mod tests {
         .await
         .unwrap();
         conn.execute(
+            "CREATE TABLE fs_session_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
             "INSERT INTO fs_whiteout (path, created_at) VALUES ('/dir/deleted', 123)",
             (),
         )
