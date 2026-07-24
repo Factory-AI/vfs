@@ -22,11 +22,27 @@ pub struct SessionMetadata {
     pub seeded_paths: Vec<String>,
 }
 
+/// Status fields that remain meaningful while a run session is live.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionStatusMetadata {
+    /// Monotonic counter incremented by every successful pack.
+    pub generation: u64,
+    /// Whether a seed manifest exists, including an empty clean-checkout manifest.
+    pub seeded: bool,
+}
+
 impl Vfs {
     /// Read persistent session handoff metadata.
     pub async fn session_metadata(&self) -> Result<SessionMetadata> {
         let conn = self.pool.get_connection().await?;
         read_session_metadata(&conn).await
+    }
+
+    /// Read the compact metadata needed by machine-readable session status.
+    pub async fn session_status_metadata(&self) -> Result<SessionStatusMetadata> {
+        let conn = self.pool.get_connection().await?;
+        read_session_status_metadata(&conn).await
     }
 
     /// Atomically increment and return the persistent session generation.
@@ -174,6 +190,21 @@ async fn read_session_metadata(conn: &Connection) -> Result<SessionMetadata> {
     })
 }
 
+async fn read_session_status_metadata(conn: &Connection) -> Result<SessionStatusMetadata> {
+    let generation = match read_metadata_value(conn, GENERATION_KEY).await? {
+        Some(value) => value.parse::<u64>().map_err(|error| {
+            Error::Internal(format!(
+                "invalid session metadata generation {value:?}: {error}"
+            ))
+        })?,
+        None => 0,
+    };
+    Ok(SessionStatusMetadata {
+        generation,
+        seeded: read_metadata_value(conn, SEEDED_PATHS_KEY).await?.is_some(),
+    })
+}
+
 async fn read_metadata_value(conn: &Connection, key: &str) -> Result<Option<String>> {
     let mut rows = conn
         .query(
@@ -230,11 +261,22 @@ mod tests {
         let vfs = Vfs::open(VfsOptions::with_path(db_path.to_string_lossy())).await?;
 
         assert_eq!(vfs.session_metadata().await?, SessionMetadata::default());
+        assert_eq!(
+            vfs.session_status_metadata().await?,
+            SessionStatusMetadata::default()
+        );
         assert_eq!(vfs.increment_session_generation().await?.generation, 1);
         assert_eq!(vfs.increment_session_generation().await?.generation, 2);
 
         let seeded_paths = vec!["/src/lib.rs".to_string(), "/Cargo.toml".to_string()];
         vfs.set_seeded_paths(&seeded_paths).await?;
+        assert_eq!(
+            vfs.session_status_metadata().await?,
+            SessionStatusMetadata {
+                generation: 2,
+                seeded: true,
+            }
+        );
         assert_eq!(
             vfs.session_metadata().await?,
             SessionMetadata {
@@ -267,6 +309,19 @@ mod tests {
                 seeded_paths,
             }
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_seed_manifest_still_marks_session_seeded() -> Result<()> {
+        let dir = tempdir()?;
+        let db_path = dir.path().join("session.db");
+        let vfs = Vfs::open(VfsOptions::with_path(db_path.to_string_lossy())).await?;
+
+        vfs.set_seeded_paths(&[]).await?;
+
+        assert!(vfs.session_status_metadata().await?.seeded);
+        assert!(vfs.session_metadata().await?.seeded_paths.is_empty());
         Ok(())
     }
 }

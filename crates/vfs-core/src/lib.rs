@@ -68,7 +68,7 @@ pub use mounts::{get_mounts, Mount};
 pub use options::{vfs_dir, EncryptionConfig, SyncOptions, VfsOptions};
 pub use schema::{SchemaVersion, CURRENT, VFS_SCHEMA_VERSION};
 pub use semantics::{AckDurability, Semantics, WriteReceipt};
-pub use session::SessionMetadata;
+pub use session::{SessionMetadata, SessionStatusMetadata};
 pub use toolcalls::{ToolCall, ToolCallStats, ToolCallStatus, ToolCalls};
 
 /// The main Vfs SDK struct

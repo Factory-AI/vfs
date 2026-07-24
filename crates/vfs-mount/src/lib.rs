@@ -114,7 +114,7 @@ pub struct MountOpts {
 
 impl MountOpts {
     /// Create default options for the given mountpoint and backend.
-    fn new(mountpoint: PathBuf, backend: Backend) -> Self {
+    pub fn new(mountpoint: PathBuf, backend: Backend) -> Self {
         Self {
             mountpoint,
             backend,
@@ -450,6 +450,26 @@ fn unmount(mountpoint: &Path, backend: Backend, lazy: bool) -> Result<()> {
     }
 }
 
+/// Detach a mount left behind by a process that died before normal teardown.
+///
+/// Callers must establish separately that no live owner exists. This helper
+/// owns the backend-specific forced-unmount operation and verifies that the
+/// mount table entry disappeared before returning.
+pub fn recover_stale_mount(mountpoint: &Path, backend: Backend) -> Result<bool> {
+    if !is_mountpoint(mountpoint) {
+        return Ok(false);
+    }
+
+    unmount(mountpoint, backend, true)?;
+    if is_mountpoint(mountpoint) {
+        anyhow::bail!(
+            "stale mountpoint {} is still mounted after forced teardown",
+            mountpoint.display()
+        );
+    }
+    Ok(true)
+}
+
 /// Mount a filesystem with the given options.
 ///
 /// Returns a handle that automatically unmounts when dropped.
@@ -521,9 +541,34 @@ pub(crate) fn wait_for_mount(path: &Path, timeout: Duration) -> bool {
     false
 }
 
-/// Check if a path is a mountpoint by comparing device IDs with parent.
+/// Check if a path is present in the process mount table.
+///
+/// Linux intentionally parses `/proc/self/mountinfo` instead of statting the
+/// path: metadata access to a dead FUSE connection can block or return
+/// `ENOTCONN`, while the mount table remains authoritative and non-blocking.
 pub fn is_mountpoint(path: &Path) -> bool {
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+
+        let absolute = match std::path::absolute(path) {
+            Ok(path) => path,
+            Err(_) => return false,
+        };
+        let mountinfo = match std::fs::read("/proc/self/mountinfo") {
+            Ok(mountinfo) => mountinfo,
+            Err(_) => return false,
+        };
+
+        mountinfo.split(|byte| *byte == b'\n').any(|line| {
+            let Some(field) = line.split(|byte| *byte == b' ').nth(4) else {
+                return false;
+            };
+            unescape_mountinfo_field(field) == absolute.as_os_str().as_bytes()
+        })
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
     {
         use std::os::unix::fs::MetadataExt;
 
@@ -549,5 +594,42 @@ pub fn is_mountpoint(path: &Path) -> bool {
     {
         let _ = path;
         false
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn unescape_mountinfo_field(field: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(field.len());
+    let mut index = 0;
+    while index < field.len() {
+        if field[index] == b'\\'
+            && index + 3 < field.len()
+            && field[index + 1..index + 4]
+                .iter()
+                .all(|byte| matches!(byte, b'0'..=b'7'))
+        {
+            let value = (field[index + 1] - b'0') * 64
+                + (field[index + 2] - b'0') * 8
+                + (field[index + 3] - b'0');
+            output.push(value);
+            index += 4;
+        } else {
+            output.push(field[index]);
+            index += 1;
+        }
+    }
+    output
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod mountinfo_tests {
+    use super::unescape_mountinfo_field;
+
+    #[test]
+    fn unescapes_mountinfo_paths_without_touching_the_mount() {
+        assert_eq!(
+            unescape_mountinfo_field(br"/tmp/a\040b\011c\134d"),
+            b"/tmp/a b\tc\\d"
+        );
     }
 }
