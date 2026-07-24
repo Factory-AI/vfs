@@ -1,10 +1,10 @@
 [workspace]
 members = [
-    "crates/agentfs-cli",
-    "crates/agentfs-core",
-    "crates/agentfs-fuse",
-    "crates/agentfs-nfs",
-    "crates/agentfs-mount",
+    "crates/vfs-cli",
+    "crates/vfs-core",
+    "crates/vfs-fuse",
+    "crates/vfs-nfs",
+    "crates/vfs-mount",
 ]
 resolver = "2"
 
@@ -12,7 +12,7 @@ resolver = "2"
 version = "0.6.4"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/tursodatabase/agentfs"
+repository = "https://github.com/tursodatabase/vfs"
 
 # Concurrency canon (architecture.md section 7 item 7): no lock guard held
 # across an .await; enforced structurally, not by review.
@@ -20,11 +20,11 @@ repository = "https://github.com/tursodatabase/agentfs"
 await_holding_lock = "deny"
 
 [workspace.dependencies]
-agentfs-core = { path = "crates/agentfs-core" }
-agentfs-cli = { path = "crates/agentfs-cli" }
-agentfs-fuse = { path = "crates/agentfs-fuse" }
-agentfs-mount = { path = "crates/agentfs-mount" }
-agentfs-nfs = { path = "crates/agentfs-nfs" }
+vfs-core = { path = "crates/vfs-core" }
+vfs-cli = { path = "crates/vfs-cli" }
+vfs-fuse = { path = "crates/vfs-fuse" }
+vfs-mount = { path = "crates/vfs-mount" }
+vfs-nfs = { path = "crates/vfs-nfs" }
 
 anyhow = "1.0"
 async-trait = "0.1"
