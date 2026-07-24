@@ -22,6 +22,7 @@ impl Drop for SessionLock {
 
 impl SessionLock {
     /// Acquire a shared lock for a run owner or joiner.
+    #[cfg(any(test, target_os = "macos"))]
     pub(crate) fn try_shared(session_dir: &Path) -> io::Result<Self> {
         Self::try_acquire(session_dir, libc::LOCK_SH)
     }

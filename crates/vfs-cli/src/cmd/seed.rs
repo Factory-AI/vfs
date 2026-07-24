@@ -80,7 +80,11 @@ pub(crate) async fn seed_session(
 
     let session_dir = home.join(".vfs").join("run").join(session_id);
     if !session_dir.is_dir() {
-        bail!("session not found: {}", session_dir.display());
+        if create_database {
+            fs::create_dir_all(&session_dir).context("Failed to create run session directory")?;
+        } else {
+            bail!("session not found: {}", session_dir.display());
+        }
     }
     let session_lock =
         super::session_lock::SessionLock::try_exclusive(&session_dir).map_err(|error| {
@@ -90,6 +94,7 @@ pub(crate) async fn seed_session(
                 anyhow::Error::new(error).context("Failed to lock session for seeding")
             }
         })?;
+    crate::cmd::run::recover_stale_session_runtime(home, session_id)?;
     ensure_session_inactive(&session_dir)?;
 
     let (base_path, publish_base_path) = resolve_base_path(&session_dir, requested_base_path)?;
@@ -115,7 +120,7 @@ pub(crate) async fn seed_session(
         .await
         .map_err(|error| super::migrate::open_error_with_guidance(error, session_id))
         .context("Failed to open session database for seeding")?;
-    if !vfs.session_metadata().await?.seeded_paths.is_empty() {
+    if vfs.session_status_metadata().await?.seeded {
         super::init::finalize_readonly(&vfs).await;
         bail!("session already seeded");
     }
@@ -1111,6 +1116,30 @@ mod tests {
         assert!(json["whiteoutPaths"].is_array());
         assert_eq!(json["localCommits"], 1);
         assert_eq!(json["pin"], fixture.pin);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_seed_manifest_still_blocks_a_second_seed() -> Result<()> {
+        let fixture = GitFixture::full_dirty_state()?;
+        let db_path = fixture.create_session("empty-seeded").await?;
+        let vfs = Vfs::open(VfsOptions::with_path(db_path.to_string_lossy())).await?;
+        vfs.set_seeded_paths(&[]).await?;
+        vfs.fs.finalize().await?;
+        drop(vfs);
+
+        let error = seed_session(
+            &fixture.home,
+            "empty-seeded",
+            &fixture.pin,
+            None,
+            false,
+            None,
+        )
+        .await
+        .expect_err("an empty seed manifest must still be one-shot");
+
+        assert_eq!(error.to_string(), "session already seeded");
         Ok(())
     }
 

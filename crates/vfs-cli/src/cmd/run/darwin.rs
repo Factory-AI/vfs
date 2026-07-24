@@ -10,16 +10,14 @@
 //! paths, and a curated set of platform roots the runtime needs (see
 //! `PLATFORM_READ_ROOTS`).
 
+use super::write_runtime_status;
 use crate::opts::RunOptions;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use vfs_core::{FileSystem, HostFS, OverlayFS, Vfs, VfsOptions};
 
-use vfs_mount::supervise::{
-    exit_code_for_spawn_error, exit_code_for_status, run_supervised, supervise_command,
-    ChildOutcome,
-};
+use vfs_mount::supervise::{exit_code_for_spawn_error, exit_code_for_status, run_supervised};
 use vfs_mount::{mount_fs, Backend, MountOpts};
 
 /// Configuration for the macOS sandbox profile.
@@ -327,43 +325,24 @@ pub async fn run(options: RunOptions) -> Result<()> {
         )
         .await?;
         session._session_lock = Some(seeded.into_shared_lock()?);
-    }
-
-    // Check if we're joining an existing session
-    if is_mountpoint(&session.mountpoint) {
-        if is_mount_healthy(&session.mountpoint) {
-            eprintln!("Joining existing session: {}", session.session_id);
-            eprintln!();
-            let proc_registration = match crate::cmd::ps::ProcRegistration::register(
-                &session.session_id,
-                false,
-                &command.to_string_lossy(),
-                &cwd,
-            ) {
-                Ok(registration) => Some(registration),
-                Err(error) => {
-                    eprintln!("Warning: Failed to write proc file: {error}");
-                    None
-                }
-            };
-            let outcome = run_command_in_mount(&session, command, args).await?;
-            drop(proc_registration);
-            crate::cmd::ps::cleanup_session_proc_state(&session.session_id);
-            crate::profiling::emit_cli_report();
-            std::process::exit(exit_code_for_outcome(outcome));
-        } else {
-            eprintln!("Cleaning up stale NFS mount...");
-            if let Err(e) = vfs_mount::unmount(&session.mountpoint, Backend::Nfs, true) {
-                eprintln!("Warning: Failed to unmount stale mount: {}", e);
-            }
-        }
+    } else {
+        crate::cmd::run::recover_stale_session_runtime(&home, &session.session_id)?;
+        let exclusive = session
+            ._session_lock
+            .take()
+            .context("Missing exclusive run session lock")?;
+        session._session_lock = Some(
+            exclusive
+                .downgrade_to_shared()
+                .context("Failed to establish run session lifetime lock")?,
+        );
     }
 
     let proc_registration = match crate::cmd::ps::ProcRegistration::register(
         &session.session_id,
         true,
         &command.to_string_lossy(),
-        &cwd,
+        &session.cwd,
     ) {
         Ok(registration) => Some(registration),
         Err(error) => {
@@ -388,9 +367,13 @@ pub async fn run(options: RunOptions) -> Result<()> {
         .await
         .map_err(|err| crate::cmd::migrate::open_error_with_guidance(err, db_path_str))
         .context("Failed to create Vfs")?;
+    let status_metadata = vfs
+        .session_status_metadata()
+        .await
+        .context("Failed to read run status metadata")?;
 
     // Create overlay filesystem with CWD as base
-    let base_str = cwd.to_string_lossy().to_string();
+    let base_str = session.cwd.to_string_lossy().to_string();
     let hostfs = HostFS::new(&base_str).context("Failed to create HostFS")?;
     let overlay = if let Some(policy) = partial_origin_policy {
         OverlayFS::new_with_partial_origin_policy(Arc::new(hostfs), vfs.fs, policy)
@@ -410,7 +393,15 @@ pub async fn run(options: RunOptions) -> Result<()> {
     mount_opts.fsname = format!("vfs:{}", session.session_id);
     mount_opts.lazy_unmount = true;
     mount_opts.timeout = std::time::Duration::from_secs(10);
-    let mount_handle = mount_fs(fs, mount_opts).await?;
+    let mount_handle = mount_fs(fs, mount_opts)
+        .await
+        .map_err(super::RunMountFailure::new)?;
+    write_runtime_status(
+        &session.runtime_status_file,
+        status_metadata.generation,
+        status_metadata.seeded,
+    )
+    .map_err(super::RunMountFailure::new)?;
 
     print_welcome_banner(&session, encrypted);
 
@@ -426,6 +417,7 @@ pub async fn run(options: RunOptions) -> Result<()> {
     }
     drop(proc_registration);
     crate::cmd::ps::cleanup_session_proc_state(&session.session_id);
+    let _ = std::fs::remove_file(&session.runtime_status_file);
 
     // Print session info for the user
     eprintln!();
@@ -449,13 +441,6 @@ pub async fn run(options: RunOptions) -> Result<()> {
                 "Darwin/NFS run supervision failed for {command_display}"
             )))
         }
-    }
-}
-
-fn exit_code_for_outcome(outcome: ChildOutcome) -> i32 {
-    match outcome {
-        ChildOutcome::Exited(status) => status.code().unwrap_or(1),
-        ChildOutcome::Interrupted(signo) => 128 + signo,
     }
 }
 
@@ -496,6 +481,8 @@ struct RunSession {
     db_path: PathBuf,
     /// Path where NFS filesystem will be mounted.
     mountpoint: PathBuf,
+    /// Machine-readable metadata used while Turso exclusively owns the DB.
+    runtime_status_file: PathBuf,
     /// Session ID for the sandbox profile.
     session_id: String,
     /// Additional paths to allow write access.
@@ -517,12 +504,21 @@ fn setup_run_directory(
     acquire_lock: bool,
 ) -> Result<RunSession> {
     let run_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    if !VfsOptions::validate_agent_id(&run_id) {
+        return Err(super::InvalidRunSession::new(format!("invalid session ID: {run_id}")).into());
+    }
     let run_dir = home.join(".vfs").join("run").join(&run_id);
+    let existed = run_dir.exists();
     std::fs::create_dir_all(&run_dir).context("Failed to create run directory")?;
+    let lock_file_existed = run_dir.join(".session.lock").is_file();
     let session_lock = if acquire_lock {
         Some(
-            crate::cmd::session_lock::SessionLock::try_shared(&run_dir).with_context(|| {
-                format!("session {run_id} is being packed or seeded; retry after it finishes")
+            crate::cmd::session_lock::SessionLock::try_exclusive(&run_dir).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    anyhow::Error::new(crate::cmd::pack::SessionStillRunning)
+                } else {
+                    anyhow::Error::new(error).context("Failed to lock run session")
+                }
             })?,
         )
     } else {
@@ -531,6 +527,36 @@ fn setup_run_directory(
 
     let db_path = run_dir.join("delta.db");
     let mountpoint = run_dir.join("mnt");
+    let runtime_status_file = run_dir.join("runtime-status.json");
+    let base_path_file = run_dir.join("base_path");
+    if acquire_lock {
+        crate::cmd::pack::recover_interrupted_publication(&db_path)?;
+    }
+    let base_path = if !existed && !acquire_lock {
+        cwd.to_path_buf()
+    } else {
+        if !existed {
+            std::fs::write(&base_path_file, cwd.to_string_lossy().as_bytes())
+                .context("Failed to write session base path")?;
+        } else if !db_path.is_file() && !lock_file_existed && acquire_lock {
+            return Err(super::InvalidRunSession::new(format!(
+                "invalid session {}: session database not found: {}",
+                run_id,
+                db_path.display()
+            ))
+            .into());
+        }
+        let base_path = std::fs::read_to_string(&base_path_file)
+            .with_context(|| format!("Failed to read {}", base_path_file.display()))?;
+        PathBuf::from(base_path.trim())
+    };
+    if !base_path.is_absolute() || !base_path.is_dir() {
+        return Err(super::InvalidRunSession::new(format!(
+            "invalid session {}: base_path must name an existing absolute directory",
+            run_id
+        ))
+        .into());
+    }
     std::fs::create_dir_all(&mountpoint).context("Failed to create mountpoint")?;
 
     // Build allowed paths list
@@ -550,37 +576,11 @@ fn setup_run_directory(
         run_dir,
         db_path,
         mountpoint,
+        runtime_status_file,
         session_id: run_id,
         allow_paths,
-        cwd: cwd.to_path_buf(),
+        cwd: base_path,
     })
-}
-
-/// Check if a path is a mountpoint by comparing device IDs with parent.
-fn is_mountpoint(path: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-
-    let Ok(path_meta) = std::fs::metadata(path) else {
-        return false;
-    };
-
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("/"));
-
-    let Ok(parent_meta) = std::fs::metadata(parent) else {
-        return false;
-    };
-
-    path_meta.dev() != parent_meta.dev()
-}
-
-/// Check if a mount is healthy (not stale).
-///
-/// Stale NFS mounts will fail when trying to access them.
-fn is_mount_healthy(mountpoint: &Path) -> bool {
-    std::fs::read_dir(mountpoint).is_ok()
 }
 
 /// Run a command with the working directory set to the mounted filesystem (macOS).
@@ -628,24 +628,4 @@ fn command_in_mount(
     crate::config::restore_original_tmpdir(&mut cmd);
 
     cmd
-}
-
-async fn run_command_in_mount(
-    session: &RunSession,
-    command: PathBuf,
-    args: Vec<String>,
-) -> Result<ChildOutcome> {
-    let command_display = command.display().to_string();
-    let child_command = command_in_mount(session, command, args);
-    match supervise_command(child_command).await {
-        Ok(outcome) => Ok(outcome),
-        Err(error) => {
-            if let Some(code) = spawn_error_exit_code(&error) {
-                eprintln!("Error: Failed to execute: {command_display}: {error}");
-                crate::profiling::emit_cli_report();
-                std::process::exit(code);
-            }
-            Err(error).with_context(|| format!("Failed to execute command: {command_display}"))
-        }
-    }
 }

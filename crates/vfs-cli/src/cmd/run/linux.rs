@@ -15,7 +15,10 @@
 //! The HostFS base layer then accesses files through `/proc/self/fd/N`,
 //! bypassing the FUSE mount entirely.
 
-use super::{default_allowed_paths, group_paths_by_parent};
+use super::{
+    default_allowed_paths, group_paths_by_parent, prepare_session, prepared_seeded_session,
+    write_runtime_status, StartState, MOUNT_FAILURE_EXIT_CODE,
+};
 use crate::opts::RunOptions;
 use anyhow::{bail, Context, Result};
 use std::{
@@ -79,48 +82,38 @@ pub fn run(options: RunOptions) -> Result<()> {
         command,
         args,
     } = options;
-    let cwd = std::env::current_dir().context("Failed to get current directory")?;
+    let requested_base = std::env::current_dir().context("Failed to get current directory")?;
     let run_started_at_ms = unix_timestamp_ms();
 
     // Build the list of allowed writable paths
     let allowed_paths = build_allowed_paths(&allow, no_default_allows)?;
 
-    // Check if we're joining an existing session
-    let mut session = setup_run_directory(session, seed_pin.is_none())?;
-    if let Some(pin) = seed_pin {
-        let home = dirs::home_dir().context("Failed to get home directory")?;
+    let home = dirs::home_dir().context("Failed to get home directory")?;
+    let run_id = session.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let prepared = if let Some(pin) = seed_pin {
         let seed_runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .context("Failed to create seed runtime")?;
         let seeded = seed_runtime.block_on(crate::cmd::seed::seed_session(
             &home,
-            &session.run_id,
+            &run_id,
             &pin,
             encryption.clone(),
             true,
-            Some(&cwd),
+            Some(&requested_base),
         ))?;
         drop(seed_runtime);
-        session._session_lock = Some(seeded.into_shared_lock()?);
-    }
-
-    // If the FUSE mountpoint is already mounted, join the existing session
-    if is_mountpoint(&session.fuse_mountpoint) {
-        // Get the original base path from the session's base_path file
-        let overlay_base = std::fs::read_to_string(&session.base_path_file)
-            .context("Failed to read session base path")?;
-        let overlay_base = PathBuf::from(overlay_base.trim());
-
-        eprintln!("Joining existing session: {}", session.run_id);
-        eprintln!();
-        return run_in_existing_session(
-            &overlay_base,
-            &session.fuse_mountpoint,
-            &allowed_paths,
-            command,
-            args,
-            &session.run_id,
+        prepared_seeded_session(&home, run_id, seeded.into_shared_lock()?)?
+    } else {
+        prepare_session(&home, run_id, &requested_base, false)?
+    };
+    let session = RunSession::from(prepared);
+    let cwd = session.base_path.clone();
+    if session.start_state == StartState::StaleRecovered {
+        eprintln!(
+            "Recovered stale runtime state for session {}.",
+            session.run_id
         );
     }
 
@@ -183,20 +176,32 @@ pub fn run(options: RunOptions) -> Result<()> {
         Ok(handle) => handle,
         Err(e) => {
             eprintln!("Error: {e:#}");
-            abort_child(pipe_to_child[1], child_pid);
+            abort_child(pipe_to_child[1], child_pid, MOUNT_FAILURE_EXIT_CODE);
         }
     };
 
     // Wait for child to signal it has called unshare
     if !wait_for_pipe_signal(pipe_to_parent[0]) {
         eprintln!("Error: Failed to read sync signal from child process");
-        abort_child_with_teardown(&rt, mount_handle, pipe_to_child[1], child_pid);
+        abort_child_with_teardown(
+            &rt,
+            mount_handle,
+            pipe_to_child[1],
+            child_pid,
+            MOUNT_FAILURE_EXIT_CODE,
+        );
     }
 
     // Configure user namespace mappings for the child
     if let Err(error) = write_namespace_mappings(child_pid, uid, gid) {
         eprintln!("Error: {error:#}");
-        abort_child_with_teardown(&rt, mount_handle, pipe_to_child[1], child_pid);
+        abort_child_with_teardown(
+            &rt,
+            mount_handle,
+            pipe_to_child[1],
+            child_pid,
+            MOUNT_FAILURE_EXIT_CODE,
+        );
     }
 
     // Signal child that mappings are done
@@ -238,6 +243,7 @@ pub fn run(options: RunOptions) -> Result<()> {
     }
     drop(proc_registration);
     crate::cmd::ps::cleanup_session_proc_state(&session.run_id);
+    let _ = std::fs::remove_file(&session.runtime_status_file);
 
     std::process::exit(exit_code);
 }
@@ -334,6 +340,10 @@ async fn mount_session_fs(
         .await
         .map_err(|err| crate::cmd::migrate::open_error_with_guidance(err, db_path_str))
         .context("Failed to create delta Vfs")?;
+    let metadata = vfs
+        .session_status_metadata()
+        .await
+        .context("Failed to read run status metadata")?;
 
     let hostfs = HostFS::new(&fd_path).context("Failed to create HostFS")?;
     #[cfg(target_family = "unix")]
@@ -376,109 +386,13 @@ async fn mount_session_fs(
         timeout: FUSE_MOUNT_TIMEOUT,
     };
 
-    mount_fs(Arc::new(overlay), mount_opts).await
-}
-
-/// Run a command in an existing session's FUSE mount.
-///
-/// This is used when joining an existing session that already has a FUSE mount active.
-/// We don't need to start a new FUSE server, just run the command in the existing mount.
-fn run_in_existing_session(
-    cwd: &Path,
-    fuse_mountpoint: &Path,
-    allowed_paths: &[PathBuf],
-    command: PathBuf,
-    args: Vec<String>,
-    session_id: &str,
-) -> Result<()> {
-    // SAFETY: getuid/getgid are always safe
-    let uid = unsafe { libc::getuid() };
-    let gid = unsafe { libc::getgid() };
-
-    // Create pipes for parent-child coordination.
-    let (pipe_to_child, pipe_to_parent) = create_sync_pipes()?;
-
-    // SAFETY: the process is still single-threaded here (no tokio runtime
-    // yet), so the child cannot inherit a lock held by another thread.
-    let child_pid = unsafe { libc::fork() };
-
-    if child_pid < 0 {
-        bail!("Failed to fork: {}", std::io::Error::last_os_error());
-    }
-
-    if child_pid == 0 {
-        // Child process
-        unsafe {
-            libc::close(pipe_to_child[1]);
-            libc::close(pipe_to_parent[0]);
-        }
-
-        run_child(
-            cwd,
-            fuse_mountpoint,
-            allowed_paths,
-            command,
-            args,
-            session_id,
-            pipe_to_child[0],
-            pipe_to_parent[1],
-        );
-    }
-
-    // Parent process
-    unsafe {
-        libc::close(pipe_to_child[0]);
-        libc::close(pipe_to_parent[1]);
-    }
-
-    // Wait for child to signal it has called unshare
-    if !wait_for_pipe_signal(pipe_to_parent[0]) {
-        eprintln!("Error: Failed to read sync signal from child process");
-        abort_child(pipe_to_child[1], child_pid);
-    }
-
-    // Configure user namespace mappings for the child
-    if let Err(error) = write_namespace_mappings(child_pid, uid, gid) {
-        eprintln!("Error: {error:#}");
-        abort_child(pipe_to_child[1], child_pid);
-    }
-
-    // Signal child that mappings are done
-    unsafe {
-        libc::write(pipe_to_child[1], b"x".as_ptr() as *const libc::c_void, 1);
-        libc::close(pipe_to_child[1]);
-        libc::close(pipe_to_parent[0]);
-    }
-
-    let proc_registration = match crate::cmd::ps::ProcRegistration::register(
-        session_id,
-        false,
-        &command.to_string_lossy(),
-        cwd,
-    ) {
-        Ok(registration) => Some(registration),
-        Err(error) => {
-            eprintln!("Warning: Failed to write proc file: {error}");
-            None
-        }
-    };
-
-    let rt = crate::get_runtime();
-    let status = rt.block_on(vfs_mount::supervise::supervise_pid_with_hooks(
-        child_pid,
-        vfs_mount::supervise::SuperviseOpts::default(),
-        vfs_mount::supervise::SuperviseHooks::with_profile_checkpoint(
-            crate::profiling::report_checkpoint,
-        ),
-    ))?;
-    let exit_code = vfs_mount::supervise::exit_code_for_status(status);
-
-    drop(proc_registration);
-    crate::cmd::ps::cleanup_session_proc_state(session_id);
-
-    crate::profiling::emit_cli_report();
-
-    std::process::exit(exit_code);
+    let mount_handle = mount_fs(Arc::new(overlay), mount_opts).await?;
+    write_runtime_status(
+        &session.runtime_status_file,
+        metadata.generation,
+        metadata.seeded,
+    )?;
+    Ok(mount_handle)
 }
 
 /// Print the welcome banner showing sandbox configuration.
@@ -507,7 +421,7 @@ fn print_welcome_banner(cwd: &Path, allowed_paths: &[PathBuf], session_id: &str,
 /// Configuration for a sandbox run session.
 struct RunSession {
     /// Shared advisory lock preventing pack from publishing over this run.
-    _session_lock: Option<crate::cmd::session_lock::SessionLock>,
+    _session_lock: crate::cmd::session_lock::SessionLock,
     /// Unique identifier for this run.
     run_id: String,
     /// Path to the delta database.
@@ -516,39 +430,27 @@ struct RunSession {
     fuse_mountpoint: PathBuf,
     /// Path to the file storing the overlay base path.
     base_path_file: PathBuf,
+    /// Machine-readable metadata used while Turso exclusively owns the DB.
+    runtime_status_file: PathBuf,
+    /// Validated base checkout used for every incarnation of this session.
+    base_path: PathBuf,
+    /// Whether startup removed runtime state left by a dead owner.
+    start_state: StartState,
 }
 
-/// Create a run directory with database and mountpoint paths.
-///
-/// If `session_id` is provided, uses that as the run ID (allowing multiple
-/// runs to share the same delta layer). Otherwise generates a unique UUID.
-fn setup_run_directory(session_id: Option<String>, acquire_lock: bool) -> Result<RunSession> {
-    let run_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let home_dir = dirs::home_dir().context("Failed to get home directory")?;
-    let run_dir = home_dir.join(".vfs").join("run").join(&run_id);
-    std::fs::create_dir_all(&run_dir).context("Failed to create run directory")?;
-    let session_lock = if acquire_lock {
-        Some(
-            crate::cmd::session_lock::SessionLock::try_shared(&run_dir).with_context(|| {
-                format!("session {run_id} is being packed or seeded; retry after it finishes")
-            })?,
-        )
-    } else {
-        None
-    };
-
-    let db_path = run_dir.join("delta.db");
-    let fuse_mountpoint = run_dir.join("mnt");
-    let base_path_file = run_dir.join("base_path");
-    std::fs::create_dir_all(&fuse_mountpoint).context("Failed to create FUSE mountpoint")?;
-
-    Ok(RunSession {
-        _session_lock: session_lock,
-        run_id,
-        db_path,
-        fuse_mountpoint,
-        base_path_file,
-    })
+impl From<super::PreparedSession> for RunSession {
+    fn from(session: super::PreparedSession) -> Self {
+        Self {
+            _session_lock: session.session_lock,
+            run_id: session.paths.session_id,
+            db_path: session.paths.db_path,
+            fuse_mountpoint: session.paths.mountpoint,
+            base_path_file: session.paths.base_path_file,
+            runtime_status_file: session.paths.runtime_status_file,
+            base_path: session.base_path,
+            start_state: session.start_state,
+        }
+    }
 }
 
 /// Create a pair of pipes for parent-child synchronization.
@@ -586,9 +488,9 @@ fn wait_for_pipe_signal(fd: libc::c_int) -> bool {
 /// Terminate child process coordination and exit with failure.
 ///
 /// Closes the pipe to signal the child, waits for it to exit, then exits.
-fn abort_child(pipe_write_fd: libc::c_int, child_pid: libc::pid_t) -> ! {
+fn abort_child(pipe_write_fd: libc::c_int, child_pid: libc::pid_t, exit_code: i32) -> ! {
     reap_child(pipe_write_fd, child_pid);
-    std::process::exit(1)
+    std::process::exit(exit_code)
 }
 
 /// Abort variant for parent errors raised while the session's FUSE mount is
@@ -601,12 +503,13 @@ fn abort_child_with_teardown(
     mount_handle: MountHandle,
     pipe_write_fd: libc::c_int,
     child_pid: libc::pid_t,
+    exit_code: i32,
 ) -> ! {
     reap_child(pipe_write_fd, child_pid);
     if let Err(error) = rt.block_on(mount_handle.unmount()) {
         eprintln!("Warning: Failed to tear down the FUSE session during abort: {error:#}");
     }
-    std::process::exit(1)
+    std::process::exit(exit_code)
 }
 
 /// Close the coordination pipe to signal the child, then wait for it to exit.
@@ -660,7 +563,7 @@ fn path_to_cstring(path: &Path, description: &str) -> CString {
             );
             // SAFETY: In forked child, must use _exit() to avoid running atexit
             // handlers and flushing stdio buffers that belong to the parent.
-            unsafe { libc::_exit(1) }
+            unsafe { libc::_exit(MOUNT_FAILURE_EXIT_CODE) }
         }
     }
 }
@@ -675,9 +578,9 @@ fn child_exit_with_code(msg: &str, code: i32) -> ! {
     unsafe { libc::_exit(code) }
 }
 
-/// Exit the child process with an error message (exit code 1).
+/// Exit the child process after sandbox or mount setup fails.
 fn child_exit(msg: &str) -> ! {
-    child_exit_with_code(msg, 1)
+    child_exit_with_code(msg, MOUNT_FAILURE_EXIT_CODE)
 }
 
 /// Child process: set up namespace isolation and execute the command.

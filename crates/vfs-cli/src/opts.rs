@@ -478,6 +478,24 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Show run session state for daemon preflight
+    Status {
+        /// Run session identifier
+        #[arg(value_name = "SESSION_ID")]
+        session_id: String,
+
+        /// Emit machine-readable JSON (status output is always JSON)
+        #[arg(long)]
+        json: bool,
+
+        /// Hex-encoded encryption key for an encrypted session database.
+        #[arg(long, env = "VFS_KEY")]
+        key: Option<String>,
+
+        /// Encryption cipher (required with --key).
+        #[arg(long, env = "VFS_CIPHER")]
+        cipher: Option<String>,
+    },
     /// Show vfs version and feature capabilities
     Version {
         /// Emit machine-readable JSON
@@ -879,6 +897,25 @@ mod tests {
         match args.command {
             Command::Version { json } => assert!(json),
             other => panic!("expected version command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn status_json_option_parses() {
+        let args = Args::try_parse_from(["vfs", "status", "session-1", "--json"]).unwrap();
+        match args.command {
+            Command::Status {
+                session_id,
+                json,
+                key,
+                cipher,
+            } => {
+                assert_eq!(session_id, "session-1");
+                assert!(json);
+                assert!(key.is_none());
+                assert!(cipher.is_none());
+            }
+            other => panic!("expected status command, got {other:?}"),
         }
     }
 }

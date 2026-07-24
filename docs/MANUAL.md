@@ -432,6 +432,24 @@ vfs seed [OPTIONS] <SESSION_ID>
 - `--pin <COMMIT>` — Git commit used as the pristine portable base
 - `--json` — Emit machine-readable JSON (seed output is always JSON)
 
+### vfs status
+
+Show run session state for daemon preflight
+
+```
+vfs status [OPTIONS] <SESSION_ID>
+```
+
+**Arguments:**
+
+- `<SESSION_ID>` — Run session identifier
+
+**Options:**
+
+- `--json` — Emit machine-readable JSON (status output is always JSON)
+- `--key <KEY>` — Hex-encoded encryption key for an encrypted session database [env: VFS_KEY]
+- `--cipher <CIPHER>` — Encryption cipher (required with --key) [env: VFS_CIPHER]
+
 ### vfs version
 
 Show vfs version and feature capabilities
@@ -617,8 +635,77 @@ single-file transfer artifact. Pack owns the operation end to end:
    a no-replace hard link, so a concurrently-created target is never
    overwritten. Backup cleanup occurs only after both publications succeed.
 
-The transfer artifact is only `delta.db`; `procs/`, `mnt/`, `base_path`, and
-other session-directory runtime files are never included.
+The packed transfer artifact is only `delta.db`; `procs/`, `mnt/`,
+`.session.lock`, `base_path`, and other session-directory files are never
+included in that artifact.
+
+### Externally materialized run sessions
+
+The receiver contract for an externally materialized session is exactly:
+
+```text
+~/.vfs/run/<session-id>/
+├── delta.db
+└── base_path
+```
+
+- `delta.db` is the packed database produced by `vfs pack`.
+- `base_path` is a UTF-8 text file containing the absolute path of the
+  receiver's existing base checkout. The path must name a directory.
+- The receiver does not create `mnt/`, `procs/`, `.session.lock`, SQLite
+  sidecars, or any other state. `vfs run --session <session-id>` creates or
+  recovers those runtime artifacts lazily.
+- A later invocation may start from any host working directory; the persisted
+  `base_path` remains the session base.
+
+After writing those two files, resume the session with:
+
+```bash
+vfs run --session <session-id> -- <command>
+```
+
+### Run session status
+
+`vfs status <session-id> --json` emits one JSON object:
+
+```json
+{
+  "sessionId": "<session-id>",
+  "state": "stopped",
+  "mounted": false,
+  "pid": null,
+  "generation": 1,
+  "seeded": false
+}
+```
+
+`state` is `stopped`, `busy`, `live`, or `stale-recovered`. `busy` means an
+exclusive seed, pack, or first-start transition owns the session; its `pid` is
+`null`, and metadata fields are conservative defaults until the transition
+finishes. For `live`, `pid` is the run owner PID. `generation` is the pack
+generation (`0` before the first pack), and `seeded` reports whether seed
+metadata is present. Status preflight takes the session lock; when no owner
+exists, it also recovers an interrupted pack publication, detaches a stale
+mount, and removes stale process records before reporting `stale-recovered`.
+
+## Exit status
+
+`vfs run` preserves the wrapped command's exit status. A command terminated by
+a signal uses the conventional `128 + signal` status. Startup failures use
+these reserved statuses before the wrapped command begins:
+
+| Status | Meaning |
+|--------|---------|
+| `1` | General CLI failure not assigned a more specific status |
+| `2` | Command-line usage or argument parsing failure |
+| `3` | The requested session is genuinely live; `run`, `pack`, or `seed` cannot take exclusive ownership |
+| `4` | `vfs run` could not create, recover, or install the session mount/sandbox |
+| `5` | The requested run session ID or externally materialized session directory is missing, malformed, or invalid |
+| `126` | The wrapped command was found but could not be executed |
+| `127` | The wrapped command was not found |
+
+Once the wrapped command starts, its status is passed through unchanged and
+may numerically coincide with a reserved startup status.
 
 ## MCP Server (`vfs serve mcp`)
 
