@@ -59,6 +59,31 @@ pub(crate) fn write_proc_file(
     Ok(())
 }
 
+/// Proc-file registration removed automatically on ordinary error returns.
+pub(crate) struct ProcRegistration {
+    session_id: String,
+}
+
+impl ProcRegistration {
+    pub(crate) fn register(
+        session_id: &str,
+        owner: bool,
+        command: &str,
+        cwd: &Path,
+    ) -> Result<Self> {
+        write_proc_file(session_id, owner, command, cwd)?;
+        Ok(Self {
+            session_id: session_id.to_string(),
+        })
+    }
+}
+
+impl Drop for ProcRegistration {
+    fn drop(&mut self) {
+        remove_proc_file(&self.session_id);
+    }
+}
+
 /// Remove the proc file for the current process.
 pub(crate) fn remove_proc_file(session_id: &str) {
     let pid = std::process::id();
@@ -92,6 +117,22 @@ struct SessionInfo {
 /// Get the set of active session IDs.
 pub(crate) fn active_session_ids() -> std::collections::HashSet<String> {
     list_sessions().into_iter().map(|s| s.session_id).collect()
+}
+
+/// Return whether a specific procs directory contains any live process.
+pub(crate) fn procs_dir_has_live_processes(procs_dir: &Path) -> bool {
+    let proc_entries = match std::fs::read_dir(procs_dir) {
+        Ok(entries) => entries,
+        Err(_) => return false,
+    };
+    proc_entries
+        .flatten()
+        .any(|entry| read_proc_file_if_alive(&entry.path()).is_some())
+}
+
+/// Remove the empty proc-state directory after all guards have dropped.
+pub(crate) fn cleanup_session_proc_state(session_id: &str) {
+    let _ = std::fs::remove_dir(procs_dir(session_id));
 }
 
 /// Read and validate a proc file, cleaning up stale entries.

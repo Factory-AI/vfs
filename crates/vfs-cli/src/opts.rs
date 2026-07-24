@@ -431,6 +431,34 @@ pub enum Command {
         #[command(subcommand)]
         command: ServeCommand,
     },
+    /// Prepare an inactive run session database for transfer
+    Pack {
+        /// Run session identifier
+        #[arg(value_name = "SESSION_ID")]
+        session_id: String,
+
+        /// Additional delta path glob to prune (can be specified multiple times)
+        #[arg(long, value_name = "GLOB")]
+        prune: Vec<String>,
+
+        /// Disable the default generated-artifact prune globs
+        #[arg(long)]
+        no_default_prunes: bool,
+
+        /// Copy the packed database to this path
+        #[arg(long, value_name = "PATH")]
+        output: Option<PathBuf>,
+
+        /// Emit machine-readable JSON (pack output is always JSON)
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show vfs version and feature capabilities
+    Version {
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// List active vfs run sessions
     Ps,
     /// Prune unused resources
@@ -761,6 +789,48 @@ mod tests {
                 assert_eq!(mountpoint, Some(PathBuf::from("/tmp/vfs-mnt")));
             }
             other => panic!("expected mount command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pack_options_parse() {
+        let args = Args::try_parse_from([
+            "vfs",
+            "pack",
+            "session-1",
+            "--prune",
+            "**/.cache/**",
+            "--no-default-prunes",
+            "--output",
+            "/tmp/packed.db",
+            "--json",
+        ])
+        .unwrap();
+
+        match args.command {
+            Command::Pack {
+                session_id,
+                prune,
+                no_default_prunes,
+                output,
+                json,
+            } => {
+                assert_eq!(session_id, "session-1");
+                assert_eq!(prune, vec!["**/.cache/**"]);
+                assert!(no_default_prunes);
+                assert_eq!(output, Some(PathBuf::from("/tmp/packed.db")));
+                assert!(json);
+            }
+            other => panic!("expected pack command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn version_json_option_parses() {
+        let args = Args::try_parse_from(["vfs", "version", "--json"]).unwrap();
+        match args.command {
+            Command::Version { json } => assert!(json),
+            other => panic!("expected version command, got {other:?}"),
         }
     }
 }

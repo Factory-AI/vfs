@@ -393,6 +393,37 @@ vfs serve mcp [OPTIONS] <ID_OR_PATH>
 
 - `--tools <TOOLS>` — Tools to expose (comma-separated). If not provided, all tools are exposed. Available tools: read_file, write_file, readdir, mkdir, remove, rename, stat, access, kv_get, kv_set, kv_delete, kv_list
 
+### vfs pack
+
+Prepare an inactive run session database for transfer
+
+```
+vfs pack [OPTIONS] <SESSION_ID>
+```
+
+**Arguments:**
+
+- `<SESSION_ID>` — Run session identifier
+
+**Options:**
+
+- `--prune <GLOB>` — Additional delta path glob to prune (can be specified multiple times)
+- `--no-default-prunes` — Disable the default generated-artifact prune globs
+- `--output <PATH>` — Copy the packed database to this path
+- `--json` — Emit machine-readable JSON (pack output is always JSON)
+
+### vfs version
+
+Show vfs version and feature capabilities
+
+```
+vfs version [OPTIONS]
+```
+
+**Options:**
+
+- `--json` — Emit machine-readable JSON
+
 ### vfs ps
 
 List active vfs run sessions
@@ -503,6 +534,37 @@ vfs migrate [OPTIONS] <ID_OR_PATH>
 - `--cipher <CIPHER>` — Encryption cipher (required with --key)
 
 <!-- END GENERATED COMMAND REFERENCE -->
+
+## Packing run sessions
+
+`vfs pack <session-id>` prepares `~/.vfs/run/<session-id>/delta.db` as a
+single-file transfer artifact. Pack owns the operation end to end:
+
+1. Every owner/joiner holds a shared advisory lock on `.session.lock` for its
+   lifetime; pack must acquire the exclusive lock before it can inspect or
+   publish the session. Kernel lock release on process death prevents stale
+   lock files from wedging a session.
+2. It rejects live mounts and live owner/joiner proc records with exit code
+   `3` and the message `session still running; exit the wrapped process first`.
+3. It copies the SQLite main database and any WAL/SHM sidecars to a private
+   staging family. Pruning, schema migration, generation increment, checkpoint,
+   and compaction happen only on that copy.
+4. Pruning removes matching delta dentries/inodes through the core filesystem
+   API. It never creates whiteouts: a pruned delta-only path disappears, while
+   a pruned path that shadowed the base falls back to the base version.
+5. The Turso engine currently implements compaction as `VACUUM INTO` rather
+   than in-place `VACUUM`; pack checkpoints the resulting database and removes
+   its sidecars before publication.
+6. Publication renames the old live database family to a deterministic private
+   backup, renames the completed single-file staging database into place,
+   verifies its metadata, and rolls back on any publication failure. A later
+   pack recovers that backup if the process died between renames. An `--output`
+   artifact is copied from the same completed staging bytes and published with
+   a no-replace hard link, so a concurrently-created target is never
+   overwritten. Backup cleanup occurs only after both publications succeed.
+
+The transfer artifact is only `delta.db`; `procs/`, `mnt/`, `base_path`, and
+other session-directory runtime files are never included.
 
 ## MCP Server (`vfs serve mcp`)
 
