@@ -2,11 +2,11 @@
 """Validate that metadata-class mutations never touch the real base tree.
 
 Exercises create / overwrite / truncate / rename / unlink / chmod / utimens and a
-concurrent read-after-write through an AgentFS mount, then asserts:
+concurrent read-after-write through a Vfs mount, then asserts:
 
   1. the host base tree is byte- and metadata-identical before and after the run
      (every mutation must land in the single delta database, never the base);
-  2. a fresh AgentFS run over the same session database reproduces every mutation
+  2. a fresh Vfs run over the same session database reproduces every mutation
      (proving the virtual state is fully persisted in the single file, with no
      hidden host-side state).
 
@@ -179,7 +179,7 @@ def env_flag(name: str) -> bool:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--agentfs-bin", default=os.environ.get("AGENTFS_BIN"))
+    parser.add_argument("--vfs-bin", default=os.environ.get("VFS_BIN"))
     parser.add_argument("--session", default=None)
     parser.add_argument("--timeout", type=positive_float, default=120.0)
     parser.add_argument("--output", default=None)
@@ -188,7 +188,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--profile",
         dest="profile",
         action="store_true",
-        default=env_flag("AGENTFS_PROFILE"),
+        default=env_flag("VFS_PROFILE"),
     )
     parser.add_argument("--keep-temp", action="store_true", default=env_flag("KEEP_TEMP"))
     return parser.parse_args(argv)
@@ -268,23 +268,23 @@ def parse_json_stdout(run: dict[str, Any]) -> Optional[dict[str, Any]]:
     return None
 
 
-def resolve_agentfs_bin(agentfs_bin: Optional[str], repo_root: Path) -> str:
-    if agentfs_bin:
-        candidate = Path(agentfs_bin).expanduser()
+def resolve_vfs_bin(vfs_bin: Optional[str], repo_root: Path) -> str:
+    if vfs_bin:
+        candidate = Path(vfs_bin).expanduser()
         if candidate.is_file() and os.access(candidate, os.X_OK):
             return str(candidate.resolve())
-        if os.sep not in agentfs_bin:
-            found = shutil.which(agentfs_bin)
+        if os.sep not in vfs_bin:
+            found = shutil.which(vfs_bin)
             if found:
                 return found
-        raise RuntimeError(f"agentfs binary not found or not executable: {agentfs_bin}")
+        raise RuntimeError(f"vfs binary not found or not executable: {vfs_bin}")
     for candidate in (
-        repo_root / "cli" / "target" / "release" / "agentfs",
-        repo_root / "cli" / "target" / "debug" / "agentfs",
+        repo_root / "cli" / "target" / "release" / "vfs",
+        repo_root / "cli" / "target" / "debug" / "vfs",
     ):
         if candidate.is_file() and os.access(candidate, os.X_OK):
             return str(candidate)
-    raise RuntimeError("no agentfs binary found; pass --agentfs-bin or set AGENTFS_BIN")
+    raise RuntimeError("no vfs binary found; pass --vfs-bin or set VFS_BIN")
 
 
 def prepare_environment(temp_root: Path, profile: bool) -> dict[str, str]:
@@ -292,9 +292,9 @@ def prepare_environment(temp_root: Path, profile: bool) -> dict[str, str]:
     env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
     env.setdefault("NO_COLOR", "1")
     if profile:
-        env["AGENTFS_PROFILE"] = "1"
+        env["VFS_PROFILE"] = "1"
     else:
-        env.pop("AGENTFS_PROFILE", None)
+        env.pop("VFS_PROFILE", None)
     home = temp_root / "home"
     for path in (home, home / ".config", home / ".cache", home / ".local" / "share"):
         path.mkdir(parents=True, exist_ok=True)
@@ -348,9 +348,9 @@ def tree_hash(root: Path) -> dict[str, Any]:
     return {"sha256": digest.hexdigest(), "file_count": file_count}
 
 
-def agentfs_run_command(agentfs_bin: str, session: str, workload: str) -> list[str]:
+def vfs_run_command(vfs_bin: str, session: str, workload: str) -> list[str]:
     return [
-        agentfs_bin,
+        vfs_bin,
         "run",
         "--session",
         session,
@@ -407,15 +407,15 @@ def main(argv: list[str]) -> int:
     repo_root = Path(__file__).resolve().parents[2]
 
     if args.keep_temp:
-        temp_root = Path(tempfile.mkdtemp(prefix="agentfs-mutation-no-real-write-"))
+        temp_root = Path(tempfile.mkdtemp(prefix="vfs-mutation-no-real-write-"))
         temp_manager = None
     else:
-        temp_manager = tempfile.TemporaryDirectory(prefix="agentfs-mutation-no-real-write-")
+        temp_manager = tempfile.TemporaryDirectory(prefix="vfs-mutation-no-real-write-")
         temp_root = Path(temp_manager.name)
 
     exit_code = 0
     try:
-        agentfs_bin = resolve_agentfs_bin(args.agentfs_bin, repo_root)
+        vfs_bin = resolve_vfs_bin(args.vfs_bin, repo_root)
         env = prepare_environment(temp_root, args.profile)
         session = args.session or f"mutation-no-real-write-{uuid.uuid4().hex}"
         base_root = temp_root / "base"
@@ -423,14 +423,14 @@ def main(argv: list[str]) -> int:
 
         before = tree_hash(base_root)
         mutation_run = run_subprocess(
-            agentfs_run_command(agentfs_bin, session, MUTATION_WORKLOAD),
+            vfs_run_command(vfs_bin, session, MUTATION_WORKLOAD),
             base_root,
             env,
             args.timeout,
         )
         after = tree_hash(base_root)
         verify_run = run_subprocess(
-            agentfs_run_command(agentfs_bin, session, VERIFY_WORKLOAD),
+            vfs_run_command(vfs_bin, session, VERIFY_WORKLOAD),
             base_root,
             env,
             args.timeout,
@@ -439,11 +439,11 @@ def main(argv: list[str]) -> int:
 
         mutation_json = parse_json_stdout(mutation_run)
         verify_json = parse_json_stdout(verify_run)
-        db_path = Path(env["HOME"]) / ".agentfs" / "run" / session / "delta.db"
+        db_path = Path(env["HOME"]) / ".vfs" / "run" / session / "delta.db"
 
         checks = evaluate(mutation_json, verify_json)
-        checks["agentfs_mutation_rc_zero"] = mutation_run["returncode"] == 0
-        checks["agentfs_verify_rc_zero"] = verify_run["returncode"] == 0
+        checks["vfs_mutation_rc_zero"] = mutation_run["returncode"] == 0
+        checks["vfs_verify_rc_zero"] = verify_run["returncode"] == 0
         checks["base_unchanged_after_mutation"] = before["sha256"] == after["sha256"]
         checks["base_unchanged_after_remount"] = before["sha256"] == after_remount["sha256"]
         passed = all(bool(v) for v in checks.values())
@@ -453,8 +453,8 @@ def main(argv: list[str]) -> int:
         result = {
             "schema_version": 1,
             "benchmark": "metadata-mutation-no-real-write",
-            "agentfs": {
-                "bin": agentfs_bin,
+            "vfs": {
+                "bin": vfs_bin,
                 "session": session,
                 "db_path": str(db_path),
                 "profile_enabled": args.profile,

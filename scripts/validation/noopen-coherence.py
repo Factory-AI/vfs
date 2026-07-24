@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Coherence around zero-message opens (AGENTFS_FUSE_NOOPEN / kernel no_open).
+"""Coherence around zero-message opens (VFS_FUSE_NOOPEN / kernel no_open).
 
 With the kernel's `no_open` latched, open(2)/close(2) complete with no FUSE
 request, all file I/O arrives with `fh=0`, and FUSE_RELEASE is skipped for
@@ -7,17 +7,17 @@ every file (including CREATE-opened ones). The adapter serves that traffic
 from a shared per-inode file table resolved on first I/O. This script hammers
 the seams of that model:
 
-  exec scenarios (pure AgentFS db):
+  exec scenarios (pure Vfs db):
     - write -> close -> immediately stat / scandir / hardlink-stat / re-read
       (race loop, absolute size asserts);
     - ftruncate through an fd (SETATTR arrives with fh=0);
     - O_TRUNC reopen (delivered as SETATTR size=0, never atomic);
     - mmap shared-write + msync;
     - fd kept open across an unlink (per-ino file must keep serving);
-    - a small AGENTFS_FUSE_INO_FILES_CAP config that forces soft-cap
+    - a small VFS_FUSE_INO_FILES_CAP config that forces soft-cap
       eviction + re-resolution mid-workload.
 
-  overlay scenario (agentfs run --session over a base tree):
+  overlay scenario (vfs run --session over a base tree):
     - read a base file (read-only resolution = host passthrough), append to
       it (write upgrade -> copy-up replaces the per-ino file), then re-read
       through fresh fds and verify base+append content and sizes.
@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from lib.common import resolve_agentfs_bin, tail_text  # noqa: E402
+from lib.common import resolve_vfs_bin, tail_text  # noqa: E402
 
 EXEC_WORKLOAD = r'''
 import ctypes
@@ -177,7 +177,7 @@ def parse_workload_json(stdout: str) -> Optional[dict[str, Any]]:
 
 def parse_fuse_counters(output: str) -> Optional[dict[str, Any]]:
     for line in reversed(output.splitlines()):
-        if '"agentfs_profile_summary"' not in line:
+        if '"vfs_profile_summary"' not in line:
             continue
         start = line.find("{")
         if start < 0:
@@ -238,14 +238,14 @@ def run_one(
 def cleanup_run_session_dir(session_id: str) -> None:
     """Remove exactly the session dir a run leg created.
 
-    Never sweeps ~/.agentfs/run wholesale (the user may have real sessions
+    Never sweeps ~/.vfs/run wholesale (the user may have real sessions
     there), and never raises: this runs in a finally block, so an exception
     here would mask the leg's real failure. If the leg died with its FUSE
     mount still live or wedged, stats under the mountpoint fail (ENOTCONN)
     and a bare rmtree would silently leave the dir behind — detach the mount
     first so the dir actually goes away.
     """
-    session_dir = Path.home() / ".agentfs" / "run" / session_id
+    session_dir = Path.home() / ".vfs" / "run" / session_id
     mountpoint = session_dir / "mnt"
     try:
         os.stat(mountpoint)
@@ -269,50 +269,50 @@ def cleanup_run_session_dir(session_id: str) -> None:
 
 def base_env(extra: dict[str, str]) -> dict[str, str]:
     env = os.environ.copy()
-    env["AGENTFS_PROFILE"] = "1"
-    env.pop("AGENTFS_FUSE_INO_FILES_CAP", None)
+    env["VFS_PROFILE"] = "1"
+    env.pop("VFS_FUSE_INO_FILES_CAP", None)
     env.update(extra)
     return env
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--agentfs-bin", default=os.environ.get("AGENTFS_BIN"))
+    parser.add_argument("--vfs-bin", default=os.environ.get("VFS_BIN"))
     parser.add_argument("--iterations", type=int, default=60)
     parser.add_argument("--timeout", type=float, default=600.0)
     parser.add_argument("--output", default=None)
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parents[2]
-    agentfs_bin = resolve_agentfs_bin(args.agentfs_bin, repo_root)
+    vfs_bin = resolve_vfs_bin(args.vfs_bin, repo_root)
 
     exec_configs = [
-        ("exec_noopen_off", {"AGENTFS_FUSE_NOOPEN": "0"}, False),
-        ("exec_noopen_on", {"AGENTFS_FUSE_NOOPEN": "1"}, True),
+        ("exec_noopen_off", {"VFS_FUSE_NOOPEN": "0"}, False),
+        ("exec_noopen_on", {"VFS_FUSE_NOOPEN": "1"}, True),
         (
             "exec_noopen_ttl0",
-            {"AGENTFS_FUSE_NOOPEN": "1", "AGENTFS_FUSE_ENTRY_TTL_MS": "0"},
+            {"VFS_FUSE_NOOPEN": "1", "VFS_FUSE_ENTRY_TTL_MS": "0"},
             True,
         ),
         (
             "exec_noopen_smallcap",
-            {"AGENTFS_FUSE_NOOPEN": "1", "AGENTFS_FUSE_INO_FILES_CAP": "16"},
+            {"VFS_FUSE_NOOPEN": "1", "VFS_FUSE_INO_FILES_CAP": "16"},
             True,
         ),
     ]
     overlay_configs = [
-        ("overlay_noopen_off", {"AGENTFS_FUSE_NOOPEN": "0"}, False),
-        ("overlay_noopen_on", {"AGENTFS_FUSE_NOOPEN": "1"}, True),
+        ("overlay_noopen_off", {"VFS_FUSE_NOOPEN": "0"}, False),
+        ("overlay_noopen_on", {"VFS_FUSE_NOOPEN": "1"}, True),
     ]
 
     runs = []
-    with tempfile.TemporaryDirectory(prefix="agentfs-noopen-coherence-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="vfs-noopen-coherence-") as tmp:
         temp_root = Path(tmp)
         for label, extra, noopen in exec_configs:
             db = temp_root / f"{label}.db"
             db.touch()
             argv = [
-                agentfs_bin,
+                vfs_bin,
                 "exec",
                 str(db),
                 sys.executable,
@@ -331,7 +331,7 @@ def main() -> int:
             (base_root / "base.txt").write_bytes(b"base-content\n")
             session_id = f"noopen-coh-{uuid.uuid4().hex[:8]}"
             argv = [
-                agentfs_bin,
+                vfs_bin,
                 "run",
                 "--session",
                 session_id,
@@ -354,7 +354,7 @@ def main() -> int:
 
     report = {
         "schema_version": 1,
-        "agentfs_bin": agentfs_bin,
+        "vfs_bin": vfs_bin,
         "iterations": args.iterations,
         "noopen_resolutions_total": resolutions,
         "noopen_upgrades_total": upgrades,
@@ -363,7 +363,7 @@ def main() -> int:
     }
     output = args.output or os.path.join(
         tempfile.gettempdir(),
-        f"agentfs-noopen-coherence-{time.strftime('%Y%m%d-%H%M%S')}.json",
+        f"vfs-noopen-coherence-{time.strftime('%Y%m%d-%H%M%S')}.json",
     )
     Path(output).write_text(json.dumps(report, indent=2))
 

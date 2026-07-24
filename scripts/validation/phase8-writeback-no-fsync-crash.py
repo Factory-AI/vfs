@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Phase 8 no-fsync writeback crash consistency gate.
 
-Writes bytes through AgentFS without fsync, SIGKILLs the mount while the file is
+Writes bytes through Vfs without fsync, SIGKILLs the mount while the file is
 still open, remounts the same DB, and requires portable integrity plus an
 unchanged base tree. The written data may be absent or a prefix of the payload,
 but arbitrary corrupt bytes fail the gate.
@@ -38,13 +38,13 @@ common = load_common()
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Verify no-fsync AgentFS crash leaves a remountable, portable, base-preserving DB."
+        description="Verify no-fsync Vfs crash leaves a remountable, portable, base-preserving DB."
     )
     parser.add_argument("--write-bytes", type=common.positive_int, default=8192)
     parser.add_argument(
-        "--agentfs-bin",
-        default=os.environ.get("AGENTFS_BIN"),
-        help="agentfs executable path/name (default: repo target binary, building cli if needed)",
+        "--vfs-bin",
+        default=os.environ.get("VFS_BIN"),
+        help="vfs executable path/name (default: repo target binary, building cli if needed)",
     )
     parser.add_argument(
         "--timeout",
@@ -60,7 +60,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def default_output_path() -> Path:
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    return Path(tempfile.gettempdir()) / f"agentfs-phase8-writeback-no-fsync-{stamp}-{uuid.uuid4().hex[:8]}.json"
+    return Path(tempfile.gettempdir()) / f"vfs-phase8-writeback-no-fsync-{stamp}-{uuid.uuid4().hex[:8]}.json"
 
 
 def classify_remount_read(read_bytes: bytes, expected: bytes, read_error: Optional[str], error_kind: Optional[str]) -> dict[str, Any]:
@@ -109,10 +109,10 @@ def main(argv: list[str]) -> int:
 
     temp_manager: Optional[tempfile.TemporaryDirectory[str]] = None
     if args.keep_temp:
-        temp_root = Path(tempfile.mkdtemp(prefix="agentfs-phase8-writeback-no-fsync-"))
+        temp_root = Path(tempfile.mkdtemp(prefix="vfs-phase8-writeback-no-fsync-"))
     else:
         temp_manager = tempfile.TemporaryDirectory(
-            prefix="agentfs-phase8-writeback-no-fsync-",
+            prefix="vfs-phase8-writeback-no-fsync-",
             ignore_cleanup_errors=True,
         )
         temp_root = Path(temp_manager.name)
@@ -123,26 +123,26 @@ def main(argv: list[str]) -> int:
     exit_code = 0
     result: dict[str, Any]
     try:
-        agentfs_bin = common.resolve_agentfs_bin(args.agentfs_bin, repo_root)
+        vfs_bin = common.resolve_vfs_bin(args.vfs_bin, repo_root)
         env = common.prepare_environment(temp_root)
         session = args.session or f"phase8-no-fsync-{uuid.uuid4().hex}"
         base_root = temp_root / "base"
         common.create_base_fixture(base_root)
         base_before = common.tree_hash(base_root)
-        db_path = temp_root / ".agentfs" / f"{session}.db"
+        db_path = temp_root / ".vfs" / f"{session}.db"
 
         init_run = common.run_subprocess(
-            [agentfs_bin, "init", "--force", "--base", str(base_root), session],
+            [vfs_bin, "init", "--force", "--base", str(base_root), session],
             temp_root,
             env,
             args.timeout,
         )
         if init_run["returncode"] != 0:
-            raise RuntimeError(f"agentfs init failed: {init_run['stderr_tail']}")
+            raise RuntimeError(f"vfs init failed: {init_run['stderr_tail']}")
 
         mountpoint = temp_root / "mnt"
         mountpoint.mkdir(parents=True, exist_ok=True)
-        mount_proc, mount_start = common.start_mount(agentfs_bin, session, mountpoint, env, args.timeout)
+        mount_proc, mount_start = common.start_mount(vfs_bin, session, mountpoint, env, args.timeout)
         expected = common.deterministic_bytes(args.write_bytes)
         write_path = mountpoint / "no_fsync_crash.bin"
         started_write = time.perf_counter()
@@ -186,7 +186,7 @@ def main(argv: list[str]) -> int:
             "fsync_called": False,
         }
 
-        remount_proc, remount_start = common.start_mount(agentfs_bin, session, mountpoint, env, args.timeout)
+        remount_proc, remount_start = common.start_mount(vfs_bin, session, mountpoint, env, args.timeout)
         read_error = None
         error_kind = None
         read_bytes = b""
@@ -199,7 +199,7 @@ def main(argv: list[str]) -> int:
         clean_unmount = common.stop_mount_clean(remount_proc, mountpoint)
         remount_proc = None
 
-        integrity = common.run_integrity(agentfs_bin, db_path, temp_root, env, args.timeout)
+        integrity = common.run_integrity(vfs_bin, db_path, temp_root, env, args.timeout)
         db_inspect = common.inspect_db(db_path)
         sidecars = common.sidecar_status(db_path)
         base_after = common.tree_hash(base_root)
@@ -224,7 +224,7 @@ def main(argv: list[str]) -> int:
             "benchmark": "phase8-writeback-no-fsync-crash",
             "git_commit": common.git_commit(repo_root),
             "parameters": {"write_bytes": args.write_bytes, "timeout_seconds": args.timeout},
-            "agentfs": {"bin": agentfs_bin, "session": session, "db_path": str(db_path)},
+            "vfs": {"bin": vfs_bin, "session": session, "db_path": str(db_path)},
             "summary": {
                 "passed": passed,
                 "data_state_after_remount": remount_read["state"],

@@ -97,7 +97,7 @@ jobs:
     - name: Allow unprivileged user namespaces
       run: |
         # Ubuntu 24.04 runner images gate unprivileged user namespaces behind
-        # AppArmor; without this the agentfs run suites SKIP and the strict
+        # AppArmor; without this the vfs run suites SKIP and the strict
         # gate goes red instead of exercising the sandbox for real.
         sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
@@ -120,10 +120,10 @@ jobs:
         # fails the strict gate. The corruption-torture uring leg needs no
         # entry: with enable_uring=N the mount falls back to the legacy
         # channel and the leg passes.
-        AGENTFS_GATE_ALLOWED_SKIPS: fuse-sigint-panic-census
+        VFS_GATE_ALLOWED_SKIPS: fuse-sigint-panic-census
       run: |
-        # scripts/gate.sh runs crates/agentfs-cli/tests/all.sh with
-        # AGENTFS_GATE_STRICT=1, then phase8-validation.py --smoke (which
+        # scripts/gate.sh runs crates/vfs-cli/tests/all.sh with
+        # VFS_GATE_STRICT=1, then phase8-validation.py --smoke (which
         # includes the noopen/flush/base-drift coherence harnesses) and the
         # consistency-canon census.
         scripts/gate.sh
@@ -131,7 +131,7 @@ jobs:
     - name: Run pjdfstest phase5-ci
       run: |
         scripts/validation/posix/run-pjdfstest.sh \
-          --agentfs-bin "$PWD/target/release/agentfs" \
+          --vfs-bin "$PWD/target/release/vfs" \
           --pjdfstest-dir /tmp/pjdfstest \
           --profile phase5-ci
 

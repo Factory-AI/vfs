@@ -70,7 +70,7 @@ def refresh_lockfile(root: Path, dry_run: bool) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Update the AgentFS workspace version")
+    parser = argparse.ArgumentParser(description="Update the Vfs workspace version")
     parser.add_argument("version", help="Version number, for example 0.6.5 or 0.7.0-pre.1")
     parser.add_argument("--dry-run", action="store_true", help="Print changes without writing files")
     args = parser.parse_args()

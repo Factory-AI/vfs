@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Phase 0 native-vs-AgentFS workload baseline harness."""
+"""Phase 0 native-vs-Vfs workload baseline harness."""
 
 from __future__ import annotations
 
@@ -104,7 +104,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Compare a workload on native filesystem storage against the same "
-            "workload under an AgentFS copy-on-write overlay."
+            "workload under a Vfs copy-on-write overlay."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
@@ -119,8 +119,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
   scripts/validation/workload-baseline.py --source /path/to/factory-mono -- cargo test -p crate
 
 Environment:
-  AGENTFS_BIN                 path/name of agentfs executable
-  AGENTFS_PROFILE             set to 1 to emit AgentFS profiling summaries
+  VFS_BIN                 path/name of vfs executable
+  VFS_PROFILE             set to 1 to emit Vfs profiling summaries
   WORKLOAD_BASELINE_COMMAND  shell command to run when --command is omitted
   WORKLOAD_BASELINE_SOURCE   source tree to copy when --source is omitted
 """,
@@ -140,13 +140,13 @@ Environment:
         "-c",
         "--command",
         default=os.environ.get("WORKLOAD_BASELINE_COMMAND"),
-        help="shell command to run in native and AgentFS worktrees",
+        help="shell command to run in native and Vfs worktrees",
     )
     parser.add_argument(
         "--iterations",
         type=positive_int,
         default=positive_int(os.environ.get("WORKLOAD_BASELINE_ITERATIONS", "1")),
-        help="number of fresh native/AgentFS comparisons to run (default: 1)",
+        help="number of fresh native/Vfs comparisons to run (default: 1)",
     )
     parser.add_argument(
         "--timeout",
@@ -155,14 +155,14 @@ Environment:
         help="per-command timeout in seconds (default: 120)",
     )
     parser.add_argument(
-        "--agentfs-bin",
-        default=os.environ.get("AGENTFS_BIN"),
-        help="agentfs executable path/name (default: repo target binary, building cli if needed)",
+        "--vfs-bin",
+        default=os.environ.get("VFS_BIN"),
+        help="vfs executable path/name (default: repo target binary, building cli if needed)",
     )
     parser.add_argument(
         "--compare-stdout",
         action="store_true",
-        help="command mode: fail if native and AgentFS stdout differ exactly",
+        help="command mode: fail if native and Vfs stdout differ exactly",
     )
     parser.add_argument(
         "--keep-temp",
@@ -223,20 +223,20 @@ Environment:
     return args
 
 
-def resolve_agentfs_bin(agentfs_bin: Optional[str], repo_root: Path) -> str:
-    if agentfs_bin:
-        candidate_path = Path(agentfs_bin).expanduser()
+def resolve_vfs_bin(vfs_bin: Optional[str], repo_root: Path) -> str:
+    if vfs_bin:
+        candidate_path = Path(vfs_bin).expanduser()
         if candidate_path.is_file() and os.access(candidate_path, os.X_OK):
             return str(candidate_path.resolve())
-        if os.sep not in agentfs_bin:
-            found = shutil.which(agentfs_bin)
+        if os.sep not in vfs_bin:
+            found = shutil.which(vfs_bin)
             if found:
                 return found
-        raise RuntimeError(f"configured agentfs executable not found or not executable: {agentfs_bin}")
+        raise RuntimeError(f"configured vfs executable not found or not executable: {vfs_bin}")
 
     for candidate_path in (
-        repo_root / "cli" / "target" / "debug" / "agentfs",
-        repo_root / "cli" / "target" / "release" / "agentfs",
+        repo_root / "cli" / "target" / "debug" / "vfs",
+        repo_root / "cli" / "target" / "release" / "vfs",
     ):
         if candidate_path.is_file() and os.access(candidate_path, os.X_OK):
             return str(candidate_path)
@@ -250,12 +250,12 @@ def resolve_agentfs_bin(agentfs_bin: Optional[str], repo_root: Path) -> str:
     )
     if build.returncode != 0:
         raise RuntimeError(
-            "failed to build repo-local agentfs binary; set AGENTFS_BIN to an explicit binary\n"
+            "failed to build repo-local vfs binary; set VFS_BIN to an explicit binary\n"
             f"stdout:\n{tail_text(build.stdout)}\n"
             f"stderr:\n{tail_text(build.stderr)}"
         )
 
-    built = repo_root / "cli" / "target" / "debug" / "agentfs"
+    built = repo_root / "cli" / "target" / "debug" / "vfs"
     if built.is_file() and os.access(built, os.X_OK):
         return str(built)
 
@@ -297,15 +297,15 @@ def create_synthetic_tree(root: Path) -> None:
     docs.mkdir(parents=True, exist_ok=True)
     for index in range(4):
         (docs / f"note_{index:02d}.md").write_text(
-            f"# Synthetic note {index}\n\n" + ("AgentFS baseline data.\n" * 20),
+            f"# Synthetic note {index}\n\n" + ("Vfs baseline data.\n" * 20),
             encoding="utf-8",
         )
 
     (root / "pyproject.toml").write_text(
-        "[project]\nname = \"agentfs-baseline-synthetic\"\nversion = \"0.0.0\"\n",
+        "[project]\nname = \"vfs-baseline-synthetic\"\nversion = \"0.0.0\"\n",
         encoding="utf-8",
     )
-    (root / ".agentfs_baseline_workload.py").write_text(
+    (root / ".vfs_baseline_workload.py").write_text(
         SYNTHETIC_WORKLOAD,
         encoding="utf-8",
     )
@@ -324,7 +324,7 @@ def copy_source_tree(source: Path, destination: Path, excludes: list[str]) -> No
 
 def prepare_environment(temp_root: Path, preserve_home: bool) -> dict[str, str]:
     env = os.environ.copy()
-    env["AGENTFS_BASELINE"] = "1"
+    env["VFS_BASELINE"] = "1"
     env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
     env.setdefault("NO_COLOR", "1")
     temp_dir = temp_root / "tmp"
@@ -371,13 +371,13 @@ def extract_profile_summaries(stderr: Any) -> list[dict[str, Any]]:
     summaries: list[dict[str, Any]] = []
     for line in text.splitlines():
         line = line.strip()
-        if not line or "agentfs_profile_summary" not in line:
+        if not line or "vfs_profile_summary" not in line:
             continue
         try:
             value = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(value, dict) and value.get("event") == "agentfs_profile_summary":
+        if isinstance(value, dict) and value.get("event") == "vfs_profile_summary":
             summaries.append(value)
     return summaries
 
@@ -464,7 +464,7 @@ def terminate_process_tree(proc: subprocess.Popen[str]) -> None:
 
 def command_argv(args: argparse.Namespace) -> tuple[str, str, list[str]]:
     if args.mode == "synthetic":
-        return ("argv", f"{sys.executable} .agentfs_baseline_workload.py", [sys.executable, ".agentfs_baseline_workload.py"])
+        return ("argv", f"{sys.executable} .vfs_baseline_workload.py", [sys.executable, ".vfs_baseline_workload.py"])
     if args.command:
         return ("shell", args.command, ["sh", "-lc", args.command])
     return ("argv", " ".join(args.argv), args.argv)
@@ -472,12 +472,12 @@ def command_argv(args: argparse.Namespace) -> tuple[str, str, list[str]]:
 
 def prepare_roots(args: argparse.Namespace, iteration_dir: Path) -> tuple[Path, Path]:
     native_root = iteration_dir / "native"
-    agentfs_root = iteration_dir / "agentfs-base"
+    vfs_root = iteration_dir / "vfs-base"
 
     if args.mode == "synthetic":
         create_synthetic_tree(native_root)
-        create_synthetic_tree(agentfs_root)
-        return native_root, agentfs_root
+        create_synthetic_tree(vfs_root)
+        return native_root, vfs_root
 
     source = Path(args.source or ".").expanduser().resolve()
     if not source.is_dir():
@@ -487,19 +487,19 @@ def prepare_roots(args: argparse.Namespace, iteration_dir: Path) -> tuple[Path, 
         return source, source
 
     copy_source_tree(source, native_root, args.exclude)
-    copy_source_tree(source, agentfs_root, args.exclude)
-    return native_root, agentfs_root
+    copy_source_tree(source, vfs_root, args.exclude)
+    return native_root, vfs_root
 
 
 def summarize_runs(iterations: list[dict[str, Any]]) -> dict[str, Any]:
     native_durations = [item["native"]["duration_seconds"] for item in iterations]
-    agentfs_durations = [item["agentfs"]["duration_seconds"] for item in iterations]
+    vfs_durations = [item["vfs"]["duration_seconds"] for item in iterations]
     native_mean = mean(native_durations)
-    agentfs_mean = mean(agentfs_durations)
+    vfs_mean = mean(vfs_durations)
     return {
         "native_seconds": native_mean,
-        "agentfs_seconds": agentfs_mean,
-        "ratio": (agentfs_mean / native_mean) if native_mean > 0 else None,
+        "vfs_seconds": vfs_mean,
+        "ratio": (vfs_mean / native_mean) if native_mean > 0 else None,
     }
 
 
@@ -510,26 +510,26 @@ def parse_json_stdout(run: dict[str, Any]) -> Any:
     return json.loads(lines[-1])
 
 
-def compare_outputs(args: argparse.Namespace, native: dict[str, Any], agentfs: dict[str, Any]) -> dict[str, Any]:
-    if native["returncode"] != 0 or agentfs["returncode"] != 0:
+def compare_outputs(args: argparse.Namespace, native: dict[str, Any], vfs: dict[str, Any]) -> dict[str, Any]:
+    if native["returncode"] != 0 or vfs["returncode"] != 0:
         return {"checked": False, "reason": "non-zero return code"}
 
     if args.mode == "synthetic":
         native_json = parse_json_stdout(native)
-        agentfs_json = parse_json_stdout(agentfs)
+        vfs_json = parse_json_stdout(vfs)
         return {
             "checked": True,
             "kind": "synthetic-json-stdout",
-            "equivalent": native_json == agentfs_json,
+            "equivalent": native_json == vfs_json,
             "native": native_json,
-            "agentfs": agentfs_json,
+            "vfs": vfs_json,
         }
 
     if args.compare_stdout:
         return {
             "checked": True,
             "kind": "stdout-tail",
-            "equivalent": native["stdout_tail"] == agentfs["stdout_tail"],
+            "equivalent": native["stdout_tail"] == vfs["stdout_tail"],
         }
 
     return {"checked": False, "reason": "command mode requires --compare-stdout or external review"}
@@ -542,43 +542,43 @@ def main(argv: list[str]) -> int:
 
     temp_manager: Optional[tempfile.TemporaryDirectory[str]] = None
     if args.keep_temp:
-        temp_root = Path(tempfile.mkdtemp(prefix="agentfs-phase0-baseline-"))
+        temp_root = Path(tempfile.mkdtemp(prefix="vfs-phase0-baseline-"))
     else:
-        temp_manager = tempfile.TemporaryDirectory(prefix="agentfs-phase0-baseline-")
+        temp_manager = tempfile.TemporaryDirectory(prefix="vfs-phase0-baseline-")
         temp_root = Path(temp_manager.name)
 
     exit_code = 0
     result: dict[str, Any]
     try:
-        agentfs_bin = resolve_agentfs_bin(args.agentfs_bin, repo_root)
+        vfs_bin = resolve_vfs_bin(args.vfs_bin, repo_root)
         env = prepare_environment(temp_root, args.preserve_home)
         command_kind, command_display, native_command = command_argv(args)
-        agentfs_command = [agentfs_bin, "run", "--no-default-allows", "--"] + native_command
+        vfs_command = [vfs_bin, "run", "--no-default-allows", "--"] + native_command
 
         iterations = []
         for index in range(args.iterations):
             iteration_dir = temp_root / f"iteration-{index + 1:02d}"
             iteration_dir.mkdir(parents=True, exist_ok=True)
-            native_root, agentfs_root = prepare_roots(args, iteration_dir)
+            native_root, vfs_root = prepare_roots(args, iteration_dir)
 
             native = run_subprocess(native_command, native_root, env, args.timeout)
-            agentfs = run_subprocess(agentfs_command, agentfs_root, env, args.timeout)
-            equivalence = compare_outputs(args, native, agentfs)
+            vfs = run_subprocess(vfs_command, vfs_root, env, args.timeout)
+            equivalence = compare_outputs(args, native, vfs)
             ratio = None
             if native["duration_seconds"] > 0:
-                ratio = agentfs["duration_seconds"] / native["duration_seconds"]
+                ratio = vfs["duration_seconds"] / native["duration_seconds"]
             iterations.append(
                 {
                     "index": index + 1,
                     "native_root": str(native_root),
-                    "agentfs_base_root": str(agentfs_root),
+                    "vfs_base_root": str(vfs_root),
                     "native": native,
-                    "agentfs": agentfs,
+                    "vfs": vfs,
                     "equivalence": equivalence,
                     "ratio": ratio,
                 }
             )
-            if native["returncode"] != 0 or agentfs["returncode"] != 0:
+            if native["returncode"] != 0 or vfs["returncode"] != 0:
                 exit_code = 1
             if equivalence.get("checked") and not equivalence.get("equivalent"):
                 exit_code = 1
@@ -590,12 +590,12 @@ def main(argv: list[str]) -> int:
                 "kind": command_kind,
                 "display": command_display,
             },
-            "agentfs": {
-                "bin": agentfs_bin,
-                "overlay_command_prefix": [agentfs_bin, "run", "--no-default-allows", "--"],
-                "profile_enabled": env_flag("AGENTFS_PROFILE"),
+            "vfs": {
+                "bin": vfs_bin,
+                "overlay_command_prefix": [vfs_bin, "run", "--no-default-allows", "--"],
+                "profile_enabled": env_flag("VFS_PROFILE"),
                 "profile_summary_count": sum(
-                    len(item["agentfs"].get("profile_summaries", [])) for item in iterations
+                    len(item["vfs"].get("profile_summaries", [])) for item in iterations
                 ),
             },
             "source": {

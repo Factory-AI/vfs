@@ -1,28 +1,28 @@
 #!/usr/bin/env bash
 #
 # Validate the macOS NFS path for git loose-object writes (#333) and the
-# `agentfs run` seatbelt read-scoping posture (secret outside the allow
+# `vfs run` seatbelt read-scoping posture (secret outside the allow
 # list must be unreadable; `--allow` must make it readable).
 #
 # Usage:
-#   macos-nfs-git-validation.sh [--agentfs-bin PATH] [--report-dir DIR] [--keep-work]
+#   macos-nfs-git-validation.sh [--vfs-bin PATH] [--report-dir DIR] [--keep-work]
 #
 # Environment:
-#   AGENTFS_BIN  agentfs executable to invoke (default: agentfs)
+#   VFS_BIN  vfs executable to invoke (default: vfs)
 #   REPORT_DIR   directory where logs should be written
 #   SKIP_CODE    exit code for unsupported platform/prerequisites (default: 77)
 #
 set -Eeuo pipefail
 
 SKIP_CODE="${SKIP_CODE:-77}"
-AGENTFS_BIN="${AGENTFS_BIN:-agentfs}"
+VFS_BIN="${VFS_BIN:-vfs}"
 REPORT_DIR="${REPORT_DIR:-}"
 KEEP_WORK=0
 
 WORK_DIR=""
 MOUNT_DIR=""
 MOUNT_PID=""
-AGENTFS_RESOLVED=""
+VFS_RESOLVED=""
 RUN_WORK_DIR=""
 SECRET_DIR=""
 RUN_SESSION_DENY=""
@@ -37,12 +37,12 @@ skip() {
     exit "$SKIP_CODE"
 }
 
-resolve_agentfs() {
-    if [[ "$AGENTFS_BIN" == */* ]]; then
-        [[ -x "$AGENTFS_BIN" ]] || return 1
-        AGENTFS_RESOLVED="$AGENTFS_BIN"
+resolve_vfs() {
+    if [[ "$VFS_BIN" == */* ]]; then
+        [[ -x "$VFS_BIN" ]] || return 1
+        VFS_RESOLVED="$VFS_BIN"
     else
-        AGENTFS_RESOLVED="$(command -v "$AGENTFS_BIN" 2>/dev/null)" || return 1
+        VFS_RESOLVED="$(command -v "$VFS_BIN" 2>/dev/null)" || return 1
     fi
 }
 
@@ -50,7 +50,7 @@ safe_rm_tmp() {
     local path="$1"
     [[ -n "$path" ]] || return 0
     case "$path" in
-        /tmp/agentfs-macos-nfs-git-work.*|/tmp/agentfs-macos-nfs-git-mnt.*|/private/tmp/agentfs-macos-nfs-git-work.*|/private/tmp/agentfs-macos-nfs-git-mnt.*|/tmp/agentfs-macos-read-scope-work.*|/private/tmp/agentfs-macos-read-scope-work.*)
+        /tmp/vfs-macos-nfs-git-work.*|/tmp/vfs-macos-nfs-git-mnt.*|/private/tmp/vfs-macos-nfs-git-work.*|/private/tmp/vfs-macos-nfs-git-mnt.*|/tmp/vfs-macos-read-scope-work.*|/private/tmp/vfs-macos-read-scope-work.*)
             rm -rf -- "$path"
             ;;
         *)
@@ -63,7 +63,7 @@ safe_rm_secret_dir() {
     local path="$1"
     [[ -n "$path" ]] || return 0
     case "$path" in
-        */.agentfs-macos-read-scope.*)
+        */.vfs-macos-read-scope.*)
             rm -rf -- "$path"
             ;;
         *)
@@ -77,7 +77,7 @@ safe_rm_run_session() {
     [[ -n "$session" ]] || return 0
     case "$session" in
         macos-read-scope-*)
-            rm -rf -- "${HOME:?}/.agentfs/run/$session"
+            rm -rf -- "${HOME:?}/.vfs/run/$session"
             ;;
         *)
             printf 'Refusing to remove non-harness run session: %s\n' "$session" >&2
@@ -133,8 +133,8 @@ cleanup() {
         printf 'Kept mount directory: %s\n' "$MOUNT_DIR" >&2
         [[ -n "$RUN_WORK_DIR" ]] && printf 'Kept run work directory: %s\n' "$RUN_WORK_DIR" >&2
         [[ -n "$SECRET_DIR" ]] && printf 'Kept secret directory: %s\n' "$SECRET_DIR" >&2
-        [[ -n "$RUN_SESSION_DENY" ]] && printf 'Kept run session: %s\n' "$HOME/.agentfs/run/$RUN_SESSION_DENY" >&2
-        [[ -n "$RUN_SESSION_ALLOW" ]] && printf 'Kept run session: %s\n' "$HOME/.agentfs/run/$RUN_SESSION_ALLOW" >&2
+        [[ -n "$RUN_SESSION_DENY" ]] && printf 'Kept run session: %s\n' "$HOME/.vfs/run/$RUN_SESSION_DENY" >&2
+        [[ -n "$RUN_SESSION_ALLOW" ]] && printf 'Kept run session: %s\n' "$HOME/.vfs/run/$RUN_SESSION_ALLOW" >&2
     fi
 
     exit "$status"
@@ -142,9 +142,9 @@ cleanup() {
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --agentfs-bin)
-            [[ $# -ge 2 ]] || { echo "missing value for --agentfs-bin" >&2; exit 2; }
-            AGENTFS_BIN="$2"
+        --vfs-bin)
+            [[ $# -ge 2 ]] || { echo "missing value for --vfs-bin" >&2; exit 2; }
+            VFS_BIN="$2"
             shift 2
             ;;
         --report-dir)
@@ -173,7 +173,7 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
 fi
 
 missing=()
-resolve_agentfs || missing+=("agentfs")
+resolve_vfs || missing+=("vfs")
 command -v git >/dev/null 2>&1 || missing+=("git")
 [[ -x /sbin/mount_nfs ]] || missing+=("/sbin/mount_nfs")
 [[ -x /sbin/umount ]] || missing+=("/sbin/umount")
@@ -186,36 +186,36 @@ if [[ ${#missing[@]} -gt 0 ]]; then
 fi
 
 if [[ -z "$REPORT_DIR" ]]; then
-    REPORT_DIR="$(mktemp -d /tmp/agentfs-macos-nfs-git-report.XXXXXX)"
+    REPORT_DIR="$(mktemp -d /tmp/vfs-macos-nfs-git-report.XXXXXX)"
 else
     mkdir -p "$REPORT_DIR"
     REPORT_DIR="$(cd "$REPORT_DIR" && pwd)"
 fi
 
-WORK_DIR="$(canonical_dir "$(mktemp -d /tmp/agentfs-macos-nfs-git-work.XXXXXX)")"
-MOUNT_DIR="$(canonical_dir "$(mktemp -d /tmp/agentfs-macos-nfs-git-mnt.XXXXXX)")"
+WORK_DIR="$(canonical_dir "$(mktemp -d /tmp/vfs-macos-nfs-git-work.XXXXXX)")"
+MOUNT_DIR="$(canonical_dir "$(mktemp -d /tmp/vfs-macos-nfs-git-mnt.XXXXXX)")"
 trap cleanup EXIT INT TERM
 
 AGENT_ID="macos-nfs-git-$$-$(date +%s)"
-DB_PATH="$WORK_DIR/.agentfs/$AGENT_ID.db"
+DB_PATH="$WORK_DIR/.vfs/$AGENT_ID.db"
 
-printf 'AgentFS binary: %s\n' "$AGENTFS_RESOLVED"
+printf 'Vfs binary: %s\n' "$VFS_RESOLVED"
 printf 'Report directory: %s\n' "$REPORT_DIR"
 printf 'Work directory: %s\n' "$WORK_DIR"
 printf 'Mount directory: %s\n' "$MOUNT_DIR"
 
 (
     cd "$WORK_DIR"
-    "$AGENTFS_RESOLVED" init "$AGENT_ID"
+    "$VFS_RESOLVED" init "$AGENT_ID"
 ) >"$REPORT_DIR/init.log" 2>&1
 
 if [[ ! -f "$DB_PATH" ]]; then
-    printf 'FAILED: expected AgentFS database was not created at %s\n' "$DB_PATH" >&2
+    printf 'FAILED: expected Vfs database was not created at %s\n' "$DB_PATH" >&2
     printf 'See %s/init.log\n' "$REPORT_DIR" >&2
     exit 1
 fi
 
-"$AGENTFS_RESOLVED" mount --backend nfs "$DB_PATH" "$MOUNT_DIR" --foreground >"$REPORT_DIR/mount.log" 2>&1 &
+"$VFS_RESOLVED" mount --backend nfs "$DB_PATH" "$MOUNT_DIR" --foreground >"$REPORT_DIR/mount.log" 2>&1 &
 MOUNT_PID=$!
 
 mounted=0
@@ -234,7 +234,7 @@ if [[ "$mounted" -ne 1 ]]; then
     if grep -Eqi 'operation not permitted|permission denied|not permitted|must be root|requires.*root' "$REPORT_DIR/mount.log"; then
         skip "mount_nfs is unavailable to this user; see $REPORT_DIR/mount.log"
     fi
-    printf 'FAILED: AgentFS NFS mount did not become ready at %s\n' "$MOUNT_DIR" >&2
+    printf 'FAILED: Vfs NFS mount did not become ready at %s\n' "$MOUNT_DIR" >&2
     printf 'See %s/mount.log\n' "$REPORT_DIR" >&2
     exit 1
 fi
@@ -244,9 +244,9 @@ set +e
     set -Eeuo pipefail
     cd "$MOUNT_DIR"
     git init
-    git config user.name "AgentFS macOS NFS validation"
-    git config user.email "agentfs-validation@example.invalid"
-    printf 'hello from AgentFS macOS NFS validation\n' >README.txt
+    git config user.name "Vfs macOS NFS validation"
+    git config user.email "vfs-validation@example.invalid"
+    printf 'hello from Vfs macOS NFS validation\n' >README.txt
     git add README.txt
     git commit -m "validate macos nfs git loose objects"
     git fsck --strict
@@ -267,16 +267,16 @@ if [[ "$git_status" -ne 0 ]]; then
     exit "$git_status"
 fi
 
-# --- agentfs run read-scoping leg -----------------------------------------
+# --- vfs run read-scoping leg -----------------------------------------
 # The darwin seatbelt profile is default-deny for reads: a secret outside the
 # session/allow/platform roots must be unreadable, and `--allow` must make it
 # readable (and writable, as before).
 
-printf 'Running agentfs run read-scoping checks...\n'
+printf 'Running vfs run read-scoping checks...\n'
 
-RUN_WORK_DIR="$(canonical_dir "$(mktemp -d /tmp/agentfs-macos-read-scope-work.XXXXXX)")"
-SECRET_DIR="$(canonical_dir "$(mktemp -d "$HOME/.agentfs-macos-read-scope.XXXXXX")")"
-printf 'agentfs-read-scope-secret\n' >"$SECRET_DIR/secret.txt"
+RUN_WORK_DIR="$(canonical_dir "$(mktemp -d /tmp/vfs-macos-read-scope-work.XXXXXX)")"
+SECRET_DIR="$(canonical_dir "$(mktemp -d "$HOME/.vfs-macos-read-scope.XXXXXX")")"
+printf 'vfs-read-scope-secret\n' >"$SECRET_DIR/secret.txt"
 
 RUN_SESSION_DENY="macos-read-scope-deny-$$-$(date +%s)"
 RUN_SESSION_ALLOW="macos-read-scope-allow-$$-$(date +%s)"
@@ -284,21 +284,21 @@ RUN_SESSION_ALLOW="macos-read-scope-allow-$$-$(date +%s)"
 set +e
 (
     cd "$RUN_WORK_DIR"
-    "$AGENTFS_RESOLVED" run --session "$RUN_SESSION_DENY" \
+    "$VFS_RESOLVED" run --session "$RUN_SESSION_DENY" \
         /bin/cat "$SECRET_DIR/secret.txt"
 ) >"$REPORT_DIR/read-scope-deny.log" 2>&1
 deny_status=$?
 set -e
 
-if ! grep -q 'Welcome to AgentFS' "$REPORT_DIR/read-scope-deny.log"; then
-    printf 'FAILED: agentfs run never reached the sandbox (mount failure?). See %s/read-scope-deny.log\n' "$REPORT_DIR" >&2
+if ! grep -q 'Welcome to Vfs' "$REPORT_DIR/read-scope-deny.log"; then
+    printf 'FAILED: vfs run never reached the sandbox (mount failure?). See %s/read-scope-deny.log\n' "$REPORT_DIR" >&2
     exit 1
 fi
 if [[ "$deny_status" -eq 0 ]]; then
     printf 'FAILED: read of %s/secret.txt outside the allow list unexpectedly succeeded. See %s/read-scope-deny.log\n' "$SECRET_DIR" "$REPORT_DIR" >&2
     exit 1
 fi
-if grep -q 'agentfs-read-scope-secret' "$REPORT_DIR/read-scope-deny.log"; then
+if grep -q 'vfs-read-scope-secret' "$REPORT_DIR/read-scope-deny.log"; then
     printf 'FAILED: secret content leaked despite exit status %s. See %s/read-scope-deny.log\n' "$deny_status" "$REPORT_DIR" >&2
     exit 1
 fi
@@ -311,13 +311,13 @@ printf 'Read of unallowed path denied as expected (exit %s).\n' "$deny_status"
 set +e
 (
     cd "$RUN_WORK_DIR"
-    "$AGENTFS_RESOLVED" run --session "$RUN_SESSION_ALLOW" --allow "$SECRET_DIR" \
+    "$VFS_RESOLVED" run --session "$RUN_SESSION_ALLOW" --allow "$SECRET_DIR" \
         /bin/cat "$SECRET_DIR/secret.txt"
 ) >"$REPORT_DIR/read-scope-allow.log" 2>&1
 allow_status=$?
 set -e
 
-if [[ "$allow_status" -ne 0 ]] || ! grep -q 'agentfs-read-scope-secret' "$REPORT_DIR/read-scope-allow.log"; then
+if [[ "$allow_status" -ne 0 ]] || ! grep -q 'vfs-read-scope-secret' "$REPORT_DIR/read-scope-allow.log"; then
     printf 'FAILED: --allow %s did not make the secret readable (exit %s). See %s/read-scope-allow.log\n' "$SECRET_DIR" "$allow_status" "$REPORT_DIR" >&2
     exit 1
 fi

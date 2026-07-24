@@ -4,7 +4,7 @@
 Single-shot benchmark runs are noisy (page cache, scheduler, disk activity).
 This wrapper runs the underlying benchmark N times and reports median +
 percentile statistics per phase, so we can make confident before/after
-comparisons when tuning AgentFS.
+comparisons when tuning Vfs.
 
 The wrapper is intentionally non-invasive: it shells out to the existing
 benchmark with --output, parses each JSON, and aggregates. Pass-through of
@@ -60,9 +60,9 @@ def summarize_floats(values: list[float]) -> dict[str, float | int]:
 def aggregate(runs: list[dict[str, Any]]) -> dict[str, Any]:
     overall_ratios: list[float] = []
     native_totals: list[float] = []
-    agentfs_totals: list[float] = []
+    vfs_totals: list[float] = []
     phase_natives: dict[str, list[float]] = {}
-    phase_agentfs: dict[str, list[float]] = {}
+    phase_vfs: dict[str, list[float]] = {}
     phase_ratios: dict[str, list[float]] = {}
 
     for run in runs:
@@ -71,30 +71,30 @@ def aggregate(runs: list[dict[str, Any]]) -> dict[str, Any]:
         if isinstance(ratio, (int, float)):
             overall_ratios.append(float(ratio))
         n = summary.get("native_seconds")
-        a = summary.get("agentfs_seconds")
+        a = summary.get("vfs_seconds")
         if isinstance(n, (int, float)):
             native_totals.append(float(n))
         if isinstance(a, (int, float)):
-            agentfs_totals.append(float(a))
+            vfs_totals.append(float(a))
 
         for phase, payload in (summary.get("phase_ratios") or {}).items():
             if not isinstance(payload, dict):
                 continue
             nv = payload.get("native_seconds")
-            av = payload.get("agentfs_seconds")
+            av = payload.get("vfs_seconds")
             rv = payload.get("ratio")
             if isinstance(nv, (int, float)):
                 phase_natives.setdefault(phase, []).append(float(nv))
             if isinstance(av, (int, float)):
-                phase_agentfs.setdefault(phase, []).append(float(av))
+                phase_vfs.setdefault(phase, []).append(float(av))
             if isinstance(rv, (int, float)):
                 phase_ratios.setdefault(phase, []).append(float(rv))
 
     phase_stats: dict[str, Any] = {}
-    for phase in sorted(set(phase_natives) | set(phase_agentfs) | set(phase_ratios)):
+    for phase in sorted(set(phase_natives) | set(phase_vfs) | set(phase_ratios)):
         phase_stats[phase] = {
             "native_seconds": summarize_floats(phase_natives.get(phase, [])),
-            "agentfs_seconds": summarize_floats(phase_agentfs.get(phase, [])),
+            "vfs_seconds": summarize_floats(phase_vfs.get(phase, [])),
             "ratio": summarize_floats(phase_ratios.get(phase, [])),
         }
 
@@ -102,19 +102,19 @@ def aggregate(runs: list[dict[str, Any]]) -> dict[str, Any]:
         "iterations": len(runs),
         "overall": {
             "native_seconds": summarize_floats(native_totals),
-            "agentfs_seconds": summarize_floats(agentfs_totals),
+            "vfs_seconds": summarize_floats(vfs_totals),
             "ratio": summarize_floats(overall_ratios),
         },
         "phases": phase_stats,
     }
 
 
-def run_one(forward_argv: list[str], output_path: Path, agentfs_bin: str | None) -> dict[str, Any]:
+def run_one(forward_argv: list[str], output_path: Path, vfs_bin: str | None) -> dict[str, Any]:
     benchmark = Path(__file__).resolve().with_name("git-workload-benchmark.py")
     argv = [sys.executable, str(benchmark), "--output", str(output_path)] + forward_argv
     env = os.environ.copy()
-    if agentfs_bin is not None:
-        env["AGENTFS_BIN"] = agentfs_bin
+    if vfs_bin is not None:
+        env["VFS_BIN"] = vfs_bin
     started = time.perf_counter()
     proc = subprocess.run(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     duration = time.perf_counter() - started
@@ -141,13 +141,13 @@ def render_human(label: str, agg: dict[str, Any]) -> str:
     out: list[str] = []
     overall = agg["overall"]
     n = overall["native_seconds"]
-    a = overall["agentfs_seconds"]
+    a = overall["vfs_seconds"]
     r = overall["ratio"]
     head = (
         f"=== {label} (iterations={agg['iterations']}) ===\n"
         f"  native  median={format_seconds(n.get('median', float('nan')))}"
         f" [p25={format_seconds(n.get('p25', float('nan')))}, p75={format_seconds(n.get('p75', float('nan')))}]\n"
-        f"  agentfs median={format_seconds(a.get('median', float('nan')))}"
+        f"  vfs median={format_seconds(a.get('median', float('nan')))}"
         f" [p25={format_seconds(a.get('p25', float('nan')))}, p75={format_seconds(a.get('p75', float('nan')))}]\n"
         f"  ratio   median={r.get('median', float('nan')):.2f}x"
         f" [p25={r.get('p25', float('nan')):.2f}x, p75={r.get('p75', float('nan')):.2f}x]"
@@ -158,12 +158,12 @@ def render_human(label: str, agg: dict[str, Any]) -> str:
     for phase, stats in agg["phases"].items():
         r = stats["ratio"]
         nv = stats["native_seconds"]
-        av = stats["agentfs_seconds"]
+        av = stats["vfs_seconds"]
         if r.get("count", 0) == 0:
             continue
         out.append(
             f"    {phase:<14s} native={format_seconds(nv['median'])}"
-            f" agentfs={format_seconds(av['median'])}"
+            f" vfs={format_seconds(av['median'])}"
             f" ratio={r['median']:.2f}x"
             f" (p25={r['p25']:.2f}x p75={r['p75']:.2f}x)"
         )
@@ -193,9 +193,9 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
         help="number of warmup iterations whose results are discarded (default: 1)",
     )
     parser.add_argument(
-        "--agentfs-bin",
-        default=os.environ.get("AGENTFS_BIN"),
-        help="override AGENTFS_BIN for the underlying benchmark",
+        "--vfs-bin",
+        default=os.environ.get("VFS_BIN"),
+        help="override VFS_BIN for the underlying benchmark",
     )
     parser.add_argument(
         "--output",
@@ -236,13 +236,13 @@ def main(argv: list[str]) -> int:
         for i in range(args.warmup):
             out_path = (persist_dir / f"warmup-{i:02d}.json") if persist_dir else (tmp_root / f"warmup-{i:02d}.json")
             print(f"[warmup {i+1}/{args.warmup}] running...", file=sys.stderr, flush=True)
-            warmup_runs.append(run_one(forward, out_path, args.agentfs_bin))
+            warmup_runs.append(run_one(forward, out_path, args.vfs_bin))
 
         runs: list[dict[str, Any]] = []
         for i in range(args.iterations):
             out_path = (persist_dir / f"iter-{i:02d}.json") if persist_dir else (tmp_root / f"iter-{i:02d}.json")
             print(f"[iter {i+1}/{args.iterations}] running...", file=sys.stderr, flush=True)
-            payload = run_one(forward, out_path, args.agentfs_bin)
+            payload = run_one(forward, out_path, args.vfs_bin)
             runs.append(payload)
             result = payload.get("result") or {}
             summary = result.get("summary") or {}
@@ -261,7 +261,7 @@ def main(argv: list[str]) -> int:
         aggregation["label"] = args.label
         aggregation["forwarded_argv"] = forward
         aggregation["warmup_iterations"] = args.warmup
-        aggregation["agentfs_bin"] = args.agentfs_bin
+        aggregation["vfs_bin"] = args.vfs_bin
         aggregation["iteration_returncodes"] = [r["returncode"] for r in runs]
         aggregation["iteration_wall_seconds"] = [r["wall_seconds"] for r in runs]
         aggregation["git_ai_census"] = {

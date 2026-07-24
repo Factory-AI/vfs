@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 #
-# Run pjdfstest against an AgentFS FUSE mount.
+# Run pjdfstest against a Vfs FUSE mount.
 #
 # Usage:
-#   run-pjdfstest.sh [--pjdfstest-dir DIR] [--agentfs-bin PATH] [--profile NAME]
+#   run-pjdfstest.sh [--pjdfstest-dir DIR] [--vfs-bin PATH] [--profile NAME]
 #                    [--manifest FILE] [--report-dir DIR] [--partial-origin]
 #                    [--no-partial-origin] [--keep-work]
 #
 # Environment:
 #   PJDFSTEST_DIR  pjdfstest checkout root or tests directory.
-#   AGENTFS_BIN    agentfs executable to invoke (default: agentfs).
+#   VFS_BIN    vfs executable to invoke (default: vfs).
 #   PJDFSTEST_PROFILE   test profile to run (default: full).
 #   PJDFSTEST_MANIFEST  explicit manifest overriding --profile.
 #   REPORT_DIR     directory where logs should be written.
@@ -18,7 +18,7 @@
 set -Eeuo pipefail
 
 SKIP_CODE="${SKIP_CODE:-77}"
-AGENTFS_BIN="${AGENTFS_BIN:-agentfs}"
+VFS_BIN="${VFS_BIN:-vfs}"
 PJDFSTEST_DIR="${PJDFSTEST_DIR:-}"
 PJDFSTEST_PROFILE="${PJDFSTEST_PROFILE:-full}"
 PJDFSTEST_MANIFEST="${PJDFSTEST_MANIFEST:-}"
@@ -33,7 +33,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 WORK_DIR=""
 MOUNT_DIR=""
 MOUNT_PID=""
-AGENTFS_RESOLVED=""
+VFS_RESOLVED=""
 PJDFSTEST_RESOLVED=""
 PJDFSTEST_TESTS=""
 PJDFSTEST_RESOLVED_MANIFEST=""
@@ -61,11 +61,11 @@ command -v prove
 command -v pjdfstest
 ```
 
-AgentFS harness command from docs/TESTING.md:
+Vfs harness command from docs/TESTING.md:
 
 ```bash
 scripts/validation/posix/run-pjdfstest.sh \
-  --agentfs-bin "$PWD/target/debug/agentfs" \
+  --vfs-bin "$PWD/target/debug/vfs" \
   --pjdfstest-dir /path/to/pjdfstest \
   --profile phase45-ci
 ```
@@ -78,15 +78,15 @@ skip_missing() {
     exit "$SKIP_CODE"
 }
 
-resolve_agentfs() {
-    if [[ "$AGENTFS_BIN" == */* ]]; then
-        [[ -x "$AGENTFS_BIN" ]] || return 1
+resolve_vfs() {
+    if [[ "$VFS_BIN" == */* ]]; then
+        [[ -x "$VFS_BIN" ]] || return 1
         # Absolutize: the harness cd's into its work and mount dirs before
         # invoking the binary, which silently breaks a relative path (the
         # exit-127 error only lands in init.log).
-        AGENTFS_RESOLVED="$(cd "$(dirname "$AGENTFS_BIN")" && pwd)/$(basename "$AGENTFS_BIN")"
+        VFS_RESOLVED="$(cd "$(dirname "$VFS_BIN")" && pwd)/$(basename "$VFS_BIN")"
     else
-        AGENTFS_RESOLVED="$(command -v "$AGENTFS_BIN" 2>/dev/null)" || return 1
+        VFS_RESOLVED="$(command -v "$VFS_BIN" 2>/dev/null)" || return 1
     fi
 }
 
@@ -229,7 +229,7 @@ safe_rm_tmp() {
     local path="$1"
     [[ -n "$path" ]] || return 0
     case "$path" in
-        /tmp/agentfs-pjdfstest-work.*|/tmp/agentfs-pjdfstest-mnt.*)
+        /tmp/vfs-pjdfstest-work.*|/tmp/vfs-pjdfstest-mnt.*)
             rm -rf -- "$path"
             ;;
         *)
@@ -284,9 +284,9 @@ while [[ $# -gt 0 ]]; do
             PJDFSTEST_DIR="$2"
             shift 2
             ;;
-        --agentfs-bin)
-            [[ $# -ge 2 ]] || { echo "missing value for --agentfs-bin" >&2; exit 2; }
-            AGENTFS_BIN="$2"
+        --vfs-bin)
+            [[ $# -ge 2 ]] || { echo "missing value for --vfs-bin" >&2; exit 2; }
+            VFS_BIN="$2"
             shift 2
             ;;
         --report-dir)
@@ -339,7 +339,7 @@ done
 
 missing=()
 command -v prove >/dev/null 2>&1 || missing+=("prove (perl-Test-Harness)")
-resolve_agentfs || missing+=("agentfs")
+resolve_vfs || missing+=("vfs")
 resolve_pjdfstest_tests || missing+=("pjdfstest tests")
 resolve_pjdfstest_binary || missing+=("pjdfstest executable")
 
@@ -362,20 +362,20 @@ fi
 resolve_prove_targets
 
 if [[ -z "$REPORT_DIR" ]]; then
-    REPORT_DIR="$(mktemp -d /tmp/agentfs-pjdfstest-report.XXXXXX)"
+    REPORT_DIR="$(mktemp -d /tmp/vfs-pjdfstest-report.XXXXXX)"
 else
     mkdir -p "$REPORT_DIR"
     REPORT_DIR="$(cd "$REPORT_DIR" && pwd)"
 fi
 
-WORK_DIR="$(mktemp -d /tmp/agentfs-pjdfstest-work.XXXXXX)"
-MOUNT_DIR="$(mktemp -d /tmp/agentfs-pjdfstest-mnt.XXXXXX)"
+WORK_DIR="$(mktemp -d /tmp/vfs-pjdfstest-work.XXXXXX)"
+MOUNT_DIR="$(mktemp -d /tmp/vfs-pjdfstest-mnt.XXXXXX)"
 trap cleanup EXIT INT TERM
 
 AGENT_ID="pjdfstest-$$-$(date +%s)"
-DB_PATH="$WORK_DIR/.agentfs/$AGENT_ID.db"
+DB_PATH="$WORK_DIR/.vfs/$AGENT_ID.db"
 
-printf 'AgentFS binary: %s\n' "$AGENTFS_RESOLVED"
+printf 'Vfs binary: %s\n' "$VFS_RESOLVED"
 printf 'pjdfstest binary: %s\n' "$PJDFSTEST_RESOLVED"
 printf 'pjdfstest tests: %s\n' "$PJDFSTEST_TESTS"
 printf 'pjdfstest profile: %s\n' "$PJDFSTEST_PROFILE"
@@ -413,16 +413,16 @@ fi
 
 (
     cd "$WORK_DIR"
-    "$AGENTFS_RESOLVED" init "$AGENT_ID"
+    "$VFS_RESOLVED" init "$AGENT_ID"
 ) >"$REPORT_DIR/init.log" 2>&1
 
 if [[ ! -f "$DB_PATH" ]]; then
-    printf 'FAILED: expected AgentFS database was not created at %s\n' "$DB_PATH" >&2
+    printf 'FAILED: expected Vfs database was not created at %s\n' "$DB_PATH" >&2
     printf 'See %s/init.log\n' "$REPORT_DIR" >&2
     exit 1
 fi
 
-MOUNT_CMD=("$AGENTFS_RESOLVED" mount "$DB_PATH" "$MOUNT_DIR" --foreground)
+MOUNT_CMD=("$VFS_RESOLVED" mount "$DB_PATH" "$MOUNT_DIR" --foreground)
 if env_flag_enabled "$PARTIAL_ORIGIN"; then
     MOUNT_CMD+=(--partial-origin on)
 fi
@@ -442,7 +442,7 @@ for _ in $(seq 1 100); do
 done
 
 if [[ "$mounted" -ne 1 ]]; then
-    printf 'FAILED: AgentFS mount did not become ready at %s\n' "$MOUNT_DIR" >&2
+    printf 'FAILED: Vfs mount did not become ready at %s\n' "$MOUNT_DIR" >&2
     printf 'See %s/mount.log\n' "$REPORT_DIR" >&2
     exit 1
 fi

@@ -1,4 +1,4 @@
 [[production]]
-package = "agentfs-cli"
-bin = "agentfs"
+package = "vfs-cli"
+bin = "vfs"
 reason = "shipped CLI binary"

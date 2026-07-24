@@ -7,10 +7,10 @@ Usage: phase0.sh
 
 Runs the Phase 0/1 local validation smoke:
   1. Phase 1 fork governance check
-  2. Phase 0 built-in native-vs-AgentFS synthetic workload baseline
+  2. Phase 0 built-in native-vs-Vfs synthetic workload baseline
 
 Environment:
-  AGENTFS_BIN                    optional agentfs executable path/name
+  VFS_BIN                    optional vfs executable path/name
   WORKLOAD_BASELINE_ITERATIONS   smoke iterations (default: 1)
   WORKLOAD_BASELINE_TIMEOUT      per-command timeout seconds (default: 120)
   WORKLOAD_BASELINE_KEEP_TEMP    keep temp baseline directories when true/1
@@ -48,7 +48,7 @@ cat <<'NEXT_STEPS'
 == Next steps for real factory-mono baselines ==
 Run a representative command against a real checkout, for example:
 
-  AGENTFS_BIN=/path/to/agentfs \
+  VFS_BIN=/path/to/vfs \
     scripts/validation/workload-baseline.py \
     --source /path/to/factory-mono \
     --command 'your representative build/test command'
@@ -56,7 +56,7 @@ Run a representative command against a real checkout, for example:
 Notes:
   - By default the source tree is copied into temp directories before timing.
   - Add --exclude PATTERN for large caches that should not be part of the baseline copy.
-  - Use --keep-temp when you need to inspect the native and AgentFS worktrees.
+  - Use --keep-temp when you need to inspect the native and Vfs worktrees.
   - Use --in-place-native only for known read-only workloads.
 NEXT_STEPS
 

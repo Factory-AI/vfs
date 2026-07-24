@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Attr coherence around close() with and without the FLUSH round trip.
 
-With AGENTFS_FUSE_NOFLUSH=1 the adapter answers the first FLUSH with ENOSYS,
+With VFS_FUSE_NOFLUSH=1 the adapter answers the first FLUSH with ENOSYS,
 so the kernel stops sending FLUSH and a closed handle's buffered write tail
 reaches the SDK only at the async RELEASE (or via the adapter's pending-tail
 drains on attr-bearing paths). This script hammers exactly that window:
@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from lib.common import resolve_agentfs_bin, tail_text  # noqa: E402
+from lib.common import resolve_vfs_bin, tail_text  # noqa: E402
 
 WORKLOAD = r'''
 import ctypes
@@ -128,7 +128,7 @@ def parse_workload_json(stdout: str) -> Optional[dict[str, Any]]:
 
 def parse_fuse_counters(output: str) -> Optional[dict[str, Any]]:
     for line in reversed(output.splitlines()):
-        if '"agentfs_profile_summary"' not in line:
+        if '"vfs_profile_summary"' not in line:
             continue
         start = line.find("{")
         if start < 0:
@@ -144,7 +144,7 @@ def parse_fuse_counters(output: str) -> Optional[dict[str, Any]]:
 
 
 def run_config(
-    agentfs_bin: str,
+    vfs_bin: str,
     temp_root: Path,
     label: str,
     iterations: int,
@@ -155,15 +155,15 @@ def run_config(
     db = temp_root / f"{label}.db"
     db.touch()
     env = os.environ.copy()
-    env["AGENTFS_PROFILE"] = "1"
-    env["AGENTFS_FUSE_NOFLUSH"] = "1" if noflush else "0"
+    env["VFS_PROFILE"] = "1"
+    env["VFS_FUSE_NOFLUSH"] = "1" if noflush else "0"
     if entry_ttl_ms is None:
-        env.pop("AGENTFS_FUSE_ENTRY_TTL_MS", None)
+        env.pop("VFS_FUSE_ENTRY_TTL_MS", None)
     else:
-        env["AGENTFS_FUSE_ENTRY_TTL_MS"] = str(entry_ttl_ms)
+        env["VFS_FUSE_ENTRY_TTL_MS"] = str(entry_ttl_ms)
 
     argv = [
-        agentfs_bin,
+        vfs_bin,
         "exec",
         str(db),
         sys.executable,
@@ -220,14 +220,14 @@ def run_config(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--agentfs-bin", default=os.environ.get("AGENTFS_BIN"))
+    parser.add_argument("--vfs-bin", default=os.environ.get("VFS_BIN"))
     parser.add_argument("--iterations", type=int, default=120)
     parser.add_argument("--timeout", type=float, default=600.0)
     parser.add_argument("--output", default=None)
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parents[2]
-    agentfs_bin = resolve_agentfs_bin(args.agentfs_bin, repo_root)
+    vfs_bin = resolve_vfs_bin(args.vfs_bin, repo_root)
 
     configs = [
         ("flush_default_ttl", False, None),
@@ -237,12 +237,12 @@ def main() -> int:
     ]
 
     runs = []
-    with tempfile.TemporaryDirectory(prefix="agentfs-flush-coherence-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="vfs-flush-coherence-") as tmp:
         temp_root = Path(tmp)
         for label, noflush, ttl in configs:
             runs.append(
                 run_config(
-                    agentfs_bin,
+                    vfs_bin,
                     temp_root,
                     label,
                     args.iterations,
@@ -260,7 +260,7 @@ def main() -> int:
 
     report = {
         "schema_version": 1,
-        "agentfs_bin": agentfs_bin,
+        "vfs_bin": vfs_bin,
         "iterations": args.iterations,
         "noflush_pending_tail_drains_total": tail_drains,
         "window_exercised": window_exercised,
@@ -269,7 +269,7 @@ def main() -> int:
     }
     output = args.output or os.path.join(
         tempfile.gettempdir(),
-        f"agentfs-flush-coherence-{time.strftime('%Y%m%d-%H%M%S')}.json",
+        f"vfs-flush-coherence-{time.strftime('%Y%m%d-%H%M%S')}.json",
     )
     Path(output).write_text(json.dumps(report, indent=2))
 

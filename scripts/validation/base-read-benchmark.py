@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Phase 6.5 native-vs-AgentFS unchanged-base read benchmark."""
+"""Phase 6.5 native-vs-Vfs unchanged-base read benchmark."""
 
 from __future__ import annotations
 
@@ -201,7 +201,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Compare repeated read-only open/read/close and read-after-mutate "
-            "cache invalidation on native storage and an unchanged AgentFS base file."
+            "cache invalidation on native storage and an unchanged Vfs base file."
         )
     )
     parser.add_argument("--file-size-bytes", type=positive_int, default=65536)
@@ -211,16 +211,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--invalidation-post-reads", type=positive_int, default=3)
     parser.add_argument("--mutation-offset", type=non_negative_int, default=0)
     parser.add_argument(
-        "--agentfs-bin",
-        default=os.environ.get("AGENTFS_BIN"),
-        help="agentfs executable path/name (default: repo target binary, building cli if needed)",
+        "--vfs-bin",
+        default=os.environ.get("VFS_BIN"),
+        help="vfs executable path/name (default: repo target binary, building cli if needed)",
     )
     parser.add_argument(
         "--timeout",
         type=positive_float,
         default=positive_float(os.environ.get("BASE_READ_BENCHMARK_TIMEOUT", "120")),
     )
-    parser.add_argument("--profile", action="store_true", default=env_flag("AGENTFS_PROFILE"))
+    parser.add_argument("--profile", action="store_true", default=env_flag("VFS_PROFILE"))
     parser.add_argument("--session-prefix", default=None)
     parser.add_argument(
         "--keep-temp",
@@ -260,13 +260,13 @@ def extract_profile_summaries(stderr: Any) -> list[dict[str, Any]]:
     summaries: list[dict[str, Any]] = []
     for line in text.splitlines():
         line = line.strip()
-        if not line or "agentfs_profile_summary" not in line:
+        if not line or "vfs_profile_summary" not in line:
             continue
         try:
             value = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(value, dict) and value.get("event") == "agentfs_profile_summary":
+        if isinstance(value, dict) and value.get("event") == "vfs_profile_summary":
             summaries.append(value)
     return summaries
 
@@ -388,20 +388,20 @@ def parse_json_stdout(run: dict[str, Any]) -> Optional[dict[str, Any]]:
     return None
 
 
-def resolve_agentfs_bin(agentfs_bin: Optional[str], repo_root: Path) -> str:
-    if agentfs_bin:
-        candidate_path = Path(agentfs_bin).expanduser()
+def resolve_vfs_bin(vfs_bin: Optional[str], repo_root: Path) -> str:
+    if vfs_bin:
+        candidate_path = Path(vfs_bin).expanduser()
         if candidate_path.is_file() and os.access(candidate_path, os.X_OK):
             return str(candidate_path.resolve())
-        if os.sep not in agentfs_bin:
-            found = shutil.which(agentfs_bin)
+        if os.sep not in vfs_bin:
+            found = shutil.which(vfs_bin)
             if found:
                 return found
-        raise RuntimeError(f"configured agentfs executable not found or not executable: {agentfs_bin}")
+        raise RuntimeError(f"configured vfs executable not found or not executable: {vfs_bin}")
 
     for candidate_path in (
-        repo_root / "cli" / "target" / "debug" / "agentfs",
-        repo_root / "cli" / "target" / "release" / "agentfs",
+        repo_root / "cli" / "target" / "debug" / "vfs",
+        repo_root / "cli" / "target" / "release" / "vfs",
     ):
         if candidate_path.is_file() and os.access(candidate_path, os.X_OK):
             return str(candidate_path)
@@ -415,12 +415,12 @@ def resolve_agentfs_bin(agentfs_bin: Optional[str], repo_root: Path) -> str:
     )
     if build.returncode != 0:
         raise RuntimeError(
-            "failed to build repo-local agentfs binary; set AGENTFS_BIN to an explicit binary\n"
+            "failed to build repo-local vfs binary; set VFS_BIN to an explicit binary\n"
             f"stdout:\n{tail_text(build.stdout)}\n"
             f"stderr:\n{tail_text(build.stderr)}"
         )
 
-    built = repo_root / "cli" / "target" / "debug" / "agentfs"
+    built = repo_root / "cli" / "target" / "debug" / "vfs"
     if built.is_file() and os.access(built, os.X_OK):
         return str(built)
     raise RuntimeError(f"repo-local build completed but binary was not found: {built}")
@@ -444,7 +444,7 @@ def prepare_environment(temp_root: Path, profile: bool) -> dict[str, str]:
     env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
     env.setdefault("NO_COLOR", "1")
     if profile:
-        env["AGENTFS_PROFILE"] = "1"
+        env["VFS_PROFILE"] = "1"
 
     home = temp_root / "home"
     for path in (home, home / ".config", home / ".cache", home / ".local" / "share"):
@@ -470,7 +470,7 @@ def create_fixture(root: Path, file_size_bytes: int) -> str:
     index = 0
     with path.open("wb") as handle:
         while written < file_size_bytes:
-            seed = hashlib.sha256(f"agentfs-phase65-base-read-{index}".encode()).digest()
+            seed = hashlib.sha256(f"vfs-phase65-base-read-{index}".encode()).digest()
             block = (seed * 4096)[: min(65536, file_size_bytes - written)]
             handle.write(block)
             digest.update(block)
@@ -590,43 +590,43 @@ def split_timing(run: dict[str, Any], workload: Optional[dict[str, Any]]) -> dic
     }
 
 
-def compare_read_workloads(native: Optional[dict[str, Any]], agentfs: Optional[dict[str, Any]]) -> dict[str, Any]:
-    if native is None or agentfs is None:
+def compare_read_workloads(native: Optional[dict[str, Any]], vfs: Optional[dict[str, Any]]) -> dict[str, Any]:
+    if native is None or vfs is None:
         return {"checked": False, "equivalent": False, "reason": "missing JSON workload output"}
     equivalent = (
-        native.get("digest") == agentfs.get("digest")
-        and native.get("counts") == agentfs.get("counts")
-        and native.get("parameters") == agentfs.get("parameters")
+        native.get("digest") == vfs.get("digest")
+        and native.get("counts") == vfs.get("counts")
+        and native.get("parameters") == vfs.get("parameters")
     )
     return {
         "checked": True,
         "equivalent": equivalent,
         "native_digest": native.get("digest"),
-        "agentfs_digest": agentfs.get("digest"),
+        "vfs_digest": vfs.get("digest"),
     }
 
 
-def compare_invalidation_workloads(native: Optional[dict[str, Any]], agentfs: Optional[dict[str, Any]]) -> dict[str, Any]:
-    if native is None or agentfs is None:
+def compare_invalidation_workloads(native: Optional[dict[str, Any]], vfs: Optional[dict[str, Any]]) -> dict[str, Any]:
+    if native is None or vfs is None:
         return {"checked": False, "equivalent": False, "reason": "missing JSON workload output"}
     fields = ("sha256_after", "old_byte", "new_byte", "stale_reads", "mutation_visible")
-    equivalent = all(native.get(field) == agentfs.get(field) for field in fields)
+    equivalent = all(native.get(field) == vfs.get(field) for field in fields)
     return {
         "checked": True,
         "equivalent": equivalent,
-        "fields": {field: {"native": native.get(field), "agentfs": agentfs.get(field)} for field in fields},
+        "fields": {field: {"native": native.get(field), "vfs": vfs.get(field)} for field in fields},
     }
 
 
-def ratio(agentfs_seconds: Optional[float], native_seconds: Optional[float]) -> Optional[float]:
-    if native_seconds is None or agentfs_seconds is None or native_seconds <= 0:
+def ratio(vfs_seconds: Optional[float], native_seconds: Optional[float]) -> Optional[float]:
+    if native_seconds is None or vfs_seconds is None or native_seconds <= 0:
         return None
-    return agentfs_seconds / native_seconds
+    return vfs_seconds / native_seconds
 
 
 def default_output_path() -> Path:
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    return Path(tempfile.gettempdir()) / f"agentfs-base-read-benchmark-{stamp}-{uuid.uuid4().hex[:8]}.json"
+    return Path(tempfile.gettempdir()) / f"vfs-base-read-benchmark-{stamp}-{uuid.uuid4().hex[:8]}.json"
 
 
 def main(argv: list[str]) -> int:
@@ -636,41 +636,41 @@ def main(argv: list[str]) -> int:
 
     temp_manager: Optional[tempfile.TemporaryDirectory[str]] = None
     if args.keep_temp:
-        temp_root = Path(tempfile.mkdtemp(prefix="agentfs-base-read-benchmark-"))
+        temp_root = Path(tempfile.mkdtemp(prefix="vfs-base-read-benchmark-"))
     else:
-        temp_manager = tempfile.TemporaryDirectory(prefix="agentfs-base-read-benchmark-")
+        temp_manager = tempfile.TemporaryDirectory(prefix="vfs-base-read-benchmark-")
         temp_root = Path(temp_manager.name)
 
     exit_code = 0
     result: dict[str, Any]
     try:
-        agentfs_bin = resolve_agentfs_bin(args.agentfs_bin, repo_root)
+        vfs_bin = resolve_vfs_bin(args.vfs_bin, repo_root)
         env = prepare_environment(temp_root, args.profile)
         source_root = temp_root / "source"
         native_root = temp_root / "native"
-        agentfs_base_root = temp_root / "agentfs-base"
+        vfs_base_root = temp_root / "vfs-base"
         original_sha = create_fixture(source_root, args.file_size_bytes)
         copy_fixture(source_root, native_root)
-        copy_fixture(source_root, agentfs_base_root)
-        agentfs_base_before = tree_hash(agentfs_base_root)
+        copy_fixture(source_root, vfs_base_root)
+        vfs_base_before = tree_hash(vfs_base_root)
 
         session_prefix = args.session_prefix or f"base-read-{uuid.uuid4().hex}"
         read_argv = read_workload_argv(args.iterations, args.read_bytes)
         native_read_run = run_subprocess(read_argv, native_root, env, args.timeout)
-        agentfs_read_run = run_subprocess(
-            [agentfs_bin, "run", "--session", f"{session_prefix}-repeat", "--no-default-allows", "--"] + read_argv,
-            agentfs_base_root,
+        vfs_read_run = run_subprocess(
+            [vfs_bin, "run", "--session", f"{session_prefix}-repeat", "--no-default-allows", "--"] + read_argv,
+            vfs_base_root,
             env,
             args.timeout,
         )
         native_read_payload = parse_json_stdout(native_read_run)
-        agentfs_read_payload = parse_json_stdout(agentfs_read_run)
-        read_equivalence = compare_read_workloads(native_read_payload, agentfs_read_payload)
-        read_profile = profile_counter_summary(agentfs_read_run.get("profile_summaries", []))
+        vfs_read_payload = parse_json_stdout(vfs_read_run)
+        read_equivalence = compare_read_workloads(native_read_payload, vfs_read_payload)
+        read_profile = profile_counter_summary(vfs_read_run.get("profile_summaries", []))
         read_counters = read_profile["max_counters"]
         repeated_passed = (
             native_read_run["returncode"] == 0
-            and agentfs_read_run["returncode"] == 0
+            and vfs_read_run["returncode"] == 0
             and read_equivalence.get("equivalent") is True
             and int(read_counters.get("chunk_read_queries", 0) or 0) == 0
             and int(read_counters.get("chunk_read_chunks", 0) or 0) == 0
@@ -678,33 +678,33 @@ def main(argv: list[str]) -> int:
 
         invalidation_argv = invalidation_workload_argv(args)
         native_invalidation_run = run_subprocess(invalidation_argv, native_root, env, args.timeout)
-        agentfs_invalidation_run = run_subprocess(
-            [agentfs_bin, "run", "--session", f"{session_prefix}-invalidate", "--no-default-allows", "--"]
+        vfs_invalidation_run = run_subprocess(
+            [vfs_bin, "run", "--session", f"{session_prefix}-invalidate", "--no-default-allows", "--"]
             + invalidation_argv,
-            agentfs_base_root,
+            vfs_base_root,
             env,
             args.timeout,
         )
         native_invalidation_payload = parse_json_stdout(native_invalidation_run)
-        agentfs_invalidation_payload = parse_json_stdout(agentfs_invalidation_run)
+        vfs_invalidation_payload = parse_json_stdout(vfs_invalidation_run)
         invalidation_equivalence = compare_invalidation_workloads(
-            native_invalidation_payload, agentfs_invalidation_payload
+            native_invalidation_payload, vfs_invalidation_payload
         )
-        agentfs_base_sha_after = hash_file(agentfs_base_root / "hot.bin")
-        agentfs_base_after = tree_hash(agentfs_base_root)
+        vfs_base_sha_after = hash_file(vfs_base_root / "hot.bin")
+        vfs_base_after = tree_hash(vfs_base_root)
         native_sha_after = hash_file(native_root / "hot.bin")
         stale_reads = (
-            int(agentfs_invalidation_payload.get("stale_reads", 1))
-            if isinstance(agentfs_invalidation_payload, dict)
+            int(vfs_invalidation_payload.get("stale_reads", 1))
+            if isinstance(vfs_invalidation_payload, dict)
             else 1
         )
-        invalidation_profile = profile_counter_summary(agentfs_invalidation_run.get("profile_summaries", []))
+        invalidation_profile = profile_counter_summary(vfs_invalidation_run.get("profile_summaries", []))
         invalidation_passed = (
             native_invalidation_run["returncode"] == 0
-            and agentfs_invalidation_run["returncode"] == 0
+            and vfs_invalidation_run["returncode"] == 0
             and invalidation_equivalence.get("equivalent") is True
             and stale_reads == 0
-            and agentfs_base_after["sha256"] == agentfs_base_before["sha256"]
+            and vfs_base_after["sha256"] == vfs_base_before["sha256"]
             and native_sha_after != original_sha
         )
 
@@ -716,9 +716,9 @@ def main(argv: list[str]) -> int:
             if native_read_payload and isinstance(native_read_payload.get("total_seconds"), (int, float))
             else None
         )
-        agentfs_workload_seconds = (
-            float(agentfs_read_payload["total_seconds"])
-            if agentfs_read_payload and isinstance(agentfs_read_payload.get("total_seconds"), (int, float))
+        vfs_workload_seconds = (
+            float(vfs_read_payload["total_seconds"])
+            if vfs_read_payload and isinstance(vfs_read_payload.get("total_seconds"), (int, float))
             else None
         )
 
@@ -734,8 +734,8 @@ def main(argv: list[str]) -> int:
                 "invalidation_post_reads": args.invalidation_post_reads,
                 "mutation_offset": args.mutation_offset,
             },
-            "agentfs": {
-                "bin": agentfs_bin,
+            "vfs": {
+                "bin": vfs_bin,
                 "profile_enabled": args.profile,
                 "passthrough": passthrough_status(read_counters),
             },
@@ -749,8 +749,8 @@ def main(argv: list[str]) -> int:
                     )
                     if not passed
                 ],
-                "repeated_open_read_ratio": ratio(agentfs_read_run["duration_seconds"], native_read_run["duration_seconds"]),
-                "repeated_open_read_workload_ratio": ratio(agentfs_workload_seconds, native_workload_seconds),
+                "repeated_open_read_ratio": ratio(vfs_read_run["duration_seconds"], native_read_run["duration_seconds"]),
+                "repeated_open_read_workload_ratio": ratio(vfs_workload_seconds, native_workload_seconds),
                 "chunk_read_queries": int(read_counters.get("chunk_read_queries", 0) or 0),
                 "chunk_read_chunks": int(read_counters.get("chunk_read_chunks", 0) or 0),
                 "stale_reads": stale_reads,
@@ -763,10 +763,10 @@ def main(argv: list[str]) -> int:
                         "workload": native_read_payload,
                         "timing": split_timing(native_read_run, native_read_payload),
                     },
-                    "agentfs": {
-                        "run": agentfs_read_run,
-                        "workload": agentfs_read_payload,
-                        "timing": split_timing(agentfs_read_run, agentfs_read_payload),
+                    "vfs": {
+                        "run": vfs_read_run,
+                        "workload": vfs_read_payload,
+                        "timing": split_timing(vfs_read_run, vfs_read_payload),
                         "profile_counters": read_profile,
                     },
                     "equivalence": read_equivalence,
@@ -778,20 +778,20 @@ def main(argv: list[str]) -> int:
                         "workload": native_invalidation_payload,
                         "timing": split_timing(native_invalidation_run, native_invalidation_payload),
                     },
-                    "agentfs": {
-                        "run": agentfs_invalidation_run,
-                        "workload": agentfs_invalidation_payload,
-                        "timing": split_timing(agentfs_invalidation_run, agentfs_invalidation_payload),
+                    "vfs": {
+                        "run": vfs_invalidation_run,
+                        "workload": vfs_invalidation_payload,
+                        "timing": split_timing(vfs_invalidation_run, vfs_invalidation_payload),
                         "profile_counters": invalidation_profile,
                     },
                     "equivalence": invalidation_equivalence,
                     "base_file": {
                         "original_sha256": original_sha,
                         "native_sha256_after": native_sha_after,
-                        "agentfs_base_sha256_after": agentfs_base_sha_after,
-                        "agentfs_base_unchanged": agentfs_base_after["sha256"] == agentfs_base_before["sha256"],
-                        "agentfs_base_tree_before": agentfs_base_before,
-                        "agentfs_base_tree_after": agentfs_base_after,
+                        "vfs_base_sha256_after": vfs_base_sha_after,
+                        "vfs_base_unchanged": vfs_base_after["sha256"] == vfs_base_before["sha256"],
+                        "vfs_base_tree_before": vfs_base_before,
+                        "vfs_base_tree_after": vfs_base_after,
                     },
                 },
             },

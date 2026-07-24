@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-# Install system dependencies for agentfs
+# Install system dependencies for vfs
 
 if [[ "$OSTYPE" == "linux-gnu"* ]]; then
     echo "Installing dependencies for Linux..."

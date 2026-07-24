@@ -2,7 +2,7 @@
 """Phase 8 concurrent Git status/diff stress gate.
 
 The gate builds a deterministic local Git fixture, runs the same concurrent
-read-mostly Git workload natively and through AgentFS, and requires the hashed
+read-mostly Git workload natively and through Vfs, and requires the hashed
 status/diff/log outputs to match exactly.
 """
 
@@ -63,7 +63,7 @@ def git_env():
 
 def run_git(label, argv, cwd):
     # Honor the harness's pinned-git override: PATH shims are invisible inside
-    # the agentfs sandbox, so only an absolute system-path GIT avoids the
+    # the vfs sandbox, so only an absolute system-path GIT avoids the
     # daemonizing hook-manager shim (scripts/validation/lib/common.py).
     git = os.environ.get("GIT", "git")
     started = time.perf_counter()
@@ -213,7 +213,7 @@ def env_flag(name: str) -> bool:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run concurrent git status/status/diff/log through native storage and AgentFS."
+        description="Run concurrent git status/status/diff/log through native storage and Vfs."
     )
     parser.add_argument("--fixture-files", type=positive_int, default=48)
     parser.add_argument("--fixture-dirs", type=positive_int, default=6)
@@ -221,9 +221,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--edit-files", type=positive_int, default=4)
     parser.add_argument("--append-bytes", type=positive_int, default=128)
     parser.add_argument(
-        "--agentfs-bin",
-        default=os.environ.get("AGENTFS_BIN"),
-        help="agentfs executable path/name (default: repo target binary, building cli if needed)",
+        "--vfs-bin",
+        default=os.environ.get("VFS_BIN"),
+        help="vfs executable path/name (default: repo target binary, building cli if needed)",
     )
     parser.add_argument(
         "--timeout",
@@ -333,20 +333,20 @@ def parse_json_stdout(run: dict[str, Any]) -> Optional[dict[str, Any]]:
     return None
 
 
-def resolve_agentfs_bin(agentfs_bin: Optional[str], repo_root: Path) -> str:
-    if agentfs_bin:
-        candidate = Path(agentfs_bin).expanduser()
+def resolve_vfs_bin(vfs_bin: Optional[str], repo_root: Path) -> str:
+    if vfs_bin:
+        candidate = Path(vfs_bin).expanduser()
         if candidate.is_file() and os.access(candidate, os.X_OK):
             return str(candidate.resolve())
-        if os.sep not in agentfs_bin:
-            found = shutil.which(agentfs_bin)
+        if os.sep not in vfs_bin:
+            found = shutil.which(vfs_bin)
             if found:
                 return found
-        raise RuntimeError(f"configured agentfs executable not found or not executable: {agentfs_bin}")
+        raise RuntimeError(f"configured vfs executable not found or not executable: {vfs_bin}")
 
     for candidate in (
-        repo_root / "cli" / "target" / "debug" / "agentfs",
-        repo_root / "cli" / "target" / "release" / "agentfs",
+        repo_root / "cli" / "target" / "debug" / "vfs",
+        repo_root / "cli" / "target" / "release" / "vfs",
     ):
         if candidate.is_file() and os.access(candidate, os.X_OK):
             return str(candidate)
@@ -360,11 +360,11 @@ def resolve_agentfs_bin(agentfs_bin: Optional[str], repo_root: Path) -> str:
     )
     if build.returncode != 0:
         raise RuntimeError(
-            "failed to build repo-local agentfs binary; set AGENTFS_BIN explicitly\n"
+            "failed to build repo-local vfs binary; set VFS_BIN explicitly\n"
             f"stdout:\n{tail_text(build.stdout)}\n"
             f"stderr:\n{tail_text(build.stderr)}"
         )
-    built = repo_root / "cli" / "target" / "debug" / "agentfs"
+    built = repo_root / "cli" / "target" / "debug" / "vfs"
     if built.is_file() and os.access(built, os.X_OK):
         return str(built)
     raise RuntimeError(f"repo-local build completed but binary was not found: {built}")
@@ -389,10 +389,10 @@ def git_env() -> dict[str, str]:
     env.setdefault("GIT_TERMINAL_PROMPT", "0")
     env.setdefault("NO_COLOR", "1")
     env.setdefault("LC_ALL", "C")
-    env["GIT_AUTHOR_NAME"] = "AgentFS Phase8"
-    env["GIT_AUTHOR_EMAIL"] = "agentfs-phase8@example.invalid"
-    env["GIT_COMMITTER_NAME"] = "AgentFS Phase8"
-    env["GIT_COMMITTER_EMAIL"] = "agentfs-phase8@example.invalid"
+    env["GIT_AUTHOR_NAME"] = "Vfs Phase8"
+    env["GIT_AUTHOR_EMAIL"] = "vfs-phase8@example.invalid"
+    env["GIT_COMMITTER_NAME"] = "Vfs Phase8"
+    env["GIT_COMMITTER_EMAIL"] = "vfs-phase8@example.invalid"
     return env
 
 
@@ -425,9 +425,9 @@ def create_generated_repo(root: Path, file_count: int, dir_count: int, file_size
     env["GIT_COMMITTER_DATE"] = "2024-01-01T00:00:00Z"
     require_git_ok(run_git(["init"], root, env=env), "git init generated repo")
     require_git_ok(run_git(["checkout", "-B", "main"], root, env=env), "git checkout main")
-    require_git_ok(run_git(["config", "user.name", "AgentFS Phase8"], root, env=env), "git config user.name")
+    require_git_ok(run_git(["config", "user.name", "Vfs Phase8"], root, env=env), "git config user.name")
     require_git_ok(
-        run_git(["config", "user.email", "agentfs-phase8@example.invalid"], root, env=env),
+        run_git(["config", "user.email", "vfs-phase8@example.invalid"], root, env=env),
         "git config user.email",
     )
 
@@ -448,7 +448,7 @@ def create_generated_repo(root: Path, file_count: int, dir_count: int, file_size
         else:
             filename = f"blob_{index:05d}.txt"
             header = f"phase8 data fixture {index} PHASE8_TOKEN\n"
-        seed = hashlib.sha256(f"agentfs-phase8-concurrent-git-{index}".encode("utf-8")).hexdigest()
+        seed = hashlib.sha256(f"vfs-phase8-concurrent-git-{index}".encode("utf-8")).hexdigest()
         filler = "".join(f"{line:04d} {seed} PHASE8_TOKEN_{line % 7}\n" for line in range(128))
         content = (header + filler)[:file_size]
         if not content.endswith("\n"):
@@ -476,9 +476,9 @@ def prepare_environment(temp_root: Path, profile: bool) -> dict[str, str]:
     env.setdefault("GIT_CONFIG_NOSYSTEM", "1")
     env.setdefault("GIT_TERMINAL_PROMPT", "0")
     if profile:
-        env["AGENTFS_PROFILE"] = "1"
+        env["VFS_PROFILE"] = "1"
     else:
-        env.pop("AGENTFS_PROFILE", None)
+        env.pop("VFS_PROFILE", None)
 
     home = temp_root / "home"
     for path in (home, home / ".config", home / ".cache", home / ".local" / "share"):
@@ -606,9 +606,9 @@ def db_artifacts(db_path: Path) -> dict[str, Any]:
     }
 
 
-def run_integrity(agentfs_bin: str, db_path: Path, cwd: Path, env: dict[str, str], timeout: float) -> dict[str, Any]:
+def run_integrity(vfs_bin: str, db_path: Path, cwd: Path, env: dict[str, str], timeout: float) -> dict[str, Any]:
     run = run_subprocess(
-        [agentfs_bin, "integrity", str(db_path), "--json", "--require-portable"],
+        [vfs_bin, "integrity", str(db_path), "--json", "--require-portable"],
         cwd,
         env,
         timeout,
@@ -635,7 +635,7 @@ def workload_argv(args: argparse.Namespace) -> list[str]:
 
 def default_output_path() -> Path:
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    return Path(tempfile.gettempdir()) / f"agentfs-phase8-concurrent-git-{stamp}-{uuid.uuid4().hex[:8]}.json"
+    return Path(tempfile.gettempdir()) / f"vfs-phase8-concurrent-git-{stamp}-{uuid.uuid4().hex[:8]}.json"
 
 
 def main(argv: list[str]) -> int:
@@ -645,10 +645,10 @@ def main(argv: list[str]) -> int:
 
     temp_manager: Optional[tempfile.TemporaryDirectory[str]] = None
     if args.keep_temp:
-        temp_root = Path(tempfile.mkdtemp(prefix="agentfs-phase8-concurrent-git-"))
+        temp_root = Path(tempfile.mkdtemp(prefix="vfs-phase8-concurrent-git-"))
     else:
         temp_manager = tempfile.TemporaryDirectory(
-            prefix="agentfs-phase8-concurrent-git-",
+            prefix="vfs-phase8-concurrent-git-",
             ignore_cleanup_errors=True,
         )
         temp_root = Path(temp_manager.name)
@@ -659,14 +659,14 @@ def main(argv: list[str]) -> int:
         common.pin_distro_git(os.environ, temp_root)
         if shutil.which(os.environ.get("GIT", "git")) is None:
             raise RuntimeError("git executable is required")
-        agentfs_bin = resolve_agentfs_bin(args.agentfs_bin, repo_root)
+        vfs_bin = resolve_vfs_bin(args.vfs_bin, repo_root)
         env = prepare_environment(temp_root, args.profile)
         session = args.session or f"phase8-concurrent-git-{uuid.uuid4().hex}"
-        db_path = Path(env["HOME"]) / ".agentfs" / "run" / session / "delta.db"
+        db_path = Path(env["HOME"]) / ".vfs" / "run" / session / "delta.db"
 
         source_root = temp_root / "source"
         native_root = temp_root / "native"
-        agentfs_base_root = temp_root / "agentfs-base"
+        vfs_base_root = temp_root / "vfs-base"
         create_generated_repo(
             source_root,
             args.fixture_files,
@@ -674,38 +674,38 @@ def main(argv: list[str]) -> int:
             args.fixture_file_size_bytes,
         )
         shutil.copytree(source_root, native_root, symlinks=True)
-        shutil.copytree(source_root, agentfs_base_root, symlinks=True)
+        shutil.copytree(source_root, vfs_base_root, symlinks=True)
 
-        base_before = tree_hash(agentfs_base_root)
+        base_before = tree_hash(vfs_base_root)
         workload = workload_argv(args)
         native_run = run_subprocess(workload, native_root, env, args.timeout)
-        agentfs_run = run_subprocess(
-            [agentfs_bin, "run", "--session", session, "--no-default-allows", "--"] + workload,
-            agentfs_base_root,
+        vfs_run = run_subprocess(
+            [vfs_bin, "run", "--session", session, "--no-default-allows", "--"] + workload,
+            vfs_base_root,
             env,
             args.timeout,
         )
-        base_after = tree_hash(agentfs_base_root)
+        base_after = tree_hash(vfs_base_root)
 
         native_payload = parse_json_stdout(native_run)
-        agentfs_payload = parse_json_stdout(agentfs_run)
+        vfs_payload = parse_json_stdout(vfs_run)
         digest_equal = (
             isinstance(native_payload, dict)
-            and isinstance(agentfs_payload, dict)
-            and native_payload.get("digest") == agentfs_payload.get("digest")
+            and isinstance(vfs_payload, dict)
+            and native_payload.get("digest") == vfs_payload.get("digest")
         )
         zero_exits = (
             native_run["returncode"] == 0
-            and agentfs_run["returncode"] == 0
+            and vfs_run["returncode"] == 0
             and isinstance(native_payload, dict)
-            and isinstance(agentfs_payload, dict)
+            and isinstance(vfs_payload, dict)
             and native_payload.get("zero_exits") is True
-            and agentfs_payload.get("zero_exits") is True
+            and vfs_payload.get("zero_exits") is True
         )
         base_unchanged = base_before["sha256"] == base_after["sha256"]
         db_after = db_artifacts(db_path)
         db_inspect = inspect_db(db_path)
-        integrity = run_integrity(agentfs_bin, db_path, temp_root, env, args.timeout) if db_path.exists() else {
+        integrity = run_integrity(vfs_bin, db_path, temp_root, env, args.timeout) if db_path.exists() else {
             "run": None,
             "result": None,
             "ok": False,
@@ -730,8 +730,8 @@ def main(argv: list[str]) -> int:
             "command": {
                 "argv": [str(Path(__file__).resolve())] + argv,
                 "workload_argv": workload,
-                "agentfs_prefix": [
-                    agentfs_bin,
+                "vfs_prefix": [
+                    vfs_bin,
                     "run",
                     "--session",
                     session,
@@ -747,8 +747,8 @@ def main(argv: list[str]) -> int:
                 "append_bytes": args.append_bytes,
                 "timeout_seconds": args.timeout,
             },
-            "agentfs": {
-                "bin": agentfs_bin,
+            "vfs": {
+                "bin": vfs_bin,
                 "session": session,
                 "db_path": str(db_path),
                 "profile_enabled": args.profile,
@@ -758,13 +758,13 @@ def main(argv: list[str]) -> int:
                 "zero_exits": zero_exits,
                 "digest_equal": digest_equal,
                 "native_digest": native_payload.get("digest") if isinstance(native_payload, dict) else None,
-                "agentfs_digest": agentfs_payload.get("digest") if isinstance(agentfs_payload, dict) else None,
+                "vfs_digest": vfs_payload.get("digest") if isinstance(vfs_payload, dict) else None,
                 "base_unchanged": base_unchanged,
                 "strict_no_sidecar_files": db_after.get("strict_no_sidecar_files"),
                 "integrity_ok": integrity.get("ok"),
             },
             "native": {"run": native_run, "workload": native_payload},
-            "agentfs_overlay": {"run": agentfs_run, "workload": agentfs_payload},
+            "vfs_overlay": {"run": vfs_run, "workload": vfs_payload},
             "base_tree": {"before": base_before, "after": base_after, "unchanged": base_unchanged},
             "database": {"after": db_after, "inspect_after": db_inspect, "integrity": integrity},
             "temp_dir": str(temp_root),

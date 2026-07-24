@@ -85,7 +85,7 @@ def env_flag(name: str) -> bool:
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run a partial-origin write through agentfs run and fail if sampled "
+            "Run a partial-origin write through vfs run and fail if sampled "
             "base-file bytes or stable metadata change."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -97,8 +97,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
   scripts/validation/partial-origin-no-real-write.py --file-size-mib 200 --timeout 180
 
 Environment:
-  AGENTFS_BIN      path/name of agentfs executable
-  AGENTFS_PROFILE  set to 1 to collect AgentFS profile summaries
+  VFS_BIN      path/name of vfs executable
+  VFS_PROFILE  set to 1 to collect Vfs profile summaries
 """,
     )
     parser.add_argument(
@@ -119,9 +119,9 @@ Environment:
         help="bytes to hash at each sampled range (default: 4096)",
     )
     parser.add_argument(
-        "--agentfs-bin",
-        default=os.environ.get("AGENTFS_BIN"),
-        help="agentfs executable path/name (default: repo target binary, building cli if needed)",
+        "--vfs-bin",
+        default=os.environ.get("VFS_BIN"),
+        help="vfs executable path/name (default: repo target binary, building cli if needed)",
     )
     parser.add_argument(
         "--timeout",
@@ -132,13 +132,13 @@ Environment:
     parser.add_argument(
         "--session",
         default=None,
-        help="AgentFS run session id (default: generated unique id)",
+        help="Vfs run session id (default: generated unique id)",
     )
     parser.add_argument(
         "--profile",
         action="store_true",
-        default=env_flag("AGENTFS_PROFILE"),
-        help="enable AGENTFS_PROFILE=1 for AgentFS invocation",
+        default=env_flag("VFS_PROFILE"),
+        help="enable VFS_PROFILE=1 for Vfs invocation",
     )
     parser.add_argument(
         "--keep-temp",
@@ -176,13 +176,13 @@ def extract_profile_summaries(stderr: Any) -> list[dict[str, Any]]:
     summaries: list[dict[str, Any]] = []
     for line in text.splitlines():
         line = line.strip()
-        if not line or "agentfs_profile_summary" not in line:
+        if not line or "vfs_profile_summary" not in line:
             continue
         try:
             value = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(value, dict) and value.get("event") == "agentfs_profile_summary":
+        if isinstance(value, dict) and value.get("event") == "vfs_profile_summary":
             summaries.append(value)
     return summaries
 
@@ -270,20 +270,20 @@ def parse_json_stdout(run: dict[str, Any]) -> Optional[dict[str, Any]]:
     return None
 
 
-def resolve_agentfs_bin(agentfs_bin: Optional[str], repo_root: Path) -> str:
-    if agentfs_bin:
-        candidate_path = Path(agentfs_bin).expanduser()
+def resolve_vfs_bin(vfs_bin: Optional[str], repo_root: Path) -> str:
+    if vfs_bin:
+        candidate_path = Path(vfs_bin).expanduser()
         if candidate_path.is_file() and os.access(candidate_path, os.X_OK):
             return str(candidate_path.resolve())
-        if os.sep not in agentfs_bin:
-            found = shutil.which(agentfs_bin)
+        if os.sep not in vfs_bin:
+            found = shutil.which(vfs_bin)
             if found:
                 return found
-        raise RuntimeError(f"configured agentfs executable not found or not executable: {agentfs_bin}")
+        raise RuntimeError(f"configured vfs executable not found or not executable: {vfs_bin}")
 
     for candidate_path in (
-        repo_root / "cli" / "target" / "debug" / "agentfs",
-        repo_root / "cli" / "target" / "release" / "agentfs",
+        repo_root / "cli" / "target" / "debug" / "vfs",
+        repo_root / "cli" / "target" / "release" / "vfs",
     ):
         if candidate_path.is_file() and os.access(candidate_path, os.X_OK):
             return str(candidate_path)
@@ -297,12 +297,12 @@ def resolve_agentfs_bin(agentfs_bin: Optional[str], repo_root: Path) -> str:
     )
     if build.returncode != 0:
         raise RuntimeError(
-            "failed to build repo-local agentfs binary; set AGENTFS_BIN to an explicit binary\n"
+            "failed to build repo-local vfs binary; set VFS_BIN to an explicit binary\n"
             f"stdout:\n{tail_text(build.stdout)}\n"
             f"stderr:\n{tail_text(build.stderr)}"
         )
 
-    built = repo_root / "cli" / "target" / "debug" / "agentfs"
+    built = repo_root / "cli" / "target" / "debug" / "vfs"
     if built.is_file() and os.access(built, os.X_OK):
         return str(built)
 
@@ -329,7 +329,7 @@ def create_large_file(path: Path, size_bytes: int) -> str:
     block_index = 0
     with path.open("wb") as handle:
         while written < size_bytes:
-            seed = hashlib.sha256(f"agentfs-phase6-no-real-write-{block_index}".encode()).digest()
+            seed = hashlib.sha256(f"vfs-phase6-no-real-write-{block_index}".encode()).digest()
             block = (seed * ((ONE_MIB // len(seed)) + 1))[: min(ONE_MIB, size_bytes - written)]
             handle.write(block)
             digest.update(block)
@@ -435,7 +435,7 @@ def prepare_environment(temp_root: Path, profile: bool) -> dict[str, str]:
     env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
     env.setdefault("NO_COLOR", "1")
     if profile:
-        env["AGENTFS_PROFILE"] = "1"
+        env["VFS_PROFILE"] = "1"
 
     home = temp_root / "home"
     for path in (home, home / ".config", home / ".cache", home / ".local" / "share"):
@@ -463,15 +463,15 @@ def main(argv: list[str]) -> int:
 
     temp_manager: Optional[tempfile.TemporaryDirectory[str]] = None
     if args.keep_temp:
-        temp_root = Path(tempfile.mkdtemp(prefix="agentfs-no-real-write-"))
+        temp_root = Path(tempfile.mkdtemp(prefix="vfs-no-real-write-"))
     else:
-        temp_manager = tempfile.TemporaryDirectory(prefix="agentfs-no-real-write-")
+        temp_manager = tempfile.TemporaryDirectory(prefix="vfs-no-real-write-")
         temp_root = Path(temp_manager.name)
 
     exit_code = 0
     result: dict[str, Any]
     try:
-        agentfs_bin = resolve_agentfs_bin(args.agentfs_bin, repo_root)
+        vfs_bin = resolve_vfs_bin(args.vfs_bin, repo_root)
         env = prepare_environment(temp_root, args.profile)
         session = args.session or f"no-real-write-{uuid.uuid4()}"
         source_root = temp_root / "base"
@@ -480,7 +480,7 @@ def main(argv: list[str]) -> int:
         before_sample = sample_base(base_file, args.sample_bytes, offset)
 
         command = [
-            agentfs_bin,
+            vfs_bin,
             "run",
             "--session",
             session,
@@ -497,13 +497,13 @@ def main(argv: list[str]) -> int:
         run = run_subprocess(command, source_root, env, args.timeout)
         after_sample = sample_base(base_file, args.sample_bytes, offset)
         workload_json = parse_json_stdout(run)
-        db_path = Path(env["HOME"]) / ".agentfs" / "run" / session / "delta.db"
+        db_path = Path(env["HOME"]) / ".vfs" / "run" / session / "delta.db"
         db_inspect = inspect_db(db_path)
 
         base_sample_unchanged = before_sample["samples"] == after_sample["samples"]
         base_metadata_unchanged = before_sample["stable_stat"] == after_sample["stable_stat"]
         correctness = {
-            "agentfs_returncode_zero": run["returncode"] == 0,
+            "vfs_returncode_zero": run["returncode"] == 0,
             "workload_json_present": workload_json is not None,
             "base_sample_unchanged": base_sample_unchanged,
             "base_metadata_unchanged": base_metadata_unchanged,
@@ -531,8 +531,8 @@ def main(argv: list[str]) -> int:
                 "edit_width_bytes": 1,
                 "sample_bytes": args.sample_bytes,
             },
-            "agentfs": {
-                "bin": agentfs_bin,
+            "vfs": {
+                "bin": vfs_bin,
                 "session": session,
                 "db_path": str(db_path),
                 "profile_enabled": args.profile,
@@ -550,7 +550,7 @@ def main(argv: list[str]) -> int:
                 "before_sample": before_sample,
                 "after_sample": after_sample,
             },
-            "agentfs_overlay": {
+            "vfs_overlay": {
                 "duration_seconds": run["duration_seconds"],
                 "run": run,
                 "result": workload_json,
