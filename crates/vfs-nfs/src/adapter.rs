@@ -24,7 +24,7 @@ use vfs_core::{
 
 /// Root directory inode number
 const ROOT_INO: fileid3 = 1;
-const WRITE_HANDLE_MAGIC: &[u8; 8] = b"AFSWRIT\0";
+const WRITE_HANDLE_MAGIC: &[u8; 8] = b"VFSWRIT\0";
 const PLAIN_HANDLE_LEN: usize = 16;
 const WRITE_HANDLE_LEN: usize = 32;
 
