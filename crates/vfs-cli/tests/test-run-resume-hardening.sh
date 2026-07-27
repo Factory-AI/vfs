@@ -195,6 +195,27 @@ test "$(stat -c %g foreign.txt)" = "$(id -g)"
 test "$(stat -c %a foreign.txt)" = 600
 '
 
+# A checkout materialized beneath an allowed ancestor keeps its overlay for
+# absolute-path resolution. A plain (non-recursive) self-bind of the allowed
+# ancestor would shadow the nested overlay mount, so a subprocess spawned with
+# an explicit absolute cwd would silently see the raw base tree.
+NESTED_ID="resume-nested-$$"
+NESTED_DIR="$TEST_HOME/.vfs/run/$NESTED_ID"
+NESTED_BASE="$TEST_HOME/.data/handoff/$NESTED_ID/checkout"
+mkdir -p "$NESTED_BASE" "$NESTED_DIR"
+printf "base payload\n" >"$NESTED_BASE/base.txt"
+cp "$PACKED" "$NESTED_DIR/delta.db"
+printf "%s" "$NESTED_BASE" >"$NESTED_DIR/base_path"
+run_from "$NESTED_BASE" run --session "$NESTED_ID" \
+    --allow "$TEST_HOME/.data" /bin/bash -c '
+set -e
+test "$(cat persisted.txt)" = two
+cd / && cd "$OLDPWD"
+test "$(cat persisted.txt)" = two
+env --chdir "$PWD" cat persisted.txt >/dev/null
+test "$(env --chdir "$PWD" cat persisted.txt)" = two
+'
+
 TARGET_STATUS="$TEST_ROOT/target-status.json"
 run_from "$OTHER" status "$TARGET_ID" --json >"$TARGET_STATUS"
 python3 - "$TARGET_STATUS" "$TARGET_ID" <<'PY'

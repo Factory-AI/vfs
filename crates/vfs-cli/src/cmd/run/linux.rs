@@ -889,14 +889,24 @@ fn remount_all_readonly_except(
             Err(_) => continue,
         };
 
-        // Bind mount to itself to establish new mountpoint (inherits rw)
+        // Bind mount to itself to establish new mountpoint (inherits rw).
+        // MS_REC keeps mounts nested under the allowed directory (for
+        // example an externally materialized session checkout with its
+        // overlay mounted under an allowed data dir) visible; a plain
+        // MS_BIND self-bind would shadow them with the underlying tree
+        // for any absolute-path resolution.
+        let bind_flags = if allowed.is_dir() {
+            libc::MS_BIND | libc::MS_REC
+        } else {
+            libc::MS_BIND
+        };
         // SAFETY: mount() with valid paths
         let bind_result = unsafe {
             libc::mount(
                 path_cstr.as_ptr(),
                 path_cstr.as_ptr(),
                 std::ptr::null(),
-                libc::MS_BIND,
+                bind_flags,
                 std::ptr::null(),
             )
         };
