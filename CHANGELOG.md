@@ -6,6 +6,22 @@ This fork restructured the post-0.6.4 tree around a five-crate Rust
 workspace. The changes below are the user-visible summary of that campaign;
 behavior-preserving moves are not listed individually.
 
+### Added
+
+- `vfs adopt <session-id> --db <path> --base <path> [--pin <commit>]`:
+  first-class installation of a transferred pack artifact as a local run
+  session, replacing the hand-written "externally materialized run
+  sessions" receiver contract. Adopt integrity-checks the artifact,
+  migrates supported older artifact schemas to the current version,
+  verifies the receiving base checkout's `HEAD` against the artifact's
+  recorded seed pin (or a required `--pin` for artifacts without recorded
+  provenance), and publishes the session atomically so a partial or
+  corrupt session is never observable. `vfs version --json` reports the
+  capability as `features.adopt`.
+- `vfs seed` records its resolved pin in `fs_session_metadata` as
+  `seed_pin`, giving packed artifacts the base provenance `vfs adopt`
+  verifies on the receiving machine.
+
 ### Removed
 
 - Deleted SDKs: the Go, Python, and TypeScript SDKs and their CI workflows;

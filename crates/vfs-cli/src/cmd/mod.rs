@@ -1,3 +1,4 @@
+pub mod adopt;
 pub mod completions;
 pub mod fs;
 pub mod init;

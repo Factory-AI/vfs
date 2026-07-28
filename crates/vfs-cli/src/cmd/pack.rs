@@ -275,7 +275,7 @@ async fn read_metadata_value(conn: &turso::Connection, key: &str) -> Result<Opti
     Ok(rows.next().await?.map(|row| row.get(0)).transpose()?)
 }
 
-fn ensure_session_inactive(session_dir: &Path) -> Result<()> {
+pub(crate) fn ensure_session_inactive(session_dir: &Path) -> Result<()> {
     let mountpoint = session_dir.join("mnt");
     if vfs_mount::is_mountpoint(&mountpoint)
         || super::ps::procs_dir_has_live_processes(&session_dir.join("procs"))

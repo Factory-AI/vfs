@@ -432,6 +432,27 @@ vfs seed [OPTIONS] <SESSION_ID>
 - `--pin <COMMIT>` — Git commit used as the pristine portable base
 - `--json` — Emit machine-readable JSON (seed output is always JSON)
 
+### vfs adopt
+
+Install an externally transferred run session.
+
+Verifies a packed session database against the receiver's base git checkout (the checkout's HEAD must equal the artifact's recorded seed pin), migrates supported older artifact schemas to the current version, and atomically publishes ~/.vfs/run/<SESSION_ID>. After adopt, `vfs run --session <SESSION_ID>` resumes the transferred session.
+
+```
+vfs adopt [OPTIONS] <SESSION_ID>
+```
+
+**Arguments:**
+
+- `<SESSION_ID>` — Run session identifier
+
+**Options:**
+
+- `--db <PATH>` — Packed session database produced by `vfs pack`
+- `--base <PATH>` — The receiver's base git checkout for the session
+- `--pin <COMMIT>` — Git commit the base checkout must be at (required only when the artifact does not record a seed pin)
+- `--json` — Emit machine-readable JSON (adopt output is always JSON)
+
 ### vfs status
 
 Show run session state for daemon preflight
@@ -603,6 +624,9 @@ copies the sender's index bytes, preserving staged versus unstaged state; Git
 revalidates cached stat fields when the delta is materialized over a pristine
 checkout at the pin.
 
+Seed records the resolved pin inside the session database as the session's
+base provenance; `vfs adopt` verifies the receiving base checkout against it.
+
 Seed is a birth-time operation. A second call fails with
 `session already seeded`, and a live mount or wrapped process fails with the
 same exit-code-3 teardown gate used by `vfs pack`.
@@ -639,30 +663,57 @@ The packed transfer artifact is only `delta.db`; `procs/`, `mnt/`,
 `.session.lock`, `base_path`, and other session-directory files are never
 included in that artifact.
 
-### Externally materialized run sessions
+### Adopting run sessions
 
-The receiver contract for an externally materialized session is exactly:
+`vfs adopt <session-id> --db <path> --base <path>` installs a transferred
+pack artifact as a local run session. Adopt owns the receiver side of a
+handoff end to end:
 
-```text
-~/.vfs/run/<session-id>/
-├── delta.db
-└── base_path
+1. It refuses a session ID whose `~/.vfs/run/<session-id>/delta.db` already
+   exists, and takes the same exclusive `.session.lock` used by `run`, `seed`,
+   and `pack`, so a live owner fails with exit code `3`.
+2. It stages a private copy of the artifact, checks SQLite integrity, and
+   migrates supported older artifact schemas to the current version — the
+   same staging migration `vfs pack` performs before it ships an artifact, so
+   an adopted session always opens under `vfs run` without a separate
+   `vfs migrate` step. An artifact written by a newer vfs is refused with an
+   error naming both versions.
+3. It verifies base provenance: `--base` must be a git checkout whose `HEAD`
+   equals the seed pin recorded in the artifact by `vfs seed`. For artifacts
+   without recorded provenance, `--pin <commit>` is required and verified the
+   same way; a `--pin` that contradicts recorded provenance is refused. A
+   base checkout at any other commit is refused before anything is published.
+4. Publication writes `base_path` and then atomically renames the staged
+   database to `delta.db`. That rename is the commit point: on any earlier
+   failure a session directory adopt created is removed again, so a partial
+   or corrupt session is never observable.
+
+Adopt prints a one-line JSON manifest:
+
+```json
+{
+  "manifestVersion": 1,
+  "sessionId": "<session-id>",
+  "basePath": "/abs/receiver/checkout",
+  "basePin": "<commit>",
+  "generation": 1,
+  "schemaVersion": "0.6",
+  "seededPaths": ["src/lib.rs"],
+  "vfsVersion": "0.6.4"
+}
 ```
 
-- `delta.db` is the packed database produced by `vfs pack`.
-- `base_path` is a UTF-8 text file containing the absolute path of the
-  receiver's existing base checkout. The path must name a directory.
-- The receiver does not create `mnt/`, `procs/`, `.session.lock`, SQLite
-  sidecars, or any other state. `vfs run --session <session-id>` creates or
-  recovers those runtime artifacts lazily.
-- A later invocation may start from any host working directory; the persisted
-  `base_path` remains the session base.
-
-After writing those two files, resume the session with:
+After adopt, resume the session with:
 
 ```bash
 vfs run --session <session-id> -- <command>
 ```
+
+The installed layout — `delta.db` plus a `base_path` text file naming the
+receiver checkout, with `mnt/`, `procs/`, `.session.lock`, and
+`runtime-status.json` created lazily by `vfs run` — is an internal detail
+owned by adopt; sessions must be installed through `vfs adopt`, not by
+writing those files by hand.
 
 ### Run session status
 
@@ -698,9 +749,9 @@ these reserved statuses before the wrapped command begins:
 |--------|---------|
 | `1` | General CLI failure not assigned a more specific status |
 | `2` | Command-line usage or argument parsing failure |
-| `3` | The requested session is genuinely live; `run`, `pack`, or `seed` cannot take exclusive ownership |
+| `3` | The requested session is genuinely live; `run`, `pack`, `seed`, or `adopt` cannot take exclusive ownership |
 | `4` | `vfs run` could not create, recover, or install the session mount/sandbox |
-| `5` | The requested run session ID or externally materialized session directory is missing, malformed, or invalid |
+| `5` | The requested run session ID or adopted session directory is missing, malformed, or invalid |
 | `126` | The wrapped command was found but could not be executed |
 | `127` | The wrapped command was not found |
 

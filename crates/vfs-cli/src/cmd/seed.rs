@@ -153,7 +153,7 @@ pub(crate) async fn seed_session(
         .iter()
         .map(|path| format!("/{path}"))
         .collect::<Vec<_>>();
-    vfs.record_seed_state(&seeded_paths, &whiteout_db_paths)
+    vfs.record_seed_state(&seeded_paths, &whiteout_db_paths, &plan.pin)
         .await
         .context("Failed to record seed metadata")?;
     vfs.fs
@@ -354,7 +354,7 @@ fn build_seed_plan(base_path: &Path, requested_pin: &str) -> Result<SeedPlan> {
     })
 }
 
-fn ensure_git_repository(base_path: &Path) -> Result<()> {
+pub(crate) fn ensure_git_repository(base_path: &Path) -> Result<()> {
     let inside = git_capture_text(base_path, &["rev-parse", "--is-inside-work-tree"])
         .context("session base is not a git repository")?;
     if inside.trim() != "true" {
@@ -363,7 +363,7 @@ fn ensure_git_repository(base_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn resolve_commit(base_path: &Path, revision: &str) -> Result<String> {
+pub(crate) fn resolve_commit(base_path: &Path, revision: &str) -> Result<String> {
     Ok(git_capture_text(
         base_path,
         &["rev-parse", "--verify", &format!("{revision}^{{commit}}")],
@@ -1049,6 +1049,7 @@ mod tests {
             vfs.session_metadata().await?.seeded_paths,
             summary.seeded_paths
         );
+        assert_eq!(vfs.seed_pin().await?.as_deref(), Some(fixture.pin.as_str()));
         let overlay = OverlayFS::new(Arc::new(HostFS::new(&pristine)?), vfs.fs);
         overlay.load().await?;
 
