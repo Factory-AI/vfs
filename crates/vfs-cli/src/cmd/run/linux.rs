@@ -110,6 +110,18 @@ pub fn run(options: RunOptions) -> Result<()> {
     };
     let session = RunSession::from(prepared);
     let cwd = session.base_path.clone();
+    if session.start_state == StartState::Live {
+        eprintln!("Joining existing session: {}", session.run_id);
+        eprintln!();
+        return run_in_existing_session(
+            &cwd,
+            &session.fuse_mountpoint,
+            &allowed_paths,
+            command,
+            args,
+            &session.run_id,
+        );
+    }
     if session.start_state == StartState::StaleRecovered {
         eprintln!(
             "Recovered stale runtime state for session {}.",
@@ -393,6 +405,96 @@ async fn mount_session_fs(
         metadata.seeded,
     )?;
     Ok(mount_handle)
+}
+
+/// Run a command through an existing session's FUSE mount.
+fn run_in_existing_session(
+    cwd: &Path,
+    fuse_mountpoint: &Path,
+    allowed_paths: &[PathBuf],
+    command: PathBuf,
+    args: Vec<String>,
+    session_id: &str,
+) -> Result<()> {
+    // SAFETY: getuid/getgid are always safe.
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+    let (pipe_to_child, pipe_to_parent) = create_sync_pipes()?;
+
+    // SAFETY: no tokio runtime exists yet, so the child cannot inherit a
+    // runtime lock held by another thread.
+    let child_pid = unsafe { libc::fork() };
+    if child_pid < 0 {
+        bail!("Failed to fork: {}", std::io::Error::last_os_error());
+    }
+
+    if child_pid == 0 {
+        // SAFETY: close the unused pipe ends inherited by the child.
+        unsafe {
+            libc::close(pipe_to_child[1]);
+            libc::close(pipe_to_parent[0]);
+        }
+        run_child(
+            cwd,
+            fuse_mountpoint,
+            allowed_paths,
+            command,
+            args,
+            session_id,
+            pipe_to_child[0],
+            pipe_to_parent[1],
+        );
+    }
+
+    // SAFETY: close the unused pipe ends inherited by the parent.
+    unsafe {
+        libc::close(pipe_to_child[0]);
+        libc::close(pipe_to_parent[1]);
+    }
+
+    if !wait_for_pipe_signal(pipe_to_parent[0]) {
+        eprintln!("Error: Failed to read sync signal from child process");
+        abort_child(pipe_to_child[1], child_pid, MOUNT_FAILURE_EXIT_CODE);
+    }
+    if let Err(error) = write_namespace_mappings(child_pid, uid, gid) {
+        eprintln!("Error: {error:#}");
+        abort_child(pipe_to_child[1], child_pid, MOUNT_FAILURE_EXIT_CODE);
+    }
+
+    // SAFETY: signal the child through valid pipe descriptors, then close
+    // both parent-owned ends.
+    unsafe {
+        libc::write(pipe_to_child[1], b"x".as_ptr() as *const libc::c_void, 1);
+        libc::close(pipe_to_child[1]);
+        libc::close(pipe_to_parent[0]);
+    }
+
+    let proc_registration = match crate::cmd::ps::ProcRegistration::register(
+        session_id,
+        false,
+        &command.to_string_lossy(),
+        cwd,
+    ) {
+        Ok(registration) => Some(registration),
+        Err(error) => {
+            eprintln!("Warning: Failed to write proc file: {error}");
+            None
+        }
+    };
+
+    let status = crate::get_runtime().block_on(vfs_mount::supervise::supervise_pid_with_hooks(
+        child_pid,
+        vfs_mount::supervise::SuperviseOpts::default(),
+        vfs_mount::supervise::SuperviseHooks::with_profile_checkpoint(
+            crate::profiling::report_checkpoint,
+        ),
+    ))?;
+    let exit_code = vfs_mount::supervise::exit_code_for_status(status);
+
+    drop(proc_registration);
+    crate::cmd::ps::cleanup_session_proc_state(session_id);
+    crate::profiling::emit_cli_report();
+    std::process::exit(exit_code);
 }
 
 /// Print the welcome banner showing sandbox configuration.

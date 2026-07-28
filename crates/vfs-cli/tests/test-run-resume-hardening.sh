@@ -232,7 +232,8 @@ assert set(status) == {
 }, status
 PY
 
-# A genuinely live incarnation is not joined or mistaken for stale state.
+# A genuinely live incarnation accepts joiners without being mistaken for
+# stale state or opening the database a second time.
 (
     cd "$OTHER"
     exec env \
@@ -260,11 +261,11 @@ while [ "$(date +%s)" -le "$deadline" ]; do
 done
 mountpoint -q "$TARGET_DIR/mnt" 2>/dev/null || fail "live owner never mounted"
 
-set +e
-run_from "$OTHER" run --session "$TARGET_ID" /bin/true >/dev/null 2>&1
-LIVE_CODE=$?
+run_from "$OTHER" run --session "$TARGET_ID" /bin/bash -c '
 set -e
-[ "$LIVE_CODE" -eq 3 ] || fail "live conflict returned $LIVE_CODE instead of 3"
+test "$(cat persisted.txt)" = two
+printf "joined\n" > live-join.txt
+'
 
 LIVE_STATUS="$TEST_ROOT/live-status.json"
 run_from "$OTHER" status "$TARGET_ID" --json >"$LIVE_STATUS"
@@ -279,6 +280,9 @@ PY
 kill -TERM "$OWNER_PID"
 wait "$OWNER_PID" 2>/dev/null || true
 OWNER_PID=""
+
+run_from "$OTHER" run --session "$TARGET_ID" \
+    /bin/bash -c 'test "$(cat live-join.txt)" = joined'
 
 set +e
 run_from "$OTHER" run --session "../invalid" /bin/true >/dev/null 2>&1

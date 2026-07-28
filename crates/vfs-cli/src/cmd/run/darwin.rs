@@ -17,8 +17,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use vfs_core::{FileSystem, HostFS, OverlayFS, Vfs, VfsOptions};
 
-use vfs_mount::supervise::{exit_code_for_spawn_error, exit_code_for_status, run_supervised};
-use vfs_mount::{mount_fs, Backend, MountOpts};
+use vfs_mount::supervise::{
+    exit_code_for_spawn_error, exit_code_for_status, run_supervised, supervise_command,
+    ChildOutcome,
+};
+use vfs_mount::{is_mountpoint, mount_fs, Backend, MountOpts};
 
 /// Configuration for the macOS sandbox profile.
 #[derive(Debug, Clone)]
@@ -325,7 +328,8 @@ pub async fn run(options: RunOptions) -> Result<()> {
         )
         .await?;
         session._session_lock = Some(seeded.into_shared_lock()?);
-    } else {
+        session.owns_runtime = true;
+    } else if session.owns_runtime {
         crate::cmd::run::recover_stale_session_runtime(&home, &session.session_id)?;
         let exclusive = session
             ._session_lock
@@ -336,6 +340,31 @@ pub async fn run(options: RunOptions) -> Result<()> {
                 .downgrade_to_shared()
                 .context("Failed to establish run session lifetime lock")?,
         );
+    } else if is_mountpoint(&session.mountpoint)
+        && std::fs::read_dir(&session.mountpoint).is_ok()
+        && session.runtime_status_file.is_file()
+    {
+        eprintln!("Joining existing session: {}", session.session_id);
+        eprintln!();
+        let proc_registration = match crate::cmd::ps::ProcRegistration::register(
+            &session.session_id,
+            false,
+            &command.to_string_lossy(),
+            &session.cwd,
+        ) {
+            Ok(registration) => Some(registration),
+            Err(error) => {
+                eprintln!("Warning: Failed to write proc file: {error}");
+                None
+            }
+        };
+        let outcome = run_command_in_mount(&session, command, args).await?;
+        drop(proc_registration);
+        crate::cmd::ps::cleanup_session_proc_state(&session.session_id);
+        crate::profiling::emit_cli_report();
+        std::process::exit(exit_code_for_outcome(outcome));
+    } else {
+        return Err(anyhow::Error::new(crate::cmd::pack::SessionStillRunning));
     }
 
     let proc_registration = match crate::cmd::ps::ProcRegistration::register(
@@ -448,6 +477,13 @@ pub async fn run(options: RunOptions) -> Result<()> {
     }
 }
 
+fn exit_code_for_outcome(outcome: ChildOutcome) -> i32 {
+    match outcome {
+        ChildOutcome::Exited(status) => status.code().unwrap_or(1),
+        ChildOutcome::Interrupted(signal) => 128 + signal,
+    }
+}
+
 /// Print the welcome banner showing sandbox configuration (macOS).
 #[cfg(target_os = "macos")]
 fn print_welcome_banner(session: &RunSession, encrypted: bool) {
@@ -479,6 +515,8 @@ fn print_welcome_banner(session: &RunSession, encrypted: bool) {
 struct RunSession {
     /// Shared advisory lock preventing pack from publishing over this run.
     _session_lock: Option<crate::cmd::session_lock::SessionLock>,
+    /// Whether this process acquired the exclusive startup lock.
+    owns_runtime: bool,
     /// Directory containing session artifacts.
     run_dir: PathBuf,
     /// Path to the delta database.
@@ -515,25 +553,33 @@ fn setup_run_directory(
     let existed = run_dir.exists();
     std::fs::create_dir_all(&run_dir).context("Failed to create run directory")?;
     let lock_file_existed = run_dir.join(".session.lock").is_file();
-    let session_lock = if acquire_lock {
-        Some(
-            crate::cmd::session_lock::SessionLock::try_exclusive(&run_dir).map_err(|error| {
-                if error.kind() == std::io::ErrorKind::WouldBlock {
-                    anyhow::Error::new(crate::cmd::pack::SessionStillRunning)
-                } else {
-                    anyhow::Error::new(error).context("Failed to lock run session")
-                }
-            })?,
-        )
+    let (session_lock, owns_runtime) = if acquire_lock {
+        match crate::cmd::session_lock::SessionLock::try_exclusive(&run_dir) {
+            Ok(lock) => (Some(lock), true),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                let lock = crate::cmd::session_lock::SessionLock::try_shared(&run_dir).map_err(
+                    |shared_error| {
+                        if shared_error.kind() == std::io::ErrorKind::WouldBlock {
+                            anyhow::Error::new(crate::cmd::pack::SessionStillRunning)
+                        } else {
+                            anyhow::Error::new(shared_error)
+                                .context("Failed to join run session lock")
+                        }
+                    },
+                )?;
+                (Some(lock), false)
+            }
+            Err(error) => return Err(error).context("Failed to lock run session"),
+        }
     } else {
-        None
+        (None, false)
     };
 
     let db_path = run_dir.join("delta.db");
     let mountpoint = run_dir.join("mnt");
     let runtime_status_file = run_dir.join("runtime-status.json");
     let base_path_file = run_dir.join("base_path");
-    if acquire_lock {
+    if owns_runtime {
         crate::cmd::pack::recover_interrupted_publication(&db_path)?;
     }
     let base_path = if !existed && !acquire_lock {
@@ -577,6 +623,7 @@ fn setup_run_directory(
 
     Ok(RunSession {
         _session_lock: session_lock,
+        owns_runtime,
         run_dir,
         db_path,
         mountpoint,
@@ -632,4 +679,24 @@ fn command_in_mount(
     crate::config::restore_original_tmpdir(&mut cmd);
 
     cmd
+}
+
+async fn run_command_in_mount(
+    session: &RunSession,
+    command: PathBuf,
+    args: Vec<String>,
+) -> Result<ChildOutcome> {
+    let command_display = command.display().to_string();
+    let child_command = command_in_mount(session, command, args);
+    match supervise_command(child_command).await {
+        Ok(outcome) => Ok(outcome),
+        Err(error) => {
+            if let Some(code) = spawn_error_exit_code(&error) {
+                eprintln!("Error: Failed to execute: {command_display}: {error}");
+                crate::profiling::emit_cli_report();
+                std::process::exit(code);
+            }
+            Err(error).with_context(|| format!("Failed to execute command: {command_display}"))
+        }
+    }
 }

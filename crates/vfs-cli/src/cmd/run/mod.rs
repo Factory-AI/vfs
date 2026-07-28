@@ -119,6 +119,7 @@ impl SessionPaths {
 enum StartState {
     Stopped,
     StaleRecovered,
+    Live,
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -182,14 +183,39 @@ fn prepare_session(
     }
     std::fs::create_dir_all(&paths.run_dir).context("Failed to create run directory")?;
     let lock_file_existed = paths.run_dir.join(".session.lock").is_file();
-    let exclusive =
-        crate::cmd::session_lock::SessionLock::try_exclusive(&paths.run_dir).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::WouldBlock {
-                anyhow::Error::new(crate::cmd::pack::SessionStillRunning)
-            } else {
-                anyhow::Error::new(error).context("Failed to lock run session")
+    let exclusive = match crate::cmd::session_lock::SessionLock::try_exclusive(&paths.run_dir) {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            let session_lock = crate::cmd::session_lock::SessionLock::try_shared(&paths.run_dir)
+                .map_err(|shared_error| {
+                    if shared_error.kind() == std::io::ErrorKind::WouldBlock {
+                        anyhow::Error::new(crate::cmd::pack::SessionStillRunning)
+                    } else {
+                        anyhow::Error::new(shared_error).context("Failed to join run session lock")
+                    }
+                })?;
+            if !vfs_mount::is_mountpoint(&paths.mountpoint) || !paths.runtime_status_file.is_file()
+            {
+                return Err(anyhow::Error::new(crate::cmd::pack::SessionStillRunning));
             }
-        })?;
+            if !paths.db_path.is_file() {
+                return Err(InvalidRunSession::new(format!(
+                    "invalid session {}: session database not found: {}",
+                    session_id,
+                    paths.db_path.display()
+                ))
+                .into());
+            }
+            let base_path = read_session_base_path(&paths)?;
+            return Ok(PreparedSession {
+                paths,
+                base_path,
+                _session_lock: session_lock,
+                start_state: StartState::Live,
+            });
+        }
+        Err(error) => return Err(error).context("Failed to lock run session"),
+    };
 
     crate::cmd::pack::recover_interrupted_publication(&paths.db_path)?;
     if !existed {

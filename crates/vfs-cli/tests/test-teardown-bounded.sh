@@ -407,7 +407,8 @@ run_leg() {
 # Parent abort-path teardown: capping max_user_namespaces at 0 inside a nested
 # user namespace makes the sandbox child's unshare fail deterministically
 # AFTER the parent's FUSE mount is live, driving the parent through its abort
-# error path. The parent must exit 1 with the mount gone from the namespace's
+# error path. The parent must use the run mount-failure exit code (4) with the
+# mount gone from the namespace's
 # mount table (pre-fix it exited via process::exit without dropping the
 # MountHandle, stranding a dead mount entry).
 run_abort_leg() {
@@ -470,8 +471,8 @@ INNER
         cleanup_current
         return 1
     fi
-    if ! grep -q "ABORT-LEG-EXIT=1" "$OWNER_LOG"; then
-        dump_failure_context "abort-path leg: run did not exit 1 after the child handshake failure"
+    if ! grep -q "ABORT-LEG-EXIT=4" "$OWNER_LOG"; then
+        dump_failure_context "abort-path leg: run did not exit 4 after the child handshake failure"
         kill_abort_leg_stragglers
         cleanup_current
         return 1

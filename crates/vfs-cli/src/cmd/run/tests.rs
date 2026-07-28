@@ -102,7 +102,7 @@ fn stale_lock_and_proc_artifacts_are_recovered_lazily() {
 }
 
 #[test]
-fn live_session_conflicts_use_the_shared_pack_error() {
+fn starting_session_without_a_live_mount_uses_the_shared_pack_error() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
     let base = root.path().join("checkout");
@@ -115,10 +115,10 @@ fn live_session_conflicts_use_the_shared_pack_error() {
         base.to_string_lossy().as_bytes(),
     )
     .unwrap();
-    let _live = crate::cmd::session_lock::SessionLock::try_shared(&session_dir).unwrap();
+    let _starting = crate::cmd::session_lock::SessionLock::try_shared(&session_dir).unwrap();
 
     let error = match prepare_session(&home, "live-session".to_string(), root.path(), false) {
-        Ok(_) => panic!("live session must conflict"),
+        Ok(_) => panic!("a starting session without a live mount must conflict"),
         Err(error) => error,
     };
     assert!(error
