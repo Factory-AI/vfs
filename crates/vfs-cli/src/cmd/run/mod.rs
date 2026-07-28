@@ -119,6 +119,7 @@ impl SessionPaths {
 enum StartState {
     Stopped,
     StaleRecovered,
+    #[cfg(any(test, target_os = "linux"))]
     Live,
 }
 
