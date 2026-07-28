@@ -389,10 +389,14 @@ pub async fn run(options: RunOptions) -> Result<()> {
 
     let fs: Arc<dyn FileSystem> = Arc::new(overlay);
 
-    let mut mount_opts = MountOpts::new(session.mountpoint.clone(), Backend::Nfs);
-    mount_opts.fsname = format!("vfs:{}", session.session_id);
-    mount_opts.lazy_unmount = true;
-    mount_opts.timeout = std::time::Duration::from_secs(10);
+    let mount_opts = MountOpts {
+        mountpoint: session.mountpoint.clone(),
+        backend: Backend::Nfs,
+        fsname: format!("vfs:{}", session.session_id),
+        lazy_unmount: true,
+        timeout: std::time::Duration::from_secs(10),
+        ..MountOpts::default()
+    };
     let mount_handle = mount_fs(fs, mount_opts)
         .await
         .map_err(super::RunMountFailure::new)?;
