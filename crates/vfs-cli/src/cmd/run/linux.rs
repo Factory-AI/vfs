@@ -189,12 +189,18 @@ pub fn run(options: RunOptions) -> Result<()> {
         libc::close(pipe_to_parent[0]);
     }
 
-    // Write proc file for this session (owner = true)
-    if let Err(e) =
-        crate::cmd::ps::write_proc_file(&session.run_id, true, &command.to_string_lossy(), &cwd)
-    {
-        eprintln!("Warning: Failed to write proc file: {}", e);
-    }
+    let proc_registration = match crate::cmd::ps::ProcRegistration::register(
+        &session.run_id,
+        true,
+        &command.to_string_lossy(),
+        &cwd,
+    ) {
+        Ok(registration) => Some(registration),
+        Err(error) => {
+            eprintln!("Warning: Failed to write proc file: {error}");
+            None
+        }
+    };
 
     let exit_code = rt.block_on(run_parent(child_pid, mount_handle, &session.run_id))?;
 
@@ -212,6 +218,8 @@ pub fn run(options: RunOptions) -> Result<()> {
     )) {
         eprintln!("Warning: Failed to record run session in timeline: {error:#}");
     }
+    drop(proc_registration);
+    crate::cmd::ps::cleanup_session_proc_state(&session.run_id);
 
     std::process::exit(exit_code);
 }
@@ -424,12 +432,18 @@ fn run_in_existing_session(
         libc::close(pipe_to_parent[0]);
     }
 
-    // Write proc file for this joined session (owner = false)
-    if let Err(e) =
-        crate::cmd::ps::write_proc_file(session_id, false, &command.to_string_lossy(), cwd)
-    {
-        eprintln!("Warning: Failed to write proc file: {}", e);
-    }
+    let proc_registration = match crate::cmd::ps::ProcRegistration::register(
+        session_id,
+        false,
+        &command.to_string_lossy(),
+        cwd,
+    ) {
+        Ok(registration) => Some(registration),
+        Err(error) => {
+            eprintln!("Warning: Failed to write proc file: {error}");
+            None
+        }
+    };
 
     let rt = crate::get_runtime();
     let status = rt.block_on(vfs_mount::supervise::supervise_pid_with_hooks(
@@ -441,8 +455,8 @@ fn run_in_existing_session(
     ))?;
     let exit_code = vfs_mount::supervise::exit_code_for_status(status);
 
-    // Clean up proc file
-    crate::cmd::ps::remove_proc_file(session_id);
+    drop(proc_registration);
+    crate::cmd::ps::cleanup_session_proc_state(session_id);
 
     crate::profiling::emit_cli_report();
 
@@ -474,6 +488,8 @@ fn print_welcome_banner(cwd: &Path, allowed_paths: &[PathBuf], session_id: &str,
 
 /// Configuration for a sandbox run session.
 struct RunSession {
+    /// Shared advisory lock preventing pack from publishing over this run.
+    _session_lock: crate::cmd::session_lock::SessionLock,
     /// Unique identifier for this run.
     run_id: String,
     /// Path to the delta database.
@@ -493,6 +509,8 @@ fn setup_run_directory(session_id: Option<String>) -> Result<RunSession> {
     let home_dir = dirs::home_dir().context("Failed to get home directory")?;
     let run_dir = home_dir.join(".vfs").join("run").join(&run_id);
     std::fs::create_dir_all(&run_dir).context("Failed to create run directory")?;
+    let session_lock = crate::cmd::session_lock::SessionLock::try_shared(&run_dir)
+        .with_context(|| format!("session {run_id} is being packed; retry after it finishes"))?;
 
     let db_path = run_dir.join("delta.db");
     let fuse_mountpoint = run_dir.join("mnt");
@@ -500,6 +518,7 @@ fn setup_run_directory(session_id: Option<String>) -> Result<RunSession> {
     std::fs::create_dir_all(&fuse_mountpoint).context("Failed to create FUSE mountpoint")?;
 
     Ok(RunSession {
+        _session_lock: session_lock,
         run_id,
         db_path,
         fuse_mountpoint,
@@ -1150,9 +1169,6 @@ async fn run_parent(child_pid: i32, mount_handle: MountHandle, session_id: &str)
     )
     .await;
 
-    // Clean up proc file
-    crate::cmd::ps::remove_proc_file(session_id);
-
     // Clean up the FUSE mountpoint directory (but keep the delta database)
     if let Err(e) = std::fs::remove_dir_all(&fuse_mountpoint) {
         eprintln!(
@@ -1161,10 +1177,6 @@ async fn run_parent(child_pid: i32, mount_handle: MountHandle, session_id: &str)
             e
         );
     }
-
-    // Clean up procs directory if empty
-    let procs_dir = crate::cmd::ps::procs_dir(session_id);
-    let _ = std::fs::remove_dir(&procs_dir);
 
     // Print session info for the user
     eprintln!();

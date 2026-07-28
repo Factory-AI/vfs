@@ -47,4 +47,20 @@ fn main() {
         .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
 
     println!("cargo:rustc-env=VFS_VERSION={}", version);
+
+    let commit = Command::new("git")
+        .current_dir(repo_root)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|output| {
+            if output.status.success() {
+                String::from_utf8(output.stdout).ok()
+            } else {
+                None
+            }
+        })
+        .map(|value| value.trim().to_string())
+        .unwrap_or_default();
+    println!("cargo:rustc-env=BUILD_COMMIT={commit}");
 }

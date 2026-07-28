@@ -3,11 +3,14 @@ pub mod fs;
 pub mod init;
 pub mod mcp_server;
 pub mod migrate;
+pub mod pack;
 pub mod profiling;
 pub mod ps;
 pub mod safety;
+mod session_lock;
 pub mod sync;
 pub mod timeline;
+pub mod version;
 
 #[cfg(unix)]
 pub mod mount;

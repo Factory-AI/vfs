@@ -314,7 +314,21 @@ pub async fn run(options: RunOptions) -> Result<()> {
         if is_mount_healthy(&session.mountpoint) {
             eprintln!("Joining existing session: {}", session.session_id);
             eprintln!();
+            let proc_registration = match crate::cmd::ps::ProcRegistration::register(
+                &session.session_id,
+                false,
+                &command.to_string_lossy(),
+                &cwd,
+            ) {
+                Ok(registration) => Some(registration),
+                Err(error) => {
+                    eprintln!("Warning: Failed to write proc file: {error}");
+                    None
+                }
+            };
             let outcome = run_command_in_mount(&session, command, args).await?;
+            drop(proc_registration);
+            crate::cmd::ps::cleanup_session_proc_state(&session.session_id);
             crate::profiling::emit_cli_report();
             std::process::exit(exit_code_for_outcome(outcome));
         } else {
@@ -324,6 +338,19 @@ pub async fn run(options: RunOptions) -> Result<()> {
             }
         }
     }
+
+    let proc_registration = match crate::cmd::ps::ProcRegistration::register(
+        &session.session_id,
+        true,
+        &command.to_string_lossy(),
+        &cwd,
+    ) {
+        Ok(registration) => Some(registration),
+        Err(error) => {
+            eprintln!("Warning: Failed to write proc file: {error}");
+            None
+        }
+    };
 
     // Initialize the Vfs database
     let db_path_str = session
@@ -381,6 +408,8 @@ pub async fn run(options: RunOptions) -> Result<()> {
             e
         );
     }
+    drop(proc_registration);
+    crate::cmd::ps::cleanup_session_proc_state(&session.session_id);
 
     // Print session info for the user
     eprintln!();
@@ -443,6 +472,8 @@ fn print_welcome_banner(session: &RunSession, encrypted: bool) {
 
 /// Configuration for a sandbox run session.
 struct RunSession {
+    /// Shared advisory lock preventing pack from publishing over this run.
+    _session_lock: crate::cmd::session_lock::SessionLock,
     /// Directory containing session artifacts.
     run_dir: PathBuf,
     /// Path to the delta database.
@@ -471,6 +502,8 @@ fn setup_run_directory(
     let run_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let run_dir = home.join(".vfs").join("run").join(&run_id);
     std::fs::create_dir_all(&run_dir).context("Failed to create run directory")?;
+    let session_lock = crate::cmd::session_lock::SessionLock::try_shared(&run_dir)
+        .with_context(|| format!("session {run_id} is being packed; retry after it finishes"))?;
 
     let db_path = run_dir.join("delta.db");
     let mountpoint = run_dir.join("mnt");
@@ -489,6 +522,7 @@ fn setup_run_directory(
         .context("Failed to write zsh config")?;
 
     Ok(RunSession {
+        _session_lock: session_lock,
         run_dir,
         db_path,
         mountpoint,

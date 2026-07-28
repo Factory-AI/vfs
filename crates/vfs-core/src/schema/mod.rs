@@ -11,7 +11,7 @@ use turso::transaction::{Transaction, TransactionBehavior};
 use turso::{Connection, Value};
 
 /// Current schema version.
-pub const CURRENT: SchemaVersion = SchemaVersion::V0_5;
+pub const CURRENT: SchemaVersion = SchemaVersion::V0_6;
 
 /// Compatibility string for callers that still surface the historical version.
 pub const VFS_SCHEMA_VERSION: &str = CURRENT.as_str();
@@ -31,6 +31,8 @@ pub enum SchemaVersion {
     V0_4,
     /// Added inline small-file storage columns and overlay sidecar tables
     V0_5,
+    /// Added persistent session handoff metadata
+    V0_6,
 }
 
 impl std::fmt::Display for SchemaVersion {
@@ -47,6 +49,7 @@ impl SchemaVersion {
             SchemaVersion::V0_2 => "0.2",
             SchemaVersion::V0_4 => "0.4",
             SchemaVersion::V0_5 => "0.5",
+            SchemaVersion::V0_6 => "0.6",
         }
     }
 
@@ -57,6 +60,7 @@ impl SchemaVersion {
             SchemaVersion::V0_2 => 2,
             SchemaVersion::V0_4 => 4,
             SchemaVersion::V0_5 => 5,
+            SchemaVersion::V0_6 => 6,
         }
     }
 
@@ -72,6 +76,7 @@ impl SchemaVersion {
             "0.2" => Some(SchemaVersion::V0_2),
             "0.4" => Some(SchemaVersion::V0_4),
             "0.5" => Some(SchemaVersion::V0_5),
+            "0.6" => Some(SchemaVersion::V0_6),
             _ => None,
         }
     }
@@ -82,6 +87,7 @@ impl SchemaVersion {
             2 => Some(SchemaVersion::V0_2),
             4 => Some(SchemaVersion::V0_4),
             5 => Some(SchemaVersion::V0_5),
+            6 => Some(SchemaVersion::V0_6),
             _ => None,
         }
     }
@@ -110,6 +116,11 @@ const MIGRATIONS: &[Migration] = &[
         from: SchemaVersion::V0_4,
         to: SchemaVersion::V0_5,
         description: "add inline storage and overlay schema sections",
+    },
+    Migration {
+        from: SchemaVersion::V0_5,
+        to: SchemaVersion::V0_6,
+        description: "add persistent session handoff metadata",
     },
 ];
 
@@ -192,6 +203,10 @@ mod ddl {
         )",
         "CREATE INDEX IF NOT EXISTS idx_fs_whiteout_parent ON fs_whiteout(parent_path)",
         "CREATE TABLE IF NOT EXISTS fs_overlay_config (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )",
+        "CREATE TABLE IF NOT EXISTS fs_session_metadata (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         )",
@@ -316,6 +331,7 @@ const REQUIRED_CURRENT_TABLES: &[&str] = &[
     "fs_symlink",
     "fs_whiteout",
     "fs_overlay_config",
+    "fs_session_metadata",
     "fs_origin",
     "fs_partial_origin",
     "fs_chunk_override",
@@ -351,6 +367,10 @@ pub async fn detect_schema_version(conn: &Connection) -> Result<Option<SchemaVer
     let has_rdev = columns.iter().any(|c| c.name == "rdev");
     let has_data_inline = columns.iter().any(|c| c.name == "data_inline");
     let has_storage_kind = columns.iter().any(|c| c.name == "storage_kind");
+
+    if has_data_inline && has_storage_kind && table_exists(conn, "fs_session_metadata").await? {
+        return Ok(Some(SchemaVersion::V0_6));
+    }
 
     // Pre-user_version v0.5 databases are recognized by columns. The old
     // fs_config markers are compatibility hints, not authoritative identity.
@@ -577,6 +597,7 @@ async fn apply_migration(conn: &Connection, migration: &Migration) -> Result<()>
             )
             .await
         }
+        (SchemaVersion::V0_5, SchemaVersion::V0_6) => Ok(()),
         _ => Err(Error::Internal(format!(
             "unsupported schema migration {} -> {}",
             migration.from, migration.to
@@ -884,6 +905,7 @@ mod tests {
             SchemaVersion::V0_2,
             SchemaVersion::V0_4,
             SchemaVersion::V0_5,
+            SchemaVersion::V0_6,
         ] {
             let dir = tempdir()?;
             let db_path = dir.path().join(format!("fixture-{}.db", version.as_str()));
@@ -1028,7 +1050,7 @@ mod tests {
         let dir = tempdir()?;
 
         let agent_path =
-            create_legacy_whiteout_fixture_file(dir.path(), "agent-open", SchemaVersion::V0_5)
+            create_legacy_whiteout_fixture_file(dir.path(), "agent-open", SchemaVersion::V0_6)
                 .await?;
         let agent = Vfs::open(VfsOptions::with_path(agent_path.to_string_lossy())).await?;
         assert_eq!(agent.fs.read_file("/file.txt").await?.unwrap(), b"abcdef");
@@ -1036,14 +1058,14 @@ mod tests {
         assert_legacy_whiteout_parent_path(&agent_path, "Vfs::open").await?;
 
         let kv_path =
-            create_legacy_whiteout_fixture_file(dir.path(), "kv-open", SchemaVersion::V0_5).await?;
+            create_legacy_whiteout_fixture_file(dir.path(), "kv-open", SchemaVersion::V0_6).await?;
         let kv = KvStore::new(kv_path.to_str().unwrap()).await?;
         kv.set("after", &serde_json::json!({ "ok": true })).await?;
         drop(kv);
         assert_legacy_whiteout_parent_path(&kv_path, "KvStore::new").await?;
 
         let tool_path =
-            create_legacy_whiteout_fixture_file(dir.path(), "tool-open", SchemaVersion::V0_5)
+            create_legacy_whiteout_fixture_file(dir.path(), "tool-open", SchemaVersion::V0_6)
                 .await?;
         let tools = ToolCalls::new(tool_path.to_str().unwrap()).await?;
         let id = tools.start("after", None).await?;
@@ -1203,19 +1225,11 @@ mod tests {
             (),
         )
         .await?;
-        if version == SchemaVersion::V0_5 {
-            conn.execute(
-                "INSERT INTO fs_config (key, value) VALUES ('schema_version', '0.5'), ('inline_threshold', '4')",
-                (),
-            )
-            .await?;
-        } else {
-            conn.execute(
-                "INSERT INTO fs_config (key, value) VALUES ('schema_version', ?), ('inline_threshold', '4')",
-                (version.as_str(),),
-            )
-            .await?;
-        }
+        conn.execute(
+            "INSERT INTO fs_config (key, value) VALUES ('schema_version', ?), ('inline_threshold', '4')",
+            (version.as_str(),),
+        )
+        .await?;
 
         let mut columns = vec![
             "ino INTEGER PRIMARY KEY AUTOINCREMENT",
@@ -1300,6 +1314,16 @@ mod tests {
             (),
         )
         .await?;
+        if version >= SchemaVersion::V0_6 {
+            conn.execute(
+                "CREATE TABLE fs_session_metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )",
+                (),
+            )
+            .await?;
+        }
 
         insert_legacy_inode(conn, version, 1, S_IFDIR | 0o755, 2, 0).await?;
         insert_legacy_inode(conn, version, 2, S_IFREG | DEFAULT_FILE_MODE as i64, 1, 6).await?;

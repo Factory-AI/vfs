@@ -147,7 +147,7 @@ pub async fn handle_backup_command(
 
     reject_partial_origin_backup(&conn).await?;
     checkpoint_for_backup(&conn, &source_path).await?;
-    copy_main_db_exclusive(&source_path, &target)?;
+    copy_file_exclusive(&source_path, &target)?;
     fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -243,7 +243,7 @@ async fn copy_and_materialize_database(
         .context("Failed to connect to source database")?;
 
     checkpoint_for_backup(&source_conn, source_path).await?;
-    copy_main_db_exclusive(source_path, target)?;
+    copy_file_exclusive(source_path, target)?;
     fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -787,14 +787,14 @@ async fn reject_partial_origin_backup(conn: &Connection) -> AnyhowResult<()> {
     Ok(())
 }
 
-fn copy_main_db_exclusive(source: &Path, target: &Path) -> AnyhowResult<()> {
+pub(crate) fn copy_file_exclusive(source: &Path, target: &Path) -> AnyhowResult<()> {
     let mut src = fs::File::open(source)
         .with_context(|| format!("Failed to open source {}", source.display()))?;
     let mut dst = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(target)
-        .with_context(|| format!("Failed to create backup {}", target.display()))?;
+        .with_context(|| format!("Failed to create {}", target.display()))?;
 
     std::io::copy(&mut src, &mut dst).with_context(|| {
         format!(
@@ -804,7 +804,7 @@ fn copy_main_db_exclusive(source: &Path, target: &Path) -> AnyhowResult<()> {
         )
     })?;
     dst.sync_all()
-        .with_context(|| format!("Failed to sync backup {}", target.display()))?;
+        .with_context(|| format!("Failed to sync {}", target.display()))?;
     Ok(())
 }
 
@@ -909,7 +909,7 @@ fn path_as_str(path: &Path) -> AnyhowResult<&str> {
         .with_context(|| format!("Path is not valid UTF-8: {}", path.display()))
 }
 
-fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+pub(crate) fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(format!("{}{}", path.display(), suffix))
 }
 

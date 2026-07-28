@@ -23,29 +23,18 @@ pub struct ProcInfo {
 }
 
 /// Get the path to the procs directory for a session.
-///
-/// Proc files are written only by the Linux `vfs run` path; other platforms
-/// read sessions via [`list_sessions`] without these helpers.
-#[cfg(target_os = "linux")]
-pub(crate) fn procs_dir(session_id: &str) -> PathBuf {
+fn procs_dir(session_id: &str) -> PathBuf {
     let home = dirs::home_dir().expect("home directory");
     home.join(".vfs").join("run").join(session_id).join("procs")
 }
 
 /// Get the path to a proc file.
-#[cfg(target_os = "linux")]
 fn proc_file(session_id: &str, pid: u32) -> PathBuf {
     procs_dir(session_id).join(format!("{}.json", pid))
 }
 
 /// Write a proc file for the current process.
-#[cfg(target_os = "linux")]
-pub(crate) fn write_proc_file(
-    session_id: &str,
-    owner: bool,
-    command: &str,
-    cwd: &Path,
-) -> Result<()> {
+fn write_proc_file(session_id: &str, owner: bool, command: &str, cwd: &Path) -> Result<()> {
     let pid = std::process::id();
     let procs_dir = procs_dir(session_id);
     std::fs::create_dir_all(&procs_dir)?;
@@ -65,9 +54,33 @@ pub(crate) fn write_proc_file(
     Ok(())
 }
 
+/// Proc-file registration removed automatically on ordinary error returns.
+pub(crate) struct ProcRegistration {
+    session_id: String,
+}
+
+impl ProcRegistration {
+    pub(crate) fn register(
+        session_id: &str,
+        owner: bool,
+        command: &str,
+        cwd: &Path,
+    ) -> Result<Self> {
+        write_proc_file(session_id, owner, command, cwd)?;
+        Ok(Self {
+            session_id: session_id.to_string(),
+        })
+    }
+}
+
+impl Drop for ProcRegistration {
+    fn drop(&mut self) {
+        remove_proc_file(&self.session_id);
+    }
+}
+
 /// Remove the proc file for the current process.
-#[cfg(target_os = "linux")]
-pub(crate) fn remove_proc_file(session_id: &str) {
+fn remove_proc_file(session_id: &str) {
     let pid = std::process::id();
     let path = proc_file(session_id, pid);
     let _ = std::fs::remove_file(path);
@@ -100,6 +113,22 @@ struct SessionInfo {
 #[cfg(target_os = "linux")]
 pub(crate) fn active_session_ids() -> std::collections::HashSet<String> {
     list_sessions().into_iter().map(|s| s.session_id).collect()
+}
+
+/// Return whether a specific procs directory contains any live process.
+pub(crate) fn procs_dir_has_live_processes(procs_dir: &Path) -> bool {
+    let proc_entries = match std::fs::read_dir(procs_dir) {
+        Ok(entries) => entries,
+        Err(_) => return false,
+    };
+    proc_entries
+        .flatten()
+        .any(|entry| read_proc_file_if_alive(&entry.path()).is_some())
+}
+
+/// Remove the empty proc-state directory after all guards have dropped.
+pub(crate) fn cleanup_session_proc_state(session_id: &str) {
+    let _ = std::fs::remove_dir(procs_dir(session_id));
 }
 
 /// Read and validate a proc file, cleaning up stale entries.

@@ -1,14 +1,15 @@
 # Agent Filesystem Specification
 
-**Version:** 0.5
+**Version:** 0.6
 
 ## Introduction
 
-The Agent Filesystem Specification defines a SQLite schema for representing agent filesystem state. The current v0.5 format adds 64 KiB default chunks, inline storage for dense files at or below 4 KiB, and `user_version`-keyed migration from older databases (in place by default, or copy-based re-chunking with `--copy`). The specification consists of three main components:
+The Agent Filesystem Specification defines a SQLite schema for representing agent filesystem state. The current v0.6 format adds persistent session handoff metadata to the v0.5 chunk and inline-storage layout, with `user_version`-keyed migration from older databases (in place by default, or copy-based re-chunking with `--copy`). The specification consists of four main components:
 
 1. **Tool Call Audit Trail**: Captures tool invocations, parameters, and results for debugging, auditing, and performance analysis
 2. **Virtual Filesystem**: Stores agent artifacts (files, documents, outputs) using a Unix-like inode design with support for hard links, proper metadata, and efficient file operations
-3. **Key-Value Store**: Provides simple get/set operations for agent context, preferences, and structured state that doesn't fit into the filesystem model
+3. **Session Handoff Metadata**: Stores the monotonic pack generation and future seed provenance inside the transferable database
+4. **Key-Value Store**: Provides simple get/set operations for agent context, preferences, and structured state that doesn't fit into the filesystem model
 
 All timestamps in this specification use Unix epoch format (seconds since 1970-01-01 00:00:00 UTC) with optional nanosecond precision via separate `_nsec` columns.
 
@@ -248,14 +249,14 @@ CREATE TABLE fs_config (
 
 | Key | Description | Default |
 |-----|-------------|---------|
-| `schema_version` | On-disk schema version | `0.5` |
+| `schema_version` | On-disk schema version | `0.6` |
 | `chunk_size` | Size of data chunks in bytes | `65536` |
 | `inline_threshold` | Maximum dense regular-file size stored inline in `fs_inode.data_inline` | `4096` |
 
 **Notes:**
 
 - `chunk_size` determines the fixed size of data chunks in `fs_data`
-- New v0.5 filesystems use 64 KiB chunks by default; legacy v0.4 databases used 4 KiB chunks until copy-migrated
+- New v0.6 filesystems use 64 KiB chunks by default; legacy v0.4 databases used 4 KiB chunks until copy-migrated
 - `inline_threshold` determines when dense regular files may avoid `fs_data` rows entirely
 - Configuration is immutable after filesystem initialization
 - Implementations MAY define additional configuration keys
@@ -395,7 +396,7 @@ CREATE TABLE fs_data (
 - Directories MUST NOT have data chunks
 - Inline regular files MUST NOT have data chunks
 - Chunk size is determined by the `chunk_size` value in `fs_config`
-- New v0.5 filesystems default to 64 KiB chunks
+- New v0.6 filesystems default to 64 KiB chunks
 - All chunks except the last chunk of a dense chunked file SHOULD be exactly `chunk_size` bytes
 - The last chunk MAY be smaller than `chunk_size`
 - Sparse holes MAY be represented by missing chunk rows and MUST read back as zero bytes
@@ -578,7 +579,7 @@ When creating a new agent database, initialize the filesystem configuration and 
 
 ```sql
 -- Initialize filesystem configuration
-INSERT INTO fs_config (key, value) VALUES ('schema_version', '0.5');
+INSERT INTO fs_config (key, value) VALUES ('schema_version', '0.6');
 INSERT INTO fs_config (key, value) VALUES ('chunk_size', '65536');
 INSERT INTO fs_config (key, value) VALUES ('inline_threshold', '4096');
 
@@ -605,6 +606,7 @@ In-place migration requirements:
 1. Every migration step MUST be an additive, idempotent DDL change applied inside a single transaction that stamps `PRAGMA user_version` before committing.
 2. Existing file contents MUST keep their recorded `chunk_size`; the in-place path does not re-chunk data. A defaulted `inline_threshold` MUST NOT exceed the database's recorded `chunk_size`.
 3. Open paths (mount, fs, exec, SDK open) MUST NOT run version upgrades implicitly; they reject old schemas and direct the user to `vfs migrate`.
+4. The v0.5 → v0.6 migration creates `fs_session_metadata` and preserves all existing filesystem, overlay, key-value, and tool-call rows.
 
 The copy-based mode rebuilds the database with the current chunk layout:
 
@@ -616,7 +618,7 @@ Copy-migration requirements:
 
 1. The source database MUST NOT be modified in place.
 2. The target database MUST be newly created unless an explicit overwrite option is used.
-3. The migration MUST preserve inode numbers, dentries, symlinks, KV rows, tool-call rows, overlay whiteouts, overlay origin mappings, and overlay configuration.
+3. The migration MUST preserve inode numbers, dentries, symlinks, KV rows, tool-call rows, overlay whiteouts, overlay origin mappings, overlay configuration, and session metadata.
 4. Small dense regular files MAY be converted to inline storage.
 5. Chunked files MUST be re-chunked using the target `chunk_size`.
 6. Sparse holes MUST preserve read-back semantics.
@@ -711,7 +713,7 @@ CREATE TABLE fs_overlay_config (
 |-----|-------------|
 | `base_path` | Canonical path to the read-only base directory |
 
-v0.5 copy migration MUST preserve this table when migrating an overlay delta database. Without it, a migrated overlay database would mount as a plain Vfs database and lose base-layer visibility.
+Copy migration MUST preserve this table when migrating an overlay delta database. Without it, a migrated overlay database would mount as a plain Vfs database and lose base-layer visibility.
 
 ### Operations
 
@@ -860,6 +862,32 @@ pass with the policy enabled.
 7. Existing overlay databases with legacy `fs_whiteout(path, created_at)` rows MUST synthesize `parent_path` before using the v0.5 whiteout schema
 8. Partial-origin files MUST remove `fs_partial_origin`, `fs_chunk_override`, and `fs_origin` rows when the last delta link is unlinked
 
+## Session Handoff Metadata
+
+Transfer preparation state is stored inside the database so a packed
+`delta.db` carries its own double-resume guard and future seed provenance.
+
+### Table: `fs_session_metadata`
+
+```sql
+CREATE TABLE fs_session_metadata (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+)
+```
+
+**Defined keys:**
+
+| Key | Encoding | Description |
+|-----|----------|-------------|
+| `generation` | Base-10 unsigned integer text | Monotonic counter incremented by each successful `vfs pack` |
+| `seeded_paths` | JSON string array | Paths materialized by the future seed operation; defaults to `[]` |
+
+`vfs pack` updates metadata only in its private database copy. The new
+generation becomes authoritative when the compacted copy is atomically
+published as the session's `delta.db`. A failed pack MUST leave both metadata
+keys and all filesystem rows at their pre-pack values.
+
 ## Key-Value Data
 
 The key-value store provides simple get/set operations for agent context and state.
@@ -944,6 +972,13 @@ Implementations MAY extend the key-value store schema with additional functional
 Such extensions SHOULD use separate tables to maintain referential integrity.
 
 ## Revision History
+
+### Version 0.6
+
+- Added `fs_session_metadata(key, value)` for persistent handoff state
+- `vfs pack` increments the `generation` key and reads `seeded_paths` into its manifest
+- The v0.5 → v0.6 migration is additive and creates the metadata table in the same schema transaction
+- Copy migration preserves session metadata when present
 
 ### Version 0.5
 

@@ -78,7 +78,23 @@ fn main() {
     // The one CLI error reporter (Display formatting, exit 1). Child-status
     // passthrough inside run/exec/init -c is the only other sanctioned exit.
     if let Err(e) = dispatch(args) {
+        let code = command_error_exit_code(&e);
+        if code != 1 {
+            eprintln!("Error: {e:#}");
+            exit_with_code(code);
+        }
         exit_with_error(format_args!("{e:#}"));
+    }
+}
+
+fn command_error_exit_code(error: &anyhow::Error) -> i32 {
+    if error
+        .downcast_ref::<cmd::pack::SessionStillRunning>()
+        .is_some()
+    {
+        cmd::pack::SESSION_STILL_RUNNING_EXIT_CODE
+    } else {
+        1
     }
 }
 
@@ -317,6 +333,26 @@ fn dispatch(args: Args) -> anyhow::Result<()> {
                 ))
             }
         },
+        Command::Pack {
+            session_id,
+            prune,
+            no_default_prunes,
+            output,
+            json,
+        } => {
+            let rt = get_runtime();
+            rt.block_on(cmd::pack::handle_pack_command(
+                &mut std::io::stdout(),
+                session_id,
+                prune,
+                no_default_prunes,
+                output,
+                json,
+            ))
+        }
+        Command::Version { json } => {
+            cmd::version::handle_version_command(&mut std::io::stdout(), json)
+        }
         Command::Ps => cmd::ps::list_ps(&mut std::io::stdout()),
         Command::Prune { command } => match command {
             PruneCommand::Mounts { force } => cmd::mount::prune_mounts(force),
@@ -437,7 +473,7 @@ fn default_shell() -> std::path::PathBuf {
 
 #[cfg(test)]
 mod partial_origin {
-    use super::partial_origin_policy;
+    use super::{command_error_exit_code, partial_origin_policy};
     use clap::Parser;
     use vfs_cli::opts::{Args, Command, PartialOriginMode};
 
@@ -481,5 +517,14 @@ mod partial_origin {
         );
         assert_eq!(mode, Some(PartialOriginMode::Off));
         assert_eq!(policy.mode, vfs_core::PartialOriginMode::Off);
+    }
+
+    #[test]
+    fn live_pack_error_has_distinct_exit_code() {
+        let error = anyhow::Error::new(vfs_cli::cmd::pack::SessionStillRunning);
+        assert_eq!(
+            command_error_exit_code(&error),
+            vfs_cli::cmd::pack::SESSION_STILL_RUNNING_EXIT_CODE
+        );
     }
 }
