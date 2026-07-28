@@ -13,6 +13,10 @@ use turso::{Connection, Value};
 /// Current schema version.
 pub const CURRENT: SchemaVersion = SchemaVersion::V0_6;
 
+/// Oldest schema version with a migration path to [`CURRENT`]; the artifact
+/// version floor for `vfs adopt` and `vfs migrate`.
+pub const MIN_SUPPORTED: SchemaVersion = SchemaVersion::V0_0;
+
 /// Compatibility string for callers that still surface the historical version.
 pub const VFS_SCHEMA_VERSION: &str = CURRENT.as_str();
 pub const CONFIG_SCHEMA_VERSION_KEY: &str = "schema_version";

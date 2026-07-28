@@ -4,13 +4,17 @@ use std::io::Write;
 
 use anyhow::Result;
 use serde::Serialize;
+use vfs_core::schema;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct VersionInfo {
     version: &'static str,
     commit: Option<&'static str>,
+    artifact_version: &'static str,
+    min_supported_artifact_version: &'static str,
     features: VersionFeatures,
 }
 
@@ -29,6 +33,8 @@ pub fn handle_version_command(stdout: &mut impl Write, json: bool) -> Result<()>
     let info = VersionInfo {
         version: VERSION,
         commit,
+        artifact_version: schema::CURRENT.as_str(),
+        min_supported_artifact_version: schema::MIN_SUPPORTED.as_str(),
         features: VersionFeatures {
             uid_squash_run: cfg!(target_os = "linux"),
             pack: true,
@@ -58,6 +64,11 @@ mod tests {
         handle_version_command(&mut output, true).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(value["artifactVersion"], schema::CURRENT.as_str());
+        assert_eq!(
+            value["minSupportedArtifactVersion"],
+            schema::MIN_SUPPORTED.as_str()
+        );
         assert_eq!(value["features"]["uidSquashRun"], cfg!(target_os = "linux"));
         assert_eq!(value["features"]["pack"], true);
         assert_eq!(value["features"]["seed"], true);

@@ -19,6 +19,9 @@ use super::safety::{
 
 pub const SESSION_STILL_RUNNING_EXIT_CODE: i32 = 3;
 
+/// Default byte size of the per-chunk verification digests in the manifest.
+pub const DEFAULT_MANIFEST_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+
 const DEFAULT_PRUNES: &[&str] = &[
     "**/node_modules/**",
     "**/target/**",
@@ -49,6 +52,9 @@ pub struct PackManifest {
     db_path: PathBuf,
     db_sha256: String,
     db_size_bytes: u64,
+    artifact_version: String,
+    chunk_size_bytes: u64,
+    chunks: Vec<ArtifactChunk>,
     base_repo: Option<String>,
     base_pin: Option<String>,
     base_path: PathBuf,
@@ -56,6 +62,16 @@ pub struct PackManifest {
     seeded_paths: Vec<String>,
     vfs_version: String,
     generation: u64,
+}
+
+/// Digest of one consecutive `chunk_size_bytes` range of the published
+/// artifact, so a consumer can stream and verify the transfer chunk by chunk.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactChunk {
+    index: u64,
+    size_bytes: u64,
+    sha256: String,
 }
 
 struct TempDatabase {
@@ -85,6 +101,7 @@ pub async fn handle_pack_command(
     extra_prunes: Vec<String>,
     no_default_prunes: bool,
     output: Option<PathBuf>,
+    chunk_size: u64,
     _json: bool,
 ) -> Result<()> {
     let home = dirs::home_dir().context("Failed to get home directory")?;
@@ -95,6 +112,7 @@ pub async fn handle_pack_command(
         extra_prunes,
         no_default_prunes,
         output,
+        chunk_size,
     )
     .await
 }
@@ -106,9 +124,13 @@ async fn pack_session(
     extra_prunes: Vec<String>,
     no_default_prunes: bool,
     output: Option<PathBuf>,
+    chunk_size: u64,
 ) -> Result<()> {
     if !VfsOptions::validate_agent_id(&session_id) {
         anyhow::bail!("invalid session ID: {session_id}");
+    }
+    if chunk_size == 0 {
+        anyhow::bail!("--chunk-size must be at least 1 byte");
     }
 
     let session_dir = home.join(".vfs").join("run").join(&session_id);
@@ -180,7 +202,7 @@ async fn pack_session(
         .context("Staged metadata verification after compaction failed")?;
     remove_sqlite_sidecars_after_checkpoint(staging.path())?;
 
-    let (db_sha256, db_size_bytes) = hash_file(staging.path())?;
+    let (db_sha256, db_size_bytes, chunks) = hash_file(staging.path(), chunk_size)?;
     let output_temp = output
         .as_deref()
         .map(|path| create_output_temp(staging.path(), path))
@@ -211,6 +233,9 @@ async fn pack_session(
         db_path: manifest_path,
         db_sha256,
         db_size_bytes,
+        artifact_version: schema::CURRENT.as_str().to_string(),
+        chunk_size_bytes: chunk_size,
+        chunks,
         base_repo,
         base_pin,
         base_path,
@@ -406,10 +431,15 @@ async fn prune_delta_paths(vfs: &Vfs, prune_set: &GlobSet) -> Result<Vec<String>
     Ok(paths)
 }
 
-fn hash_file(path: &Path) -> Result<(String, u64)> {
+/// Hash a published artifact whole-file and over consecutive `chunk_size`
+/// byte ranges in one streaming pass.
+fn hash_file(path: &Path, chunk_size: u64) -> Result<(String, u64, Vec<ArtifactChunk>)> {
     let mut file =
         fs::File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
     let mut hasher = Sha256::new();
+    let mut chunk_hasher = Sha256::new();
+    let mut chunks = Vec::new();
+    let mut chunk_len = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
     let mut size = 0_u64;
     loop {
@@ -421,8 +451,31 @@ fn hash_file(path: &Path) -> Result<(String, u64)> {
         }
         hasher.update(&buffer[..read]);
         size += read as u64;
+
+        let mut slice = &buffer[..read];
+        while !slice.is_empty() {
+            let take = slice.len().min((chunk_size - chunk_len) as usize);
+            chunk_hasher.update(&slice[..take]);
+            chunk_len += take as u64;
+            slice = &slice[take..];
+            if chunk_len == chunk_size {
+                push_chunk(&mut chunks, &mut chunk_hasher, &mut chunk_len);
+            }
+        }
     }
-    Ok((hex::encode(hasher.finalize()), size))
+    if chunk_len > 0 {
+        push_chunk(&mut chunks, &mut chunk_hasher, &mut chunk_len);
+    }
+    Ok((hex::encode(hasher.finalize()), size, chunks))
+}
+
+fn push_chunk(chunks: &mut Vec<ArtifactChunk>, chunk_hasher: &mut Sha256, chunk_len: &mut u64) {
+    chunks.push(ArtifactChunk {
+        index: chunks.len() as u64,
+        size_bytes: *chunk_len,
+        sha256: hex::encode(std::mem::take(chunk_hasher).finalize()),
+    });
+    *chunk_len = 0;
 }
 
 fn create_output_temp(staging_path: &Path, output: &Path) -> Result<TempDatabase> {
@@ -704,10 +757,14 @@ mod tests {
             Vec::new(),
             false,
             Some(output_path.clone()),
+            4096,
         )
         .await?;
         let first: PackManifest = serde_json::from_slice(&first_stdout)?;
         assert_eq!(first.manifest_version, 1);
+        assert_eq!(first.artifact_version, schema::CURRENT.as_str());
+        assert_eq!(first.chunk_size_bytes, 4096);
+        assert_chunks_cover_artifact(&first.chunks, &fs::read(&output_path)?, 4096);
         assert_eq!(first.session_id, "pack-test");
         assert_eq!(first.db_path, output_path);
         assert_eq!(first.generation, 1);
@@ -754,11 +811,67 @@ mod tests {
             Vec::new(),
             false,
             None,
+            DEFAULT_MANIFEST_CHUNK_SIZE,
         )
         .await?;
         let second: PackManifest = serde_json::from_slice(&second_stdout)?;
         assert_eq!(second.generation, 2);
         assert_eq!(second.db_path, db_path);
+        assert_eq!(second.chunk_size_bytes, DEFAULT_MANIFEST_CHUNK_SIZE);
+        assert_chunks_cover_artifact(
+            &second.chunks,
+            &fs::read(&db_path)?,
+            DEFAULT_MANIFEST_CHUNK_SIZE,
+        );
+        Ok(())
+    }
+
+    fn assert_chunks_cover_artifact(chunks: &[ArtifactChunk], bytes: &[u8], chunk_size: u64) {
+        let expected: Vec<_> = bytes.chunks(chunk_size as usize).collect();
+        assert_eq!(chunks.len(), expected.len());
+        for (index, (chunk, expected_bytes)) in chunks.iter().zip(expected).enumerate() {
+            assert_eq!(chunk.index, index as u64);
+            assert_eq!(chunk.size_bytes, expected_bytes.len() as u64);
+            assert_eq!(chunk.sha256, hex::encode(Sha256::digest(expected_bytes)));
+        }
+        assert_eq!(
+            chunks.iter().map(|chunk| chunk.size_bytes).sum::<u64>(),
+            bytes.len() as u64
+        );
+    }
+
+    #[test]
+    fn hash_file_chunks_exact_multiples_small_and_empty_files() -> Result<()> {
+        let dir = tempdir()?;
+
+        let exact = dir.path().join("exact.bin");
+        let exact_bytes = (0..8192_u32).map(|value| value as u8).collect::<Vec<_>>();
+        fs::write(&exact, &exact_bytes)?;
+        let (sha256, size, chunks) = hash_file(&exact, 4096)?;
+        assert_eq!(sha256, hex::encode(Sha256::digest(&exact_bytes)));
+        assert_eq!(size, 8192);
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks.iter().all(|chunk| chunk.size_bytes == 4096));
+        assert_chunks_cover_artifact(&chunks, &exact_bytes, 4096);
+
+        let small = dir.path().join("small.bin");
+        fs::write(&small, b"tiny artifact")?;
+        let (sha256, size, chunks) = hash_file(&small, 4096)?;
+        assert_eq!(sha256, hex::encode(Sha256::digest(b"tiny artifact")));
+        assert_eq!(size, 13);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].index, 0);
+        assert_eq!(chunks[0].size_bytes, 13);
+        assert_eq!(
+            chunks[0].sha256,
+            hex::encode(Sha256::digest(b"tiny artifact"))
+        );
+
+        let empty = dir.path().join("empty.bin");
+        fs::write(&empty, b"")?;
+        let (_, size, chunks) = hash_file(&empty, 4096)?;
+        assert_eq!(size, 0);
+        assert!(chunks.is_empty());
         Ok(())
     }
 
@@ -792,6 +905,7 @@ mod tests {
             Vec::new(),
             false,
             None,
+            DEFAULT_MANIFEST_CHUNK_SIZE,
         )
         .await
         .expect_err("live session must be rejected");

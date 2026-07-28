@@ -21,6 +21,13 @@ behavior-preserving moves are not listed individually.
 - `vfs seed` records its resolved pin in `fs_session_metadata` as
   `seed_pin`, giving packed artifacts the base provenance `vfs adopt`
   verifies on the receiving machine.
+- Artifact wire contract for daemon-to-daemon handoff: `vfs version --json`
+  reports `artifactVersion` and `minSupportedArtifactVersion` for
+  version-floor negotiation, and the `vfs pack` manifest adds
+  `artifactVersion`, `chunkSizeBytes`, and a `chunks` list of
+  `{index, sizeBytes, sha256}` digests over consecutive `--chunk-size`-byte
+  ranges (default 4194304) of the published artifact, alongside the existing
+  whole-file `dbSha256`.
 
 ### Removed
 
