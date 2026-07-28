@@ -478,6 +478,36 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Install an externally transferred run session.
+    ///
+    /// Verifies a packed session database against the receiver's base git
+    /// checkout (the checkout's HEAD must equal the artifact's recorded seed
+    /// pin), migrates supported older artifact schemas to the current
+    /// version, and atomically publishes ~/.vfs/run/<SESSION_ID>. After
+    /// adopt, `vfs run --session <SESSION_ID>` resumes the transferred
+    /// session.
+    Adopt {
+        /// Run session identifier
+        #[arg(value_name = "SESSION_ID")]
+        session_id: String,
+
+        /// Packed session database produced by `vfs pack`
+        #[arg(long, value_name = "PATH")]
+        db: PathBuf,
+
+        /// The receiver's base git checkout for the session
+        #[arg(long, value_name = "PATH", add = ArgValueCompleter::new(PathCompleter::dir()))]
+        base: PathBuf,
+
+        /// Git commit the base checkout must be at (required only when the
+        /// artifact does not record a seed pin)
+        #[arg(long, value_name = "COMMIT")]
+        pin: Option<String>,
+
+        /// Emit machine-readable JSON (adopt output is always JSON)
+        #[arg(long)]
+        json: bool,
+    },
     /// Show run session state for daemon preflight
     Status {
         /// Run session identifier
@@ -888,6 +918,40 @@ mod tests {
                 assert!(json);
             }
             other => panic!("expected seed command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn adopt_options_parse() {
+        let args = Args::try_parse_from([
+            "vfs",
+            "adopt",
+            "session-1",
+            "--db",
+            "/tmp/packed.db",
+            "--base",
+            "/tmp/checkout",
+            "--pin",
+            "abc123",
+            "--json",
+        ])
+        .unwrap();
+
+        match args.command {
+            Command::Adopt {
+                session_id,
+                db,
+                base,
+                pin,
+                json,
+            } => {
+                assert_eq!(session_id, "session-1");
+                assert_eq!(db, PathBuf::from("/tmp/packed.db"));
+                assert_eq!(base, PathBuf::from("/tmp/checkout"));
+                assert_eq!(pin.as_deref(), Some("abc123"));
+                assert!(json);
+            }
+            other => panic!("expected adopt command, got {other:?}"),
         }
     }
 

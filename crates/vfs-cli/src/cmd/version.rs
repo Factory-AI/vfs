@@ -20,6 +20,7 @@ struct VersionFeatures {
     uid_squash_run: bool,
     pack: bool,
     seed: bool,
+    adopt: bool,
 }
 
 /// Print the build version and supported handoff capabilities.
@@ -32,6 +33,7 @@ pub fn handle_version_command(stdout: &mut impl Write, json: bool) -> Result<()>
             uid_squash_run: cfg!(target_os = "linux"),
             pack: true,
             seed: true,
+            adopt: true,
         },
     };
 
@@ -59,5 +61,6 @@ mod tests {
         assert_eq!(value["features"]["uidSquashRun"], cfg!(target_os = "linux"));
         assert_eq!(value["features"]["pack"], true);
         assert_eq!(value["features"]["seed"], true);
+        assert_eq!(value["features"]["adopt"], true);
     }
 }

@@ -372,6 +372,23 @@ fn dispatch(args: Args) -> anyhow::Result<()> {
                 json,
             ))
         }
+        Command::Adopt {
+            session_id,
+            db,
+            base,
+            pin,
+            json,
+        } => {
+            let rt = get_runtime();
+            rt.block_on(cmd::adopt::handle_adopt_command(
+                &mut std::io::stdout(),
+                session_id,
+                db,
+                base,
+                pin,
+                json,
+            ))
+        }
         Command::Status {
             session_id,
             json,
