@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+use turso::transaction::{Transaction, TransactionBehavior};
 use turso::{Builder, Connection, Value};
 
 use crate::error::{Error, Result};
@@ -63,6 +64,48 @@ impl Vfs {
         let conn = self.pool.get_connection().await?;
         let value = serde_json::to_string(paths)?;
         write_metadata_value(&conn, SEEDED_PATHS_KEY, value).await
+    }
+
+    /// Atomically persist seed whiteouts and the path manifest.
+    ///
+    /// Content import commits before this call; publishing the whiteouts and
+    /// manifest together prevents a completed seed from exposing only half of
+    /// its deletion state.
+    pub async fn record_seed_state(
+        &self,
+        seeded_paths: &[String],
+        whiteout_paths: &[String],
+    ) -> Result<()> {
+        let conn = self.pool.get_connection().await?;
+        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+        let result = async {
+            let created_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs() as i64;
+            for path in whiteout_paths {
+                let parent_path = crate::fs::overlay::parent_path_for_whiteout(path);
+                conn.execute(
+                    "INSERT OR REPLACE INTO fs_whiteout (path, parent_path, created_at)
+                     VALUES (?, ?, ?)",
+                    (path.as_str(), parent_path, created_at),
+                )
+                .await?;
+            }
+            let value = serde_json::to_string(seeded_paths)?;
+            write_metadata_value(&conn, SEEDED_PATHS_KEY, value).await
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                txn.commit().await?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = txn.rollback().await;
+                Err(error)
+            }
+        }
     }
 
     /// Checkpoint and compact a local database into a new single-file artifact.
@@ -198,6 +241,17 @@ mod tests {
                 generation: 2,
                 seeded_paths: seeded_paths.clone(),
             }
+        );
+        let seeded_paths = vec!["src/main.rs".to_string(), "deleted.txt".to_string()];
+        vfs.record_seed_state(&seeded_paths, &["/deleted.txt".to_string()])
+            .await?;
+        assert_eq!(
+            vfs.session_metadata().await?.seeded_paths,
+            seeded_paths.clone()
+        );
+        assert_eq!(
+            vfs.get_whiteouts().await?,
+            std::collections::HashSet::from(["/deleted.txt".to_string()])
         );
         drop(vfs);
         let vfs = Vfs::open(VfsOptions::with_path(db_path.to_string_lossy())).await?;

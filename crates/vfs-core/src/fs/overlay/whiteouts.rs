@@ -1,18 +1,6 @@
 use super::*;
 use turso::transaction::{Transaction, TransactionBehavior};
 
-fn parent_path_for_whiteout(path: &str) -> String {
-    if path == "/" {
-        return "/".to_string();
-    }
-
-    let trimmed = path.trim_end_matches('/');
-    match trimmed.rfind('/') {
-        Some(0) | None => "/".to_string(),
-        Some(index) => trimmed[..index].to_string(),
-    }
-}
-
 impl OverlayFS {
     /// Check if a path is whiteout (deleted from base).
     pub(super) fn is_whiteout(&self, path: &str) -> bool {

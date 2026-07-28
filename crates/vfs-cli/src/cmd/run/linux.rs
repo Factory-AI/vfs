@@ -75,6 +75,7 @@ pub fn run(options: RunOptions) -> Result<()> {
         system,
         encryption,
         partial_origin_policy,
+        seed_pin,
         command,
         args,
     } = options;
@@ -85,7 +86,24 @@ pub fn run(options: RunOptions) -> Result<()> {
     let allowed_paths = build_allowed_paths(&allow, no_default_allows)?;
 
     // Check if we're joining an existing session
-    let session = setup_run_directory(session)?;
+    let mut session = setup_run_directory(session, seed_pin.is_none())?;
+    if let Some(pin) = seed_pin {
+        let home = dirs::home_dir().context("Failed to get home directory")?;
+        let seed_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("Failed to create seed runtime")?;
+        let seeded = seed_runtime.block_on(crate::cmd::seed::seed_session(
+            &home,
+            &session.run_id,
+            &pin,
+            encryption.clone(),
+            true,
+            Some(&cwd),
+        ))?;
+        drop(seed_runtime);
+        session._session_lock = Some(seeded.into_shared_lock()?);
+    }
 
     // If the FUSE mountpoint is already mounted, join the existing session
     if is_mountpoint(&session.fuse_mountpoint) {
@@ -489,7 +507,7 @@ fn print_welcome_banner(cwd: &Path, allowed_paths: &[PathBuf], session_id: &str,
 /// Configuration for a sandbox run session.
 struct RunSession {
     /// Shared advisory lock preventing pack from publishing over this run.
-    _session_lock: crate::cmd::session_lock::SessionLock,
+    _session_lock: Option<crate::cmd::session_lock::SessionLock>,
     /// Unique identifier for this run.
     run_id: String,
     /// Path to the delta database.
@@ -504,13 +522,20 @@ struct RunSession {
 ///
 /// If `session_id` is provided, uses that as the run ID (allowing multiple
 /// runs to share the same delta layer). Otherwise generates a unique UUID.
-fn setup_run_directory(session_id: Option<String>) -> Result<RunSession> {
+fn setup_run_directory(session_id: Option<String>, acquire_lock: bool) -> Result<RunSession> {
     let run_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let home_dir = dirs::home_dir().context("Failed to get home directory")?;
     let run_dir = home_dir.join(".vfs").join("run").join(&run_id);
     std::fs::create_dir_all(&run_dir).context("Failed to create run directory")?;
-    let session_lock = crate::cmd::session_lock::SessionLock::try_shared(&run_dir)
-        .with_context(|| format!("session {run_id} is being packed; retry after it finishes"))?;
+    let session_lock = if acquire_lock {
+        Some(
+            crate::cmd::session_lock::SessionLock::try_shared(&run_dir).with_context(|| {
+                format!("session {run_id} is being packed or seeded; retry after it finishes")
+            })?,
+        )
+    } else {
+        None
+    };
 
     let db_path = run_dir.join("delta.db");
     let fuse_mountpoint = run_dir.join("mnt");

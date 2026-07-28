@@ -88,6 +88,8 @@ pub struct RunOptions {
     pub encryption: Option<vfs_core::EncryptionConfig>,
     /// Partial-origin copy-up policy resolved from CLI flags.
     pub partial_origin_policy: Option<vfs_core::PartialOriginPolicy>,
+    /// Git commit whose pristine tree is the portable session base.
+    pub seed_pin: Option<String>,
     /// Command to execute inside the sandbox.
     pub command: PathBuf,
     /// Arguments for the command.
@@ -230,6 +232,11 @@ pub enum Command {
         /// Options: aegis128l, aegis128x2, aegis128x4, aegis256, aegis256x2, aegis256x4, aes128gcm, aes256gcm
         #[arg(long, env = "VFS_CIPHER")]
         cipher: Option<String>,
+
+        /// Seed dirty and local-commit state against this git commit before mounting.
+        /// Ignored files are not part of portable state.
+        #[arg(long = "seed-pin", value_name = "COMMIT")]
+        seed_pin: Option<String>,
 
         /// Command to execute (defaults to bash on Linux, zsh on macOS)
         command: Option<PathBuf>,
@@ -450,6 +457,24 @@ pub enum Command {
         output: Option<PathBuf>,
 
         /// Emit machine-readable JSON (pack output is always JSON)
+        #[arg(long)]
+        json: bool,
+    },
+    /// Capture a run session's live git state into its portable delta.
+    ///
+    /// Compares the session base checkout with --pin, imports dirty files and
+    /// local commits without mounting, and records deletions as whiteouts.
+    /// Ignored files are not part of portable state.
+    Seed {
+        /// Run session identifier
+        #[arg(value_name = "SESSION_ID")]
+        session_id: String,
+
+        /// Git commit used as the pristine portable base
+        #[arg(long, value_name = "COMMIT")]
+        pin: String,
+
+        /// Emit machine-readable JSON (seed output is always JSON)
         #[arg(long)]
         json: bool,
     },
@@ -742,6 +767,8 @@ mod tests {
             "auto",
             "--partial-origin-threshold-bytes",
             "4096",
+            "--seed-pin",
+            "abc123",
             "bash",
         ])
         .unwrap();
@@ -750,11 +777,13 @@ mod tests {
             Command::Run {
                 partial_origin,
                 partial_origin_threshold_bytes,
+                seed_pin,
                 command,
                 ..
             } => {
                 assert_eq!(partial_origin, Some(PartialOriginMode::Auto));
                 assert_eq!(partial_origin_threshold_bytes, Some(4096));
+                assert_eq!(seed_pin.as_deref(), Some("abc123"));
                 assert_eq!(command, Some(PathBuf::from("bash")));
             }
             other => panic!("expected run command, got {other:?}"),
@@ -822,6 +851,25 @@ mod tests {
                 assert!(json);
             }
             other => panic!("expected pack command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn seed_options_parse() {
+        let args = Args::try_parse_from(["vfs", "seed", "session-1", "--pin", "abc123", "--json"])
+            .unwrap();
+
+        match args.command {
+            Command::Seed {
+                session_id,
+                pin,
+                json,
+            } => {
+                assert_eq!(session_id, "session-1");
+                assert_eq!(pin, "abc123");
+                assert!(json);
+            }
+            other => panic!("expected seed command, got {other:?}"),
         }
     }
 

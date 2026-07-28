@@ -7,6 +7,7 @@ pub mod pack;
 pub mod profiling;
 pub mod ps;
 pub mod safety;
+pub mod seed;
 mod session_lock;
 pub mod sync;
 pub mod timeline;

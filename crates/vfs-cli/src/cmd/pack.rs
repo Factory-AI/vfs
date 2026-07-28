@@ -335,7 +335,7 @@ fn validate_output_target(output: Option<&Path>, live_db: &Path) -> Result<()> {
     Ok(())
 }
 
-fn copy_database_family(source: &Path, target: &Path) -> Result<()> {
+pub(crate) fn copy_database_family(source: &Path, target: &Path) -> Result<()> {
     copy_file_exclusive(source, target)?;
     for suffix in ["-wal", "-shm"] {
         let source_sidecar = sidecar_path(source, suffix);
@@ -500,7 +500,7 @@ fn rollback_live_database(live: &Path, backup: &Path) -> Result<()> {
         .context("Failed to roll back the live session database after output publication failed")
 }
 
-fn rename_database_family(source: &Path, target: &Path) -> Result<()> {
+pub(crate) fn rename_database_family(source: &Path, target: &Path) -> Result<()> {
     let mut renamed = Vec::new();
     for suffix in ["", "-wal", "-shm"] {
         let source_path = if suffix.is_empty() {
@@ -546,7 +546,7 @@ fn cleanup_backup_family(backup: &Path) {
     }
 }
 
-fn remove_database_family(path: &Path) {
+pub(crate) fn remove_database_family(path: &Path) {
     for path in database_family(path) {
         let _ = fs::remove_file(path);
     }
@@ -560,7 +560,7 @@ fn database_family(path: &Path) -> [PathBuf; 3] {
     ]
 }
 
-fn sync_file_and_parent(path: &Path) -> Result<()> {
+pub(crate) fn sync_file_and_parent(path: &Path) -> Result<()> {
     fs::OpenOptions::new()
         .read(true)
         .write(true)
