@@ -93,6 +93,13 @@ fn command_error_exit_code(error: &anyhow::Error) -> i32 {
         .is_some()
     {
         cmd::pack::SESSION_STILL_RUNNING_EXIT_CODE
+    } else if error.downcast_ref::<cmd::run::RunMountFailure>().is_some() {
+        cmd::run::MOUNT_FAILURE_EXIT_CODE
+    } else if error
+        .downcast_ref::<cmd::run::InvalidRunSession>()
+        .is_some()
+    {
+        cmd::run::INVALID_SESSION_EXIT_CODE
     } else {
         1
     }
@@ -365,6 +372,22 @@ fn dispatch(args: Args) -> anyhow::Result<()> {
                 json,
             ))
         }
+        Command::Status {
+            session_id,
+            json,
+            key,
+            cipher,
+        } => {
+            let encryption = parse_encryption(key, cipher)?
+                .map(|(hex_key, cipher)| vfs_core::EncryptionConfig { hex_key, cipher });
+            let rt = get_runtime();
+            rt.block_on(cmd::run::handle_status_command(
+                &mut std::io::stdout(),
+                session_id,
+                json,
+                encryption,
+            ))
+        }
         Command::Version { json } => {
             cmd::version::handle_version_command(&mut std::io::stdout(), json)
         }
@@ -540,6 +563,22 @@ mod partial_origin {
         assert_eq!(
             command_error_exit_code(&error),
             vfs_cli::cmd::pack::SESSION_STILL_RUNNING_EXIT_CODE
+        );
+    }
+
+    #[test]
+    fn run_lifecycle_errors_have_distinct_exit_codes() {
+        let mount = anyhow::Error::new(vfs_cli::cmd::run::RunMountFailure::new("mount failed"));
+        assert_eq!(
+            command_error_exit_code(&mount),
+            vfs_cli::cmd::run::MOUNT_FAILURE_EXIT_CODE
+        );
+
+        let invalid =
+            anyhow::Error::new(vfs_cli::cmd::run::InvalidRunSession::new("invalid session"));
+        assert_eq!(
+            command_error_exit_code(&invalid),
+            vfs_cli::cmd::run::INVALID_SESSION_EXIT_CODE
         );
     }
 }

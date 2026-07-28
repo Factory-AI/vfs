@@ -16,7 +16,7 @@ pub mod version;
 #[cfg(unix)]
 pub mod mount;
 
-mod run;
+pub mod run;
 
 // Standalone NFS server command (Unix only)
 #[cfg(unix)]

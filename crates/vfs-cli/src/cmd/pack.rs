@@ -458,7 +458,7 @@ fn publish_live_database(staging: &Path, live: &Path) -> Result<PathBuf> {
     Ok(backup)
 }
 
-fn recover_interrupted_publication(live: &Path) -> Result<()> {
+pub(crate) fn recover_interrupted_publication(live: &Path) -> Result<()> {
     let backup = publication_backup_path(live)?;
     if !backup.exists() {
         return Ok(());

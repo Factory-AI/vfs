@@ -3,9 +3,9 @@
 # SIGKILL recovery regression for mount-owning run sessions.
 #
 # Killing the owner cannot run normal teardown, so this pins the recovery
-# contract: the supervised workload dies with the owner, the stale mount is
-# externally cleanable, fsynced data is still present after remount, and the DB
-# integrity check stays clean.
+# contract: the supervised workload dies with the owner, the next `vfs run`
+# detaches the stale mount and removes stale runtime records itself, fsynced
+# data is still present, and the DB integrity check stays clean.
 #
 set -eu
 
@@ -298,34 +298,49 @@ if ! wait_pid_exit "$CHILD_PID" "$EXIT_TIMEOUT"; then
 fi
 
 if ! mountpoint -q "$FUSE_MNT" 2>/dev/null; then
-    dump_context "expected stale FUSE mountpoint before external cleanup"
+    dump_context "expected stale FUSE mountpoint before automatic recovery"
     exit 1
 fi
 
-unmount_path "$FUSE_MNT"
+(
+    cd "$WORKDIR"
+    HOME="$TEST_HOME" \
+    XDG_CACHE_HOME="$TEST_HOME/.cache" \
+    XDG_CONFIG_HOME="$TEST_HOME/.config" \
+    CARGO_HOME="$CARGO_HOME_FOR_TEST" \
+    RUSTUP_HOME="$RUSTUP_HOME_FOR_TEST" \
+    RUSTUP_TOOLCHAIN="$RUSTUP_TOOLCHAIN_FOR_TEST" \
+    VFS_FUSE_URING=0 \
+    "$VFS_BIN" run --session "$SESSION_ID" --allow "$LOGDIR" \
+        /bin/bash -c '
+set -euo pipefail
+while read -r rel expected; do
+    test -f "$rel"
+    observed="$(sha256sum "$rel" | awk "{print \$1}")"
+    test "$observed" = "$expected"
+done < "$1"
+' vfs-sigkill-recovery "$ACK_LOG"
+) >"$REMOUNT_LOG" 2>&1 || {
+    dump_context "next run did not recover stale session automatically"
+    exit 1
+}
+
 if mountpoint -q "$FUSE_MNT" 2>/dev/null; then
-    dump_context "stale FUSE mountpoint could not be externally cleaned"
+    dump_context "stale mount survived automatic recovery run"
     exit 1
 fi
+if [ -d "$RUN_DIR/procs" ]; then
+    dump_context "stale proc records survived automatic recovery run"
+    exit 1
+fi
+for sidecar in "$DELTA_DB-wal" "$DELTA_DB-shm"; do
+    if [ -e "$sidecar" ] && [ -s "$sidecar" ]; then
+        dump_context "non-empty database sidecar survived recovery: $sidecar"
+        exit 1
+    fi
+done
 
 "$VFS_BIN" integrity "$DELTA_DB" --json >/dev/null
-
-"$VFS_BIN" mount "$DELTA_DB" "$REMOUNT" --backend fuse --foreground >"$REMOUNT_LOG" 2>&1 &
-REMOUNT_PID=$!
-if ! wait_for_remount; then
-    dump_context "remount did not become ready after SIGKILL recovery"
-    exit 1
-fi
-
-assert_acked_files_present
-
-kill -TERM "$REMOUNT_PID" 2>/dev/null || true
-if ! wait_pid_exit "$REMOUNT_PID" "$EXIT_TIMEOUT"; then
-    dump_context "recovery remount did not exit after SIGTERM"
-    exit 1
-fi
-wait "$REMOUNT_PID" 2>/dev/null || true
-REMOUNT_PID=""
 
 if mount | grep "$SESSION_ID" >/dev/null 2>&1 || mount | grep "$REMOUNT" >/dev/null 2>&1; then
     dump_context "mount residue after SIGKILL recovery"

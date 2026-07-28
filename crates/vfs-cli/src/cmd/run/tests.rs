@@ -52,6 +52,225 @@ fn default_allowed_paths_keeps_only_existing_entries() {
     );
 }
 
+#[test]
+fn externally_materialized_session_needs_only_database_and_base_path() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let base = root.path().join("checkout");
+    let session_dir = home.join(".vfs/run/external-session");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::create_dir_all(&session_dir).unwrap();
+    std::fs::write(session_dir.join("delta.db"), b"packed database").unwrap();
+    std::fs::write(
+        session_dir.join("base_path"),
+        base.to_string_lossy().as_bytes(),
+    )
+    .unwrap();
+
+    let prepared =
+        prepare_session(&home, "external-session".to_string(), root.path(), false).unwrap();
+
+    assert_eq!(prepared.base_path, base);
+    assert_eq!(prepared.start_state, StartState::Stopped);
+    assert!(prepared.paths.mountpoint.is_dir());
+    assert!(session_dir.join(".session.lock").is_file());
+}
+
+#[test]
+fn stale_lock_and_proc_artifacts_are_recovered_lazily() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let base = root.path().join("checkout");
+    let session_dir = home.join(".vfs/run/stale-session");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::create_dir_all(session_dir.join("procs")).unwrap();
+    std::fs::write(session_dir.join("delta.db"), b"packed database").unwrap();
+    std::fs::write(
+        session_dir.join("base_path"),
+        base.to_string_lossy().as_bytes(),
+    )
+    .unwrap();
+    std::fs::write(session_dir.join(".session.lock"), b"stale inode").unwrap();
+    std::fs::write(session_dir.join("procs/999999.json"), b"stale proc").unwrap();
+    std::fs::write(session_dir.join("runtime-status.json.tmp"), b"partial").unwrap();
+
+    let prepared = prepare_session(&home, "stale-session".to_string(), root.path(), false).unwrap();
+
+    assert_eq!(prepared.start_state, StartState::StaleRecovered);
+    assert!(!session_dir.join("procs").exists());
+    assert!(!session_dir.join("runtime-status.json.tmp").exists());
+}
+
+#[test]
+fn starting_session_without_a_live_mount_uses_the_shared_pack_error() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let base = root.path().join("checkout");
+    let session_dir = home.join(".vfs/run/live-session");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::create_dir_all(&session_dir).unwrap();
+    std::fs::write(session_dir.join("delta.db"), b"packed database").unwrap();
+    std::fs::write(
+        session_dir.join("base_path"),
+        base.to_string_lossy().as_bytes(),
+    )
+    .unwrap();
+    let _starting = crate::cmd::session_lock::SessionLock::try_shared(&session_dir).unwrap();
+
+    let error = match prepare_session(&home, "live-session".to_string(), root.path(), false) {
+        Ok(_) => panic!("a starting session without a live mount must conflict"),
+        Err(error) => error,
+    };
+    assert!(error
+        .downcast_ref::<crate::cmd::pack::SessionStillRunning>()
+        .is_some());
+}
+
+#[test]
+fn malformed_external_session_is_rejected() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let base = root.path().join("checkout");
+    let session_dir = home.join(".vfs/run/malformed-session");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::create_dir_all(&session_dir).unwrap();
+    std::fs::write(
+        session_dir.join("base_path"),
+        base.to_string_lossy().as_bytes(),
+    )
+    .unwrap();
+
+    let error = match prepare_session(&home, "malformed-session".to_string(), root.path(), false) {
+        Ok(_) => panic!("missing delta.db must be rejected"),
+        Err(error) => error,
+    };
+    assert!(error.downcast_ref::<InvalidRunSession>().is_some());
+}
+
+#[test]
+fn interrupted_first_start_can_retry_before_database_creation() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let base = root.path().join("checkout");
+    let session_dir = home.join(".vfs/run/retry-first-start");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::create_dir_all(&session_dir).unwrap();
+    std::fs::write(
+        session_dir.join("base_path"),
+        base.to_string_lossy().as_bytes(),
+    )
+    .unwrap();
+    std::fs::write(session_dir.join(".session.lock"), b"").unwrap();
+
+    let prepared =
+        prepare_session(&home, "retry-first-start".to_string(), root.path(), false).unwrap();
+
+    assert_eq!(prepared.base_path, base);
+    assert!(prepared.paths.mountpoint.is_dir());
+}
+
+#[test]
+fn interrupted_pack_publication_recovers_before_database_validation() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let base = root.path().join("checkout");
+    let session_dir = home.join(".vfs/run/recover-pack");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::create_dir_all(&session_dir).unwrap();
+    std::fs::write(
+        session_dir.join("base_path"),
+        base.to_string_lossy().as_bytes(),
+    )
+    .unwrap();
+    std::fs::write(session_dir.join(".delta.db.pack-backup"), b"recover me").unwrap();
+
+    let prepared = prepare_session(&home, "recover-pack".to_string(), root.path(), false).unwrap();
+
+    assert_eq!(prepared.base_path, base);
+    assert_eq!(
+        std::fs::read(session_dir.join("delta.db")).unwrap(),
+        b"recover me"
+    );
+    assert!(!session_dir.join(".delta.db.pack-backup").exists());
+}
+
+#[test]
+fn status_json_schema_is_stable() {
+    let status = SessionStatus {
+        session_id: "session-1".to_string(),
+        state: SessionState::StaleRecovered,
+        mounted: false,
+        pid: None,
+        generation: 7,
+        seeded: true,
+    };
+
+    assert_eq!(
+        serde_json::to_value(status).unwrap(),
+        serde_json::json!({
+            "sessionId": "session-1",
+            "state": "stale-recovered",
+            "mounted": false,
+            "pid": null,
+            "generation": 7,
+            "seeded": true,
+        })
+    );
+}
+
+#[test]
+fn live_runtime_status_carries_locked_database_metadata() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = SessionPaths::new(root.path(), "live-session");
+    std::fs::create_dir_all(&paths.run_dir).unwrap();
+
+    write_runtime_status(&paths.runtime_status_file, 9, true).unwrap();
+    let status = read_runtime_status(&paths).unwrap().unwrap();
+
+    assert_eq!(status.pid, std::process::id());
+    assert_eq!(status.generation, 9);
+    assert!(status.seeded);
+}
+
+#[test]
+fn missing_runtime_status_represents_a_busy_non_run_operation() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = SessionPaths::new(root.path(), "busy-session");
+
+    assert!(read_runtime_status(&paths).unwrap().is_none());
+    assert_eq!(
+        serde_json::to_value(SessionState::Busy).unwrap(),
+        serde_json::json!("busy")
+    );
+}
+
+#[tokio::test]
+async fn stopped_status_reads_encrypted_session_metadata() {
+    let root = tempfile::tempdir().unwrap();
+    let db_path = root.path().join("encrypted.db");
+    let encryption = vfs_core::EncryptionConfig {
+        hex_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+        cipher: "aes256gcm".to_string(),
+    };
+    let vfs = vfs_core::Vfs::open(
+        vfs_core::VfsOptions::with_path(db_path.to_string_lossy())
+            .with_encryption(encryption.clone()),
+    )
+    .await
+    .unwrap();
+    vfs.increment_session_generation().await.unwrap();
+    vfs.set_seeded_paths(&[]).await.unwrap();
+    vfs.fs.finalize().await.unwrap();
+    drop(vfs);
+
+    let status = read_session_metadata(&db_path, Some(&encryption))
+        .await
+        .unwrap();
+
+    assert_eq!(status.generation, 1);
+    assert!(status.seeded);
+}
+
 #[cfg(target_os = "linux")]
 mod read_scoping {
     use super::super::linux::{plan_read_scoping, ZonePlan};
