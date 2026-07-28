@@ -121,10 +121,11 @@ enum StartState {
     StaleRecovered,
 }
 
+#[cfg(any(test, target_os = "linux"))]
 struct PreparedSession {
     paths: SessionPaths,
     base_path: PathBuf,
-    session_lock: crate::cmd::session_lock::SessionLock,
+    _session_lock: crate::cmd::session_lock::SessionLock,
     start_state: StartState,
 }
 
@@ -162,6 +163,7 @@ fn read_session_base_path(paths: &SessionPaths) -> Result<PathBuf> {
     Ok(base_path)
 }
 
+#[cfg(any(test, target_os = "linux"))]
 fn prepare_session(
     home: &Path,
     session_id: String,
@@ -213,7 +215,7 @@ fn prepare_session(
     Ok(PreparedSession {
         paths,
         base_path,
-        session_lock,
+        _session_lock: session_lock,
         start_state,
     })
 }
@@ -261,6 +263,7 @@ pub(crate) fn recover_stale_session_runtime(home: &Path, session_id: &str) -> Re
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn prepared_seeded_session(
     home: &Path,
     session_id: String,
@@ -281,7 +284,7 @@ fn prepared_seeded_session(
     Ok(PreparedSession {
         paths,
         base_path,
-        session_lock,
+        _session_lock: session_lock,
         start_state: StartState::Stopped,
     })
 }

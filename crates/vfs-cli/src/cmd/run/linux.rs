@@ -441,7 +441,7 @@ struct RunSession {
 impl From<super::PreparedSession> for RunSession {
     fn from(session: super::PreparedSession) -> Self {
         Self {
-            _session_lock: session.session_lock,
+            _session_lock: session._session_lock,
             run_id: session.paths.session_id,
             db_path: session.paths.db_path,
             fuse_mountpoint: session.paths.mountpoint,
