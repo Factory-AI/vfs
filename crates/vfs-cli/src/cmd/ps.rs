@@ -23,17 +23,23 @@ pub struct ProcInfo {
 }
 
 /// Get the path to the procs directory for a session.
+///
+/// Proc files are written only by the Linux `vfs run` path; other platforms
+/// read sessions via [`list_sessions`] without these helpers.
+#[cfg(target_os = "linux")]
 pub(crate) fn procs_dir(session_id: &str) -> PathBuf {
     let home = dirs::home_dir().expect("home directory");
     home.join(".vfs").join("run").join(session_id).join("procs")
 }
 
 /// Get the path to a proc file.
+#[cfg(target_os = "linux")]
 fn proc_file(session_id: &str, pid: u32) -> PathBuf {
     procs_dir(session_id).join(format!("{}.json", pid))
 }
 
 /// Write a proc file for the current process.
+#[cfg(target_os = "linux")]
 pub(crate) fn write_proc_file(
     session_id: &str,
     owner: bool,
@@ -60,6 +66,7 @@ pub(crate) fn write_proc_file(
 }
 
 /// Remove the proc file for the current process.
+#[cfg(target_os = "linux")]
 pub(crate) fn remove_proc_file(session_id: &str) {
     let pid = std::process::id();
     let path = proc_file(session_id, pid);
@@ -90,6 +97,7 @@ struct SessionInfo {
 }
 
 /// Get the set of active session IDs.
+#[cfg(target_os = "linux")]
 pub(crate) fn active_session_ids() -> std::collections::HashSet<String> {
     list_sessions().into_iter().map(|s| s.session_id).collect()
 }
