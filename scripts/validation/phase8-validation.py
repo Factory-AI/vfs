@@ -81,9 +81,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     mode.add_argument("--smoke", action="store_true", help="run smoke-sized gates without enforcing Phase 8 perf/parallel targets")
     mode.add_argument("--full", action="store_true", help="run full Phase 8 policy (default)")
     parser.add_argument(
-        "--agentfs-bin",
-        default=os.environ.get("AGENTFS_BIN"),
-        help="agentfs executable path/name (default: repo target binary, building cli if needed)",
+        "--vfs-bin",
+        default=os.environ.get("VFS_BIN"),
+        help="vfs executable path/name (default: repo target binary, building cli if needed)",
     )
     parser.add_argument(
         "--timeout",
@@ -99,7 +99,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def default_output_path() -> Path:
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    return Path(tempfile.gettempdir()) / f"agentfs-phase8-validation-{stamp}-{uuid.uuid4().hex[:8]}.json"
+    return Path(tempfile.gettempdir()) / f"vfs-phase8-validation-{stamp}-{uuid.uuid4().hex[:8]}.json"
 
 
 def load_json(path: Path) -> Optional[dict[str, Any]]:
@@ -121,11 +121,11 @@ def tool_path(name: str) -> Optional[str]:
     return found
 
 
-def child_env(agentfs_bin: str, output_dir: Path) -> dict[str, str]:
+def child_env(vfs_bin: str, output_dir: Path) -> dict[str, str]:
     env = os.environ.copy()
     env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
     env.setdefault("NO_COLOR", "1")
-    env["AGENTFS_BIN"] = agentfs_bin
+    env["VFS_BIN"] = vfs_bin
     child_tmp = output_dir / "tmp"
     child_tmp.mkdir(parents=True, exist_ok=True)
     env["TMPDIR"] = str(child_tmp)
@@ -231,8 +231,8 @@ def max_counter(payload: Optional[dict[str, Any]], key: str) -> Optional[int]:
         return None
     candidates: list[Any] = []
     candidates.append(payload.get("summary", {}).get(key))
-    candidates.append(payload.get("agentfs", {}).get("profile_counters", {}).get(key))
-    candidates.append(payload.get("agentfs", {}).get("profile_counters", {}).get("max_counters", {}).get(key))
+    candidates.append(payload.get("vfs", {}).get("profile_counters", {}).get(key))
+    candidates.append(payload.get("vfs", {}).get("profile_counters", {}).get("max_counters", {}).get(key))
     for item in candidates:
         if isinstance(item, int):
             return item
@@ -316,10 +316,10 @@ def main(argv: list[str]) -> int:
 
     temp_manager: Optional[tempfile.TemporaryDirectory[str]] = None
     if args.keep_temp:
-        output_dir = Path(tempfile.mkdtemp(prefix="agentfs-phase8-validation-"))
+        output_dir = Path(tempfile.mkdtemp(prefix="vfs-phase8-validation-"))
     else:
         temp_manager = tempfile.TemporaryDirectory(
-            prefix="agentfs-phase8-validation-",
+            prefix="vfs-phase8-validation-",
             ignore_cleanup_errors=True,
         )
         output_dir = Path(temp_manager.name)
@@ -329,22 +329,22 @@ def main(argv: list[str]) -> int:
     try:
         git_ai_before = common.git_ai_processes()
         pinned_git = common.pin_distro_git(os.environ, output_dir)
-        agentfs_bin = common.resolve_agentfs_bin(args.agentfs_bin, repo_root)
-        env = child_env(agentfs_bin, output_dir)
+        vfs_bin = common.resolve_vfs_bin(args.vfs_bin, repo_root)
+        env = child_env(vfs_bin, output_dir)
         scripts = repo_root / "scripts" / "validation"
         gates: dict[str, dict[str, Any]] = {}
 
         gates["phase7_validation_smoke"] = run_json_gate(
             "phase7-validation-smoke",
             scripts / "phase7-validation.py",
-            ["--smoke", "--timeout", str(args.timeout), "--agentfs-bin", agentfs_bin],
+            ["--smoke", "--timeout", str(args.timeout), "--vfs-bin", vfs_bin],
             repo_root,
             env,
             args.timeout * 6 + 120,
             output_dir,
         )
 
-        git_args = ["--timeout", str(args.timeout), "--agentfs-bin", agentfs_bin, "--profile"]
+        git_args = ["--timeout", str(args.timeout), "--vfs-bin", vfs_bin, "--profile"]
         if args.smoke:
             git_args.extend(
                 [
@@ -380,7 +380,7 @@ def main(argv: list[str]) -> int:
             enforce=enforce_phase8,
         )
 
-        fuse_args = ["--timeout", str(args.timeout), "--agentfs-bin", agentfs_bin, "--profile"]
+        fuse_args = ["--timeout", str(args.timeout), "--vfs-bin", vfs_bin, "--profile"]
         if args.smoke:
             fuse_args.extend(["--files", "4", "--file-size-bytes", "1024", "--threads", "2", "--iterations", "4", "--read-bytes", "512"])
         gates["fuse_serialization_parallelism"] = run_json_gate(
@@ -394,7 +394,7 @@ def main(argv: list[str]) -> int:
         )
         apply_parallel_policy(gates["fuse_serialization_parallelism"], enforce=enforce_phase8)
 
-        concurrent_args = ["--timeout", str(args.timeout), "--agentfs-bin", agentfs_bin]
+        concurrent_args = ["--timeout", str(args.timeout), "--vfs-bin", vfs_bin]
         if args.smoke:
             concurrent_args.extend(["--fixture-files", "12", "--fixture-dirs", "3", "--fixture-file-size-bytes", "512", "--edit-files", "2", "--append-bytes", "32"])
         gates["phase8_concurrent_git_stress"] = run_json_gate(
@@ -407,8 +407,8 @@ def main(argv: list[str]) -> int:
             output_dir,
         )
 
-        durability_args = ["--timeout", str(args.timeout), "--agentfs-bin", agentfs_bin]
-        no_fsync_args = ["--timeout", str(args.timeout), "--agentfs-bin", agentfs_bin]
+        durability_args = ["--timeout", str(args.timeout), "--vfs-bin", vfs_bin]
+        no_fsync_args = ["--timeout", str(args.timeout), "--vfs-bin", vfs_bin]
         if args.smoke:
             durability_args.extend(["--write-bytes", "1024"])
             no_fsync_args.extend(["--write-bytes", "1024"])
@@ -431,7 +431,7 @@ def main(argv: list[str]) -> int:
             output_dir,
         )
 
-        base_read_args = ["--timeout", str(args.timeout), "--agentfs-bin", agentfs_bin, "--profile"]
+        base_read_args = ["--timeout", str(args.timeout), "--vfs-bin", vfs_bin, "--profile"]
         if args.smoke:
             base_read_args.extend(["--file-size-bytes", "65536", "--iterations", "4", "--read-bytes", "4096"])
         else:
@@ -459,7 +459,7 @@ def main(argv: list[str]) -> int:
         gates["noopen_coherence"] = run_json_gate(
             "noopen-coherence",
             scripts / "noopen-coherence.py",
-            ["--agentfs-bin", agentfs_bin],
+            ["--vfs-bin", vfs_bin],
             repo_root,
             env,
             coherence_wall_timeout,
@@ -468,7 +468,7 @@ def main(argv: list[str]) -> int:
         gates["flush_coherence"] = run_json_gate(
             "flush-coherence",
             scripts / "flush-coherence.py",
-            ["--agentfs-bin", agentfs_bin],
+            ["--vfs-bin", vfs_bin],
             repo_root,
             env,
             coherence_wall_timeout,
@@ -477,7 +477,7 @@ def main(argv: list[str]) -> int:
         gates["external_base_mutation_coherence"] = run_json_gate(
             "external-base-mutation-coherence",
             scripts / "external-base-mutation-coherence.py",
-            ["--agentfs-bin", agentfs_bin],
+            ["--vfs-bin", vfs_bin],
             repo_root,
             env,
             coherence_wall_timeout,
@@ -532,7 +532,7 @@ def main(argv: list[str]) -> int:
             "gates": gates,
             "env": {
                 "python": sys.executable,
-                "agentfs_bin": agentfs_bin,
+                "vfs_bin": vfs_bin,
                 "git": tool_path("git"),
                 "fusermount3": tool_path("fusermount3"),
                 "fusermount": tool_path("fusermount"),

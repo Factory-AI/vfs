@@ -14,21 +14,21 @@ All timestamps in this specification use Unix epoch format (seconds since 1970-0
 
 ## Runtime Architecture and Safety Invariants
 
-The persistent AgentFS authority is the SQLite database described by this
+The persistent Vfs authority is the SQLite database described by this
 specification. Runtime mounts, caches, file handles, FUSE lookup references, and
 overlay inode maps are acceleration structures only; they MUST be reconstructible
 from the database plus the configured read-only base path and MUST NOT become
 the only source of virtual filesystem state.
 
-AgentFS sandboxing is built around two invariants:
+Vfs sandboxing is built around two invariants:
 
-1. A portable AgentFS database contains all writable virtual filesystem state.
+1. A portable Vfs database contains all writable virtual filesystem state.
    Clean shutdown SHOULD checkpoint transient SQLite sidecars so backups and
    materialized copies can be represented as a single main database file.
 2. Copy-on-write sandbox writes MUST NOT modify the real filesystem. Overlay
    backends MAY read from an explicitly scoped base directory, but file creates,
    writes, truncates, chmod/chown/utimens, links, renames, and deletes are
-   represented in the AgentFS delta database and overlay metadata.
+   represented in the Vfs delta database and overlay metadata.
 
 Implementations MAY use kernel caches, positive/negative lookup caches,
 attribute caches, read-dir caches, and parallel FUSE dispatch, provided they
@@ -50,7 +50,7 @@ Writes MAY be acknowledged from an in-memory pending map before their bytes
 reach SQLite. The reference implementation batches FUSE writeback-cache
 writes and drains them on a short timer window, a per-inode pending-byte
 trigger, a global pending-byte cap, and bounded per-transaction inode/byte
-budgets (`AGENTFS_BATCH_*` knobs). Buffered acknowledgement is only permitted
+budgets (`VFS_BATCH_*` knobs). Buffered acknowledgement is only permitted
 for volatile-durability writes; any operation that promises durability —
 `fsync`, an NFSv3 `WRITE` acknowledged as `FILE_SYNC`, or unmount/shutdown
 finalization — MUST NOT return until the affected pending bytes are committed
@@ -71,7 +71,7 @@ flush by default: it answers `OPEN`/`RELEASE` (and close-time `FLUSH`) with
 with `fh = 0`. Implementations using this mode MUST NOT key any state to
 open/release pairs. Per-inode resources (backing file handles for base reads,
 caches) are keyed by inode number, held in a bounded LRU
-(`AGENTFS_FUSE_INO_FILES_CAP`), and reclaimed by kernel `FORGET` traffic and
+(`VFS_FUSE_INO_FILES_CAP`), and reclaimed by kernel `FORGET` traffic and
 LRU eviction rather than by `RELEASE`.
 
 Consequences that MUST hold:
@@ -82,8 +82,8 @@ Consequences that MUST hold:
 2. Close does not imply commit. With no-flush enabled the kernel has already
    written back dirty pages before close; durability is promised only by
    `fsync` (see the durability contract above).
-3. Both behaviors retain kill switches (`AGENTFS_FUSE_NOOPEN`,
-   `AGENTFS_FUSE_NOFLUSH`) and dedicated coherence gates
+3. Both behaviors retain kill switches (`VFS_FUSE_NOOPEN`,
+   `VFS_FUSE_NOFLUSH`) and dedicated coherence gates
    (`scripts/validation/noopen-coherence.py`,
    `scripts/validation/flush-coherence.py`) that validate the default and
    disabled legs.
@@ -92,7 +92,7 @@ Consequences that MUST hold:
 
 On kernels that expose `/sys/module/fuse/parameters/enable_uring = Y`, the
 FUSE session attempts the FUSE-over-io_uring transport by default
-(`AGENTFS_FUSE_URING`, bounded queue depth via `AGENTFS_FUSE_URING_DEPTH`)
+(`VFS_FUSE_URING`, bounded queue depth via `VFS_FUSE_URING_DEPTH`)
 and falls back to the classic `/dev/fuse` read/write loop when io_uring
 setup is unavailable or fails. The transport is a performance detail only:
 request semantics, reply contents, cache invalidation, and teardown bounds
@@ -597,19 +597,19 @@ Migrations are keyed by `PRAGMA user_version` and land any supported old
 schema (v0.0, v0.2, v0.4) at the current version with one command:
 
 ```bash
-agentfs migrate <id-or-path>
+vfs migrate <id-or-path>
 ```
 
 In-place migration requirements:
 
 1. Every migration step MUST be an additive, idempotent DDL change applied inside a single transaction that stamps `PRAGMA user_version` before committing.
 2. Existing file contents MUST keep their recorded `chunk_size`; the in-place path does not re-chunk data. A defaulted `inline_threshold` MUST NOT exceed the database's recorded `chunk_size`.
-3. Open paths (mount, fs, exec, SDK open) MUST NOT run version upgrades implicitly; they reject old schemas and direct the user to `agentfs migrate`.
+3. Open paths (mount, fs, exec, SDK open) MUST NOT run version upgrades implicitly; they reject old schemas and direct the user to `vfs migrate`.
 
 The copy-based mode rebuilds the database with the current chunk layout:
 
 ```bash
-agentfs migrate <source-old.db> --copy <target.db> --verify
+vfs migrate <source-old.db> --copy <target.db> --verify
 ```
 
 Copy-migration requirements:
@@ -711,7 +711,7 @@ CREATE TABLE fs_overlay_config (
 |-----|-------------|
 | `base_path` | Canonical path to the read-only base directory |
 
-v0.5 copy migration MUST preserve this table when migrating an overlay delta database. Without it, a migrated overlay database would mount as a plain AgentFS database and lose base-layer visibility.
+v0.5 copy migration MUST preserve this table when migrating an overlay delta database. Without it, a migrated overlay database would mount as a plain Vfs database and lose base-layer visibility.
 
 ### Operations
 
@@ -816,8 +816,8 @@ fail reads of partial-origin files if the recorded base size or modification
 metadata no longer matches the current base file. Snapshot/restore of the main
 delta database is supported only when the same unchanged base path is available.
 A database containing partial-origin rows is not portable on its own:
-`agentfs backup` rejects it unless `--materialize` folds the base bytes in,
-`agentfs materialize` produces a portable copy, and `agentfs integrity`
+`vfs backup` rejects it unless `--materialize` folds the base bytes in,
+`vfs materialize` produces a portable copy, and `vfs integrity`
 exposes the dependency via `--require-portable` and `--check-base`.
 
 #### Tables: `fs_partial_origin` and `fs_chunk_override`
@@ -952,7 +952,7 @@ Such extensions SHOULD use separate tables to maintain referential integrity.
 - Added `inline_threshold` to the required `fs_config` keys
 - Added partial-origin overlay mode tables (`fs_partial_origin`, `fs_chunk_override`) behind the opt-in `--partial-origin` CLI policy
 - Whiteout schema requires `parent_path`; legacy `fs_whiteout(path, created_at)` rows are synthesized on migration
-- Schema migrations are keyed by `PRAGMA user_version`; `agentfs migrate` lands any supported old schema (v0.0, v0.2, v0.4) at the current version in place, and `--copy` rebuilds with the current chunk layout
+- Schema migrations are keyed by `PRAGMA user_version`; `vfs migrate` lands any supported old schema (v0.0, v0.2, v0.4) at the current version in place, and `--copy` rebuilds with the current chunk layout
 
 ### Version 0.4
 

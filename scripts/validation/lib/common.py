@@ -5,7 +5,7 @@ Import via a sys.path bootstrap so the dash-named top-level scripts can use
 the package from any CWD:
 
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from lib.common import resolve_agentfs_bin, run_subprocess
+    from lib.common import resolve_vfs_bin, run_subprocess
 """
 
 from __future__ import annotations
@@ -54,12 +54,12 @@ def pin_distro_git(
     whose `git` symlinks the distro binary, and point the global git config at
     a hookless file so no hook manager can re-enter via config.
 
-    The PATH shim only holds for host-side processes: inside an `agentfs run`
+    The PATH shim only holds for host-side processes: inside an `vfs run`
     sandbox, temp dirs and home files are hidden, so any shim dir silently
     falls out of PATH and the hook-manager git takes over. That is what
     ``env["GIT"]`` is for — it names the distro binary by absolute (system,
     sandbox-visible) path, and every harness git invocation must honor it,
-    including the workload scripts spawned inside `agentfs run`. Pass ``home``
+    including the workload scripts spawned inside `vfs run`. Pass ``home``
     to also write a hookless ``~/.gitconfig`` into a temp HOME (belt and
     braces for host-side legs).
     """
@@ -107,7 +107,7 @@ def git_ai_processes() -> dict[int, dict[str, Any]]:
         info: dict[str, Any] = {
             "cmdline": " ".join(argv),
             "home": None,
-            "agentfs_session": False,
+            "vfs_session": False,
         }
         try:
             environ = (entry / "environ").read_bytes()
@@ -116,8 +116,8 @@ def git_ai_processes() -> dict[int, dict[str, Any]]:
         for chunk in environ.split(b"\0"):
             if chunk.startswith(b"HOME="):
                 info["home"] = chunk[len(b"HOME="):].decode("utf-8", "replace")
-            elif chunk.startswith(b"AGENTFS_SESSION="):
-                info["agentfs_session"] = True
+            elif chunk.startswith(b"VFS_SESSION="):
+                info["vfs_session"] = True
         procs[int(entry.name)] = info
     return procs
 
@@ -129,7 +129,7 @@ def git_ai_leaks(
 
     The user's own hook manager churns independently (its daemon respawns with
     HOME under the real home dir), so a bare pid diff false-positives. Count
-    only new processes with a temp-dir HOME or an AGENTFS session in their
+    only new processes with a temp-dir HOME or an VFS session in their
     environment — the same discrimination rule library/environment.md requires
     before killing one.
     """
@@ -139,7 +139,7 @@ def git_ai_leaks(
         if pid in before:
             continue
         home = info.get("home") or ""
-        if info.get("agentfs_session") or home.startswith(tmp_prefix):
+        if info.get("vfs_session") or home.startswith(tmp_prefix):
             leaks.append({"pid": pid, **info})
     return leaks
 
@@ -260,29 +260,29 @@ def workspace_target_dir(repo_root: Path) -> Path:
     return repo_root / "target"
 
 
-def resolve_agentfs_bin(agentfs_bin: Optional[str], repo_root: Path) -> str:
-    if agentfs_bin:
-        candidate = Path(agentfs_bin).expanduser()
+def resolve_vfs_bin(vfs_bin: Optional[str], repo_root: Path) -> str:
+    if vfs_bin:
+        candidate = Path(vfs_bin).expanduser()
         if candidate.is_file() and os.access(candidate, os.X_OK):
             return str(candidate.resolve())
-        if os.sep not in agentfs_bin:
-            found = shutil.which(agentfs_bin)
+        if os.sep not in vfs_bin:
+            found = shutil.which(vfs_bin)
             if found:
                 return found
-        raise RuntimeError(f"configured agentfs executable not found or not executable: {agentfs_bin}")
+        raise RuntimeError(f"configured vfs executable not found or not executable: {vfs_bin}")
 
     target_dir = workspace_target_dir(repo_root)
     # Release first: it is what the gates measure and it is rebuilt more often
     # during active development, so it is less likely to be stale.
     for candidate in (
-        target_dir / "release" / "agentfs",
-        target_dir / "debug" / "agentfs",
+        target_dir / "release" / "vfs",
+        target_dir / "debug" / "vfs",
     ):
         if candidate.is_file() and os.access(candidate, os.X_OK):
             return str(candidate)
 
     build = subprocess.run(
-        ["cargo", "build", "-p", "agentfs-cli", "--manifest-path", str(repo_root / "Cargo.toml")],
+        ["cargo", "build", "-p", "vfs-cli", "--manifest-path", str(repo_root / "Cargo.toml")],
         cwd=str(repo_root),
         text=True,
         stdout=subprocess.PIPE,
@@ -290,11 +290,11 @@ def resolve_agentfs_bin(agentfs_bin: Optional[str], repo_root: Path) -> str:
     )
     if build.returncode != 0:
         raise RuntimeError(
-            "failed to build repo-local agentfs binary; set AGENTFS_BIN explicitly\n"
+            "failed to build repo-local vfs binary; set VFS_BIN explicitly\n"
             f"stdout:\n{tail_text(build.stdout)}\n"
             f"stderr:\n{tail_text(build.stderr)}"
         )
-    built = target_dir / "debug" / "agentfs"
+    built = target_dir / "debug" / "vfs"
     if built.is_file() and os.access(built, os.X_OK):
         return str(built)
     raise RuntimeError(f"repo-local build completed but binary was not found: {built}")

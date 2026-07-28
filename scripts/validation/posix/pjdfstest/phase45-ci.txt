@@ -1,4 +1,4 @@
-# Conservative unprivileged AgentFS POSIX gate for Phase 4.5.
+# Conservative unprivileged Vfs POSIX gate for Phase 4.5.
 #
 # This profile intentionally excludes tests requiring root-only capabilities
 # such as block/char device mknod, successful chown/lchown, and alternate

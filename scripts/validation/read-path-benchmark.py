@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Phase 5.5 native-vs-AgentFS read-path profiling benchmark."""
+"""Phase 5.5 native-vs-Vfs read-path profiling benchmark."""
 
 from __future__ import annotations
 
@@ -232,20 +232,20 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Compare read-heavy filesystem operations on native storage and an "
-            "AgentFS overlay, with cold/warm and startup/steady-state timing splits."
+            "Vfs overlay, with cold/warm and startup/steady-state timing splits."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
   # Fast smoke with profile summaries
-  AGENTFS_PROFILE=1 scripts/validation/read-path-benchmark.py --files 8 --dirs 3 \\
+  VFS_PROFILE=1 scripts/validation/read-path-benchmark.py --files 8 --dirs 3 \\
     --stat-iterations 1 --readdir-iterations 1 --open-iterations 1 --timeout 60
 
   # Larger bounded read-path run
   scripts/validation/read-path-benchmark.py --files 256 --dirs 32 --file-size-bytes 8192
 
 Environment:
-  AGENTFS_BIN      path/name of agentfs executable
-  AGENTFS_PROFILE  set to 1 to collect AgentFS profile summaries
+  VFS_BIN      path/name of vfs executable
+  VFS_PROFILE  set to 1 to collect Vfs profile summaries
 """,
     )
     parser.add_argument("--files", type=positive_int, default=64, help="fixture file count")
@@ -305,9 +305,9 @@ Environment:
         help="comma-separated modes to run: cold,warm (default: cold,warm)",
     )
     parser.add_argument(
-        "--agentfs-bin",
-        default=os.environ.get("AGENTFS_BIN"),
-        help="agentfs executable path/name (default: repo target binary, building cli if needed)",
+        "--vfs-bin",
+        default=os.environ.get("VFS_BIN"),
+        help="vfs executable path/name (default: repo target binary, building cli if needed)",
     )
     parser.add_argument(
         "--timeout",
@@ -318,13 +318,13 @@ Environment:
     parser.add_argument(
         "--profile",
         action="store_true",
-        default=env_flag("AGENTFS_PROFILE"),
-        help="enable AGENTFS_PROFILE=1 for AgentFS invocations",
+        default=env_flag("VFS_PROFILE"),
+        help="enable VFS_PROFILE=1 for Vfs invocations",
     )
     parser.add_argument(
         "--session-prefix",
         default=None,
-        help="AgentFS run session prefix (default: generated unique prefix)",
+        help="Vfs run session prefix (default: generated unique prefix)",
     )
     parser.add_argument(
         "--keep-temp",
@@ -335,7 +335,7 @@ Environment:
     parser.add_argument(
         "--output",
         default=None,
-        help="write JSON result to this file; defaults to /tmp/agentfs-read-path-benchmark-*.json",
+        help="write JSON result to this file; defaults to /tmp/vfs-read-path-benchmark-*.json",
     )
     parser.add_argument(
         "--json-indent",
@@ -369,13 +369,13 @@ def extract_profile_summaries(stderr: Any) -> list[dict[str, Any]]:
     summaries: list[dict[str, Any]] = []
     for line in text.splitlines():
         line = line.strip()
-        if not line or "agentfs_profile_summary" not in line:
+        if not line or "vfs_profile_summary" not in line:
             continue
         try:
             value = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(value, dict) and value.get("event") == "agentfs_profile_summary":
+        if isinstance(value, dict) and value.get("event") == "vfs_profile_summary":
             summaries.append(value)
     return summaries
 
@@ -478,20 +478,20 @@ def parse_json_stdout(run: dict[str, Any]) -> Optional[dict[str, Any]]:
     return None
 
 
-def resolve_agentfs_bin(agentfs_bin: Optional[str], repo_root: Path) -> str:
-    if agentfs_bin:
-        candidate_path = Path(agentfs_bin).expanduser()
+def resolve_vfs_bin(vfs_bin: Optional[str], repo_root: Path) -> str:
+    if vfs_bin:
+        candidate_path = Path(vfs_bin).expanduser()
         if candidate_path.is_file() and os.access(candidate_path, os.X_OK):
             return str(candidate_path.resolve())
-        if os.sep not in agentfs_bin:
-            found = shutil.which(agentfs_bin)
+        if os.sep not in vfs_bin:
+            found = shutil.which(vfs_bin)
             if found:
                 return found
-        raise RuntimeError(f"configured agentfs executable not found or not executable: {agentfs_bin}")
+        raise RuntimeError(f"configured vfs executable not found or not executable: {vfs_bin}")
 
     for candidate_path in (
-        repo_root / "cli" / "target" / "debug" / "agentfs",
-        repo_root / "cli" / "target" / "release" / "agentfs",
+        repo_root / "cli" / "target" / "debug" / "vfs",
+        repo_root / "cli" / "target" / "release" / "vfs",
     ):
         if candidate_path.is_file() and os.access(candidate_path, os.X_OK):
             return str(candidate_path)
@@ -505,12 +505,12 @@ def resolve_agentfs_bin(agentfs_bin: Optional[str], repo_root: Path) -> str:
     )
     if build.returncode != 0:
         raise RuntimeError(
-            "failed to build repo-local agentfs binary; set AGENTFS_BIN to an explicit binary\n"
+            "failed to build repo-local vfs binary; set VFS_BIN to an explicit binary\n"
             f"stdout:\n{tail_text(build.stdout)}\n"
             f"stderr:\n{tail_text(build.stderr)}"
         )
 
-    built = repo_root / "cli" / "target" / "debug" / "agentfs"
+    built = repo_root / "cli" / "target" / "debug" / "vfs"
     if built.is_file() and os.access(built, os.X_OK):
         return str(built)
 
@@ -535,7 +535,7 @@ def prepare_environment(temp_root: Path, profile: bool) -> dict[str, str]:
     env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
     env.setdefault("NO_COLOR", "1")
     if profile:
-        env["AGENTFS_PROFILE"] = "1"
+        env["VFS_PROFILE"] = "1"
 
     home = temp_root / "home"
     for path in (home, home / ".config", home / ".cache", home / ".local" / "share"):
@@ -563,13 +563,13 @@ def create_fixture(root: Path, file_count: int, dir_count: int, file_size: int) 
 
     for index in range(file_count):
         directory = dirs[index % len(dirs)]
-        seed = hashlib.sha256(f"agentfs-phase55-read-{index}".encode("utf-8")).digest()
+        seed = hashlib.sha256(f"vfs-phase55-read-{index}".encode("utf-8")).digest()
         data = (seed * ((file_size // len(seed)) + 1))[:file_size]
         (directory / f"file_{index:05d}.dat").write_bytes(data)
 
     nested = root / "nested" / "a" / "b"
     nested.mkdir(parents=True, exist_ok=True)
-    (nested / "leaf.txt").write_text("agentfs read-path benchmark\n", encoding="utf-8")
+    (nested / "leaf.txt").write_text("vfs read-path benchmark\n", encoding="utf-8")
 
 
 def copy_fixture(source: Path, destination: Path) -> None:
@@ -615,35 +615,35 @@ def split_timing(run: dict[str, Any], workload: Optional[dict[str, Any]]) -> dic
     }
 
 
-def compare_workloads(native: Optional[dict[str, Any]], agentfs: Optional[dict[str, Any]]) -> dict[str, Any]:
-    if native is None or agentfs is None:
+def compare_workloads(native: Optional[dict[str, Any]], vfs: Optional[dict[str, Any]]) -> dict[str, Any]:
+    if native is None or vfs is None:
         return {"checked": False, "equivalent": False, "reason": "missing JSON workload output"}
     equivalent = (
-        native.get("digest") == agentfs.get("digest")
-        and native.get("counts") == agentfs.get("counts")
-        and native.get("parameters") == agentfs.get("parameters")
+        native.get("digest") == vfs.get("digest")
+        and native.get("counts") == vfs.get("counts")
+        and native.get("parameters") == vfs.get("parameters")
     )
     return {
         "checked": True,
         "equivalent": equivalent,
         "native_digest": native.get("digest"),
-        "agentfs_digest": agentfs.get("digest"),
+        "vfs_digest": vfs.get("digest"),
     }
 
 
-def mode_summary(native_run: dict[str, Any], agentfs_run: dict[str, Any]) -> dict[str, Any]:
+def mode_summary(native_run: dict[str, Any], vfs_run: dict[str, Any]) -> dict[str, Any]:
     native_seconds = native_run["duration_seconds"]
-    agentfs_seconds = agentfs_run["duration_seconds"]
+    vfs_seconds = vfs_run["duration_seconds"]
     return {
         "native_seconds": native_seconds,
-        "agentfs_seconds": agentfs_seconds,
-        "ratio": (agentfs_seconds / native_seconds) if native_seconds > 0 else None,
+        "vfs_seconds": vfs_seconds,
+        "ratio": (vfs_seconds / native_seconds) if native_seconds > 0 else None,
     }
 
 
 def default_output_path() -> Path:
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    return Path(tempfile.gettempdir()) / f"agentfs-read-path-benchmark-{stamp}-{uuid.uuid4().hex[:8]}.json"
+    return Path(tempfile.gettempdir()) / f"vfs-read-path-benchmark-{stamp}-{uuid.uuid4().hex[:8]}.json"
 
 
 def main(argv: list[str]) -> int:
@@ -652,23 +652,23 @@ def main(argv: list[str]) -> int:
 
     temp_manager: Optional[tempfile.TemporaryDirectory[str]] = None
     if args.keep_temp:
-        temp_root = Path(tempfile.mkdtemp(prefix="agentfs-read-path-benchmark-"))
+        temp_root = Path(tempfile.mkdtemp(prefix="vfs-read-path-benchmark-"))
     else:
-        temp_manager = tempfile.TemporaryDirectory(prefix="agentfs-read-path-benchmark-")
+        temp_manager = tempfile.TemporaryDirectory(prefix="vfs-read-path-benchmark-")
         temp_root = Path(temp_manager.name)
 
     exit_code = 0
     output_path = Path(args.output).expanduser() if args.output else default_output_path()
     result: dict[str, Any]
     try:
-        agentfs_bin = resolve_agentfs_bin(args.agentfs_bin, repo_root)
+        vfs_bin = resolve_vfs_bin(args.vfs_bin, repo_root)
         env = prepare_environment(temp_root, args.profile)
         source_root = temp_root / "source"
         native_root = temp_root / "native"
-        agentfs_base_root = temp_root / "agentfs-base"
+        vfs_base_root = temp_root / "vfs-base"
         create_fixture(source_root, args.files, args.dirs, args.file_size_bytes)
         copy_fixture(source_root, native_root)
-        copy_fixture(source_root, agentfs_base_root)
+        copy_fixture(source_root, vfs_base_root)
 
         base_workload = workload_argv(args)
         session_prefix = args.session_prefix or f"read-path-{uuid.uuid4().hex}"
@@ -676,33 +676,33 @@ def main(argv: list[str]) -> int:
         for mode in args.modes:
             session = f"{session_prefix}-{mode}"
             native_warmup = None
-            agentfs_warmup = None
+            vfs_warmup = None
             if mode == "warm":
                 native_warmup = run_subprocess(base_workload, native_root, env, args.timeout)
-                agentfs_warmup = run_subprocess(
-                    [agentfs_bin, "run", "--session", session, "--no-default-allows", "--"] + base_workload,
-                    agentfs_base_root,
+                vfs_warmup = run_subprocess(
+                    [vfs_bin, "run", "--session", session, "--no-default-allows", "--"] + base_workload,
+                    vfs_base_root,
                     env,
                     args.timeout,
                 )
 
             native_run = run_subprocess(base_workload, native_root, env, args.timeout)
-            agentfs_run = run_subprocess(
-                [agentfs_bin, "run", "--session", session, "--no-default-allows", "--"] + base_workload,
-                agentfs_base_root,
+            vfs_run = run_subprocess(
+                [vfs_bin, "run", "--session", session, "--no-default-allows", "--"] + base_workload,
+                vfs_base_root,
                 env,
                 args.timeout,
             )
 
             native_workload = parse_json_stdout(native_run)
-            agentfs_workload = parse_json_stdout(agentfs_run)
-            equivalence = compare_workloads(native_workload, agentfs_workload)
+            vfs_workload = parse_json_stdout(vfs_run)
+            equivalence = compare_workloads(native_workload, vfs_workload)
             profile_summaries = []
-            if agentfs_warmup is not None:
-                profile_summaries.extend(agentfs_warmup.get("profile_summaries", []))
-            profile_summaries.extend(agentfs_run.get("profile_summaries", []))
+            if vfs_warmup is not None:
+                profile_summaries.extend(vfs_warmup.get("profile_summaries", []))
+            profile_summaries.extend(vfs_run.get("profile_summaries", []))
 
-            if native_run["returncode"] != 0 or agentfs_run["returncode"] != 0:
+            if native_run["returncode"] != 0 or vfs_run["returncode"] != 0:
                 exit_code = 1
             if equivalence["checked"] and not equivalence["equivalent"]:
                 exit_code = 1
@@ -716,22 +716,22 @@ def main(argv: list[str]) -> int:
                     "workload": native_workload,
                     "timing": split_timing(native_run, native_workload),
                 },
-                "agentfs": {
-                    "warmup": agentfs_warmup,
-                    "run": agentfs_run,
-                    "workload": agentfs_workload,
-                    "timing": split_timing(agentfs_run, agentfs_workload),
+                "vfs": {
+                    "warmup": vfs_warmup,
+                    "run": vfs_run,
+                    "workload": vfs_workload,
+                    "timing": split_timing(vfs_run, vfs_workload),
                     "profile_summaries": profile_summaries,
                     "profile_counters": profile_counter_summary(profile_summaries),
                 },
-                "summary": mode_summary(native_run, agentfs_run),
+                "summary": mode_summary(native_run, vfs_run),
                 "steady_state": {
                     "native_workload_seconds": native_workload.get("total_seconds") if native_workload else None,
-                    "agentfs_workload_seconds": agentfs_workload.get("total_seconds") if agentfs_workload else None,
+                    "vfs_workload_seconds": vfs_workload.get("total_seconds") if vfs_workload else None,
                     "ratio": (
-                        agentfs_workload["total_seconds"] / native_workload["total_seconds"]
+                        vfs_workload["total_seconds"] / native_workload["total_seconds"]
                         if native_workload
-                        and agentfs_workload
+                        and vfs_workload
                         and native_workload.get("total_seconds", 0) > 0
                         else None
                     ),
@@ -747,11 +747,11 @@ def main(argv: list[str]) -> int:
             "command": {
                 "argv": [str(Path(__file__).resolve())] + argv,
                 "workload_argv": base_workload,
-                "agentfs_prefix": [agentfs_bin, "run", "--session", "<session>", "--no-default-allows", "--"],
+                "vfs_prefix": [vfs_bin, "run", "--session", "<session>", "--no-default-allows", "--"],
             },
             "environment": {
-                "AGENTFS_PROFILE": "1" if args.profile else os.environ.get("AGENTFS_PROFILE"),
-                "AGENTFS_BIN": args.agentfs_bin,
+                "VFS_PROFILE": "1" if args.profile else os.environ.get("VFS_PROFILE"),
+                "VFS_BIN": args.vfs_bin,
             },
             "parameters": {
                 "files": args.files,
@@ -766,18 +766,18 @@ def main(argv: list[str]) -> int:
                 "repeated_read_files": args.repeated_read_files,
                 "modes": args.modes,
             },
-            "agentfs": {
-                "bin": agentfs_bin,
+            "vfs": {
+                "bin": vfs_bin,
                 "profile_enabled": args.profile,
                 "profile_summary_count": sum(
-                    mode["agentfs"]["profile_counters"]["summary_count"] for mode in modes
+                    mode["vfs"]["profile_counters"]["summary_count"] for mode in modes
                 ),
             },
             "summary": {
                 "native_seconds": mean([mode["summary"]["native_seconds"] for mode in modes]),
-                "agentfs_seconds": mean([mode["summary"]["agentfs_seconds"] for mode in modes]),
+                "vfs_seconds": mean([mode["summary"]["vfs_seconds"] for mode in modes]),
                 "ratio": (
-                    mean([mode["summary"]["agentfs_seconds"] for mode in modes])
+                    mean([mode["summary"]["vfs_seconds"] for mode in modes])
                     / mean([mode["summary"]["native_seconds"] for mode in modes])
                     if mean([mode["summary"]["native_seconds"] for mode in modes]) > 0
                     else None

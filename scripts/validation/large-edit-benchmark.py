@@ -109,7 +109,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Compare a native single-byte edit to the same edit through an "
-            "AgentFS overlay and report delta DB growth."
+            "Vfs overlay and report delta DB growth."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
@@ -120,8 +120,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
   scripts/validation/large-edit-benchmark.py --file-size-mib 1 --timeout 60
 
 Environment:
-  AGENTFS_BIN      path/name of agentfs executable
-  AGENTFS_PROFILE  set to 1 to collect AgentFS profile summaries
+  VFS_BIN      path/name of vfs executable
+  VFS_PROFILE  set to 1 to collect Vfs profile summaries
 """,
     )
     parser.add_argument(
@@ -136,9 +136,9 @@ Environment:
         help="byte offset to edit (default: middle of the file)",
     )
     parser.add_argument(
-        "--agentfs-bin",
-        default=os.environ.get("AGENTFS_BIN"),
-        help="agentfs executable path/name (default: repo target binary, building cli if needed)",
+        "--vfs-bin",
+        default=os.environ.get("VFS_BIN"),
+        help="vfs executable path/name (default: repo target binary, building cli if needed)",
     )
     parser.add_argument(
         "--timeout",
@@ -149,26 +149,26 @@ Environment:
     parser.add_argument(
         "--session",
         default=None,
-        help="AgentFS run session id (default: generated unique id)",
+        help="Vfs run session id (default: generated unique id)",
     )
     parser.add_argument(
         "--profile",
         action="store_true",
-        default=env_flag("AGENTFS_PROFILE"),
-        help="enable AGENTFS_PROFILE=1 for AgentFS invocations",
+        default=env_flag("VFS_PROFILE"),
+        help="enable VFS_PROFILE=1 for Vfs invocations",
     )
     partial_origin_group = parser.add_mutually_exclusive_group()
     partial_origin_group.add_argument(
         "--partial-origin",
         dest="partial_origin",
         action="store_true",
-        help="pass --partial-origin on to AgentFS overlay invocations",
+        help="pass --partial-origin on to Vfs overlay invocations",
     )
     partial_origin_group.add_argument(
         "--no-partial-origin",
         dest="partial_origin",
         action="store_false",
-        help="omit --partial-origin for AgentFS overlay invocations",
+        help="omit --partial-origin for Vfs overlay invocations",
     )
     parser.set_defaults(partial_origin=False)
     parser.add_argument(
@@ -213,13 +213,13 @@ def extract_profile_summaries(stderr: Any) -> list[dict[str, Any]]:
     summaries: list[dict[str, Any]] = []
     for line in text.splitlines():
         line = line.strip()
-        if not line or "agentfs_profile_summary" not in line:
+        if not line or "vfs_profile_summary" not in line:
             continue
         try:
             value = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(value, dict) and value.get("event") == "agentfs_profile_summary":
+        if isinstance(value, dict) and value.get("event") == "vfs_profile_summary":
             summaries.append(value)
     return summaries
 
@@ -293,20 +293,20 @@ def run_subprocess(
     }
 
 
-def resolve_agentfs_bin(agentfs_bin: Optional[str], repo_root: Path) -> str:
-    if agentfs_bin:
-        candidate_path = Path(agentfs_bin).expanduser()
+def resolve_vfs_bin(vfs_bin: Optional[str], repo_root: Path) -> str:
+    if vfs_bin:
+        candidate_path = Path(vfs_bin).expanduser()
         if candidate_path.is_file() and os.access(candidate_path, os.X_OK):
             return str(candidate_path.resolve())
-        if os.sep not in agentfs_bin:
-            found = shutil.which(agentfs_bin)
+        if os.sep not in vfs_bin:
+            found = shutil.which(vfs_bin)
             if found:
                 return found
-        raise RuntimeError(f"configured agentfs executable not found or not executable: {agentfs_bin}")
+        raise RuntimeError(f"configured vfs executable not found or not executable: {vfs_bin}")
 
     for candidate_path in (
-        repo_root / "cli" / "target" / "debug" / "agentfs",
-        repo_root / "cli" / "target" / "release" / "agentfs",
+        repo_root / "cli" / "target" / "debug" / "vfs",
+        repo_root / "cli" / "target" / "release" / "vfs",
     ):
         if candidate_path.is_file() and os.access(candidate_path, os.X_OK):
             return str(candidate_path)
@@ -320,12 +320,12 @@ def resolve_agentfs_bin(agentfs_bin: Optional[str], repo_root: Path) -> str:
     )
     if build.returncode != 0:
         raise RuntimeError(
-            "failed to build repo-local agentfs binary; set AGENTFS_BIN to an explicit binary\n"
+            "failed to build repo-local vfs binary; set VFS_BIN to an explicit binary\n"
             f"stdout:\n{tail_text(build.stdout)}\n"
             f"stderr:\n{tail_text(build.stderr)}"
         )
 
-    built = repo_root / "cli" / "target" / "debug" / "agentfs"
+    built = repo_root / "cli" / "target" / "debug" / "vfs"
     if built.is_file() and os.access(built, os.X_OK):
         return str(built)
 
@@ -352,7 +352,7 @@ def create_large_file(path: Path, size_bytes: int) -> str:
     block_index = 0
     with path.open("wb") as handle:
         while written < size_bytes:
-            seed = hashlib.sha256(f"agentfs-phase5-large-edit-{block_index}".encode()).digest()
+            seed = hashlib.sha256(f"vfs-phase5-large-edit-{block_index}".encode()).digest()
             block = (seed * ((ONE_MIB // len(seed)) + 1))[: min(ONE_MIB, size_bytes - written)]
             handle.write(block)
             digest.update(block)
@@ -489,7 +489,7 @@ def prepare_environment(temp_root: Path, profile: bool) -> dict[str, str]:
     env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
     env.setdefault("NO_COLOR", "1")
     if profile:
-        env["AGENTFS_PROFILE"] = "1"
+        env["VFS_PROFILE"] = "1"
 
     home = temp_root / "home"
     for path in (home, home / ".config", home / ".cache", home / ".local" / "share"):
@@ -517,79 +517,79 @@ def main(argv: list[str]) -> int:
 
     temp_manager: Optional[tempfile.TemporaryDirectory[str]] = None
     if args.keep_temp:
-        temp_root = Path(tempfile.mkdtemp(prefix="agentfs-large-edit-"))
+        temp_root = Path(tempfile.mkdtemp(prefix="vfs-large-edit-"))
     else:
-        temp_manager = tempfile.TemporaryDirectory(prefix="agentfs-large-edit-")
+        temp_manager = tempfile.TemporaryDirectory(prefix="vfs-large-edit-")
         temp_root = Path(temp_manager.name)
 
     exit_code = 0
     result: dict[str, Any]
     try:
-        agentfs_bin = resolve_agentfs_bin(args.agentfs_bin, repo_root)
+        vfs_bin = resolve_vfs_bin(args.vfs_bin, repo_root)
         env = prepare_environment(temp_root, args.profile)
         session = args.session or f"large-edit-{uuid.uuid4()}"
 
         source_root = temp_root / "source"
         native_root = temp_root / "native"
-        agentfs_base_root = temp_root / "agentfs-base"
+        vfs_base_root = temp_root / "vfs-base"
         source_file = source_root / "large.bin"
         original_sha = create_large_file(source_file, file_size_bytes)
         copy_base_tree(source_root, native_root)
-        copy_base_tree(source_root, agentfs_base_root)
+        copy_base_tree(source_root, vfs_base_root)
 
-        db_path = Path(env["HOME"]) / ".agentfs" / "run" / session / "delta.db"
-        agentfs_run_prefix = [
-            agentfs_bin,
+        db_path = Path(env["HOME"]) / ".vfs" / "run" / session / "delta.db"
+        vfs_run_prefix = [
+            vfs_bin,
             "run",
             "--session",
             session,
             "--no-default-allows",
         ]
         if args.partial_origin:
-            agentfs_run_prefix.extend(["--partial-origin", "on"])
+            vfs_run_prefix.extend(["--partial-origin", "on"])
         warmup_command = [
-            *agentfs_run_prefix,
+            *vfs_run_prefix,
             "--",
             sys.executable,
             "-c",
             READONLY_WARMUP,
         ]
-        warmup = run_subprocess(warmup_command, agentfs_base_root, env, args.timeout)
+        warmup = run_subprocess(warmup_command, vfs_base_root, env, args.timeout)
         db_before = db_artifacts(db_path)
         inspect_before = inspect_db(db_path)
 
         native_command = [sys.executable, "-c", EDIT_WORKLOAD, "large.bin", str(offset)]
-        agentfs_command = [*agentfs_run_prefix, "--"] + native_command
+        vfs_command = [*vfs_run_prefix, "--"] + native_command
 
         native = run_subprocess(native_command, native_root, env, args.timeout)
-        agentfs = run_subprocess(agentfs_command, agentfs_base_root, env, args.timeout)
+        vfs = run_subprocess(vfs_command, vfs_base_root, env, args.timeout)
 
         db_after = db_artifacts(db_path)
         inspect_after = inspect_db(db_path)
 
         native_json = parse_json_stdout(native)
-        agentfs_json = parse_json_stdout(agentfs)
-        agentfs_base_sha_after = hash_file(agentfs_base_root / "large.bin")
+        vfs_json = parse_json_stdout(vfs)
+        vfs_base_sha_after = hash_file(vfs_base_root / "large.bin")
         native_sha_after = hash_file(native_root / "large.bin")
         comparable_fields = ("size", "size_before", "offset", "old_byte", "new_byte", "sha256")
         outputs_match = (
             native_json is not None
-            and agentfs_json is not None
-            and all(native_json.get(field) == agentfs_json.get(field) for field in comparable_fields)
+            and vfs_json is not None
+            and all(native_json.get(field) == vfs_json.get(field) for field in comparable_fields)
         )
         correctness = {
             "native_returncode_zero": native["returncode"] == 0,
-            "agentfs_returncode_zero": agentfs["returncode"] == 0,
+            "vfs_returncode_zero": vfs["returncode"] == 0,
             "warmup_returncode_zero": warmup["returncode"] == 0,
             "outputs_match": outputs_match,
-            "agentfs_base_unchanged": agentfs_base_sha_after == original_sha,
+            "vfs_base_unchanged": vfs_base_sha_after == original_sha,
             "native_file_changed": native_sha_after != original_sha,
             "passed": (
                 warmup["returncode"] == 0
                 and native["returncode"] == 0
-                and agentfs["returncode"] == 0
+                and vfs["returncode"] == 0
                 and outputs_match
-                and agentfs_base_sha_after == original_sha
+                and vfs_base_sha_after == original_sha
                 and native_sha_after != original_sha
             ),
         }
@@ -606,14 +606,14 @@ def main(argv: list[str]) -> int:
                 "offset": offset,
                 "edit_width_bytes": 1,
             },
-            "agentfs": {
-                "bin": agentfs_bin,
+            "vfs": {
+                "bin": vfs_bin,
                 "session": session,
                 "db_path": str(db_path),
                 "profile_enabled": args.profile,
                 "partial_origin_enabled": args.partial_origin,
                 "partial_origin_cli": "on" if args.partial_origin else "omitted",
-                "profile_summary_count": len(warmup["profile_summaries"]) + len(agentfs["profile_summaries"]),
+                "profile_summary_count": len(warmup["profile_summaries"]) + len(vfs["profile_summaries"]),
             },
             "database": {
                 "before_edit": db_before,
@@ -627,16 +627,16 @@ def main(argv: list[str]) -> int:
                 "run": native,
                 "result": native_json,
             },
-            "agentfs_overlay": {
-                "duration_seconds": agentfs["duration_seconds"],
+            "vfs_overlay": {
+                "duration_seconds": vfs["duration_seconds"],
                 "warmup": warmup,
-                "run": agentfs,
-                "result": agentfs_json,
+                "run": vfs,
+                "result": vfs_json,
             },
             "base_file": {
                 "original_sha256": original_sha,
                 "native_sha256_after": native_sha_after,
-                "agentfs_base_sha256_after": agentfs_base_sha_after,
+                "vfs_base_sha256_after": vfs_base_sha_after,
             },
             "correctness": correctness,
             "temp_dir": str(temp_root),

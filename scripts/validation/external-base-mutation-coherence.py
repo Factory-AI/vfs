@@ -32,21 +32,21 @@ def tail_text(text: str) -> str:
     return text if len(text) <= OUTPUT_TAIL_CHARS else text[-OUTPUT_TAIL_CHARS:]
 
 
-def resolve_agentfs_bin(agentfs_bin: str | None, repo_root: Path) -> str:
-    if agentfs_bin:
-        candidate = Path(agentfs_bin).expanduser()
+def resolve_vfs_bin(vfs_bin: str | None, repo_root: Path) -> str:
+    if vfs_bin:
+        candidate = Path(vfs_bin).expanduser()
         if candidate.is_file() and os.access(candidate, os.X_OK):
             return str(candidate.resolve())
-        if os.sep not in agentfs_bin:
-            found = shutil.which(agentfs_bin)
+        if os.sep not in vfs_bin:
+            found = shutil.which(vfs_bin)
             if found:
                 return found
-        raise RuntimeError(f"agentfs binary not found or not executable: {agentfs_bin}")
+        raise RuntimeError(f"vfs binary not found or not executable: {vfs_bin}")
 
-    candidate = repo_root / "target" / "release" / "agentfs"
+    candidate = repo_root / "target" / "release" / "vfs"
     if candidate.is_file() and os.access(candidate, os.X_OK):
         return str(candidate)
-    raise RuntimeError("no release agentfs binary found, pass --agentfs-bin or build release")
+    raise RuntimeError("no release vfs binary found, pass --vfs-bin or build release")
 
 
 def sha256(data: bytes) -> str:
@@ -55,7 +55,7 @@ def sha256(data: bytes) -> str:
 
 def parse_profile_summary(output: str) -> dict[str, Any]:
     for line in reversed(output.splitlines()):
-        if '"agentfs_profile_summary"' not in line:
+        if '"vfs_profile_summary"' not in line:
             continue
         start = line.find("{")
         if start < 0:
@@ -327,12 +327,12 @@ def run_leg(
     label: str,
     extra_env: dict[str, str],
     expect_noopen: bool,
-    agentfs_bin: str,
+    vfs_bin: str,
     timeout: float,
     cleanup_timeout: float,
 ) -> dict[str, Any]:
     started = time.perf_counter()
-    with tempfile.TemporaryDirectory(prefix=f"agentfs-base-drift-{label}-") as tmp:
+    with tempfile.TemporaryDirectory(prefix=f"vfs-base-drift-{label}-") as tmp:
         root = Path(tmp)
         work = root / "work"
         base = root / "base"
@@ -345,9 +345,9 @@ def run_leg(
 
         env = os.environ.copy()
         env.update(extra_env)
-        env["AGENTFS_PROFILE"] = "1"
+        env["VFS_PROFILE"] = "1"
 
-        init = run_checked([agentfs_bin, "init", "drift", "--base", str(base)], work, env, timeout)
+        init = run_checked([vfs_bin, "init", "drift", "--base", str(base)], work, env, timeout)
         if init.returncode != 0:
             return {
                 "label": label,
@@ -365,9 +365,9 @@ def run_leg(
         try:
             proc = subprocess.Popen(
                 [
-                    agentfs_bin,
+                    vfs_bin,
                     "mount",
-                    str(work / ".agentfs" / "drift.db"),
+                    str(work / ".vfs" / "drift.db"),
                     str(mountpoint),
                     "--foreground",
                 ],
@@ -504,24 +504,24 @@ def main() -> int:
     signal.signal(signal.SIGINT, raise_keyboard_interrupt)
     signal.signal(signal.SIGTERM, raise_keyboard_interrupt)
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--agentfs-bin", default=os.environ.get("AGENTFS_BIN"))
+    parser.add_argument("--vfs-bin", default=os.environ.get("VFS_BIN"))
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--cleanup-timeout", type=float, default=DEFAULT_CLEANUP_TIMEOUT)
     parser.add_argument("--output", default=None)
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parents[2]
-    agentfs_bin = resolve_agentfs_bin(args.agentfs_bin, repo_root)
+    vfs_bin = resolve_vfs_bin(args.vfs_bin, repo_root)
     legs = [
         ("default_noopen", {}, True),
-        ("noopen_off", {"AGENTFS_FUSE_NOOPEN": "0"}, False),
+        ("noopen_off", {"VFS_FUSE_NOOPEN": "0"}, False),
     ]
     runs = []
     interrupted = False
     for label, env, noopen in legs:
         leg_started = time.perf_counter()
         try:
-            run = run_leg(label, env, noopen, agentfs_bin, args.timeout, args.cleanup_timeout)
+            run = run_leg(label, env, noopen, vfs_bin, args.timeout, args.cleanup_timeout)
         except KeyboardInterrupt as exc:
             run = {
                 "label": label,
@@ -537,14 +537,14 @@ def main() -> int:
             break
     report = {
         "schema_version": 1,
-        "agentfs_bin": agentfs_bin,
+        "vfs_bin": vfs_bin,
         "passed": not interrupted and all(run.get("passed") for run in runs),
         "interrupted": interrupted,
         "runs": runs,
     }
     output = args.output or os.path.join(
         tempfile.gettempdir(),
-        f"agentfs-external-base-mutation-{time.strftime('%Y%m%d-%H%M%S')}.json",
+        f"vfs-external-base-mutation-{time.strftime('%Y%m%d-%H%M%S')}.json",
     )
     Path(output).write_text(json.dumps(report, indent=2))
 

@@ -38,11 +38,11 @@ check_python "dag" - <<'PY'
 import json, subprocess, sys
 
 expected = {
-    "agentfs-cli": {"agentfs-core", "agentfs-mount"},
-    "agentfs-core": set(),
-    "agentfs-fuse": {"agentfs-core"},
-    "agentfs-nfs": {"agentfs-core"},
-    "agentfs-mount": {"agentfs-core", "agentfs-fuse", "agentfs-nfs"},
+    "vfs-cli": {"vfs-core", "vfs-mount"},
+    "vfs-core": set(),
+    "vfs-fuse": {"vfs-core"},
+    "vfs-nfs": {"vfs-core"},
+    "vfs-mount": {"vfs-core", "vfs-fuse", "vfs-nfs"},
 }
 
 meta = json.loads(
@@ -58,7 +58,7 @@ if set(packages) != set(expected):
 for name, wanted in expected.items():
     actual = {
         dep["name"] for dep in packages[name]["dependencies"]
-        if dep["name"].startswith("agentfs-")
+        if dep["name"].startswith("vfs-")
     }
     if actual != wanted:
         print(f"{name} first-party deps {sorted(actual)} != expected {sorted(wanted)}")
@@ -73,14 +73,14 @@ from pathlib import Path
 
 problems = []
 
-fuse = Path("crates/agentfs-fuse/src/lib.rs").read_text()
+fuse = Path("crates/vfs-fuse/src/lib.rs").read_text()
 fuse_pubs = re.findall(r"^pub .*$", fuse, re.M)
 if fuse_pubs != ["pub use adapter::{mount, FuseMountOptions, SessionHandle};"]:
     problems.append(f"fuse lib.rs pub surface drifted: {fuse_pubs}")
 if re.search(r"^pub mod", fuse, re.M):
     problems.append("fuse lib.rs exposes a pub mod")
 
-nfs = Path("crates/agentfs-nfs/src/lib.rs").read_text()
+nfs = Path("crates/vfs-nfs/src/lib.rs").read_text()
 nfs_items = re.findall(r"^pub (?:async )?(?:struct|fn|enum|trait|mod|use) (\w+)", nfs, re.M)
 if sorted(nfs_items) != ["NfsServeOptions", "ServerHandle", "serve"]:
     problems.append(f"nfs lib.rs pub surface drifted: {sorted(nfs_items)}")
@@ -170,8 +170,8 @@ exec(os.environ["CANON_SCAN_HELPER"])
 def allowed(path):
     p = str(path)
     return (
-        p.startswith("crates/agentfs-cli/src/cmd/")
-        or p == "crates/agentfs-cli/src/main.rs"
+        p.startswith("crates/vfs-cli/src/cmd/")
+        or p == "crates/vfs-cli/src/main.rs"
         or path.name == "build.rs"
     )
 
@@ -200,9 +200,9 @@ exec(os.environ["CANON_SCAN_HELPER"])
 
 # Env reads live in each crate's config module (canon section 7 item 3).
 ALLOWED_PREFIXES = (
-    "crates/agentfs-core/src/config/",
-    "crates/agentfs-fuse/src/adapter/config.rs",
-    "crates/agentfs-cli/src/config.rs",
+    "crates/vfs-core/src/config/",
+    "crates/vfs-fuse/src/adapter/config.rs",
+    "crates/vfs-cli/src/config.rs",
 )
 
 offenders = []
@@ -226,10 +226,10 @@ check_python "envfilter-coverage" - <<'PY'
 import sys
 from pathlib import Path
 
-logging = Path("crates/agentfs-cli/src/logging.rs").read_text()
+logging = Path("crates/vfs-cli/src/logging.rs").read_text()
 missing = [
     target for target in
-    ("agentfs=", "agentfs_cli=", "agentfs_core=", "agentfs_fuse=", "agentfs_nfs=", "agentfs_mount=")
+    ("vfs=", "vfs_cli=", "vfs_core=", "vfs_fuse=", "vfs_nfs=", "vfs_mount=")
     if target not in logging
 ]
 if missing:
@@ -248,7 +248,7 @@ if 'await_holding_lock = "deny"' not in root:
     print("workspace lints table does not deny clippy::await_holding_lock")
     sys.exit(1)
 missing = [
-    crate for crate in ("agentfs-cli", "agentfs-core", "agentfs-fuse", "agentfs-nfs", "agentfs-mount")
+    crate for crate in ("vfs-cli", "vfs-core", "vfs-fuse", "vfs-nfs", "vfs-mount")
     if "workspace = true" not in Path(f"crates/{crate}/Cargo.toml").read_text().split("[lints]")[-1]
     or "[lints]" not in Path(f"crates/{crate}/Cargo.toml").read_text()
 ]
@@ -264,10 +264,10 @@ import re, sys
 from pathlib import Path
 
 modules = [
-    "crates/agentfs-core/src/fs/agentfs/batcher.rs",
-    "crates/agentfs-fuse/src/adapter/cache.rs",
-    "crates/agentfs-core/src/fs/overlay/mod.rs",
-    "crates/agentfs-core/src/semantics/handles.rs",
+    "crates/vfs-core/src/fs/vfs/batcher.rs",
+    "crates/vfs-fuse/src/adapter/cache.rs",
+    "crates/vfs-core/src/fs/overlay/mod.rs",
+    "crates/vfs-core/src/semantics/handles.rs",
 ]
 missing = [
     m for m in modules

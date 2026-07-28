@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Replay a minimal filesystem workload against a temporary AgentFS mount.
+Replay a minimal filesystem workload against a temporary Vfs mount.
 
 Supported normalized JSONL/TSV operations:
   mkdir      path
@@ -16,7 +16,7 @@ Supported strace-like subset:
   open/openat + read(...) for read_file
 
 Unsupported operations are summarized and skipped. Use --dry-run to parse and
-summarize without creating an AgentFS database or mount.
+summarize without creating a Vfs database or mount.
 """
 
 from __future__ import annotations
@@ -530,18 +530,18 @@ def print_summary(result: ParseResult) -> None:
     print(f"Ignored lines: {result.ignored_lines}")
 
 
-def resolve_agentfs(agentfs_bin: str) -> str:
-    if os.sep in agentfs_bin:
-        resolved = os.path.abspath(os.path.expanduser(agentfs_bin))
+def resolve_vfs(vfs_bin: str) -> str:
+    if os.sep in vfs_bin:
+        resolved = os.path.abspath(os.path.expanduser(vfs_bin))
         if os.access(resolved, os.X_OK):
             return resolved
-        raise PrerequisiteSkip(f"agentfs binary is not executable: {agentfs_bin}")
+        raise PrerequisiteSkip(f"vfs binary is not executable: {vfs_bin}")
 
-    resolved = shutil.which(agentfs_bin)
+    resolved = shutil.which(vfs_bin)
     if not resolved:
         raise PrerequisiteSkip(
-            "agentfs binary not found. Build/install it first, or pass --agentfs-bin PATH "
-            "(for example: cargo build --release -p agentfs-cli --bins && cp target/release/agentfs /usr/local/bin)."
+            "vfs binary not found. Build/install it first, or pass --vfs-bin PATH "
+            "(for example: cargo build --release -p vfs-cli --bins && cp target/release/vfs /usr/local/bin)."
         )
     return resolved
 
@@ -574,34 +574,34 @@ def unmount(path: str, log_file) -> None:
     print("No fusermount3/fusermount/umount helper found for cleanup", file=log_file)
 
 
-class AgentFSMount:
-    def __init__(self, agentfs_bin: str, report_dir: Optional[str], keep_work: bool) -> None:
-        self.agentfs_bin = resolve_agentfs(agentfs_bin)
+class VfsMount:
+    def __init__(self, vfs_bin: str, report_dir: Optional[str], keep_work: bool) -> None:
+        self.vfs_bin = resolve_vfs(vfs_bin)
         self.keep_work = keep_work
-        self.report_dir = report_dir or tempfile.mkdtemp(prefix="agentfs-replay-report.", dir="/tmp")
+        self.report_dir = report_dir or tempfile.mkdtemp(prefix="vfs-replay-report.", dir="/tmp")
         self.report_dir = os.path.abspath(self.report_dir)
         self.work_dir = ""
         self.mount_dir = ""
         self.mount_process: Optional[subprocess.Popen] = None
 
-    def __enter__(self) -> "AgentFSMount":
+    def __enter__(self) -> "VfsMount":
         try:
             os.makedirs(self.report_dir, exist_ok=True)
-            self.work_dir = tempfile.mkdtemp(prefix="agentfs-replay-work.", dir="/tmp")
-            self.mount_dir = tempfile.mkdtemp(prefix="agentfs-replay-mnt.", dir="/tmp")
+            self.work_dir = tempfile.mkdtemp(prefix="vfs-replay-work.", dir="/tmp")
+            self.mount_dir = tempfile.mkdtemp(prefix="vfs-replay-mnt.", dir="/tmp")
             agent_id = f"replay-{os.getpid()}-{int(time.time())}"
-            db_path = os.path.join(self.work_dir, ".agentfs", f"{agent_id}.db")
+            db_path = os.path.join(self.work_dir, ".vfs", f"{agent_id}.db")
 
             with open(os.path.join(self.report_dir, "init.log"), "w", encoding="utf-8") as log_file:
-                subprocess.run([self.agentfs_bin, "init", agent_id], cwd=self.work_dir, stdout=log_file, stderr=subprocess.STDOUT, check=True)
+                subprocess.run([self.vfs_bin, "init", agent_id], cwd=self.work_dir, stdout=log_file, stderr=subprocess.STDOUT, check=True)
 
             if not os.path.isfile(db_path):
-                raise ReplayError(f"AgentFS database was not created at {db_path}; see {self.report_dir}/init.log")
+                raise ReplayError(f"Vfs database was not created at {db_path}; see {self.report_dir}/init.log")
 
             mount_log_path = os.path.join(self.report_dir, "mount.log")
             mount_log = open(mount_log_path, "w", encoding="utf-8")
             self.mount_process = subprocess.Popen(
-                [self.agentfs_bin, "mount", db_path, self.mount_dir, "--foreground"],
+                [self.vfs_bin, "mount", db_path, self.mount_dir, "--foreground"],
                 stdout=mount_log,
                 stderr=subprocess.STDOUT,
             )
@@ -614,7 +614,7 @@ class AgentFSMount:
                     break
                 time.sleep(0.1)
 
-            raise ReplayError(f"AgentFS mount did not become ready at {self.mount_dir}; see {mount_log_path}")
+            raise ReplayError(f"Vfs mount did not become ready at {self.mount_dir}; see {mount_log_path}")
         except Exception:
             self.cleanup()
             raise
@@ -640,8 +640,8 @@ class AgentFSMount:
                     self.mount_process.wait()
 
         if not self.keep_work:
-            safe_rmtree_tmp(self.work_dir, ("/tmp/agentfs-replay-work.",))
-            safe_rmtree_tmp(self.mount_dir, ("/tmp/agentfs-replay-mnt.",))
+            safe_rmtree_tmp(self.work_dir, ("/tmp/vfs-replay-work.",))
+            safe_rmtree_tmp(self.mount_dir, ("/tmp/vfs-replay-mnt.",))
         else:
             print(f"Kept work directory: {self.work_dir}", file=sys.stderr)
             print(f"Kept mount directory: {self.mount_dir}", file=sys.stderr)
@@ -713,10 +713,10 @@ def replay_operations(operations: Iterable[Operation], mount_dir: str, report_di
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("logfile", help="JSONL, TSV, or strace-like workload log")
-    parser.add_argument("--dry-run", action="store_true", help="parse and summarize only; do not create an AgentFS mount")
-    parser.add_argument("--agentfs-bin", default=os.environ.get("AGENTFS_BIN", "agentfs"), help="agentfs executable for replay mode")
+    parser.add_argument("--dry-run", action="store_true", help="parse and summarize only; do not create a Vfs mount")
+    parser.add_argument("--vfs-bin", default=os.environ.get("VFS_BIN", "vfs"), help="vfs executable for replay mode")
     parser.add_argument("--report-dir", default=os.environ.get("REPORT_DIR"), help="directory for init/mount/replay logs")
-    parser.add_argument("--keep-work", action="store_true", help="keep temporary AgentFS work and mount directories after replay")
+    parser.add_argument("--keep-work", action="store_true", help="keep temporary Vfs work and mount directories after replay")
     return parser
 
 
@@ -737,7 +737,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if result.unsupported:
         print("Unsupported operations will be skipped during replay.", file=sys.stderr)
 
-    active_mount: Optional[AgentFSMount] = None
+    active_mount: Optional[VfsMount] = None
 
     def handle_signal(signum, _frame) -> None:
         if active_mount is not None:
@@ -747,11 +747,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     old_int = signal.signal(signal.SIGINT, handle_signal)
     old_term = signal.signal(signal.SIGTERM, handle_signal)
     try:
-        with AgentFSMount(args.agentfs_bin, args.report_dir, args.keep_work) as mount:
+        with VfsMount(args.vfs_bin, args.report_dir, args.keep_work) as mount:
             active_mount = mount
             return replay_operations(result.operations, mount.mount_dir, mount.report_dir)
     except subprocess.CalledProcessError as exc:
-        print(f"AgentFS command failed with status {exc.returncode}; see report logs.", file=sys.stderr)
+        print(f"Vfs command failed with status {exc.returncode}; see report logs.", file=sys.stderr)
         return 1
     except PrerequisiteSkip as exc:
         print(f"SKIP: {exc}", file=sys.stderr)

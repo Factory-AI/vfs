@@ -24,7 +24,7 @@ SCHEMA_AUTHORITY_FILES = {
 }
 SCHEMA_AUTHORITY_DIRS = (
     Path("sdk/rust/src/schema"),
-    Path("crates/agentfs-core/src/schema"),
+    Path("crates/vfs-core/src/schema"),
 )
 
 EXCLUDED_DIR_NAMES = {".git", "target"}
@@ -365,14 +365,14 @@ def emit_result(result: CensusResult) -> int:
 def run_self_test() -> int:
     with tempfile.TemporaryDirectory(prefix="ddl-census-fixture-") as tmp:
         root = Path(tmp)
-        schema_dir = root / "crates/agentfs-core/src/schema"
+        schema_dir = root / "crates/vfs-core/src/schema"
         schema_dir.mkdir(parents=True)
         (schema_dir / "mod.rs").write_text(
             'pub const AUTHORITY_DDL: &str = "CREATE TABLE authority (id INTEGER)";\n',
             encoding="utf-8",
         )
 
-        src_dir = root / "crates/agentfs-core/src"
+        src_dir = root / "crates/vfs-core/src"
         (src_dir / "lib.rs").write_text(
             r'''
 #[cfg(test)]

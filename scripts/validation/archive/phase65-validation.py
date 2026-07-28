@@ -31,7 +31,7 @@ root = Path.cwd()
 max_files = int(os.environ.get("PHASE65_FACTORY_MAX_FILES", "512"))
 scan_bytes = int(os.environ.get("PHASE65_FACTORY_SCAN_BYTES", "4096"))
 skip_names = {
-    ".agentfs",
+    ".vfs",
     ".direnv",
     ".git",
     ".next",
@@ -119,9 +119,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 """,
     )
     parser.add_argument(
-        "--agentfs-bin",
-        default=os.environ.get("AGENTFS_BIN"),
-        help="agentfs executable path/name (default: repo target binary, building cli if needed)",
+        "--vfs-bin",
+        default=os.environ.get("VFS_BIN"),
+        help="vfs executable path/name (default: repo target binary, building cli if needed)",
     )
     parser.add_argument(
         "--timeout",
@@ -252,20 +252,20 @@ def run_subprocess(argv: list[str], cwd: Path, env: dict[str, str], timeout: flo
     }
 
 
-def resolve_agentfs_bin(agentfs_bin: Optional[str], repo_root: Path) -> str:
-    if agentfs_bin:
-        candidate_path = Path(agentfs_bin).expanduser()
+def resolve_vfs_bin(vfs_bin: Optional[str], repo_root: Path) -> str:
+    if vfs_bin:
+        candidate_path = Path(vfs_bin).expanduser()
         if candidate_path.is_file() and os.access(candidate_path, os.X_OK):
             return str(candidate_path.resolve())
-        if os.sep not in agentfs_bin:
-            found = shutil.which(agentfs_bin)
+        if os.sep not in vfs_bin:
+            found = shutil.which(vfs_bin)
             if found:
                 return found
-        raise RuntimeError(f"configured agentfs executable not found or not executable: {agentfs_bin}")
+        raise RuntimeError(f"configured vfs executable not found or not executable: {vfs_bin}")
 
     for candidate_path in (
-        repo_root / "cli" / "target" / "debug" / "agentfs",
-        repo_root / "cli" / "target" / "release" / "agentfs",
+        repo_root / "cli" / "target" / "debug" / "vfs",
+        repo_root / "cli" / "target" / "release" / "vfs",
     ):
         if candidate_path.is_file() and os.access(candidate_path, os.X_OK):
             return str(candidate_path)
@@ -279,12 +279,12 @@ def resolve_agentfs_bin(agentfs_bin: Optional[str], repo_root: Path) -> str:
     )
     if build.returncode != 0:
         raise RuntimeError(
-            "failed to build repo-local agentfs binary; set AGENTFS_BIN to an explicit binary\n"
+            "failed to build repo-local vfs binary; set VFS_BIN to an explicit binary\n"
             f"stdout:\n{tail_text(build.stdout)}\n"
             f"stderr:\n{tail_text(build.stderr)}"
         )
 
-    built = repo_root / "cli" / "target" / "debug" / "agentfs"
+    built = repo_root / "cli" / "target" / "debug" / "vfs"
     if built.is_file() and os.access(built, os.X_OK):
         return str(built)
     raise RuntimeError(f"repo-local build completed but binary was not found: {built}")
@@ -321,17 +321,17 @@ def parse_json_stdout_tail(run: dict[str, Any]) -> Optional[dict[str, Any]]:
     return None
 
 
-def child_env(agentfs_bin: str) -> dict[str, str]:
+def child_env(vfs_bin: str) -> dict[str, str]:
     env = os.environ.copy()
     env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
     env.setdefault("NO_COLOR", "1")
-    env["AGENTFS_BIN"] = agentfs_bin
+    env["VFS_BIN"] = vfs_bin
     return env
 
 
 def default_output_path() -> Path:
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    return Path(tempfile.gettempdir()) / f"agentfs-phase65-validation-{stamp}-{uuid.uuid4().hex[:8]}.json"
+    return Path(tempfile.gettempdir()) / f"vfs-phase65-validation-{stamp}-{uuid.uuid4().hex[:8]}.json"
 
 
 def factory_command(args: argparse.Namespace) -> str:
@@ -386,8 +386,8 @@ def run_factory_bounded_read(
         coverage_ok = True
         for iteration in payload.get("iterations", []):
             native_json = parse_json_stdout_tail(iteration.get("native", {}))
-            agentfs_json = parse_json_stdout_tail(iteration.get("agentfs", {}))
-            for workload_json in (native_json, agentfs_json):
+            vfs_json = parse_json_stdout_tail(iteration.get("vfs", {}))
+            for workload_json in (native_json, vfs_json):
                 if (
                     not isinstance(workload_json, dict)
                     or int(workload_json.get("files", 0) or 0) <= 0
@@ -424,7 +424,7 @@ def read_path_chunk_counters(payload: Optional[dict[str, Any]]) -> dict[str, Any
     if not isinstance(payload, dict):
         return counters
     for mode in payload.get("modes", []):
-        profile_counters = mode.get("agentfs", {}).get("profile_counters", {})
+        profile_counters = mode.get("vfs", {}).get("profile_counters", {})
         if int(profile_counters.get("summary_count", 0) or 0) <= 0:
             continue
         max_counters = profile_counters.get("max_counters", {})
@@ -532,7 +532,7 @@ def run_base_read(
     payload = load_json(output_path) if output_path.exists() else None
     status = "passed" if run["returncode"] == 0 else "failed"
     summary = payload.get("summary", {}) if isinstance(payload, dict) else {}
-    passthrough = payload.get("agentfs", {}).get("passthrough", {}) if isinstance(payload, dict) else {}
+    passthrough = payload.get("vfs", {}).get("passthrough", {}) if isinstance(payload, dict) else {}
     repeated_ratio = summary.get("repeated_open_read_workload_ratio")
     chunk_read_queries = int(summary.get("chunk_read_queries", 1) or 0)
     chunk_read_chunks = int(summary.get("chunk_read_chunks", 1) or 0)
@@ -579,16 +579,16 @@ def main(argv: list[str]) -> int:
 
     temp_manager: Optional[tempfile.TemporaryDirectory[str]] = None
     if args.keep_temp:
-        output_dir = Path(tempfile.mkdtemp(prefix="agentfs-phase65-validation-"))
+        output_dir = Path(tempfile.mkdtemp(prefix="vfs-phase65-validation-"))
     else:
-        temp_manager = tempfile.TemporaryDirectory(prefix="agentfs-phase65-validation-")
+        temp_manager = tempfile.TemporaryDirectory(prefix="vfs-phase65-validation-")
         output_dir = Path(temp_manager.name)
 
     exit_code = 0
     result: dict[str, Any]
     try:
-        agentfs_bin = resolve_agentfs_bin(args.agentfs_bin, repo_root)
-        env = child_env(agentfs_bin)
+        vfs_bin = resolve_vfs_bin(args.vfs_bin, repo_root)
+        env = child_env(vfs_bin)
         runs: dict[str, dict[str, Any]] = {}
         runs["factory_bounded_read"] = run_factory_bounded_read(args, repo_root, env, output_dir)
         runs["controlled_read_metadata"] = run_controlled_read_metadata(args, repo_root, env, output_dir)
@@ -612,8 +612,8 @@ def main(argv: list[str]) -> int:
                 "factory_max_files": args.factory_max_files,
                 "factory_scan_bytes": args.factory_scan_bytes,
             },
-            "agentfs": {
-                "bin": agentfs_bin,
+            "vfs": {
+                "bin": vfs_bin,
                 "passthrough": passthrough,
             },
             "summary": {

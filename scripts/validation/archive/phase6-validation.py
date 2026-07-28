@@ -33,7 +33,7 @@ root = Path.cwd()
 max_files = int(os.environ.get("PHASE6_FACTORY_MAX_FILES", "512"))
 scan_bytes = int(os.environ.get("PHASE6_FACTORY_SCAN_BYTES", "4096"))
 skip_names = {
-    ".agentfs",
+    ".vfs",
     ".direnv",
     ".git",
     ".next",
@@ -125,9 +125,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 """,
     )
     parser.add_argument(
-        "--agentfs-bin",
-        default=os.environ.get("AGENTFS_BIN"),
-        help="agentfs executable path/name (default: repo target binary, building cli if needed)",
+        "--vfs-bin",
+        default=os.environ.get("VFS_BIN"),
+        help="vfs executable path/name (default: repo target binary, building cli if needed)",
     )
     parser.add_argument(
         "--timeout",
@@ -201,7 +201,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--output",
-        help="write JSON result to this file; defaults to /tmp/agentfs-phase6-validation-*.json",
+        help="write JSON result to this file; defaults to /tmp/vfs-phase6-validation-*.json",
     )
     parser.add_argument(
         "--json-indent",
@@ -292,20 +292,20 @@ def run_subprocess(
     }
 
 
-def resolve_agentfs_bin(agentfs_bin: Optional[str], repo_root: Path) -> str:
-    if agentfs_bin:
-        candidate_path = Path(agentfs_bin).expanduser()
+def resolve_vfs_bin(vfs_bin: Optional[str], repo_root: Path) -> str:
+    if vfs_bin:
+        candidate_path = Path(vfs_bin).expanduser()
         if candidate_path.is_file() and os.access(candidate_path, os.X_OK):
             return str(candidate_path.resolve())
-        if os.sep not in agentfs_bin:
-            found = shutil.which(agentfs_bin)
+        if os.sep not in vfs_bin:
+            found = shutil.which(vfs_bin)
             if found:
                 return found
-        raise RuntimeError(f"configured agentfs executable not found or not executable: {agentfs_bin}")
+        raise RuntimeError(f"configured vfs executable not found or not executable: {vfs_bin}")
 
     for candidate_path in (
-        repo_root / "cli" / "target" / "debug" / "agentfs",
-        repo_root / "cli" / "target" / "release" / "agentfs",
+        repo_root / "cli" / "target" / "debug" / "vfs",
+        repo_root / "cli" / "target" / "release" / "vfs",
     ):
         if candidate_path.is_file() and os.access(candidate_path, os.X_OK):
             return str(candidate_path)
@@ -319,12 +319,12 @@ def resolve_agentfs_bin(agentfs_bin: Optional[str], repo_root: Path) -> str:
     )
     if build.returncode != 0:
         raise RuntimeError(
-            "failed to build repo-local agentfs binary; set AGENTFS_BIN to an explicit binary\n"
+            "failed to build repo-local vfs binary; set VFS_BIN to an explicit binary\n"
             f"stdout:\n{tail_text(build.stdout)}\n"
             f"stderr:\n{tail_text(build.stderr)}"
         )
 
-    built = repo_root / "cli" / "target" / "debug" / "agentfs"
+    built = repo_root / "cli" / "target" / "debug" / "vfs"
     if built.is_file() and os.access(built, os.X_OK):
         return str(built)
 
@@ -346,7 +346,7 @@ def git_commit(repo_root: Path) -> Optional[str]:
 
 def default_output_path() -> Path:
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    return Path(tempfile.gettempdir()) / f"agentfs-phase6-validation-{stamp}-{uuid.uuid4().hex[:8]}.json"
+    return Path(tempfile.gettempdir()) / f"vfs-phase6-validation-{stamp}-{uuid.uuid4().hex[:8]}.json"
 
 
 def table_exists(conn: sqlite3.Connection, name: str) -> bool:
@@ -418,11 +418,11 @@ def load_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def child_env(agentfs_bin: str) -> dict[str, str]:
+def child_env(vfs_bin: str) -> dict[str, str]:
     env = os.environ.copy()
     env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
     env.setdefault("NO_COLOR", "1")
-    env["AGENTFS_BIN"] = agentfs_bin
+    env["VFS_BIN"] = vfs_bin
     return env
 
 
@@ -549,7 +549,7 @@ def run_read_path(
         if summary.get("all_equivalent") is not True:
             status = "failed"
         for mode in payload.get("modes", []):
-            counters = mode.get("agentfs", {}).get("profile_counters", {}).get("max_counters", {})
+            counters = mode.get("vfs", {}).get("profile_counters", {}).get("max_counters", {})
             if counters.get("chunk_read_queries", 0) != 0 or counters.get("chunk_read_chunks", 0) != 0:
                 status = "failed"
     return {
@@ -600,8 +600,8 @@ def run_large_edit(
             stored = int(inspect.get("fs_data_bytes", 0) or 0)
             override_rows = int(inspect.get("fs_chunk_override_rows", 0) or 0)
             native_seconds = payload.get("native", {}).get("run", {}).get("duration_seconds", 0)
-            agentfs_seconds = payload.get("agentfs_overlay", {}).get("run", {}).get("duration_seconds", 0)
-            ratio = (agentfs_seconds / native_seconds) if native_seconds else None
+            vfs_seconds = payload.get("vfs_overlay", {}).get("run", {}).get("duration_seconds", 0)
+            ratio = (vfs_seconds / native_seconds) if native_seconds else None
             if stored > 128 * 1024 or override_rows > 1 or ratio is None or ratio > 15.0:
                 status = "failed"
     return {
@@ -642,8 +642,8 @@ def run_no_real_write(
     }
 
 
-def materialize_help(agentfs_bin: str, repo_root: Path, env: dict[str, str]) -> dict[str, Any]:
-    run = run_subprocess([agentfs_bin, "materialize", "--help"], repo_root, env, 30)
+def materialize_help(vfs_bin: str, repo_root: Path, env: dict[str, str]) -> dict[str, Any]:
+    run = run_subprocess([vfs_bin, "materialize", "--help"], repo_root, env, 30)
     return {
         "available": run["returncode"] == 0,
         "probe": run,
@@ -656,14 +656,14 @@ def run_materialize_if_available(
     env: dict[str, str],
     output_dir: Path,
     file_size_mib: int,
-    agentfs_bin: str,
+    vfs_bin: str,
 ) -> dict[str, Any]:
-    help_result = materialize_help(agentfs_bin, repo_root, env)
+    help_result = materialize_help(vfs_bin, repo_root, env)
     if not help_result["available"]:
         return {
             "name": "materialize_benchmark",
             "status": "skipped",
-            "reason": "agentfs materialize command is not available",
+            "reason": "vfs materialize command is not available",
             "probe": help_result["probe"],
         }
 
@@ -685,9 +685,9 @@ def run_materialize_if_available(
             "setup_result": setup_payload,
         }
 
-    db_path = setup_payload.get("agentfs", {}).get("db_path")
+    db_path = setup_payload.get("vfs", {}).get("db_path")
     target_db = output_dir / "materialized.db"
-    command = [agentfs_bin, "materialize", str(db_path), "--output", str(target_db), "--verify"]
+    command = [vfs_bin, "materialize", str(db_path), "--output", str(target_db), "--verify"]
     run = run_subprocess(command, repo_root, env, args.timeout * 2 + 30)
     inspect = inspect_db(target_db)
     port_status = portability_status(inspect)
@@ -748,16 +748,16 @@ def main(argv: list[str]) -> int:
 
     temp_manager: Optional[tempfile.TemporaryDirectory[str]] = None
     if args.keep_temp:
-        output_dir = Path(tempfile.mkdtemp(prefix="agentfs-phase6-validation-"))
+        output_dir = Path(tempfile.mkdtemp(prefix="vfs-phase6-validation-"))
     else:
-        temp_manager = tempfile.TemporaryDirectory(prefix="agentfs-phase6-validation-")
+        temp_manager = tempfile.TemporaryDirectory(prefix="vfs-phase6-validation-")
         output_dir = Path(temp_manager.name)
 
     exit_code = 0
     result: dict[str, Any]
     try:
-        agentfs_bin = resolve_agentfs_bin(args.agentfs_bin, repo_root)
-        env = child_env(agentfs_bin)
+        vfs_bin = resolve_vfs_bin(args.vfs_bin, repo_root)
+        env = child_env(vfs_bin)
         runs: dict[str, dict[str, Any]] = {}
         runs["factory_bounded_read"] = run_factory_bounded_read(args, repo_root, env, output_dir)
         runs["read_path_profile"] = run_read_path(args, repo_root, env, output_dir)
@@ -771,7 +771,7 @@ def main(argv: list[str]) -> int:
             args, repo_root, env, output_dir, file_size_mib
         )
         runs["materialize_benchmark"] = run_materialize_if_available(
-            args, repo_root, env, output_dir, file_size_mib, agentfs_bin
+            args, repo_root, env, output_dir, file_size_mib, vfs_bin
         )
 
         failed = [
@@ -797,8 +797,8 @@ def main(argv: list[str]) -> int:
                 "factory_max_files": args.factory_max_files,
                 "factory_scan_bytes": args.factory_scan_bytes,
             },
-            "agentfs": {
-                "bin": agentfs_bin,
+            "vfs": {
+                "bin": vfs_bin,
             },
             "summary": {
                 "passed": exit_code == 0,

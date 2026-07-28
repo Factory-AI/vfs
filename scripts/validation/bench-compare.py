@@ -29,7 +29,7 @@ class BenchmarkFormatError(ValueError):
 @dataclass(frozen=True)
 class PhaseMedian:
     phase: str
-    agentfs_seconds: float
+    vfs_seconds: float
     count: int
 
 
@@ -103,22 +103,22 @@ def parse_phase_medians(payload: dict[str, Any], source: Path) -> dict[str, Phas
             raise BenchmarkFormatError(f"{source}: phase name must be a string")
         if not isinstance(phase_payload, dict):
             raise BenchmarkFormatError(f"{source}: phases.{phase} must be an object")
-        agentfs = phase_payload.get("agentfs_seconds")
-        if not isinstance(agentfs, dict):
+        vfs = phase_payload.get("vfs_seconds")
+        if not isinstance(vfs, dict):
             raise BenchmarkFormatError(
-                f"{source}: phases.{phase}.agentfs_seconds must be an object"
+                f"{source}: phases.{phase}.vfs_seconds must be an object"
             )
-        count = require_int(agentfs.get("count"), f"{source}: phases.{phase}.agentfs_seconds.count")
+        count = require_int(vfs.get("count"), f"{source}: phases.{phase}.vfs_seconds.count")
         if count != EXPECTED_ITERATIONS:
             raise BenchmarkFormatError(
-                f"{source}: phases.{phase}.agentfs_seconds.count expected "
+                f"{source}: phases.{phase}.vfs_seconds.count expected "
                 f"{EXPECTED_ITERATIONS}, got {count}"
             )
         median = require_number(
-            agentfs.get("median"),
-            f"{source}: phases.{phase}.agentfs_seconds.median",
+            vfs.get("median"),
+            f"{source}: phases.{phase}.vfs_seconds.median",
         )
-        parsed[phase] = PhaseMedian(phase=phase, agentfs_seconds=median, count=count)
+        parsed[phase] = PhaseMedian(phase=phase, vfs_seconds=median, count=count)
 
     return parsed
 
@@ -139,8 +139,8 @@ def compare_phase_medians(
 
     comparisons: list[PhaseComparison] = []
     for phase in sorted(baseline):
-        base = baseline[phase].agentfs_seconds
-        cand = candidate[phase].agentfs_seconds
+        base = baseline[phase].vfs_seconds
+        cand = candidate[phase].vfs_seconds
         if base <= 0:
             raise BenchmarkFormatError(
                 f"baseline phase {phase} has non-positive median {base}"

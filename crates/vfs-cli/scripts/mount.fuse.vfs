@@ -1,0 +1,14 @@
+#!/bin/bash
+
+# Determine the path to vfs
+if [ -n "$VFS_BIN" ]; then
+    VFS_PATH="$VFS_BIN"
+else
+    VFS_PATH="$(which vfs 2>/dev/null)"
+    if [ -z "$VFS_PATH" ]; then
+        echo "Error: vfs binary not found. Please install vfs or set VFS_BIN." >&2
+        exit 1
+    fi
+fi
+
+"$VFS_PATH" mount "$1" "$2"

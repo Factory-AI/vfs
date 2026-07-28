@@ -48,110 +48,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "agentfs-cli"
-version = "0.6.4"
-dependencies = [
- "agentfs-core",
- "agentfs-mount",
- "anyhow",
- "base64",
- "chrono",
- "clap",
- "clap_complete",
- "dirs",
- "hex",
- "libc",
- "parking_lot",
- "serde",
- "serde_json",
- "sha1",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "turso",
- "uuid",
-]
-
-[[package]]
-name = "agentfs-core"
-version = "0.6.4"
-dependencies = [
- "aegis",
- "async-trait",
- "criterion",
- "libc",
- "lru",
- "parking_lot",
- "proptest",
- "rand 0.8.6",
- "serde",
- "serde_json",
- "smallvec",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "turso",
-]
-
-[[package]]
-name = "agentfs-fuse"
-version = "0.6.4"
-dependencies = [
- "agentfs-core",
- "anyhow",
- "async-trait",
- "libc",
- "memchr",
- "nix",
- "page_size",
- "parking_lot",
- "smallvec",
- "tempfile",
- "tokio",
- "tracing",
- "turso",
- "zerocopy",
-]
-
-[[package]]
-name = "agentfs-mount"
-version = "0.6.4"
-dependencies = [
- "agentfs-core",
- "agentfs-fuse",
- "agentfs-nfs",
- "anyhow",
- "async-trait",
- "libc",
- "tempfile",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "agentfs-nfs"
-version = "0.6.4"
-dependencies = [
- "agentfs-core",
- "anyhow",
- "async-trait",
- "byteorder",
- "filetime",
- "libc",
- "num-derive",
- "num-traits",
- "smallvec",
- "tempfile",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2941,6 +2837,110 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "vfs-cli"
+version = "0.6.4"
+dependencies = [
+ "anyhow",
+ "base64",
+ "chrono",
+ "clap",
+ "clap_complete",
+ "dirs",
+ "hex",
+ "libc",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "sha1",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "turso",
+ "uuid",
+ "vfs-core",
+ "vfs-mount",
+]
+
+[[package]]
+name = "vfs-core"
+version = "0.6.4"
+dependencies = [
+ "aegis",
+ "async-trait",
+ "criterion",
+ "libc",
+ "lru",
+ "parking_lot",
+ "proptest",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "turso",
+]
+
+[[package]]
+name = "vfs-fuse"
+version = "0.6.4"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "libc",
+ "memchr",
+ "nix",
+ "page_size",
+ "parking_lot",
+ "smallvec",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "turso",
+ "vfs-core",
+ "zerocopy",
+]
+
+[[package]]
+name = "vfs-mount"
+version = "0.6.4"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "libc",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "vfs-core",
+ "vfs-fuse",
+ "vfs-nfs",
+]
+
+[[package]]
+name = "vfs-nfs"
+version = "0.6.4"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "byteorder",
+ "filetime",
+ "libc",
+ "num-derive",
+ "num-traits",
+ "smallvec",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+ "vfs-core",
+]
 
 [[package]]
 name = "wait-timeout"

@@ -73,9 +73,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 """,
     )
     parser.add_argument(
-        "--agentfs-bin",
-        default=os.environ.get("AGENTFS_BIN"),
-        help="agentfs executable path/name (default: repo target binary, building cli if needed)",
+        "--vfs-bin",
+        default=os.environ.get("VFS_BIN"),
+        help="vfs executable path/name (default: repo target binary, building cli if needed)",
     )
     parser.add_argument(
         "--timeout",
@@ -225,20 +225,20 @@ def run_subprocess(
     return result
 
 
-def resolve_agentfs_bin(agentfs_bin: Optional[str], repo_root: Path) -> str:
-    if agentfs_bin:
-        candidate_path = Path(agentfs_bin).expanduser()
+def resolve_vfs_bin(vfs_bin: Optional[str], repo_root: Path) -> str:
+    if vfs_bin:
+        candidate_path = Path(vfs_bin).expanduser()
         if candidate_path.is_file() and os.access(candidate_path, os.X_OK):
             return str(candidate_path.resolve())
-        if os.sep not in agentfs_bin:
-            found = shutil.which(agentfs_bin)
+        if os.sep not in vfs_bin:
+            found = shutil.which(vfs_bin)
             if found:
                 return found
-        raise RuntimeError(f"configured agentfs executable not found or not executable: {agentfs_bin}")
+        raise RuntimeError(f"configured vfs executable not found or not executable: {vfs_bin}")
 
     for candidate_path in (
-        repo_root / "cli" / "target" / "debug" / "agentfs",
-        repo_root / "cli" / "target" / "release" / "agentfs",
+        repo_root / "cli" / "target" / "debug" / "vfs",
+        repo_root / "cli" / "target" / "release" / "vfs",
     ):
         if candidate_path.is_file() and os.access(candidate_path, os.X_OK):
             return str(candidate_path)
@@ -252,12 +252,12 @@ def resolve_agentfs_bin(agentfs_bin: Optional[str], repo_root: Path) -> str:
     )
     if build.returncode != 0:
         raise RuntimeError(
-            "failed to build repo-local agentfs binary; set AGENTFS_BIN to an explicit binary\n"
+            "failed to build repo-local vfs binary; set VFS_BIN to an explicit binary\n"
             f"stdout:\n{tail_text(build.stdout)}\n"
             f"stderr:\n{tail_text(build.stderr)}"
         )
 
-    built = repo_root / "cli" / "target" / "debug" / "agentfs"
+    built = repo_root / "cli" / "target" / "debug" / "vfs"
     if built.is_file() and os.access(built, os.X_OK):
         return str(built)
 
@@ -279,7 +279,7 @@ def git_commit(repo_root: Path) -> Optional[str]:
 
 def default_output_path() -> Path:
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    return Path(tempfile.gettempdir()) / f"agentfs-phase7-validation-{stamp}-{uuid.uuid4().hex[:8]}.json"
+    return Path(tempfile.gettempdir()) / f"vfs-phase7-validation-{stamp}-{uuid.uuid4().hex[:8]}.json"
 
 
 def load_json(path: Path) -> Any:
@@ -377,11 +377,11 @@ def inspect_db(db_path: Path) -> dict[str, Any]:
         return {"inspectable": False, "reason": str(exc), "path": str(db_path)}
 
 
-def child_env(agentfs_bin: str, output_dir: Path) -> dict[str, str]:
+def child_env(vfs_bin: str, output_dir: Path) -> dict[str, str]:
     env = os.environ.copy()
     env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
     env.setdefault("NO_COLOR", "1")
-    env["AGENTFS_BIN"] = agentfs_bin
+    env["VFS_BIN"] = vfs_bin
     child_tmp = output_dir / "child-tmp"
     child_tmp.mkdir(parents=True, exist_ok=True)
     env["TMPDIR"] = str(child_tmp)
@@ -542,7 +542,7 @@ def run_git_workload(
     repo_root: Path,
     env: dict[str, str],
     output_dir: Path,
-    agentfs_bin: str,
+    vfs_bin: str,
 ) -> dict[str, Any]:
     script = (
         Path(args.git_workload_script).expanduser()
@@ -561,7 +561,7 @@ def run_git_workload(
     output_path = output_dir / "git-workload-benchmark.json"
     argv = [sys.executable, str(script)]
     optional_args = [
-        ("--agentfs-bin", agentfs_bin),
+        ("--vfs-bin", vfs_bin),
         ("--timeout", str(args.timeout)),
         ("--profile", None),
         ("--strict-portable", None),
@@ -590,7 +590,7 @@ def run_git_workload(
         correctness_ok = False
 
     base_unchanged_values = [
-        value for value in recursive_key_values(payload, "agentfs_base_unchanged") if isinstance(value, bool)
+        value for value in recursive_key_values(payload, "vfs_base_unchanged") if isinstance(value, bool)
     ]
     base_unchanged = all(base_unchanged_values) if base_unchanged_values else None
 
@@ -689,18 +689,18 @@ def run_strict_large_edit(
         inspect = payload.get("database", {}).get("inspect_after", {})
         portability = inspect.get("portability_status") or portability_status(inspect) if isinstance(inspect, dict) else {}
         native_seconds = payload.get("native", {}).get("duration_seconds")
-        agentfs_seconds = payload.get("agentfs_overlay", {}).get("duration_seconds")
+        vfs_seconds = payload.get("vfs_overlay", {}).get("duration_seconds")
         ratio_value = (
-            float(agentfs_seconds) / float(native_seconds)
+            float(vfs_seconds) / float(native_seconds)
             if isinstance(native_seconds, (int, float))
-            and isinstance(agentfs_seconds, (int, float))
+            and isinstance(vfs_seconds, (int, float))
             and float(native_seconds) > 0
             else None
         )
         gate = {
             "correctness_passed": correctness.get("passed") is True,
-            "base_unchanged": correctness.get("agentfs_base_unchanged") is True,
-            "partial_origin_enabled": payload.get("agentfs", {}).get("partial_origin_enabled"),
+            "base_unchanged": correctness.get("vfs_base_unchanged") is True,
+            "partial_origin_enabled": payload.get("vfs", {}).get("partial_origin_enabled"),
             "partial_origin_rows": int(portability.get("partial_origin_rows", 0) or 0),
             "portable": portability.get("portable"),
             "ratio": ratio_value,
@@ -719,7 +719,7 @@ def run_strict_large_edit(
 def strict_db_path(record: dict[str, Any]) -> Optional[Path]:
     payload = record.get("result")
     if isinstance(payload, dict):
-        raw = payload.get("agentfs", {}).get("db_path")
+        raw = payload.get("vfs", {}).get("db_path")
         if isinstance(raw, str):
             return Path(raw)
     return None
@@ -730,7 +730,7 @@ def run_strict_partial_rows_check(record: dict[str, Any], args: argparse.Namespa
     if db_path is None:
         return skipped_gate(
             "strict_no_partial_origin_rows",
-            "strict portable benchmark did not produce an AgentFS database path",
+            "strict portable benchmark did not produce a Vfs database path",
             gate_required(args),
         )
     inspect = inspect_db(db_path)
@@ -751,11 +751,11 @@ def run_integrity(
     args: argparse.Namespace,
     repo_root: Path,
     env: dict[str, str],
-    agentfs_bin: str,
+    vfs_bin: str,
 ) -> dict[str, Any]:
     if db_path is None:
         return skipped_gate(name, "no database path available", gate_required(args))
-    argv = [agentfs_bin, "integrity", str(db_path), "--json", "--require-portable"]
+    argv = [vfs_bin, "integrity", str(db_path), "--json", "--require-portable"]
     run = run_subprocess(argv, repo_root, env, args.timeout, keep_stdout=True)
     report = parse_json_text(str(run.get("stdout", "")))
     ok = run["returncode"] == 0 and isinstance(report, dict) and report.get("ok") is True
@@ -802,13 +802,13 @@ def run_backup(
     args: argparse.Namespace,
     repo_root: Path,
     env: dict[str, str],
-    agentfs_bin: str,
+    vfs_bin: str,
     *,
     materialize: bool,
 ) -> dict[str, Any]:
     if source_db is None:
         return skipped_gate(name, "no source database path available", gate_required(args))
-    argv = [agentfs_bin, "backup", str(source_db), str(target_db), "--verify"]
+    argv = [vfs_bin, "backup", str(source_db), str(target_db), "--verify"]
     if materialize:
         argv.append("--materialize")
     run = run_subprocess(argv, repo_root, env, args.timeout * 2 + 30)
@@ -937,7 +937,7 @@ def run_base_read(
                 payload.get("runs", {})
                 .get("cache_invalidation", {})
                 .get("base_file", {})
-                .get("agentfs_base_unchanged")
+                .get("vfs_base_unchanged")
             ),
         }
         if (
@@ -997,13 +997,13 @@ def run_partial_setup(
         correctness = payload.get("correctness", {})
         record["gate"] = {
             "correctness_passed": correctness.get("passed") is True,
-            "partial_origin_enabled": payload.get("agentfs", {}).get("partial_origin_enabled"),
+            "partial_origin_enabled": payload.get("vfs", {}).get("partial_origin_enabled"),
             "partial_origin_rows": partial_rows,
             "origin_backed": portability.get("origin_backed"),
         }
         if record["status"] == "passed" and (
             correctness.get("passed") is not True
-            or payload.get("agentfs", {}).get("partial_origin_enabled") is not True
+            or payload.get("vfs", {}).get("partial_origin_enabled") is not True
             or partial_rows <= 0
         ):
             record["status"] = "failed"
@@ -1016,13 +1016,13 @@ def run_materialize(
     repo_root: Path,
     env: dict[str, str],
     output_dir: Path,
-    agentfs_bin: str,
+    vfs_bin: str,
 ) -> dict[str, Any]:
     source_db = strict_db_path(source_record)
     if source_db is None:
         return skipped_gate("materialize_verify", "partial-origin setup did not produce a database path", gate_required(args))
     target_db = output_dir / "materialized.db"
-    argv = [agentfs_bin, "materialize", str(source_db), "--output", str(target_db), "--verify"]
+    argv = [vfs_bin, "materialize", str(source_db), "--output", str(target_db), "--verify"]
     run = run_subprocess(argv, repo_root, env, args.timeout * 2 + 30)
     sidecars = sidecar_status(target_db)
     inspect = inspect_db(target_db)
@@ -1080,26 +1080,26 @@ def main(argv: list[str]) -> int:
 
     temp_manager: Optional[tempfile.TemporaryDirectory[str]] = None
     if args.keep_temp:
-        output_dir = Path(tempfile.mkdtemp(prefix="agentfs-phase7-validation-"))
+        output_dir = Path(tempfile.mkdtemp(prefix="vfs-phase7-validation-"))
     else:
-        temp_manager = tempfile.TemporaryDirectory(prefix="agentfs-phase7-validation-")
+        temp_manager = tempfile.TemporaryDirectory(prefix="vfs-phase7-validation-")
         output_dir = Path(temp_manager.name)
 
     exit_code = 0
     result: dict[str, Any]
     try:
-        agentfs_bin = resolve_agentfs_bin(args.agentfs_bin, repo_root)
-        env = child_env(agentfs_bin, output_dir)
+        vfs_bin = resolve_vfs_bin(args.vfs_bin, repo_root)
+        env = child_env(vfs_bin, output_dir)
         runs: dict[str, dict[str, Any]] = {}
 
-        runs["git_workload_benchmark"] = run_git_workload(args, repo_root, env, output_dir, agentfs_bin)
+        runs["git_workload_benchmark"] = run_git_workload(args, repo_root, env, output_dir, vfs_bin)
         runs["strict_portable_large_edit"] = run_strict_large_edit(args, repo_root, env, output_dir)
         strict_db = strict_db_path(runs["strict_portable_large_edit"])
         runs["strict_no_partial_origin_rows"] = run_strict_partial_rows_check(
             runs["strict_portable_large_edit"], args
         )
         runs["strict_portable_integrity"] = run_integrity(
-            "strict_portable_integrity", strict_db, args, repo_root, env, agentfs_bin
+            "strict_portable_integrity", strict_db, args, repo_root, env, vfs_bin
         )
         runs["strict_backup_verify"] = run_backup(
             "strict_backup_verify",
@@ -1108,7 +1108,7 @@ def main(argv: list[str]) -> int:
             args,
             repo_root,
             env,
-            agentfs_bin,
+            vfs_bin,
             materialize=False,
         )
         runs["partial_origin_no_real_write"] = run_no_real_write(args, repo_root, env, output_dir)
@@ -1116,7 +1116,7 @@ def main(argv: list[str]) -> int:
         runs["partial_origin_materialize_setup"] = run_partial_setup(args, repo_root, env, output_dir)
         partial_db = strict_db_path(runs["partial_origin_materialize_setup"])
         runs["materialize_verify"] = run_materialize(
-            runs["partial_origin_materialize_setup"], args, repo_root, env, output_dir, agentfs_bin
+            runs["partial_origin_materialize_setup"], args, repo_root, env, output_dir, vfs_bin
         )
         runs["backup_materialize_verify"] = run_backup(
             "backup_materialize_verify",
@@ -1125,7 +1125,7 @@ def main(argv: list[str]) -> int:
             args,
             repo_root,
             env,
-            agentfs_bin,
+            vfs_bin,
             materialize=True,
         )
 
@@ -1154,14 +1154,14 @@ def main(argv: list[str]) -> int:
                 "materialize_file_size_mib": args.materialize_file_size_mib or (200 if args.full_gates else 1),
                 "require_git_workload": bool(args.require_git_workload),
             },
-            "agentfs": {"bin": agentfs_bin},
+            "vfs": {"bin": vfs_bin},
             "policy": {
                 "full_mode_skipped_required_gates_fail": True,
                 "git_workload_absent_policy": (
                     "skipped in smoke unless --require-git-workload is set; required in full"
                 ),
                 "strict_mode_forbids_partial_origin_rows": True,
-                "strict_portable_integrity_command": "agentfs integrity --json --require-portable",
+                "strict_portable_integrity_command": "vfs integrity --json --require-portable",
             "backup_outputs_must_not_depend_on_nonempty_wal_or_shm_sidecars": True,
             },
             "summary": {

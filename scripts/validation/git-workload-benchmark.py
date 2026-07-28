@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Phase 7 native-vs-AgentFS Git workload benchmark and principle gate."""
+"""Phase 7 native-vs-Vfs Git workload benchmark and principle gate."""
 
 from __future__ import annotations
 
@@ -51,19 +51,19 @@ PROFILE_CHECKPOINTS = []
 
 
 def profile_checkpoint(label):
-    """Request an AgentFS profiling checkpoint at a phase boundary.
+    """Request a Vfs profiling checkpoint at a phase boundary.
 
-    Only meaningful when running inside an AgentFS sandbox with profiling
-    enabled. We signal the parent `agentfs run` process (SIGUSR1), which emits a
+    Only meaningful when running inside a Vfs sandbox with profiling
+    enabled. We signal the parent `vfs run` process (SIGUSR1), which emits a
     cumulative, sequence-tagged profile summary to its stderr; the analyzer
     subtracts consecutive checkpoints to obtain per-phase counter deltas. A small
-    sleep lets the parent flush before the next phase begins. Guarded on AGENTFS
+    sleep lets the parent flush before the next phase begins. Guarded on VFS
     so native runs never signal the benchmark harness.
     """
     PROFILE_CHECKPOINTS.append(label)
-    if os.environ.get("AGENTFS") != "1":
+    if os.environ.get("VFS") != "1":
         return
-    if os.environ.get("AGENTFS_PROFILE", "") not in {"1", "true", "TRUE", "yes", "on"}:
+    if os.environ.get("VFS_PROFILE", "") not in {"1", "true", "TRUE", "yes", "on"}:
         return
     try:
         os.kill(os.getppid(), signal.SIGUSR1)
@@ -95,7 +95,7 @@ def git_env():
 
 def run_git(argv, cwd):
     # Honor the harness's pinned-git override: PATH shims are invisible inside
-    # the agentfs sandbox, so only an absolute system-path GIT avoids the
+    # the vfs sandbox, so only an absolute system-path GIT avoids the
     # daemonizing hook-manager shim (scripts/validation/lib/common.py).
     git = os.environ.get("GIT", "git")
     started = time.perf_counter()
@@ -191,7 +191,7 @@ def edit_files(workdir, paths, limit):
     for index, rel in enumerate(selected):
         path = workdir / rel
         before_size = path.stat().st_size
-        payload = f"\nAgentFS Git benchmark edit {index:02d} for {rel}\n".encode("utf-8")
+        payload = f"\nVfs Git benchmark edit {index:02d} for {rel}\n".encode("utf-8")
         with path.open("ab", buffering=0) as handle:
             handle.write(payload)
             handle.flush()
@@ -239,7 +239,7 @@ def main(argv):
     parser.add_argument("--read-files", type=int, required=True)
     parser.add_argument("--read-bytes", type=int, required=True)
     parser.add_argument("--edit-files", type=int, required=True)
-    parser.add_argument("--search-token", default="AGENTFS_TOKEN")
+    parser.add_argument("--search-token", default="VFS_TOKEN")
     parser.add_argument("--skip-fsck", action="store_true")
     args = parser.parse_args(argv)
 
@@ -258,7 +258,7 @@ def main(argv):
     profile_checkpoint("clone")
 
     started = time.perf_counter()
-    checkout = run_git(["checkout", "-B", "agentfs-benchmark"], workdir)
+    checkout = run_git(["checkout", "-B", "vfs-benchmark"], workdir)
     require_ok(checkout, "checkout")
     head = run_git(["rev-parse", "HEAD"], workdir)
     require_ok(head, "rev-parse")
@@ -362,7 +362,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Compare a deterministic Git-like mixed workflow on native storage "
-            "against the same workflow through an AgentFS overlay."
+            "against the same workflow through a Vfs overlay."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
@@ -373,10 +373,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
   scripts/validation/git-workload-benchmark.py --source /path/to/repo --read-files 128
 
 Environment:
-  AGENTFS_BIN                  path/name of agentfs executable
-  AGENTFS_PROFILE              set to 0 only when --no-profile is supplied
+  VFS_BIN                  path/name of vfs executable
+  VFS_PROFILE              set to 0 only when --no-profile is supplied
   GIT_WORKLOAD_BENCHMARK_KEEP_TEMP=1
-                               keep temporary source/native/AgentFS trees
+                               keep temporary source/native/Vfs trees
 """,
     )
     source_group = parser.add_mutually_exclusive_group()
@@ -400,11 +400,11 @@ Environment:
     parser.add_argument("--read-files", type=positive_int, default=64)
     parser.add_argument("--read-bytes", type=positive_int, default=4096)
     parser.add_argument("--edit-files", type=positive_int, default=8)
-    parser.add_argument("--search-token", default="AGENTFS_TOKEN")
+    parser.add_argument("--search-token", default="VFS_TOKEN")
     parser.add_argument(
-        "--agentfs-bin",
-        default=os.environ.get("AGENTFS_BIN"),
-        help="agentfs executable path/name (default: repo target binary, building cli if needed)",
+        "--vfs-bin",
+        default=os.environ.get("VFS_BIN"),
+        help="vfs executable path/name (default: repo target binary, building cli if needed)",
     )
     parser.add_argument(
         "--timeout",
@@ -412,19 +412,19 @@ Environment:
         default=positive_float(os.environ.get("GIT_WORKLOAD_BENCHMARK_TIMEOUT", "180")),
         help="per-command timeout in seconds (default: 180)",
     )
-    parser.add_argument("--session", default=None, help="AgentFS session id (default: generated)")
+    parser.add_argument("--session", default=None, help="Vfs session id (default: generated)")
     profile_group = parser.add_mutually_exclusive_group()
     profile_group.add_argument(
         "--profile",
         dest="profile",
         action="store_true",
-        help="enable AGENTFS_PROFILE=1 for AgentFS invocation (default)",
+        help="enable VFS_PROFILE=1 for Vfs invocation (default)",
     )
     profile_group.add_argument(
         "--no-profile",
         dest="profile",
         action="store_false",
-        help="disable AgentFS profile summaries",
+        help="disable Vfs profile summaries",
     )
     parser.set_defaults(profile=True)
     parser.add_argument("--skip-fsck", action="store_true", help="skip git fsck --strict phase")
@@ -468,13 +468,13 @@ def extract_profile_summaries(stderr: Any) -> list[dict[str, Any]]:
     summaries: list[dict[str, Any]] = []
     for line in text.splitlines():
         line = line.strip()
-        if not line or "agentfs_profile_summary" not in line:
+        if not line or "vfs_profile_summary" not in line:
             continue
         try:
             value = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(value, dict) and value.get("event") == "agentfs_profile_summary":
+        if isinstance(value, dict) and value.get("event") == "vfs_profile_summary":
             summaries.append(value)
     return summaries
 
@@ -634,16 +634,16 @@ def parse_json_stdout(run: dict[str, Any]) -> Optional[dict[str, Any]]:
     return None
 
 
-def resolve_agentfs_bin(agentfs_bin: Optional[str], repo_root: Path) -> str:
-    if agentfs_bin:
-        candidate_path = Path(agentfs_bin).expanduser()
+def resolve_vfs_bin(vfs_bin: Optional[str], repo_root: Path) -> str:
+    if vfs_bin:
+        candidate_path = Path(vfs_bin).expanduser()
         if candidate_path.is_file() and os.access(candidate_path, os.X_OK):
             return str(candidate_path.resolve())
-        if os.sep not in agentfs_bin:
-            found = shutil.which(agentfs_bin)
+        if os.sep not in vfs_bin:
+            found = shutil.which(vfs_bin)
             if found:
                 return found
-        raise RuntimeError(f"configured agentfs executable not found or not executable: {agentfs_bin}")
+        raise RuntimeError(f"configured vfs executable not found or not executable: {vfs_bin}")
 
     # Prefer release over debug: release binaries are what benchmarks should be
     # measuring (debug is unoptimized and can be 10x slower), AND release tends
@@ -653,8 +653,8 @@ def resolve_agentfs_bin(agentfs_bin: Optional[str], repo_root: Path) -> str:
     # pre-ABI-collapse workspace kept returning ENOSYS while the just-built
     # release binary worked fine.
     for candidate_path in (
-        repo_root / "cli" / "target" / "release" / "agentfs",
-        repo_root / "cli" / "target" / "debug" / "agentfs",
+        repo_root / "cli" / "target" / "release" / "vfs",
+        repo_root / "cli" / "target" / "debug" / "vfs",
     ):
         if candidate_path.is_file() and os.access(candidate_path, os.X_OK):
             return str(candidate_path)
@@ -668,12 +668,12 @@ def resolve_agentfs_bin(agentfs_bin: Optional[str], repo_root: Path) -> str:
     )
     if build.returncode != 0:
         raise RuntimeError(
-            "failed to build repo-local agentfs binary; set AGENTFS_BIN to an explicit binary\n"
+            "failed to build repo-local vfs binary; set VFS_BIN to an explicit binary\n"
             f"stdout:\n{tail_text(build.stdout)}\n"
             f"stderr:\n{tail_text(build.stderr)}"
         )
 
-    built = repo_root / "cli" / "target" / "debug" / "agentfs"
+    built = repo_root / "cli" / "target" / "debug" / "vfs"
     if built.is_file() and os.access(built, os.X_OK):
         return str(built)
     raise RuntimeError(f"repo-local build completed but binary was not found: {built}")
@@ -698,10 +698,10 @@ def git_env() -> dict[str, str]:
     env.setdefault("GIT_TERMINAL_PROMPT", "0")
     env.setdefault("NO_COLOR", "1")
     env.setdefault("LC_ALL", "C")
-    env["GIT_AUTHOR_NAME"] = "AgentFS Benchmark"
-    env["GIT_AUTHOR_EMAIL"] = "agentfs-benchmark@example.invalid"
-    env["GIT_COMMITTER_NAME"] = "AgentFS Benchmark"
-    env["GIT_COMMITTER_EMAIL"] = "agentfs-benchmark@example.invalid"
+    env["GIT_AUTHOR_NAME"] = "Vfs Benchmark"
+    env["GIT_AUTHOR_EMAIL"] = "vfs-benchmark@example.invalid"
+    env["GIT_COMMITTER_NAME"] = "Vfs Benchmark"
+    env["GIT_COMMITTER_EMAIL"] = "vfs-benchmark@example.invalid"
     return env
 
 
@@ -740,9 +740,9 @@ def create_generated_repo(root: Path, file_count: int, dir_count: int, file_size
     init = run_git(["init"], root, env=env)
     require_git_ok(init, "git init generated repo")
     require_git_ok(run_git(["checkout", "-B", "main"], root, env=env), "git checkout main")
-    require_git_ok(run_git(["config", "user.name", "AgentFS Benchmark"], root, env=env), "git config user.name")
+    require_git_ok(run_git(["config", "user.name", "Vfs Benchmark"], root, env=env), "git config user.name")
     require_git_ok(
-        run_git(["config", "user.email", "agentfs-benchmark@example.invalid"], root, env=env),
+        run_git(["config", "user.email", "vfs-benchmark@example.invalid"], root, env=env),
         "git config user.email",
     )
 
@@ -753,18 +753,18 @@ def create_generated_repo(root: Path, file_count: int, dir_count: int, file_size
         directory.mkdir(parents=True, exist_ok=True)
         if category == "src":
             filename = f"module_{index:05d}.py"
-            header = f"# Generated source {index}\nTOKEN = 'AGENTFS_TOKEN_{index % 11}'\n"
+            header = f"# Generated source {index}\nTOKEN = 'VFS_TOKEN_{index % 11}'\n"
         elif category == "tests":
             filename = f"test_{index:05d}.py"
-            header = f"# Generated test {index}\ndef test_{index:05d}():\n    assert 'AGENTFS_TOKEN'\n"
+            header = f"# Generated test {index}\ndef test_{index:05d}():\n    assert 'VFS_TOKEN'\n"
         elif category == "docs":
             filename = f"note_{index:05d}.md"
-            header = f"# Generated note {index}\n\nAGENTFS_TOKEN documentation fixture.\n"
+            header = f"# Generated note {index}\n\nVFS_TOKEN documentation fixture.\n"
         else:
             filename = f"blob_{index:05d}.txt"
-            header = f"data fixture {index} AGENTFS_TOKEN\n"
-        seed = hashlib.sha256(f"agentfs-git-fixture-{index}".encode("utf-8")).hexdigest()
-        filler = "".join(f"{line:04d} {seed} AGENTFS_TOKEN_{line % 7}\n" for line in range(128))
+            header = f"data fixture {index} VFS_TOKEN\n"
+        seed = hashlib.sha256(f"vfs-git-fixture-{index}".encode("utf-8")).hexdigest()
+        filler = "".join(f"{line:04d} {seed} VFS_TOKEN_{line % 7}\n" for line in range(128))
         content = (header + filler)[:file_size]
         if not content.endswith("\n"):
             content += "\n"
@@ -779,10 +779,10 @@ def create_generated_repo(root: Path, file_count: int, dir_count: int, file_size
     touched = sorted((root / "src").rglob("*.py"))[: max(1, min(4, file_count))]
     for index, path in enumerate(touched):
         with path.open("a", encoding="utf-8") as handle:
-            handle.write(f"\n# second commit marker {index} AGENTFS_TOKEN\n")
+            handle.write(f"\n# second commit marker {index} VFS_TOKEN\n")
     require_git_ok(run_git(["add", "."], root, env=env), "git add second commit")
     require_git_ok(run_git(["commit", "-m", "update source markers"], root, env=env), "git commit second")
-    require_git_ok(run_git(["tag", "agentfs-benchmark-fixture"], root, env=env), "git tag fixture")
+    require_git_ok(run_git(["tag", "vfs-benchmark-fixture"], root, env=env), "git tag fixture")
 
 
 def prepare_bare_mirror(args: argparse.Namespace, temp_root: Path) -> tuple[Path, dict[str, Any]]:
@@ -849,9 +849,9 @@ def prepare_environment(temp_root: Path, profile: bool) -> dict[str, str]:
     env.setdefault("GIT_CONFIG_NOSYSTEM", "1")
     env.setdefault("GIT_TERMINAL_PROMPT", "0")
     if profile:
-        env["AGENTFS_PROFILE"] = "1"
+        env["VFS_PROFILE"] = "1"
     else:
-        env.pop("AGENTFS_PROFILE", None)
+        env.pop("VFS_PROFILE", None)
 
     home = temp_root / "home"
     for path in (home, home / ".config", home / ".cache", home / ".local" / "share"):
@@ -1070,18 +1070,18 @@ def workload_argv(args: argparse.Namespace) -> list[str]:
     return argv
 
 
-def phase_ratios(native_workload: Optional[dict[str, Any]], agentfs_workload: Optional[dict[str, Any]]) -> dict[str, Any]:
+def phase_ratios(native_workload: Optional[dict[str, Any]], vfs_workload: Optional[dict[str, Any]]) -> dict[str, Any]:
     native_phases = native_workload.get("phase_seconds", {}) if isinstance(native_workload, dict) else {}
-    agentfs_phases = agentfs_workload.get("phase_seconds", {}) if isinstance(agentfs_workload, dict) else {}
-    names = sorted(set(native_phases) | set(agentfs_phases))
+    vfs_phases = vfs_workload.get("phase_seconds", {}) if isinstance(vfs_workload, dict) else {}
+    names = sorted(set(native_phases) | set(vfs_phases))
     ratios = {}
     for name in names:
         native_value = native_phases.get(name)
-        agentfs_value = agentfs_phases.get(name)
+        vfs_value = vfs_phases.get(name)
         ratios[name] = {
             "native_seconds": native_value,
-            "agentfs_seconds": agentfs_value,
-            "ratio": (agentfs_value / native_value) if isinstance(native_value, (int, float)) and native_value > 0 and isinstance(agentfs_value, (int, float)) else None,
+            "vfs_seconds": vfs_value,
+            "ratio": (vfs_value / native_value) if isinstance(native_value, (int, float)) and native_value > 0 and isinstance(vfs_value, (int, float)) else None,
         }
     return ratios
 
@@ -1117,22 +1117,22 @@ def comparable_workload(workload: Optional[dict[str, Any]]) -> Optional[dict[str
     }
 
 
-def equivalence(native_workload: Optional[dict[str, Any]], agentfs_workload: Optional[dict[str, Any]]) -> dict[str, Any]:
+def equivalence(native_workload: Optional[dict[str, Any]], vfs_workload: Optional[dict[str, Any]]) -> dict[str, Any]:
     native_compare = comparable_workload(native_workload)
-    agentfs_compare = comparable_workload(agentfs_workload)
-    if native_compare is None or agentfs_compare is None:
+    vfs_compare = comparable_workload(vfs_workload)
+    if native_compare is None or vfs_compare is None:
         return {
             "checked": False,
             "equivalent": False,
             "reason": "missing comparable workload JSON",
             "native": native_compare,
-            "agentfs": agentfs_compare,
+            "vfs": vfs_compare,
         }
     return {
         "checked": True,
-        "equivalent": native_compare == agentfs_compare,
+        "equivalent": native_compare == vfs_compare,
         "native": native_compare,
-        "agentfs": agentfs_compare,
+        "vfs": vfs_compare,
     }
 
 
@@ -1142,10 +1142,10 @@ def main(argv: list[str]) -> int:
 
     temp_manager: Optional[tempfile.TemporaryDirectory[str]] = None
     if args.keep_temp:
-        temp_root = Path(tempfile.mkdtemp(prefix="agentfs-git-workload-"))
+        temp_root = Path(tempfile.mkdtemp(prefix="vfs-git-workload-"))
     else:
         temp_manager = tempfile.TemporaryDirectory(
-            prefix="agentfs-git-workload-", ignore_cleanup_errors=True
+            prefix="vfs-git-workload-", ignore_cleanup_errors=True
         )
         temp_root = Path(temp_manager.name)
 
@@ -1154,34 +1154,34 @@ def main(argv: list[str]) -> int:
     try:
         common.pin_distro_git(os.environ, temp_root)
         require_git()
-        agentfs_bin = resolve_agentfs_bin(args.agentfs_bin, repo_root)
+        vfs_bin = resolve_vfs_bin(args.vfs_bin, repo_root)
         env = prepare_environment(temp_root, args.profile)
         session = args.session or f"git-workload-{uuid.uuid4().hex}"
-        db_path = Path(env["HOME"]) / ".agentfs" / "run" / session / "delta.db"
+        db_path = Path(env["HOME"]) / ".vfs" / "run" / session / "delta.db"
         mirror, source_info = prepare_bare_mirror(args, temp_root)
 
         native_root = temp_root / "native"
-        agentfs_base_root = temp_root / "agentfs-base"
+        vfs_base_root = temp_root / "vfs-base"
         copy_mirror(mirror, native_root)
-        copy_mirror(mirror, agentfs_base_root)
+        copy_mirror(mirror, vfs_base_root)
 
-        base_before = tree_hash(agentfs_base_root)
+        base_before = tree_hash(vfs_base_root)
         base_workload = workload_argv(args)
         native_run = run_subprocess(base_workload, native_root, env, args.timeout)
-        agentfs_command = [
-            agentfs_bin,
+        vfs_command = [
+            vfs_bin,
             "run",
             "--session",
             session,
             "--no-default-allows",
             "--",
         ] + base_workload
-        agentfs_run = run_subprocess(agentfs_command, agentfs_base_root, env, args.timeout)
-        base_after = tree_hash(agentfs_base_root)
+        vfs_run = run_subprocess(vfs_command, vfs_base_root, env, args.timeout)
+        base_after = tree_hash(vfs_base_root)
         db_after = db_artifacts(db_path)
         inspect_after = inspect_db(db_path)
         integrity_run = run_subprocess(
-            [agentfs_bin, "integrity", str(db_path), "--json", "--require-portable"],
+            [vfs_bin, "integrity", str(db_path), "--json", "--require-portable"],
             temp_root,
             env,
             args.timeout,
@@ -1189,7 +1189,7 @@ def main(argv: list[str]) -> int:
         integrity_payload = parse_json_stdout(integrity_run)
         backup_path = temp_root / "git-workload-backup.db"
         backup_run = run_subprocess(
-            [agentfs_bin, "backup", str(db_path), str(backup_path), "--verify"],
+            [vfs_bin, "backup", str(db_path), str(backup_path), "--verify"],
             temp_root,
             env,
             args.timeout,
@@ -1198,24 +1198,24 @@ def main(argv: list[str]) -> int:
         backup_inspect = inspect_db(backup_path)
 
         native_workload = parse_json_stdout(native_run)
-        agentfs_workload = parse_json_stdout(agentfs_run)
-        equivalent = equivalence(native_workload, agentfs_workload)
-        profile_summaries = agentfs_run.get("profile_summaries", [])
+        vfs_workload = parse_json_stdout(vfs_run)
+        equivalent = equivalence(native_workload, vfs_workload)
+        profile_summaries = vfs_run.get("profile_summaries", [])
         profile_counters = profile_counter_summary(profile_summaries)
         phase_labels = (
-            agentfs_workload.get("profile_checkpoints", [])
-            if isinstance(agentfs_workload, dict)
+            vfs_workload.get("profile_checkpoints", [])
+            if isinstance(vfs_workload, dict)
             else []
         )
         per_phase_counters = per_phase_profile_counters(profile_summaries, phase_labels)
-        ratios = phase_ratios(native_workload, agentfs_workload)
+        ratios = phase_ratios(native_workload, vfs_workload)
         native_total = native_workload.get("total_seconds") if isinstance(native_workload, dict) else None
-        agentfs_total = agentfs_workload.get("total_seconds") if isinstance(agentfs_workload, dict) else None
+        vfs_total = vfs_workload.get("total_seconds") if isinstance(vfs_workload, dict) else None
         overall_ratio = (
-            agentfs_total / native_total
+            vfs_total / native_total
             if isinstance(native_total, (int, float))
             and native_total > 0
-            and isinstance(agentfs_total, (int, float))
+            and isinstance(vfs_total, (int, float))
             else None
         )
         base_unchanged = base_before["sha256"] == base_after["sha256"]
@@ -1252,18 +1252,18 @@ def main(argv: list[str]) -> int:
 
         correctness = {
             "native_returncode_zero": native_run["returncode"] == 0,
-            "agentfs_returncode_zero": agentfs_run["returncode"] == 0,
+            "vfs_returncode_zero": vfs_run["returncode"] == 0,
             "equivalence": equivalent,
-            "agentfs_base_unchanged": base_unchanged,
-            "agentfs_db_inspectable": inspectable,
-            "agentfs_portable": portable is True,
-            "agentfs_no_nonempty_sidecars": no_sidecars,
-            "agentfs_integrity_require_portable": integrity_ok,
-            "agentfs_backup_verify": backup_ok,
+            "vfs_base_unchanged": base_unchanged,
+            "vfs_db_inspectable": inspectable,
+            "vfs_portable": portable is True,
+            "vfs_no_nonempty_sidecars": no_sidecars,
+            "vfs_integrity_require_portable": integrity_ok,
+            "vfs_backup_verify": backup_ok,
             "performance_passed": performance_passed,
             "passed": (
                 native_run["returncode"] == 0
-                and agentfs_run["returncode"] == 0
+                and vfs_run["returncode"] == 0
                 and equivalent.get("equivalent") is True
                 and base_unchanged
                 and portability_ok
@@ -1283,8 +1283,8 @@ def main(argv: list[str]) -> int:
             "command": {
                 "argv": [str(Path(__file__).resolve())] + argv,
                 "workload_argv": base_workload,
-                "agentfs_prefix": [
-                    agentfs_bin,
+                "vfs_prefix": [
+                    vfs_bin,
                     "run",
                     "--session",
                     session,
@@ -1293,8 +1293,8 @@ def main(argv: list[str]) -> int:
                 ],
             },
             "environment": {
-                "AGENTFS_PROFILE": env.get("AGENTFS_PROFILE"),
-                "AGENTFS_BIN": args.agentfs_bin,
+                "VFS_PROFILE": env.get("VFS_PROFILE"),
+                "VFS_BIN": args.vfs_bin,
             },
             "parameters": {
                 "fixture_files": args.fixture_files,
@@ -1308,8 +1308,8 @@ def main(argv: list[str]) -> int:
                 "timeout_seconds": args.timeout,
             },
             "source": source_info,
-            "agentfs": {
-                "bin": agentfs_bin,
+            "vfs": {
+                "bin": vfs_bin,
                 "session": session,
                 "db_path": str(db_path),
                 "profile_enabled": args.profile,
@@ -1319,13 +1319,13 @@ def main(argv: list[str]) -> int:
             },
             "summary": {
                 "native_seconds": native_total,
-                "agentfs_seconds": agentfs_total,
+                "vfs_seconds": vfs_total,
                 "ratio": overall_ratio,
                 "phase_ratios": ratios,
                 "threshold_failures": threshold_failures,
                 "performance_passed": performance_passed,
                 "all_equivalent": equivalent.get("equivalent") is True,
-                "agentfs_base_unchanged": base_unchanged,
+                "vfs_base_unchanged": base_unchanged,
                 "passed": correctness["passed"],
                 "correctness_passed": correctness["passed"],
             },
@@ -1333,9 +1333,9 @@ def main(argv: list[str]) -> int:
                 "run": strip_stdout(native_run),
                 "workload": native_workload,
             },
-            "agentfs_overlay": {
-                "run": strip_stdout(agentfs_run),
-                "workload": agentfs_workload,
+            "vfs_overlay": {
+                "run": strip_stdout(vfs_run),
+                "workload": vfs_workload,
                 "profile_summaries": profile_summaries,
             },
             "base_tree": {

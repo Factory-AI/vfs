@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Phase 8 writeback durability crash/reopen gate.
 
-Writes bytes through a fresh AgentFS FUSE mount, fsyncs the file and parent
+Writes bytes through a fresh Vfs FUSE mount, fsyncs the file and parent
 directory, SIGKILLs the mount process, remounts the same DB, and requires the
 bytes to be present with portable integrity and an unchanged base tree.
 """
@@ -30,7 +30,7 @@ from lib.common import (  # noqa: E402
     parse_json_stdout,
     positive_float,
     positive_int,
-    resolve_agentfs_bin,
+    resolve_vfs_bin,
     run_subprocess,
     tail_text,
     terminate_process_tree,
@@ -41,13 +41,13 @@ HASH_BLOCK_BYTES = 1024 * 1024
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Verify fsynced AgentFS writes survive mount SIGKILL and remount."
+        description="Verify fsynced Vfs writes survive mount SIGKILL and remount."
     )
     parser.add_argument("--write-bytes", type=positive_int, default=8192)
     parser.add_argument(
-        "--agentfs-bin",
-        default=os.environ.get("AGENTFS_BIN"),
-        help="agentfs executable path/name (default: repo target binary, building cli if needed)",
+        "--vfs-bin",
+        default=os.environ.get("VFS_BIN"),
+        help="vfs executable path/name (default: repo target binary, building cli if needed)",
     )
     parser.add_argument(
         "--timeout",
@@ -84,7 +84,7 @@ def deterministic_bytes(length: int) -> bytes:
     out = bytearray()
     index = 0
     while len(out) < length:
-        out.extend(hashlib.sha256(f"agentfs-phase8-durable-{index}".encode()).digest())
+        out.extend(hashlib.sha256(f"vfs-phase8-durable-{index}".encode()).digest())
         index += 1
     return bytes(out[:length])
 
@@ -188,13 +188,13 @@ def unmount(mountpoint: Path) -> list[dict[str, Any]]:
     return attempts
 
 
-def start_mount(agentfs_bin: str, id_or_path: Any, mountpoint: Path, env: dict[str, str], timeout: float) -> tuple[subprocess.Popen[str], dict[str, Any]]:
+def start_mount(vfs_bin: str, id_or_path: Any, mountpoint: Path, env: dict[str, str], timeout: float) -> tuple[subprocess.Popen[str], dict[str, Any]]:
     try:
         mountpoint.mkdir(parents=True, exist_ok=True)
     except FileExistsError:
         pass
     argv = [
-        agentfs_bin,
+        vfs_bin,
         "mount",
         str(id_or_path),
         str(mountpoint),
@@ -302,9 +302,9 @@ def sidecar_status(db_path: Path) -> dict[str, Any]:
     }
 
 
-def run_integrity(agentfs_bin: str, db_path: Path, cwd: Path, env: dict[str, str], timeout: float) -> dict[str, Any]:
+def run_integrity(vfs_bin: str, db_path: Path, cwd: Path, env: dict[str, str], timeout: float) -> dict[str, Any]:
     run = run_subprocess(
-        [agentfs_bin, "integrity", str(db_path), "--json", "--require-portable"],
+        [vfs_bin, "integrity", str(db_path), "--json", "--require-portable"],
         cwd,
         env,
         timeout,
@@ -327,7 +327,7 @@ def fsync_directory(path: Path) -> None:
 
 def default_output_path() -> Path:
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    return Path(tempfile.gettempdir()) / f"agentfs-phase8-writeback-durability-{stamp}-{uuid.uuid4().hex[:8]}.json"
+    return Path(tempfile.gettempdir()) / f"vfs-phase8-writeback-durability-{stamp}-{uuid.uuid4().hex[:8]}.json"
 
 
 def main(argv: list[str]) -> int:
@@ -337,10 +337,10 @@ def main(argv: list[str]) -> int:
 
     temp_manager: Optional[tempfile.TemporaryDirectory[str]] = None
     if args.keep_temp:
-        temp_root = Path(tempfile.mkdtemp(prefix="agentfs-phase8-writeback-durable-"))
+        temp_root = Path(tempfile.mkdtemp(prefix="vfs-phase8-writeback-durable-"))
     else:
         temp_manager = tempfile.TemporaryDirectory(
-            prefix="agentfs-phase8-writeback-durable-",
+            prefix="vfs-phase8-writeback-durable-",
             ignore_cleanup_errors=True,
         )
         temp_root = Path(temp_manager.name)
@@ -351,26 +351,26 @@ def main(argv: list[str]) -> int:
     exit_code = 0
     result: dict[str, Any]
     try:
-        agentfs_bin = resolve_agentfs_bin(args.agentfs_bin, repo_root)
+        vfs_bin = resolve_vfs_bin(args.vfs_bin, repo_root)
         env = prepare_environment(temp_root)
         session = args.session or f"phase8-durable-{uuid.uuid4().hex}"
         base_root = temp_root / "base"
         create_base_fixture(base_root)
         base_before = tree_hash(base_root)
-        db_path = temp_root / ".agentfs" / f"{session}.db"
+        db_path = temp_root / ".vfs" / f"{session}.db"
 
         init_run = run_subprocess(
-            [agentfs_bin, "init", "--force", "--base", str(base_root), session],
+            [vfs_bin, "init", "--force", "--base", str(base_root), session],
             temp_root,
             env,
             args.timeout,
         )
         if init_run["returncode"] != 0:
-            raise RuntimeError(f"agentfs init failed: {init_run['stderr_tail']}")
+            raise RuntimeError(f"vfs init failed: {init_run['stderr_tail']}")
 
         mountpoint = temp_root / "mnt"
         mountpoint.mkdir(parents=True, exist_ok=True)
-        mount_proc, mount_start = start_mount(agentfs_bin, session, mountpoint, env, args.timeout)
+        mount_proc, mount_start = start_mount(vfs_bin, session, mountpoint, env, args.timeout)
         expected = deterministic_bytes(args.write_bytes)
         write_path = mountpoint / "durable.bin"
         started_write = time.perf_counter()
@@ -390,7 +390,7 @@ def main(argv: list[str]) -> int:
         kill_record = kill_mount(mount_proc, mountpoint)
         mount_proc = None
 
-        remount_proc, remount_start = start_mount(agentfs_bin, session, mountpoint, env, args.timeout)
+        remount_proc, remount_start = start_mount(vfs_bin, session, mountpoint, env, args.timeout)
         read_error = None
         read_bytes = b""
         try:
@@ -407,7 +407,7 @@ def main(argv: list[str]) -> int:
         clean_unmount = stop_mount_clean(remount_proc, mountpoint)
         remount_proc = None
 
-        integrity = run_integrity(agentfs_bin, db_path, temp_root, env, args.timeout)
+        integrity = run_integrity(vfs_bin, db_path, temp_root, env, args.timeout)
         db_inspect = inspect_db(db_path)
         sidecars = sidecar_status(db_path)
         base_after = tree_hash(base_root)
@@ -432,7 +432,7 @@ def main(argv: list[str]) -> int:
             "benchmark": "phase8-writeback-durability",
             "git_commit": git_commit(repo_root),
             "parameters": {"write_bytes": args.write_bytes, "timeout_seconds": args.timeout},
-            "agentfs": {"bin": agentfs_bin, "session": session, "db_path": str(db_path)},
+            "vfs": {"bin": vfs_bin, "session": session, "db_path": str(db_path)},
             "summary": {
                 "passed": passed,
                 "bytes_present_after_remount": remount_read["matches_expected"],
