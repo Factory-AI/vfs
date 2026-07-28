@@ -440,7 +440,7 @@ impl Drop for MountHandle {
 ///
 /// This function handles unmounting for both FUSE and NFS backends.
 /// If `lazy` is true, uses lazy unmount which detaches immediately even if busy.
-fn unmount(mountpoint: &Path, backend: Backend, lazy: bool) -> Result<()> {
+pub fn unmount(mountpoint: &Path, backend: Backend, lazy: bool) -> Result<()> {
     match backend {
         #[cfg(target_os = "linux")]
         Backend::Fuse => fuse::unmount_fuse(mountpoint, lazy),
