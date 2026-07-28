@@ -35,6 +35,7 @@ pub fn emit_cli_report() {
     emit_profile_summary("cli");
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn report_checkpoint() {
     if let Some(payload) = vfs_core::telemetry::checkpoint_payload(PROFILE_SUMMARY_EVENT) {
         eprintln!("{payload}");

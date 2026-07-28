@@ -91,6 +91,8 @@ const DEFAULT_URING_DEPTH: usize = 4;
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum KnobClass {
     ProductConfig,
+    /// Constructed only by Linux FUSE kill-switch knobs today.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     KillSwitch,
     Sunset,
 }
