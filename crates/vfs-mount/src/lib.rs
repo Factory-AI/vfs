@@ -508,6 +508,10 @@ async fn shutdown_signal() -> std::io::Result<()> {
 }
 
 /// Wait for a path to become a mountpoint.
+///
+/// Only the Linux FUSE backend polls for mount readiness; the macOS NFS
+/// backend learns readiness from its own server loop.
+#[cfg(target_os = "linux")]
 pub(crate) fn wait_for_mount(path: &Path, timeout: Duration) -> bool {
     let start = std::time::Instant::now();
     let interval = Duration::from_millis(50);
