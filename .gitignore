@@ -4,8 +4,7 @@
 __MACOSX/
 .AppleDouble
 .LSOverride
-Icon[
-]
+Icon?
 
 # Thumbnails
 ._*
@@ -27,6 +26,7 @@ Temporary Items
 .apdisk
 
 .vfs
+.agentfs
 target/
 
 # Python bytecode cache
