@@ -882,6 +882,7 @@ CREATE TABLE fs_session_metadata (
 |-----|----------|-------------|
 | `generation` | Base-10 unsigned integer text | Monotonic counter incremented by each successful `vfs pack` |
 | `seeded_paths` | JSON string array | Paths materialized by the future seed operation; defaults to `[]` |
+| `seed_pin` | Full git commit hash text | Base provenance recorded by `vfs seed`; `vfs adopt` verifies the receiving base checkout's `HEAD` against it |
 
 `vfs pack` updates metadata only in its private database copy. The new
 generation becomes authoritative when the compacted copy is atomically

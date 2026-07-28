@@ -11,6 +11,7 @@ use crate::Vfs;
 
 const GENERATION_KEY: &str = "generation";
 const SEEDED_PATHS_KEY: &str = "seeded_paths";
+const SEED_PIN_KEY: &str = "seed_pin";
 
 /// Persistent handoff metadata stored inside a session database.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,15 +83,22 @@ impl Vfs {
         write_metadata_value(&conn, SEEDED_PATHS_KEY, value).await
     }
 
-    /// Atomically persist seed whiteouts and the path manifest.
+    /// Read the git commit recorded as the session's seed pin, if any.
+    pub async fn seed_pin(&self) -> Result<Option<String>> {
+        let conn = self.pool.get_connection().await?;
+        read_metadata_value(&conn, SEED_PIN_KEY).await
+    }
+
+    /// Atomically persist seed whiteouts, the path manifest, and the pin.
     ///
-    /// Content import commits before this call; publishing the whiteouts and
-    /// manifest together prevents a completed seed from exposing only half of
-    /// its deletion state.
+    /// Content import commits before this call; publishing the whiteouts,
+    /// manifest, and pin together prevents a completed seed from exposing only
+    /// half of its deletion state.
     pub async fn record_seed_state(
         &self,
         seeded_paths: &[String],
         whiteout_paths: &[String],
+        pin: &str,
     ) -> Result<()> {
         let conn = self.pool.get_connection().await?;
         let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
@@ -107,6 +115,7 @@ impl Vfs {
                 )
                 .await?;
             }
+            write_metadata_value(&conn, SEED_PIN_KEY, pin.to_string()).await?;
             let value = serde_json::to_string(seeded_paths)?;
             write_metadata_value(&conn, SEEDED_PATHS_KEY, value).await
         }
@@ -285,12 +294,13 @@ mod tests {
             }
         );
         let seeded_paths = vec!["src/main.rs".to_string(), "deleted.txt".to_string()];
-        vfs.record_seed_state(&seeded_paths, &["/deleted.txt".to_string()])
+        vfs.record_seed_state(&seeded_paths, &["/deleted.txt".to_string()], "pin-sha")
             .await?;
         assert_eq!(
             vfs.session_metadata().await?.seeded_paths,
             seeded_paths.clone()
         );
+        assert_eq!(vfs.seed_pin().await?.as_deref(), Some("pin-sha"));
         assert_eq!(
             vfs.get_whiteouts().await?,
             std::collections::HashSet::from(["/deleted.txt".to_string()])
