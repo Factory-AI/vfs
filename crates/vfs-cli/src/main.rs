@@ -347,6 +347,7 @@ fn dispatch(args: Args) -> anyhow::Result<()> {
             prune,
             no_default_prunes,
             output,
+            chunk_size,
             json,
         } => {
             let rt = get_runtime();
@@ -356,6 +357,7 @@ fn dispatch(args: Args) -> anyhow::Result<()> {
                 prune,
                 no_default_prunes,
                 output,
+                chunk_size,
                 json,
             ))
         }

@@ -456,6 +456,11 @@ pub enum Command {
         #[arg(long, value_name = "PATH")]
         output: Option<PathBuf>,
 
+        /// Byte size of the per-chunk verification digests reported in the
+        /// manifest's `chunks` list
+        #[arg(long = "chunk-size", value_name = "BYTES", default_value_t = 4_194_304)]
+        chunk_size: u64,
+
         /// Emit machine-readable JSON (pack output is always JSON)
         #[arg(long)]
         json: bool,
@@ -890,14 +895,23 @@ mod tests {
                 prune,
                 no_default_prunes,
                 output,
+                chunk_size,
                 json,
             } => {
                 assert_eq!(session_id, "session-1");
                 assert_eq!(prune, vec!["**/.cache/**"]);
                 assert!(no_default_prunes);
                 assert_eq!(output, Some(PathBuf::from("/tmp/packed.db")));
+                assert_eq!(chunk_size, 4_194_304);
                 assert!(json);
             }
+            other => panic!("expected pack command, got {other:?}"),
+        }
+
+        let args =
+            Args::try_parse_from(["vfs", "pack", "session-1", "--chunk-size", "65536"]).unwrap();
+        match args.command {
+            Command::Pack { chunk_size, .. } => assert_eq!(chunk_size, 65_536),
             other => panic!("expected pack command, got {other:?}"),
         }
     }

@@ -411,6 +411,7 @@ vfs pack [OPTIONS] <SESSION_ID>
 - `--prune <GLOB>` — Additional delta path glob to prune (can be specified multiple times)
 - `--no-default-prunes` — Disable the default generated-artifact prune globs
 - `--output <PATH>` — Copy the packed database to this path
+- `--chunk-size <BYTES>` — Byte size of the per-chunk verification digests reported in the manifest's `chunks` list [default: 4194304]
 - `--json` — Emit machine-readable JSON (pack output is always JSON)
 
 ### vfs seed
@@ -662,6 +663,24 @@ single-file transfer artifact. Pack owns the operation end to end:
 The packed transfer artifact is only `delta.db`; `procs/`, `mnt/`,
 `.session.lock`, `base_path`, and other session-directory files are never
 included in that artifact.
+
+Pack prints a one-line JSON manifest describing the published artifact.
+`dbSha256` and `dbSizeBytes` cover the whole file; `artifactVersion` is the
+schema version the artifact was migrated to during staging; and `chunks`
+lists `{index, sizeBytes, sha256}` digests over consecutive
+`--chunk-size`-byte ranges (default 4194304) of the exact published bytes.
+A consumer streams the artifact in precisely those chunks and verifies each
+one, with the whole-file `dbSha256` as the final check.
+
+### Artifact version negotiation
+
+`vfs version --json` reports `artifactVersion` (the schema version this
+binary writes when packing) and `minSupportedArtifactVersion` (the oldest
+artifact schema it can still migrate forward during adopt), so two daemons
+can agree on an artifact-version floor before transferring anything. The
+sender's `artifactVersion` must be within the receiver's supported range;
+`vfs adopt` enforces the ceiling by refusing an artifact newer than its own
+`artifactVersion` with an error naming both versions.
 
 ### Adopting run sessions
 
