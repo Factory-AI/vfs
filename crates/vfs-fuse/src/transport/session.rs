@@ -480,12 +480,12 @@ impl<FS: Filesystem> Session<FS> {
     }
 
     /// Returns an object that can be used to send notifications to the kernel
-    fn notifier(&self) -> Notifier {
+    pub(crate) fn notifier(&self) -> Notifier {
         Notifier::new(self.ch.sender())
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 /// A thread-safe object that can be used to unmount a Filesystem
 pub(crate) struct SessionUnmounter {
     mount: Arc<Mutex<Option<(PathBuf, Mount)>>>,

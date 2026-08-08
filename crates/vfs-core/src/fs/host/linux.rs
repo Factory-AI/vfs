@@ -43,6 +43,8 @@ struct Inode {
 /// - File I/O uses real fds obtained via /proc/self/fd/
 pub struct HostFS {
     root: PathBuf,
+    /// Stable host path resolved while descriptor-backed roots still exist.
+    watch_root: PathBuf,
     /// The root O_PATH file descriptor
     root_fd: OwnedFd,
     /// Map from our inode numbers to Inode structs
@@ -66,6 +68,9 @@ impl HostFS {
         if !root.is_dir() {
             return Err(Error::NotADirectory(root.display().to_string()));
         }
+        let watch_root = root
+            .canonicalize()
+            .map_err(|e| Error::Internal(format!("failed to resolve base directory: {e}")))?;
 
         // Open root with O_PATH
         let c_path = CString::new(root.as_os_str().as_bytes())
@@ -114,6 +119,7 @@ impl HostFS {
 
         Ok(Self {
             root,
+            watch_root,
             root_fd,
             inodes: RwLock::new(inodes),
             src_to_ino: RwLock::new(src_to_ino),
@@ -226,6 +232,10 @@ impl HostFS {
 
 #[async_trait]
 impl FileSystem for HostFS {
+    fn external_watch_root(&self) -> Option<PathBuf> {
+        Some(self.watch_root.clone())
+    }
+
     async fn lookup(&self, parent_ino: i64, name: &str) -> Result<Option<Stats>> {
         let parent_fd = self.get_inode_fd(parent_ino)?;
 

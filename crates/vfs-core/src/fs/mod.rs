@@ -4,6 +4,7 @@ pub mod vfs;
 
 use crate::error::Result;
 use async_trait::async_trait;
+use std::path::PathBuf;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -175,8 +176,9 @@ pub enum KernelCachePolicy {
     /// so adapter invalidations bound kernel-cache staleness.
     Stable,
     /// Inode contents may change outside this filesystem implementation.
-    /// Adapters must avoid long-lived kernel page, attr, and entry cache
-    /// grants that could present stale bytes as current.
+    /// Adapters must keep their own metadata caches conservative, invalidate
+    /// kernel grants from [`FileSystem::external_watch_root`] events, and
+    /// revalidate data reads against the backing file.
     ExternalDrift,
 }
 
@@ -373,6 +375,24 @@ pub trait FileSystem: Send + Sync {
     /// Return the kernel-cache coherence class for an inode.
     fn kernel_cache_policy(&self, _ino: i64) -> KernelCachePolicy {
         KernelCachePolicy::Stable
+    }
+
+    /// Host directory whose out-of-band mutations can change this
+    /// filesystem's externally backed view.
+    ///
+    /// FUSE watches this root to invalidate positive and negative kernel
+    /// metadata caches. Database-backed filesystems return `None`.
+    fn external_watch_root(&self) -> Option<PathBuf> {
+        None
+    }
+
+    /// Files below [`FileSystem::external_watch_root`] that belong to this
+    /// filesystem's own storage rather than to the externally backed view.
+    ///
+    /// Watchers ignore each path and SQLite-style `-suffix` sidecars rooted at
+    /// it, preventing delta commits from masquerading as base mutations.
+    fn external_watch_ignored_paths(&self) -> Vec<PathBuf> {
+        Vec::new()
     }
 
     /// Create a directory with the specified ownership.

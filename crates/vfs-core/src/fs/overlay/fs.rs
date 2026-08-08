@@ -439,6 +439,14 @@ impl FileSystem for OverlayFS {
         }
     }
 
+    fn external_watch_root(&self) -> Option<std::path::PathBuf> {
+        self.base.external_watch_root()
+    }
+
+    fn external_watch_ignored_paths(&self) -> Vec<std::path::PathBuf> {
+        self.delta.external_watch_ignored_paths()
+    }
+
     async fn open(&self, ino: i64, flags: i32) -> Result<BoxedFile> {
         trace!("OverlayFS::open: ino={}", ino);
 

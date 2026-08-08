@@ -289,6 +289,14 @@ impl vfs_core::FileSystem for ReadWriteLaneFsAdapter {
         self.inner.kernel_cache_policy(ino)
     }
 
+    fn external_watch_root(&self) -> Option<std::path::PathBuf> {
+        self.inner.external_watch_root()
+    }
+
+    fn external_watch_ignored_paths(&self) -> Vec<std::path::PathBuf> {
+        self.inner.external_watch_ignored_paths()
+    }
+
     async fn mkdir(
         &self,
         parent_ino: i64,

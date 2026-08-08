@@ -23,6 +23,7 @@ pub(crate) use ll::fuse_abi::fuse_forget_one;
 pub(crate) use ll::TimeOrNow;
 pub(crate) use mnt::mount_options::check_option_conflicts;
 pub(crate) use mnt::mount_options::MountOption;
+pub(crate) use notify::Notifier;
 pub(crate) use reply::ReplyPoll;
 pub(crate) use reply::ReplyXattr;
 pub(crate) use reply::{ReplyAttr, ReplyData, ReplyEmpty, ReplyEntry, ReplyOpen};

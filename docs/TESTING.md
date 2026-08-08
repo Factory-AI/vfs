@@ -112,7 +112,7 @@ python3 scripts/validation/phase8-validation.py --smoke --timeout 20 \
 python3 scripts/validation/noopen-coherence.py --vfs-bin "$PWD/target/release/vfs"
 python3 scripts/validation/flush-coherence.py --vfs-bin "$PWD/target/release/vfs"
 
-# Overlay base-drift rejection
+# Immediate overlay base metadata/namespace coherence with bounded callback volume
 python3 scripts/validation/external-base-mutation-coherence.py \
   --vfs-bin "$PWD/target/release/vfs" \
   --output /tmp/vfs-val/external-base-mutation.json

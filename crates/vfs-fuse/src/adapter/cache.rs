@@ -2,6 +2,7 @@
 //!
 //! Lock order: `reply_lock` -> one cache map lock at a time (`dir_entries`,
 //! `attr`, `entry`, `negative_entry`, `external_read_*`, `keepcache_drift`).
+//! `external_kernel` participates at the same one-map-at-a-time level.
 //! Mutations go through [`AdapterCaches::mutate`], which holds `reply_lock`
 //! while bumping the epoch and touching map locks sequentially; cacheable
 //! replies hold only [`CacheReplyGuard`]. Map locks never nest with each
@@ -118,6 +119,18 @@ pub(super) struct EntryInvalidation {
     pub(super) notify_kernel: bool,
 }
 
+pub(super) struct ExternalKernelInvalidation {
+    pub(super) inodes: Vec<u64>,
+    pub(super) entries: Vec<(u64, String)>,
+}
+
+#[derive(Default)]
+struct ExternalKernelCache {
+    inodes: HashSet<u64>,
+    entries: HashSet<(u64, String, u64)>,
+    lookups: HashMap<u64, u64>,
+}
+
 /// Reply-lock guard retained while a cacheable FUSE reply is emitted.
 pub(super) struct CacheReplyGuard<'a> {
     _guard: MutexGuard<'a, ()>,
@@ -135,6 +148,7 @@ pub(super) struct AdapterCaches {
     negative_entry: Arc<Mutex<HashMap<(u64, String), ()>>>,
     external_read_fingerprints: Arc<Mutex<HashMap<u64, KeepCacheFingerprint>>>,
     external_read_seen: Arc<Mutex<HashSet<u64>>>,
+    external_kernel: Arc<Mutex<ExternalKernelCache>>,
     keepcache_drift: Arc<Mutex<KeepCacheDriftGuard>>,
     reply_lock: Arc<Mutex<()>>,
     epoch: AtomicU64,
@@ -149,6 +163,7 @@ impl AdapterCaches {
             negative_entry: Arc::new(Mutex::new(HashMap::new())),
             external_read_fingerprints: Arc::new(Mutex::new(HashMap::new())),
             external_read_seen: Arc::new(Mutex::new(HashSet::new())),
+            external_kernel: Arc::new(Mutex::new(ExternalKernelCache::default())),
             keepcache_drift: Arc::new(Mutex::new(KeepCacheDriftGuard::new(keepcache_sticky_drop))),
             reply_lock: Arc::new(Mutex::new(())),
             epoch: AtomicU64::new(0),
@@ -183,6 +198,13 @@ impl AdapterCaches {
         let notify_kernel = self.mutate(policy, |caches| {
             dropped_keepcache = caches.drop_keepcache_eligibility(ino);
             caches.prune_external_read_state(ino);
+            let mut external = caches.external_kernel.lock();
+            external.inodes.remove(&ino);
+            external.lookups.remove(&ino);
+            external
+                .entries
+                .retain(|(_, _, entry_ino)| *entry_ino != ino);
+            drop(external);
             caches.attrs().lock().remove(&ino);
             caches
                 .entries()
@@ -209,6 +231,13 @@ impl AdapterCaches {
             let key = (parent, name.to_string());
             caches.entries().lock().remove(&key);
             removed_negative = caches.negative_entries().lock().remove(&key).is_some();
+            caches
+                .external_kernel
+                .lock()
+                .entries
+                .retain(|(entry_parent, entry_name, _)| {
+                    *entry_parent != parent || entry_name != name
+                });
         });
         EntryInvalidation {
             removed_negative,
@@ -285,6 +314,112 @@ impl AdapterCaches {
             }
         }
     }
+
+    /// Record an external-origin inode granted a non-zero kernel metadata TTL.
+    ///
+    /// Callers hold a [`CacheReplyGuard`] while recording and replying, so an
+    /// out-of-band invalidation cannot interleave between these two actions.
+    pub(super) fn track_external_kernel_inode(&self, ino: u64) {
+        self.external_kernel.lock().inodes.insert(ino);
+    }
+
+    /// Record an external-origin dentry granted a non-zero kernel entry TTL.
+    ///
+    /// Callers hold a [`CacheReplyGuard`] while recording and replying.
+    pub(super) fn track_external_kernel_lookup(&self, parent: u64, name: Option<&str>, ino: u64) {
+        let mut external = self.external_kernel.lock();
+        external.inodes.insert(ino);
+        if let Some(name) = name {
+            external.entries.insert((parent, name.to_string(), ino));
+        }
+        let refs = external.lookups.entry(ino).or_insert(0);
+        *refs = refs.saturating_add(1);
+    }
+
+    /// Forget tracked external kernel grants once the kernel drops its final
+    /// lookup reference for the inode.
+    pub(super) fn forget_external_kernel_lookup(&self, ino: u64, nlookup: u64) {
+        let mut external = self.external_kernel.lock();
+        let final_lookup = {
+            let Some(refs) = external.lookups.get_mut(&ino) else {
+                return;
+            };
+            if *refs > nlookup {
+                *refs -= nlookup;
+                false
+            } else {
+                external.lookups.remove(&ino);
+                true
+            }
+        };
+        if final_lookup {
+            external.inodes.remove(&ino);
+            external
+                .entries
+                .retain(|(_, _, entry_ino)| *entry_ino != ino);
+        }
+    }
+
+    /// Drop every kernel cache grant whose backing host state may have changed.
+    ///
+    /// The epoch bump makes in-flight backend observations retry or reply with
+    /// zero TTL. Negative dentries are included because a host-side create can
+    /// make any previously missing name visible.
+    pub(super) fn invalidate_external_kernel_state(&self) -> ExternalKernelInvalidation {
+        let mut inodes = Vec::new();
+        let mut entries = Vec::new();
+        self.mutate(NotifyPolicy::SuppressKernel, |caches| {
+            let mut external = caches.external_kernel.lock();
+            let invalidated = std::mem::take(&mut external.inodes);
+            entries.extend(
+                external
+                    .entries
+                    .drain()
+                    .map(|(parent, name, _)| (parent, name)),
+            );
+            drop(external);
+            entries.extend(
+                caches
+                    .negative_entries()
+                    .lock()
+                    .drain()
+                    .map(|(entry, ())| entry),
+            );
+
+            {
+                let mut keepcache = caches.keepcache_drift.lock();
+                for ino in &invalidated {
+                    keepcache.drop_eligibility(*ino);
+                }
+            }
+            caches
+                .external_read_fingerprints
+                .lock()
+                .retain(|ino, _| !invalidated.contains(ino));
+            caches
+                .external_read_seen
+                .lock()
+                .retain(|ino| !invalidated.contains(ino));
+            caches
+                .attrs()
+                .lock()
+                .retain(|ino, _| !invalidated.contains(ino));
+            caches
+                .entries()
+                .lock()
+                .retain(|_, stats| !invalidated.contains(&(stats.ino as u64)));
+            caches.dir_entries().lock().retain(|dir_ino, dir_entries| {
+                !invalidated.contains(dir_ino)
+                    && !dir_entries
+                        .iter()
+                        .any(|entry| invalidated.contains(&entry.attr.ino))
+            });
+            inodes.extend(invalidated);
+        });
+        entries.sort();
+        entries.dedup();
+        ExternalKernelInvalidation { inodes, entries }
+    }
 }
 
 #[cfg(test)]
@@ -357,5 +492,49 @@ mod tests {
             !caches.external_read_drifted(ino, fingerprint),
             "pruned fingerprint should behave like a fresh baseline"
         );
+    }
+
+    #[test]
+    fn external_mutation_drains_positive_and_negative_kernel_grants() {
+        let caches = AdapterCaches::new(false);
+        caches.track_external_kernel_inode(11);
+        caches.track_external_kernel_lookup(1, Some("present"), 11);
+        caches
+            .negative_entries()
+            .lock()
+            .insert((1, "missing".to_string()), ());
+        caches.mark_external_read_seen(11);
+        caches.set_external_read_fingerprint(
+            11,
+            KeepCacheFingerprint::from_stats(&stats_with_size(5)),
+        );
+        let epoch = caches.epoch();
+
+        let invalidation = caches.invalidate_external_kernel_state();
+
+        assert_eq!(invalidation.inodes, vec![11]);
+        assert_eq!(
+            invalidation.entries,
+            vec![(1, "missing".to_string()), (1, "present".to_string())]
+        );
+        assert!(caches.epoch_changed(epoch));
+        assert!(!caches.external_read_was_seen(11));
+        assert!(caches.invalidate_external_kernel_state().inodes.is_empty());
+    }
+
+    #[test]
+    fn external_kernel_grants_live_until_the_final_forget() {
+        let caches = AdapterCaches::new(false);
+        caches.track_external_kernel_inode(11);
+        caches.track_external_kernel_lookup(1, Some("present"), 11);
+        caches.track_external_kernel_lookup(1, Some("present"), 11);
+
+        caches.forget_external_kernel_lookup(11, 1);
+        assert!(caches.external_kernel.lock().inodes.contains(&11));
+
+        caches.forget_external_kernel_lookup(11, 1);
+        let external = caches.external_kernel.lock();
+        assert!(!external.inodes.contains(&11));
+        assert!(external.entries.is_empty());
     }
 }

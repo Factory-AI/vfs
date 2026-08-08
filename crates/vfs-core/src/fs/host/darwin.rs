@@ -222,6 +222,10 @@ impl HostFS {
 
 #[async_trait]
 impl FileSystem for HostFS {
+    fn external_watch_root(&self) -> Option<PathBuf> {
+        Some(self.root.clone())
+    }
+
     async fn lookup(&self, parent_ino: i64, name: &str) -> Result<Option<Stats>> {
         let parent_path = self.get_inode_path(parent_ino)?;
 

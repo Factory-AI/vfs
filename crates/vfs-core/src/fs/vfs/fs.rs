@@ -148,6 +148,13 @@ impl FileSystem for Vfs {
         self.core_config.keepcache_delta
     }
 
+    fn external_watch_ignored_paths(&self) -> Vec<PathBuf> {
+        self.db_path
+            .as_ref()
+            .map(|path| vec![path.as_ref().clone()])
+            .unwrap_or_default()
+    }
+
     async fn readlink(&self, ino: i64) -> Result<Option<String>> {
         let conn = self.pool.get_connection().await?;
 

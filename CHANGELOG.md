@@ -1,13 +1,24 @@
 # Changelog
 
-## [1.0.1] - 2026-08-08 - Protocol stream and validation hardening
+## [1.0.1] - 2026-08-08 - Protocol, cache, and validation hardening
 
-Patch release for one runtime bug and the benchmark defects found while
-validating it. The handoff wire contract and database schema do not change:
+Patch release for two runtime bugs and the benchmark defects found while
+validating them. The handoff wire contract and database schema do not change:
 `artifactVersion` remains `0.6`.
 
 ### Fixed
 
+- Restore normal kernel metadata TTL grants for base-origin files while
+  retaining fail-closed external-drift detection. The drift guard previously
+  returned zero entry and attribute TTLs for every base inode, turning the
+  reader workload from roughly 47,000 FUSE callbacks into 578,000 and making
+  legacy FUSE 3.7x slower in an exact parent/commit comparison. A recursive
+  host watcher now invalidates tracked positive entries, negative entries, and
+  inode metadata after external base mutations; it excludes the delta database
+  and its SQLite sidecars. Base reads retain their data-drift guard,
+  adapter-local caches remain conservative, and the coherence gate now pins
+  immediate metadata and namespace freshness alongside callback volume and
+  stale-byte rejection.
 - Send tracing to stderr. The formatter previously wrote diagnostics to
   stdout, where `vfs run` and `vfs exec` expose the wrapped command's output
   and `vfs mcp-server` speaks JSON-RPC. An asynchronous mount log could

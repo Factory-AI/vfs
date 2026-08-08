@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate that overlay base-file drift never serves stale mounted bytes."""
+"""Validate immediate overlay base data, metadata, and namespace coherence."""
 
 from __future__ import annotations
 
@@ -23,6 +23,8 @@ from lib.common import resolve_vfs_bin, tail_text  # noqa: E402
 
 DEFAULT_CLEANUP_TIMEOUT = 10.0
 FINAL_UNMOUNT_SETTLE_TIMEOUT = 0.5
+METADATA_PROBE_COUNT = 64
+MAX_METADATA_CALLBACKS = 12
 STALE_BYTES = b"before-base-content\n"
 FRESH_BYTES = b"after-base-content-with-new-size\n"
 MOUNTINFO_ESCAPE_RE = re.compile(r"\\([0-7]{3})")
@@ -321,7 +323,10 @@ def run_leg(
         base.mkdir()
         mountpoint.mkdir()
         base_file = base / "base.txt"
+        created_file = base / "created.txt"
+        deleted_file = base / "deleted.txt"
         base_file.write_bytes(STALE_BYTES)
+        deleted_file.write_bytes(STALE_BYTES)
 
         env = os.environ.copy()
         env.update(extra_env)
@@ -383,12 +388,73 @@ def run_leg(
                 }
                 return result
 
+            for _ in range(METADATA_PROBE_COUNT):
+                try:
+                    probe_size = (mountpoint / "base.txt").stat().st_size
+                except OSError as exc:
+                    result = {
+                        "label": label,
+                        "passed": False,
+                        "phase": "metadata_cache_probe",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                    return result
+                if probe_size != len(STALE_BYTES):
+                    result = {
+                        "label": label,
+                        "passed": False,
+                        "phase": "metadata_cache_probe",
+                        "size": probe_size,
+                    }
+                    return result
+
+            mounted_created = mountpoint / created_file.name
+            mounted_deleted = mountpoint / deleted_file.name
+            try:
+                mounted_deleted_size = mounted_deleted.stat().st_size
+            except OSError as exc:
+                result = {
+                    "label": label,
+                    "passed": False,
+                    "phase": "positive_entry_prime",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+                return result
+            if mounted_deleted_size != len(STALE_BYTES):
+                result = {
+                    "label": label,
+                    "passed": False,
+                    "phase": "positive_entry_prime",
+                    "size": mounted_deleted_size,
+                }
+                return result
+            try:
+                mounted_created.stat()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                result = {
+                    "label": label,
+                    "passed": False,
+                    "phase": "negative_entry_prime",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+                return result
+            else:
+                result = {
+                    "label": label,
+                    "passed": False,
+                    "phase": "negative_entry_prime",
+                    "error": "created.txt unexpectedly exists before host-side creation",
+                }
+                return result
+
             before_stat = base_file.stat()
             before_hash = sha256(base_file.read_bytes())
 
-            # Keep mtime distinguishable on filesystems with coarse timestamps.
-            time.sleep(1.1)
             base_file.write_bytes(FRESH_BYTES)
+            created_file.write_bytes(FRESH_BYTES)
+            deleted_file.unlink()
             after_stat = base_file.stat()
             after_hash = sha256(base_file.read_bytes())
 
@@ -413,6 +479,18 @@ def run_leg(
                     stdout=b"",
                     stderr=stat_after.stderr.encode("utf-8", "replace"),
                 )
+            try:
+                created_after_size = mounted_created.stat().st_size
+            except OSError:
+                created_after_size = None
+            try:
+                mounted_deleted.stat()
+            except FileNotFoundError:
+                deleted_after_missing = True
+            except OSError:
+                deleted_after_missing = False
+            else:
+                deleted_after_missing = False
         except KeyboardInterrupt as exc:
             result = {
                 "label": label,
@@ -438,6 +516,8 @@ def run_leg(
         drift_error = is_eio_failure(read_after) or is_eio_failure(stat_after)
         stat_size = stat_after.stdout.strip().split(" ")[0] if stat_after.returncode == 0 else None
         stat_fresh = stat_size == str(len(FRESH_BYTES))
+        created_after_fresh = created_after_size == len(FRESH_BYTES)
+        namespace_fresh = created_after_fresh and deleted_after_missing
         noopen_ok = True
         if expect_noopen:
             noopen_ok = counters.get("fuse_noopen_enosys_replies") == 1 and counters.get("fuse_op_open_count") == 1
@@ -447,11 +527,19 @@ def run_leg(
             ) == 0
         invalidations = counters.get("base_fast_inode_invalidations") or 0
         stale_rejections = counters.get("base_fast_stale_rejections") or 0
+        lookup_count = counters.get("fuse_lookup_count") or 0
+        getattr_count = counters.get("fuse_getattr_count") or 0
+        metadata_counters_present = "fuse_lookup_count" in counters and "fuse_getattr_count" in counters
+        metadata_cache_ok = (
+            metadata_counters_present
+            and 0 < lookup_count <= MAX_METADATA_CALLBACKS
+            and 0 < getattr_count <= MAX_METADATA_CALLBACKS
+        )
+        coherence_ok = ((fresh and stat_fresh) or drift_error) and not stale and namespace_fresh
 
         return {
             "label": label,
-            "passed": (fresh and stat_fresh and not stale and noopen_ok)
-            or (drift_error and not stale and noopen_ok),
+            "passed": coherence_ok and noopen_ok and metadata_cache_ok,
             "duration_seconds": time.perf_counter() - started,
             "before_hash": before_hash,
             "after_hash": after_hash,
@@ -469,9 +557,19 @@ def run_leg(
             "drift_error": drift_error,
             "drift_errno": "EIO" if drift_error else None,
             "stat_fresh": stat_fresh,
+            "created_after_size": created_after_size,
+            "created_after_fresh": created_after_fresh,
+            "deleted_after_missing": deleted_after_missing,
+            "namespace_fresh": namespace_fresh,
             "noopen_ok": noopen_ok,
             "fuse_op_open_count": counters.get("fuse_op_open_count"),
             "fuse_noopen_enosys_replies": counters.get("fuse_noopen_enosys_replies"),
+            "fuse_lookup_count": lookup_count,
+            "fuse_getattr_count": getattr_count,
+            "metadata_probe_count": METADATA_PROBE_COUNT,
+            "max_metadata_callbacks": MAX_METADATA_CALLBACKS,
+            "metadata_counters_present": metadata_counters_present,
+            "metadata_cache_ok": metadata_cache_ok,
             "base_fast_inode_invalidations": invalidations,
             "base_fast_stale_rejections": stale_rejections,
             "profile_counters_present": bool(counters),
@@ -539,8 +637,11 @@ def main() -> int:
         print(
             f"{status} {run['label']:15s} stale={run.get('stale')} "
             f"fresh={run.get('fresh')} stat_fresh={run.get('stat_fresh')} "
+            f"namespace_fresh={run.get('namespace_fresh')} "
             f"read_rc={run.get('mounted_read_returncode')} opens={run.get('fuse_op_open_count')} "
             f"enosys={run.get('fuse_noopen_enosys_replies')} "
+            f"lookup={run.get('fuse_lookup_count')} getattr={run.get('fuse_getattr_count')} "
+            f"metadata_cache={run.get('metadata_cache_ok')} "
             f"base_invalidations={run.get('base_fast_inode_invalidations')} "
             f"stale_rejections={run.get('base_fast_stale_rejections')}"
         )

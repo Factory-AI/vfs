@@ -1,3 +1,4 @@
+mod base_watcher;
 mod cache;
 pub(crate) mod config;
 mod ino_files;
@@ -181,7 +182,7 @@ struct VfsFuse {
     /// Maps file handle -> open file state
     open_files: Arc<Mutex<HashMap<u64, OpenFile>>>,
     /// Adapter cache state and the epoch/reply-lock coherence protocol.
-    caches: AdapterCaches,
+    caches: Arc<AdapterCaches>,
     /// Next file handle to allocate
     next_fh: AtomicU64,
     /// Whether kernel cache invalidations are sent synchronously before replies.
@@ -478,15 +479,25 @@ impl Filesystem for VfsFuse {
                 if stable && !external_drift {
                     self.cache_entry(parent, name_str, &stats);
                 }
+                if stable && external_drift {
+                    self.caches.track_external_kernel_lookup(
+                        parent,
+                        Some(name_str),
+                        stats.ino as u64,
+                    );
+                }
                 let attr = self.fillattr(&stats);
-                let cacheable = stable && !external_drift;
+                // External base files stay out of adapter-local caches. The
+                // base watcher invalidates their positive dentries and attrs
+                // after host-side mutations, while READ retains its
+                // boundary invalidation for data-drift rejection.
                 reply.entry_with_ttls(
-                    if cacheable {
+                    if stable {
                         &self.cache_config.entry_ttl
                     } else {
                         &Duration::ZERO
                     },
-                    if cacheable {
+                    if stable {
                         &self.cache_config.attr_ttl
                     } else {
                         &Duration::ZERO
@@ -569,12 +580,14 @@ impl Filesystem for VfsFuse {
                         KeepCacheFingerprint::from_stats(&stats),
                     );
                 }
-                let cacheable = stable && !external_drift;
-                if cacheable && self.attrs_cacheable() {
+                if stable && !external_drift && self.attrs_cacheable() {
                     self.cache_attr(&stats);
                 }
+                if stable && external_drift {
+                    self.caches.track_external_kernel_inode(ino);
+                }
                 reply.attr(
-                    if cacheable {
+                    if stable {
                         &self.cache_config.attr_ttl
                     } else {
                         &Duration::ZERO
@@ -822,17 +835,21 @@ impl Filesystem for VfsFuse {
         let cache_reply = self.caches.try_reply_guard(stable_epoch);
         let stable = stable && cache_reply.is_some();
         for (i, entry) in all_entries.iter().enumerate().skip(readdir_start(offset)) {
-            let entry_cacheable = stable && !self.external_drift_sensitive(entry.attr.ino);
+            if stable && self.external_drift_sensitive(entry.attr.ino) {
+                let name = (entry.name != "." && entry.name != "..").then_some(entry.name.as_str());
+                self.caches
+                    .track_external_kernel_lookup(ino, name, entry.attr.ino);
+            }
             if reply.add_with_ttls(
                 entry.attr.ino,
                 (i + 1) as i64,
                 &entry.name,
-                if entry_cacheable {
+                if stable {
                     &self.cache_config.entry_ttl
                 } else {
                     &Duration::ZERO
                 },
-                if entry_cacheable {
+                if stable {
                     &self.cache_config.attr_ttl
                 } else {
                     &Duration::ZERO
@@ -1815,6 +1832,7 @@ impl Filesystem for VfsFuse {
     fn forget(&self, _req: &Request, ino: u64, nlookup: u64) {
         tracing::debug!("FUSE::forget: ino={}, nlookup={}", ino, nlookup);
         self.drop_ino_file(ino);
+        self.caches.forget_external_kernel_lookup(ino, nlookup);
         let fs = self.fs.clone();
         // Default: do NOT commit pending batched writes here. The kernel
         // FORGETs every freshly-written file shortly after our post-write
@@ -1843,6 +1861,8 @@ impl Filesystem for VfsFuse {
         tracing::debug!("FUSE::batch_forget: {} nodes", nodes.len());
         for node in nodes {
             self.drop_ino_file(node.nodeid);
+            self.caches
+                .forget_external_kernel_lookup(node.nodeid, node.nlookup);
         }
         let fs = self.fs.clone();
         let nodes_vec: Vec<(i64, u64)> =
@@ -2608,7 +2628,7 @@ impl VfsFuse {
             cache_config,
             uring,
             open_files: Arc::new(Mutex::new(HashMap::new())),
-            caches: AdapterCaches::new(config.keepcache_sticky_drop),
+            caches: Arc::new(AdapterCaches::new(config.keepcache_sticky_drop)),
             next_fh: AtomicU64::new(1),
             sync_inval: config.sync_inval,
             self_inval: config.self_inval,
@@ -2858,7 +2878,11 @@ pub fn mount(
     let dispatch_mode = fuse_config.dispatch_mode;
     let uring_config = fuse_config.uring;
     let fs = VfsFuse::new(fs, runtime, fuse_config, opts.uid, opts.gid);
+    let watch_root = fs.fs.external_watch_root();
+    let ignored_watch_paths = fs.fs.external_watch_ignored_paths();
+    let caches = fs.caches.clone();
     let mount_opts = build_mount_options(&opts)?;
+    let prepared_watcher = base_watcher::prepare(watch_root, ignored_watch_paths)?;
 
     let mut session = crate::transport::Session::new(
         fs,
@@ -2868,7 +2892,13 @@ pub fn mount(
         uring_config,
     )?;
     let unmounter = session.unmount_callable();
-    let thread = std::thread::spawn(move || session.run().map_err(anyhow::Error::from));
+    let base_watcher = prepared_watcher
+        .map(|watcher| watcher.start(caches, session.notifier(), unmounter.clone()))
+        .transpose()?;
+    let thread = std::thread::spawn(move || {
+        let _base_watcher = base_watcher;
+        session.run().map_err(anyhow::Error::from)
+    });
 
     Ok(SessionHandle {
         thread: Some(thread),

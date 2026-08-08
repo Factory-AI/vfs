@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 vfs-core = { workspace = true }
 anyhow = { workspace = true }
+inotify = { workspace = true }
 libc = { workspace = true }
 memchr = { workspace = true }
 nix = { workspace = true }
