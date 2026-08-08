@@ -23,17 +23,30 @@ first failing command and runs, in order:
    logging, env-reads-at-the-config-edge, `await_holding_lock`, lock-order
    headers, docs layout, changelog)
 
+Steps 1-4 are the `cargo` phase, 5 the `shell` phase, 6 the `python` phase
+and 7 the `canon` phase. `gate.sh --phases shell,canon` runs a subset; with
+no argument you get all four, which is what the gate means locally.
+
 Knobs: `VFS_BIN` (defaults to `target/release/vfs`),
 `VFS_GATE_SHELL_TIMEOUT` (default 900 s), `VFS_GATE_PHASE8_TIMEOUT`
 (default 20 s), `VFS_GATE_ALLOWED_SKIPS` (forwarded to the shell suite,
-see below), and the `CORRUPTION_TORTURE_*` variables forwarded to the
-shell suite. The gate pins `TMPDIR` to a per-run scratch dir cleaned on exit
-so dependency temp-file litter cannot accumulate on the host.
+see below), `VFS_GATE_SHARD=<index>/<total>` (1-based; runs one round-robin
+slice of the shell suite), and the `CORRUPTION_TORTURE_*` variables forwarded
+to the shell suite. The gate pins `TMPDIR` to a per-run scratch dir cleaned on
+exit so dependency temp-file litter cannot accumulate on the host.
+
+A shard must own a whole machine. The corruption-torture legs may not run
+concurrently with another mount, which holds across CI jobs because each is
+its own runner; backgrounding two shards on one host breaks it.
 
 CI (`.github/workflows/rust.yml`) runs the workspace job (fmt/clippy/build/test
-on Linux and macOS, build+test on Linux arm64), the honest milestone gate
-(`scripts/gate.sh` plus pjdfstest `phase5-ci`), and the release workflow.
-The gate job first sets `kernel.apparmor_restrict_unprivileged_userns=0` so
+on Linux and macOS, build+test on Linux arm64), then builds the release binary
+once in `gate-binary` and fans it out as an artifact to four `gate-shell`
+shards and one `gate-python` job (`--phases python,canon` plus pjdfstest
+`phase5-ci`). Sharing one prebuilt binary keeps the release build off every
+shard's critical path, and the cargo phase is not repeated there because the
+workspace job already covers fmt, clippy, and the workspace tests.
+The gate jobs first set `kernel.apparmor_restrict_unprivileged_userns=0` so
 the `vfs run` suites exercise the sandbox instead of skipping on the
 Ubuntu 24.04 runner image. FUSE-over-io_uring coverage stays local-only: the
 CI kernel exposes `/sys/module/fuse/parameters/enable_uring` but ships it

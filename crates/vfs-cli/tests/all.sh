@@ -8,6 +8,13 @@ set -u
 # stays green under VFS_GATE_STRICT=1. This is for runner kernels that
 # cannot provide a prerequisite at all (e.g. no FUSE-over-io_uring module
 # parameter); every other SKIP remains red on the strict runner.
+#
+# Set VFS_GATE_SHARD=<index>/<total> (1-based) to run one slice of the suite.
+# Tests are assigned round-robin over declaration order, so adjacent
+# heavyweights — the two corruption-torture legs — never land in the same
+# slice. A shard must be a whole machine: the torture test may not run beside
+# another mount, which holds across CI jobs because each one is its own runner,
+# and does NOT hold if you background two shards on one host.
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(cd "$DIR/.." && pwd)"
@@ -28,6 +35,31 @@ TMPDIR="$SUITE_TMPDIR"
 TMP="$SUITE_TMPDIR"
 TEMP="$SUITE_TMPDIR"
 export TMPDIR TMP TEMP
+
+SHARD_INDEX=0
+SHARD_TOTAL=0
+case "${VFS_GATE_SHARD:-}" in
+    "") ;;
+    *[!0-9]*/*[!0-9]* | */ | /*)
+        printf 'VFS_GATE_SHARD must be <index>/<total>, got %s\n' "$VFS_GATE_SHARD" >&2
+        exit 2
+        ;;
+    */*)
+        SHARD_INDEX="${VFS_GATE_SHARD%%/*}"
+        SHARD_TOTAL="${VFS_GATE_SHARD##*/}"
+        if [ "$SHARD_TOTAL" -lt 1 ] ||
+            [ "$SHARD_INDEX" -lt 1 ] ||
+            [ "$SHARD_INDEX" -gt "$SHARD_TOTAL" ]; then
+            printf 'VFS_GATE_SHARD index out of range: %s\n' "$VFS_GATE_SHARD" >&2
+            exit 2
+        fi
+        ;;
+    *)
+        printf 'VFS_GATE_SHARD must be <index>/<total>, got %s\n' "$VFS_GATE_SHARD" >&2
+        exit 2
+        ;;
+esac
+TEST_ORDINAL=0
 
 PASS_COUNT=0
 SKIP_COUNT=0
@@ -89,6 +121,14 @@ record_result() {
 run_test() {
     label="$1"
     shift
+
+    if [ "$SHARD_TOTAL" -gt 0 ]; then
+        selected=$((TEST_ORDINAL % SHARD_TOTAL == SHARD_INDEX - 1))
+        TEST_ORDINAL=$((TEST_ORDINAL + 1))
+        # Not this shard's test: not run and not recorded, so the summary and
+        # the strict-SKIP accounting describe only this slice.
+        [ "$selected" -eq 1 ] || return 0
+    fi
 
     printf '\n==> %s\n' "$label"
     tmp="$(mktemp "${TMPDIR:-/tmp}/vfs-all.${label}.XXXXXX")"

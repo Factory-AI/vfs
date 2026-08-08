@@ -41,7 +41,11 @@ case "$(uname -s)" in
         ;;
 esac
 
-command -v cargo >/dev/null 2>&1 || skip "cargo is unavailable"
+# Only a source build needs cargo; a supplied VFS_BIN does not, and
+# claiming the prerequisite unconditionally turns a binary-only runner
+# into a SKIP, which is red under VFS_GATE_STRICT=1.
+[ -n "${VFS_BIN:-}" ] || command -v cargo >/dev/null 2>&1 ||
+    skip "cargo is unavailable and VFS_BIN is unset"
 command -v git >/dev/null 2>&1 || skip "git is unavailable"
 command -v timeout >/dev/null 2>&1 || skip "timeout is unavailable"
 [ -e /dev/fuse ] || skip "requires /dev/fuse for FUSE mounts"

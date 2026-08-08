@@ -61,8 +61,11 @@ jobs:
     - name: Run tests
       run: cargo +"$RUST_TOOLCHAIN" test --workspace --verbose
 
-  milestone-gate:
-    name: Honest milestone gate
+  # The gate's runtime phases all need the same release binary. Building it
+  # once here keeps that build off the critical path of every shard, which
+  # otherwise each pay for it.
+  gate-binary:
+    name: Gate binary
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
@@ -71,7 +74,6 @@ jobs:
       uses: dtolnay/rust-toolchain@master
       with:
         toolchain: ${{ env.RUST_TOOLCHAIN }}
-        components: rustfmt, clippy
 
     - name: Install system dependencies
       run: ./scripts/install-deps.sh
@@ -94,11 +96,77 @@ jobs:
         path: target
         key: ${{ runner.os }}-cargo-build-target-gate-${{ hashFiles('Cargo.lock') }}
 
+    - name: Build release binary
+      run: cargo +"$RUST_TOOLCHAIN" build --release --workspace --bins
+
+    - name: Upload vfs binary
+      uses: actions/upload-artifact@v4
+      with:
+        name: vfs-release-binary
+        path: target/release/vfs
+        retention-days: 1
+        if-no-files-found: error
+
+  gate-shell:
+    name: Gate shell ${{ matrix.shard }}/4
+    needs: gate-binary
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install system dependencies
+      run: ./scripts/install-deps.sh
+
+    - name: Download vfs binary
+      uses: actions/download-artifact@v4
+      with:
+        name: vfs-release-binary
+        path: target/release
+
     - name: Allow unprivileged user namespaces
       run: |
         # Ubuntu 24.04 runner images gate unprivileged user namespaces behind
         # AppArmor; without this the vfs run suites SKIP and the strict
         # gate goes red instead of exercising the sandbox for real.
+        chmod +x target/release/vfs
+        sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+    - name: Run shell gate shard
+      env:
+        # The runner kernel ships FUSE-over-io_uring disabled
+        # (/sys/module/fuse/parameters/enable_uring reads N), so the kernel
+        # refuses ring registration and the panic-census uring leg can never
+        # run here. That one SKIP is allowlisted; every other SKIP still
+        # fails the strict gate. The corruption-torture uring leg needs no
+        # entry: with enable_uring=N the mount falls back to the legacy
+        # channel and the leg passes.
+        VFS_GATE_ALLOWED_SKIPS: fuse-sigint-panic-census
+        VFS_GATE_SHARD: ${{ matrix.shard }}/4
+      run: scripts/gate.sh --phases shell
+
+  gate-python:
+    name: Honest milestone gate (python, canon, pjdfstest)
+    needs: gate-binary
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install system dependencies
+      run: ./scripts/install-deps.sh
+
+    - name: Download vfs binary
+      uses: actions/download-artifact@v4
+      with:
+        name: vfs-release-binary
+        path: target/release
+
+    - name: Allow unprivileged user namespaces
+      run: |
+        chmod +x target/release/vfs
         sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
     - name: Build pjdfstest
@@ -111,22 +179,11 @@ jobs:
         ./configure
         make pjdfstest
 
-    - name: Run shell and Python gate
-      env:
-        # The runner kernel ships FUSE-over-io_uring disabled
-        # (/sys/module/fuse/parameters/enable_uring reads N), so the kernel
-        # refuses ring registration and the panic-census uring leg can never
-        # run here. That one SKIP is allowlisted; every other SKIP still
-        # fails the strict gate. The corruption-torture uring leg needs no
-        # entry: with enable_uring=N the mount falls back to the legacy
-        # channel and the leg passes.
-        VFS_GATE_ALLOWED_SKIPS: fuse-sigint-panic-census
+    - name: Run Python gate and consistency canon
       run: |
-        # scripts/gate.sh runs crates/vfs-cli/tests/all.sh with
-        # VFS_GATE_STRICT=1, then phase8-validation.py --smoke (which
-        # includes the noopen/flush/base-drift coherence harnesses) and the
-        # consistency-canon census.
-        scripts/gate.sh
+        # phase8-validation.py --smoke includes the noopen/flush/base-drift
+        # coherence harnesses; the canon census is the structural gate.
+        scripts/gate.sh --phases python,canon
 
     - name: Run pjdfstest phase5-ci
       run: |

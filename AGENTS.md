@@ -124,6 +124,14 @@ warnings`, workspace tests, release build, the shell suite
 (`crates/vfs-cli/tests/all.sh` with `VFS_GATE_STRICT=1`, where a SKIP is red),
 `phase8-validation.py --smoke`, and the consistency canon.
 
+Those four groups are the `cargo`, `shell`, `python`, and `canon` phases.
+`gate.sh --phases shell,canon` runs a subset, and `VFS_GATE_SHARD=<i>/<n>`
+runs one round-robin slice of the shell suite against a prebuilt `VFS_BIN`.
+CI composes this one script across runners with those two knobs rather than
+keeping its own idea of what the gate is. A shard must own a whole machine —
+the corruption-torture legs may not run beside another mount — so never
+background two shards on one host.
+
 Narrower loops while iterating:
 
 ```bash
