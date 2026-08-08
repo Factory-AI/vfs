@@ -152,6 +152,43 @@ python3 scripts/validation/git-workload-benchmark-multi.py \
 python3 scripts/validation/bench-compare.py <baseline-medians.json> /tmp/vfs-val/bench-multi.json
 ```
 
+### The ratio is not the measurement
+
+Read the **absolute** per-phase medians, for both legs, before you read any
+`vfs / native` ratio. The two legs do not share controlled page-cache state,
+so the ratio moves when the *native* denominator moves, which it does a lot.
+Worked example from the two committed baselines in `.agents/benchmarks/`:
+
+| Phase | native | vfs | ratio |
+|---|---|---|---|
+| status | 0.1775s → 0.0271s | 0.3418s → 0.2999s | 1.93x → 11.06x |
+| diff | 0.2491s → 0.0204s | 0.2955s → 0.2751s | 1.19x → 13.50x |
+
+Vfs got *faster* on both phases while both ratios got roughly ten times
+worse. Anyone reading only the ratio column would report a severe regression
+that did not happen. A ratio is only meaningful against a native median
+captured under the same cache state, in the same session, with dispersion
+reported next to it.
+
+Corollary: the single-run JSONs in `.agents/benchmarks/` (`baseline-*.json`)
+are profiled single shots, not medians. They are provenance records, not the
+scoreboard. Do not quote them as targets.
+
+### The benchmark refuses to guess its workload
+
+`.agents/benchmarks/fixtures/` is gitignored, so the canonical codex fixture
+is absent on CI and on every fresh clone. `git-workload-benchmark.py` used to
+fall back to a generated 96x1KB fixture with a warning on stderr and still
+emit a scoreboard-shaped report. It now **errors out** instead; state your
+intent explicitly:
+
+* `--source <path>` / `--remote <url>` — measure a specific repository
+* nothing, with the fixture materialized — the canonical codex workload
+* `--synthetic` — the toy fixture, deliberately
+
+Every report carries `source.kind` and `source.comparable_to_scoreboard`.
+Check that field before comparing two runs.
+
 Focused local benchmarks: `git-workload-benchmark.py` (single run with
 `--profile` phase breakdown), `read-path-benchmark.py`,
 `large-edit-benchmark.py` (one-byte edit to a large base file must grow the

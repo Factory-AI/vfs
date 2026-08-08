@@ -416,6 +416,13 @@ def run_git_workload(
         ("--profile", None),
         ("--strict-portable", None),
     ]
+    if not args.full_gates:
+        # The smoke leg exists for correctness coverage (base unchanged,
+        # integrity, portability), not for the scoreboard, and the canonical
+        # fixture is gitignored so CI never has it. Ask for the toy fixture by
+        # name instead of relying on a fallback: the benchmark now refuses to
+        # substitute one workload for another.
+        optional_args.append(("--synthetic", None))
     if args.full_gates:
         optional_args.append(("--full-gates", None))
     for flag, value in optional_args:

@@ -225,6 +225,19 @@ Not regressions — deliberate, documented state. Don't "fix" them by accident.
 * **Benchmarks are a local gate, not CI.** Serialized, median-of-5, fresh
   release build, against a pinned baseline; single runs are noise. Red is a
   per-phase median regression >5% relative *and* >10ms absolute.
+* **Read absolute medians, not ratios.** The native and Vfs legs do not share
+  controlled page-cache state, so a `vfs / native` ratio moves when the
+  denominator moves. In the committed baselines, `status` and `diff` ratios
+  worsened roughly tenfold across two runs while the Vfs times *improved* —
+  the native leg had simply gotten faster. Quote absolute times with
+  dispersion; treat a bare ratio as unreviewed. The single-run
+  `.agents/benchmarks/baseline-*.json` files are profiled single shots, not
+  the scoreboard.
+* **The workload benchmark refuses to guess.** `.agents/benchmarks/fixtures/`
+  is gitignored, so the canonical codex fixture is missing on CI and on fresh
+  clones. `git-workload-benchmark.py` errors rather than silently measuring
+  the 96x1KB toy; pass `--source`, materialize the fixture, or say
+  `--synthetic`. Reports carry `source.comparable_to_scoreboard`.
 * **Known flakes**: `concurrency_integrity::active_workers` under full parallel
   load, and an occasional mcp-server "stdio session failed" under back-to-back
   gate load. Rerun before concluding regression.

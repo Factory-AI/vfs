@@ -614,10 +614,7 @@ def prepare_bare_mirror(args: argparse.Namespace, temp_root: Path) -> tuple[Path
         source_path = str(source)
     elif not args.synthetic and CANONICAL_FIXTURE.is_dir():
         # The scoreboard and every perf target are defined against the codex
-        # checkout. Bare invocations silently measuring the 96x1KB synthetic
-        # fixture produced incomparable ratios more than once, so the
-        # canonical fixture is the default; --synthetic is the explicit
-        # opt-out.
+        # checkout, so it is the default whenever it is present.
         print(
             f"note: no --source given; defaulting to the canonical fixture {CANONICAL_FIXTURE}",
             file=sys.stderr,
@@ -628,13 +625,23 @@ def prepare_bare_mirror(args: argparse.Namespace, temp_root: Path) -> tuple[Path
         require_git_ok(clone, "git clone --mirror canonical fixture")
         kind = "canonical-fixture"
         source_path = str(CANONICAL_FIXTURE)
+    elif not args.synthetic:
+        # Refuse rather than substitute. `.agents/benchmarks/fixtures/` is
+        # gitignored, so the canonical fixture is absent on CI and on every
+        # fresh clone. Quietly measuring the 96x1KB toy instead yields
+        # scoreboard-shaped numbers for a different workload, and a warning on
+        # stderr is no defence when the caller reads a JSON report. A
+        # benchmark that cannot measure the workload it claims must refuse to
+        # publish a number for it.
+        raise RuntimeError(
+            f"canonical fixture not found at {CANONICAL_FIXTURE}.\n"
+            "Refusing to silently measure a different workload. Pick one:\n"
+            "  * materialize it:  git clone --bare https://github.com/openai/codex "
+            f"{CANONICAL_FIXTURE}\n"
+            "  * measure another repo:  --source <path>   (or --remote <url>)\n"
+            "  * accept the toy fixture:  --synthetic   (NOT comparable to the scoreboard)"
+        )
     else:
-        if not args.synthetic:
-            print(
-                "warning: canonical fixture missing; falling back to the generated synthetic "
-                "fixture — numbers are NOT comparable to the scoreboard",
-                file=sys.stderr,
-            )
         generated = prepared / "generated-source"
         create_generated_repo(generated, args.fixture_files, args.fixture_dirs, args.fixture_file_size_bytes)
         clone = run_git(["clone", "--mirror", str(generated), str(mirror)], prepared, timeout=args.timeout)
@@ -644,7 +651,14 @@ def prepare_bare_mirror(args: argparse.Namespace, temp_root: Path) -> tuple[Path
 
     head = run_git(["--git-dir", str(mirror), "rev-parse", "HEAD"], prepared, timeout=args.timeout)
     require_git_ok(head, "git rev-parse mirror HEAD")
-    return mirror, {"kind": kind, "path": source_path, "mirror_head": head.stdout.strip()}
+    return mirror, {
+        "kind": kind,
+        "path": source_path,
+        "mirror_head": head.stdout.strip(),
+        # Every consumer of these ratios has to know whether they belong on
+        # the scoreboard. Carry it in the payload rather than in a log line.
+        "comparable_to_scoreboard": kind in ("canonical-fixture", "source", "remote"),
+    }
 
 
 def copy_mirror(source: Path, destination_root: Path) -> None:
@@ -1109,9 +1123,18 @@ def main(argv: list[str]) -> int:
                 "VFS_BIN": args.vfs_bin,
             },
             "parameters": {
-                "fixture_files": args.fixture_files,
-                "fixture_dirs": args.fixture_dirs,
-                "fixture_file_size_bytes": args.fixture_file_size_bytes,
+                # Synthetic-fixture geometry is only meaningful when the
+                # synthetic fixture was the thing measured. Reporting it
+                # unconditionally made codex runs look like 96x1KB runs.
+                **(
+                    {
+                        "fixture_files": args.fixture_files,
+                        "fixture_dirs": args.fixture_dirs,
+                        "fixture_file_size_bytes": args.fixture_file_size_bytes,
+                    }
+                    if source_info["kind"] == "generated"
+                    else {}
+                ),
                 "read_files": args.read_files,
                 "read_bytes": args.read_bytes,
                 "edit_files": args.edit_files,
