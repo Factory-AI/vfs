@@ -57,8 +57,12 @@ fn main() {
     // environment (see config::init_private_spill_dir).
     vfs_cli::config::init_private_spill_dir();
 
+    // Diagnostics go to stderr. stdout is a data channel this binary does not
+    // own: `run`/`exec` pass the wrapped command's output through it, and
+    // `mcp-server` speaks JSON-RPC over it. The fmt layer defaults to stdout,
+    // which interleaved log lines into both.
     let _ = tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .with(default_env_filter())
         .try_init();
 

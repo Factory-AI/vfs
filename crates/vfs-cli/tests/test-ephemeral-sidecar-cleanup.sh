@@ -110,15 +110,16 @@ assert_no_sidecars "run"
 
 # The private spill-dir TMPDIR override is process-internal: children of
 # run/exec must see the user's TMPDIR, not the vfs-spill-* dir.
-# Mount tracing emits on stdout; the child's printf (no trailing newline) is
-# always the last line of the captured stream.
-CHILD_TMPDIR="$(run_vfs run --session sidecar-tmpdir -- sh -c 'printf %s "${TMPDIR:-}"' 2>/dev/null | tail -n 1)"
+# stdout carries only the wrapped child's output, so it is compared verbatim:
+# a log line appearing here means diagnostics have leaked back onto the data
+# channel, which is the bug this asserts against.
+CHILD_TMPDIR="$(run_vfs run --session sidecar-tmpdir -- sh -c 'printf %s "${TMPDIR:-}"' 2>/dev/null)"
 if [ "$CHILD_TMPDIR" != "$PINNED_TMP" ]; then
     echo "FAILED: run child saw TMPDIR='$CHILD_TMPDIR', expected '$PINNED_TMP'"
     exit 1
 fi
 assert_no_sidecars "run-child-tmpdir"
-CHILD_TMPDIR="$(run_vfs exec sidecar sh -c 'printf %s "${TMPDIR:-}"' 2>/dev/null | tail -n 1)"
+CHILD_TMPDIR="$(run_vfs exec sidecar sh -c 'printf %s "${TMPDIR:-}"' 2>/dev/null)"
 if [ "$CHILD_TMPDIR" != "$PINNED_TMP" ]; then
     echo "FAILED: exec child saw TMPDIR='$CHILD_TMPDIR', expected '$PINNED_TMP'"
     exit 1
