@@ -12,7 +12,7 @@ resolver = "2"
 version = "0.6.4"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/tursodatabase/vfs"
+repository = "https://github.com/Factory-AI/vfs"
 
 # Concurrency canon (architecture.md section 7 item 7): no lock guard held
 # across an .await; enforced structurally, not by review.

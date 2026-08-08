@@ -1,13 +1,59 @@
 # Changelog
 
-## [Unreleased] - Fork-era: VFS Right-Thing Restructure
+## [Unreleased] - Fork era: restructure, rename, and session handoff
 
-This fork restructured the post-0.6.4 tree around a five-crate Rust
-workspace. The changes below are the user-visible summary of that campaign;
-behavior-preserving moves are not listed individually.
+Factory's fork of agentfs diverged after 0.6.4. This section is the
+user-visible summary of three campaigns: the Right-Thing Restructure onto a
+five-crate Rust workspace, the rename of the product surface to `vfs`, and
+the session-handoff pipeline (`seed` → `pack` → `adopt`).
+Behavior-preserving moves are not listed individually.
 
 ### Added
 
+- `vfs pack <session-id>`: prepares an inactive run session's `delta.db` as a
+  single-file transfer artifact. Pack takes the exclusive `.session.lock`,
+  rejects live mounts and owner/joiner processes with exit code `3`, and
+  performs pruning, schema migration, generation bump, checkpoint, and
+  compaction on a private staging copy only. Publication renames the old
+  database family to a deterministic backup, renames the completed staging
+  database into place, verifies its metadata, and rolls back on failure; a
+  later pack recovers the backup if the process died between renames.
+  `--output` artifacts publish via no-replace hard link. Pruning removes
+  matching delta paths through the core filesystem API rather than by
+  whiteout, so a pruned base-shadowing path falls back to the base version
+  (`--prune <GLOB>`, `--no-default-prunes`).
+- `vfs seed <session-id> --pin <commit>`: captures a run session's live git
+  state — dirty and untracked files, deletions since the pin as whiteouts,
+  local-only commits as a compact git pack plus `HEAD` and the branch ref,
+  and the sender's raw index bytes to preserve staged-vs-unstaged — into its
+  portable delta, without mounting. Git-ignored files are excluded as the
+  portable-state boundary. Seed is birth-time only and writes a private
+  staging database published only after import, whiteouts, metadata, and
+  finalization all succeed. `vfs run --session <id> --seed-pin <commit>` is
+  the atomic startup form, creating and seeding the delta under the exclusive
+  lock before downgrading to the lifetime shared run lock.
+- Schema v0.6: `fs_session_metadata(key, value)` carries `generation`,
+  `seeded_paths`, and `seed_pin` inside the transferable database, so handoff
+  provenance travels with the artifact instead of in session-directory
+  sidecars. The v0.5 → v0.6 migration is additive and runs in the same schema
+  transaction.
+- `vfs status <session-id> --json`: run-session state for daemon preflight,
+  reporting `stopped | busy | live | stale-recovered`, pid, pack generation,
+  and the seeded flag. Preflight performs the same recovery as resume, so the
+  reported state is truthful rather than cached.
+- Resumable run sessions: every start runs a recovery ladder under the session
+  lock — roll forward an interrupted pack publication, detach a stale mount,
+  reap dead owner/joiner proc records. Liveness is derived from the advisory
+  lock plus proc records, both released by the kernel on process death, which
+  makes the classification crash-consistent. A `vfs run --session <id>`
+  against a genuinely live session now joins it (shared lock, validated mount
+  and runtime status) instead of being rejected.
+- Reserved startup exit statuses, now API for daemon callers: `2` usage, `3`
+  session genuinely live, `4` mount or sandbox install failed, `5` session
+  missing or malformed, `126`/`127` exec conventions. The wrapped command's
+  own status passes through unchanged, and signals report as `128 + n`.
+- `vfs version` / `vfs version --json`: version, commit, and a `features`
+  capability map for callers that must detect a verb before invoking it.
 - `vfs adopt <session-id> --db <path> --base <path> [--pin <commit>]`:
   first-class installation of a transferred pack artifact as a local run
   session, replacing the hand-written "externally materialized run
@@ -32,29 +78,59 @@ behavior-preserving moves are not listed individually.
 ### Removed
 
 - Deleted SDKs: the Go, Python, and TypeScript SDKs and their CI workflows;
-  the Rust library survives as the `agentfs-core` crate.
+  the Rust library survives as the `vfs-core` crate.
 - The standalone example projects (built against the deleted SDKs).
 - The experimental ptrace sandbox and the `--experimental-sandbox` flag;
-  `agentfs run` is FUSE+overlay in Linux user/mount namespaces (NFS +
+  `vfs run` is FUSE+overlay in Linux user/mount namespaces (NFS +
   Sandbox on macOS).
 - Windows stubs and the Windows dist target; supported platforms are Linux
   (first-tier) and macOS (second-tier: NFS mount plus a sandboxed
-  `agentfs run`).
+  `vfs run`).
 - The `abi-7-*` FUSE feature matrix (17 features collapsed into the one
   compiled ABI level) and the dead vendored fuser/nfsserve surface.
 - The legacy path-based SDK API and the `AGENTFS_OVERLAY_PARTIAL_ORIGIN`
   env opt-in (superseded by the first-class `--partial-origin` policy).
-- `migrate-v0-5`: one `agentfs migrate` now lands any supported old schema
+- `migrate-v0-5`: one `vfs migrate` now lands any supported old schema
   (v0.0, v0.2, v0.4) at the current version, in place by default or with
   `--copy`-based re-chunking.
+- The hand-written "externally materialized run session" receiver contract,
+  in which a receiver assembled `~/.vfs/run/<id>/` by hand. The store layout
+  is private to `vfs` and reachable only through `vfs adopt`.
 
 ### Changed
 
+- The run-store layout (`~/.vfs/run/<id>/`) has a single owner. Six command
+  modules had each rebuilt the path set by hand, and `run/darwin.rs` carried a
+  wholesale duplicate of `SessionPaths`; a layout change had to be made in
+  seven places to be correct. `SessionPaths` is now the sole authority, with
+  `SessionLock` owning the `.session.lock` name. Remaining literals are
+  confined to test fixtures, where asserting the layout independently is the
+  point.
+- The Python validation harnesses no longer carry private copies of the
+  shared helpers in `scripts/validation/lib/common.py`. Sixteen files
+  duplicated `run_subprocess`, `resolve_vfs_bin`, `tail_text`,
+  `parse_json_stdout`, `git_commit`, and friends, and the copies had drifted:
+  eleven resolved the binary through the pre-restructure `cli/` path, several
+  called `git` directly instead of the `GIT`-pinned distro binary that
+  `pin_distro_git()` exists to enforce, one dropped the `TimeoutExpired`
+  guard that keeps a stuck process tree from crashing the harness, and one
+  scanned only the tail of stderr for profile summaries. All now import the
+  canonical implementations.
+- Toolchain moved to `nightly-2026-08-07` with dependencies refreshed;
+  `async-trait` 0.1.91 clears the `double_must_use` errors the newer clippy
+  reports against `#[async_trait]` expansions.
+- Renamed the product surface from `agentfs` to `vfs`: workspace crates, the
+  CLI binary and its output, validation tooling, benchmarks, and docs. Env
+  vars follow (`VFS_*`), as does the session store (`~/.vfs/run/`) and the
+  default database directory (`.vfs/`). One deliberate protocol break: the
+  NFS write-handle magic changes `AFSWRIT\0` → `VFSWRIT\0`, so write handles
+  minted by a pre-rename server are invalid after upgrade (clients re-open;
+  no data loss).
 - One root workspace after the crate split, five crates in a clean DAG —
-  `agentfs-core` (storage engine, overlay, schema authority, typed config,
-  telemetry, semantics), `agentfs-fuse` and `agentfs-nfs` (sealed transport
-  + adapter crates), `agentfs-mount` (one mount/supervision lifecycle), and
-  `agentfs-cli` (thin edge with a single error reporter).
+  `vfs-core` (storage engine, overlay, schema authority, typed config,
+  telemetry, semantics), `vfs-fuse` and `vfs-nfs` (sealed transport
+  + adapter crates), `vfs-mount` (one mount/supervision lifecycle), and
+  `vfs-cli` (thin edge with a single error reporter).
 - Config: every runtime knob is a typed declaration parsed at the crate
   edge with one truthy grammar; the generated `docs/KNOBS.md` ledger is
   parity-checked in CI, as is the `docs/MANUAL.md` command reference
@@ -68,18 +144,48 @@ behavior-preserving moves are not listed individually.
 
 ### Fixed
 
+- `vfs run`'s epilogue advertises `vfs diff <session-id>`, but `diff` only
+  resolved the `.vfs/<id>.db` agent-database convention, so the command it
+  printed always failed for run sessions. `diff` now falls back to the run
+  store after the agent lookup misses, and the not-found error names both
+  lookups and points at `vfs ps`.
+
+- The validation harnesses launched workloads with `sys.executable`. Under
+  `vfs run --no-default-allows` the sandbox hides `$HOME`, so on any machine
+  whose `python3` lives under `~/.local` (pyenv, uv, a user-installed
+  CPython) the interpreter did not exist inside the sandbox and the workload
+  died with exit `127` before it could test anything. Nine harnesses were
+  affected, including the `noopen-coherence` and `partial-origin-no-real-write`
+  gates. They now resolve a system interpreter via `sandbox_python()`, the
+  counterpart to the existing `pin_distro_git()`. Machines whose `python3` is
+  the distro one were never affected, which is why CI never saw it.
+
+- `scripts/gate.sh` defaulted to a bare `+nightly`, which overrides the
+  `rust-toolchain.toml` pin: the gate could lint and test against a different
+  compiler than CI and than every plain `cargo` invocation in the tree. It now
+  derives the channel from the pin.
+
 - The FUSE mount surface accepted `--uid`/`--gid` ("User ID to report for
   all files") but never consumed them: attributes always reported the
   stored inode ownership. A delta created by one user and resumed by
   another (e.g. a session database moved to a different machine) surfaced
-  every file as an unmappable foreign uid — `nobody` inside the `agentfs
+  every file as an unmappable foreign uid — `nobody` inside the `vfs
   run` user namespace — making owner-only (0600) files unreadable. The
   adapter now squashes reported ownership to the configured uid/gid; since
-  `agentfs run` already mounts with the current user, resumed foreign
+  `vfs run` already mounts with the current user, resumed foreign
   deltas are fully readable. Modes are untouched, and stored ownership in
   the database is preserved.
 
-- macOS `agentfs run` left reads unscoped (a blanket `(allow file-read*)`
+- A directory passed to `vfs run --allow` was self-bound with a plain
+  `MS_BIND`, which shadowed any mount nested beneath it. An externally
+  materialized checkout under an allowed data directory therefore kept its
+  overlay for the inherited-cwd view but served the raw base tree to any
+  subprocess spawned with an absolute cwd, silently losing the delta.
+  Directory allows now bind with `MS_BIND | MS_REC`. Found by the live
+  cross-machine handoff demo and pinned by
+  `crates/vfs-cli/tests/test-run-resume-hardening.sh`.
+
+- macOS `vfs run` left reads unscoped (a blanket `(allow file-read*)`
   in the generated Seatbelt profile) while Linux hid home and temp dirs
   behind namespaces. The profile is now default-deny for reads: only the
   session paths, the allowed directories (defaults plus `--allow`), and a
@@ -107,10 +213,25 @@ behavior-preserving moves are not listed individually.
 - Honest CI gate (`scripts/gate.sh`): strict shell suite where SKIP is
   red, corruption torture on both uring legs, Phase 8 smoke, and the
   no-open/no-flush coherence gates.
+- Structural canon census (`scripts/validation/consistency-canon.sh`), wired
+  into the gate: crate DAG, sealed transport surfaces, production file-size
+  cap, tracing-only logging, env reads confined to config modules,
+  `await_holding_lock`, lock-order headers, and docs layout.
+- `crates/vfs-cli/tests/test-run-resume-hardening.sh` pins the receiver
+  contract, the crash-resume matrix, and the nested-checkout-under-allowed-
+  ancestor case.
 - Local-only perf gate: serialized median-of-5 codex workload benchmark
   against a pinned baseline; any per-phase median regression >5% is red.
 - The macOS NFS git validation script is documented as a manual release
   gate to run on real hardware.
+
+### Known gaps
+
+- Cross-platform handoff (a macOS sender to a Linux receiver) is exercised
+  manually only; there is no macOS runner in the automated gate.
+- FUSE-over-io_uring legs are honest only on a local kernel with
+  `fuse.enable_uring=1`; CI kernels ship it disabled and fall back to the
+  legacy channel.
 
 ## [0.6.4] - 2026-03-25
 
