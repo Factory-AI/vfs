@@ -11,10 +11,12 @@ the package from any CWD:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
 import signal
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -24,6 +26,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 OUTPUT_TAIL_CHARS = 8000
+HASH_BLOCK_BYTES = 1024 * 1024
 
 
 def positive_int(value: str) -> int:
@@ -38,6 +41,128 @@ def positive_float(value: str) -> float:
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be > 0")
     return parsed
+
+
+
+
+def percentile(values: list[float], quantile: float) -> float:
+    """Linearly interpolated percentile for a non-empty numeric sample."""
+    if not values:
+        raise ValueError("percentile requires at least one value")
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    position = (len(ordered) - 1) * quantile
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    fraction = position - lower
+    return ordered[lower] * (1.0 - fraction) + ordered[upper] * fraction
+
+
+def summarize_floats(values: list[float]) -> dict[str, float | int]:
+    """Absolute distribution summary used by local measurement harnesses."""
+    cleaned = [float(value) for value in values if isinstance(value, (int, float))]
+    if not cleaned:
+        return {"n": 0}
+    return {
+        "n": len(cleaned),
+        "median": statistics.median(cleaned),
+        "p25": percentile(cleaned, 0.25),
+        "p75": percentile(cleaned, 0.75),
+        "min": min(cleaned),
+        "max": max(cleaned),
+        "stdev": statistics.stdev(cleaned) if len(cleaned) > 1 else 0.0,
+    }
+
+
+def tree_fingerprint(root: Path) -> dict[str, Any]:
+    """Hash recursive content plus stable metadata without reading atime.
+
+    Sandboxed-write validators compare this value before and after a run.
+    Symlinked directories are recorded as links instead of traversed so a
+    fixture cannot make the invariant check escape its declared base tree.
+    """
+    digest = hashlib.sha256()
+    files = 0
+    directories = 0
+    symlinks = 0
+    total_bytes = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        for name in sorted(list(dirnames)):
+            path = Path(dirpath) / name
+            if not path.is_symlink():
+                continue
+            rel = path.relative_to(root).as_posix()
+            stat = path.lstat()
+            digest.update(b"symlink-dir\0")
+            digest.update(rel.encode("utf-8", errors="surrogateescape"))
+            digest.update(b"\0")
+            digest.update(
+                f"{stat.st_mode}:{stat.st_uid}:{stat.st_gid}:{stat.st_size}:{stat.st_mtime_ns}".encode(
+                    "ascii"
+                )
+            )
+            digest.update(b"\0")
+            digest.update(os.readlink(path).encode("utf-8", errors="surrogateescape"))
+            digest.update(b"\0")
+            symlinks += 1
+            dirnames.remove(name)
+        dirnames.sort()
+        filenames.sort()
+        directory = Path(dirpath)
+        rel_dir = directory.relative_to(root).as_posix()
+        stat = directory.lstat()
+        digest.update(b"dir\0")
+        digest.update(rel_dir.encode("utf-8", errors="surrogateescape"))
+        digest.update(b"\0")
+        digest.update(
+            f"{stat.st_mode}:{stat.st_uid}:{stat.st_gid}:{stat.st_size}:{stat.st_mtime_ns}".encode(
+                "ascii"
+            )
+        )
+        digest.update(b"\0")
+        directories += 1
+        for name in filenames:
+            path = directory / name
+            rel = path.relative_to(root).as_posix()
+            stat = path.lstat()
+            if path.is_symlink():
+                digest.update(b"symlink\0")
+                digest.update(rel.encode("utf-8", errors="surrogateescape"))
+                digest.update(b"\0")
+                digest.update(
+                    f"{stat.st_mode}:{stat.st_uid}:{stat.st_gid}:{stat.st_size}:{stat.st_mtime_ns}".encode(
+                        "ascii"
+                    )
+                )
+                digest.update(b"\0")
+                digest.update(
+                    os.readlink(path).encode("utf-8", errors="surrogateescape")
+                )
+                digest.update(b"\0")
+                symlinks += 1
+                continue
+            digest.update(b"file\0")
+            digest.update(rel.encode("utf-8", errors="surrogateescape"))
+            digest.update(b"\0")
+            digest.update(
+                f"{stat.st_mode}:{stat.st_uid}:{stat.st_gid}:{stat.st_size}:{stat.st_mtime_ns}".encode(
+                    "ascii"
+                )
+            )
+            digest.update(b"\0")
+            files += 1
+            total_bytes += stat.st_size
+            with path.open("rb") as handle:
+                while chunk := handle.read(HASH_BLOCK_BYTES):
+                    digest.update(chunk)
+    return {
+        "sha256": digest.hexdigest(),
+        "files": files,
+        "directories": directories,
+        "symlinks": symlinks,
+        "bytes": total_bytes,
+    }
 
 
 def env_flag(name: str) -> bool:

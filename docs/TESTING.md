@@ -189,6 +189,58 @@ intent explicitly:
 Every report carries `source.kind` and `source.comparable_to_scoreboard`.
 Check that field before comparing two runs.
 
+### Chaos workload benchmark
+
+`chaos-workload-benchmark.py` runs a seeded, concurrent approximation of an
+agent workload rather than a sequence of isolated Git phases. Its actors mix
+Git status/diff/add/commit/branch switching, scattered edits, one-byte edits
+to large base files, metadata-heavy scans and small reads, build-artifact
+create/rewrite/delete churn, rename/unlink including unlink-while-open, and
+`git fetch` over a hermetic loopback Git daemon.
+Each Git-churn actor uses a nested checkout inside the same mount, so branch
+switching cannot invalidate an editor's correctness assertion in the root
+checkout. Operations that mutate the same Git control directory share a
+narrow lock; Git reads and all non-Git actors remain concurrent.
+
+```bash
+python3 scripts/validation/chaos-workload-benchmark.py \
+  --samples 5 --seed 20250808 --actors 6 --operations 8 --profile \
+  --vfs-bin "$PWD/target/release/vfs" \
+  --output /tmp/vfs-val/chaos.json
+```
+
+The measured schedule is strictly interleaved
+`native, vfs, native, vfs, ...`. Dropping the global page cache is neither
+available nor appropriate for an unprivileged local harness, so each leg
+performs the same read/status/loopback warmup before its timer starts and the
+payload records that disposition. Read `absolute_wall_seconds.native` and
+`.vfs` first: each reports median, p25, p75, min, max, stdev, and n. The
+`derived.vfs_over_native_median` value is calculated only after those
+distributions and is not a primary measurement or a gate.
+
+Fixed-operation runs reproduce the same actor action plan for a given seed;
+the payload carries its digest. `--duration` is available for exploratory
+soak runs but is explicitly marked less reproducible because scheduling
+determines the final operation count. Actor count must be at least six so
+every actor class remains represented. Per-actor intensity flags multiply
+the base operation count.
+
+The fixture contract matches the Git workload benchmark: the canonical codex
+fixture is used when materialized, otherwise the benchmark refuses to run
+unless given `--source`, `--remote`, or the explicit non-comparable
+`--synthetic`. Only the resolved canonical fixture is marked scoreboard
+comparable; an arbitrary source path or remote has a different workload
+identity. Real fetch egress is available only through `--fetch-url`; the
+default loopback remote is deterministic, and any override also marks
+`source.comparable_to_scoreboard` false.
+
+Every Vfs sample enables partial-origin copy-up and must pass actor read-back
+checks, `git fsck --strict`, a recursive host-base fingerprint comparison, and
+`vfs integrity --check-base --checkpoint`. `--profile` attaches the FUSE
+per-operation counters emitted at teardown. This is a measurement instrument:
+it has no performance threshold and is not part of `gate.sh` or CI. As with
+the corruption-torture tests, never run it beside another mount workload.
+
 Focused local benchmarks: `git-workload-benchmark.py` (single run with
 `--profile` phase breakdown), `read-path-benchmark.py`,
 `large-edit-benchmark.py` (one-byte edit to a large base file must grow the

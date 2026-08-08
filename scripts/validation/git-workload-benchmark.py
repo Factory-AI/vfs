@@ -651,13 +651,21 @@ def prepare_bare_mirror(args: argparse.Namespace, temp_root: Path) -> tuple[Path
 
     head = run_git(["--git-dir", str(mirror), "rev-parse", "HEAD"], prepared, timeout=args.timeout)
     require_git_ok(head, "git rev-parse mirror HEAD")
+    # The scoreboard is defined against one workload, so only that workload is
+    # comparable to it -- an arbitrary --source measures something else, however
+    # valid. Resolve the path rather than trusting `kind`: the committed
+    # baselines were captured by passing --source at the canonical fixture, and
+    # those are the same workload.
+    comparable = kind == "canonical-fixture" or (
+        kind == "source" and Path(source_path).resolve() == CANONICAL_FIXTURE.resolve()
+    )
     return mirror, {
         "kind": kind,
         "path": source_path,
         "mirror_head": head.stdout.strip(),
         # Every consumer of these ratios has to know whether they belong on
         # the scoreboard. Carry it in the payload rather than in a log line.
-        "comparable_to_scoreboard": kind in ("canonical-fixture", "source", "remote"),
+        "comparable_to_scoreboard": comparable,
     }
 
 
