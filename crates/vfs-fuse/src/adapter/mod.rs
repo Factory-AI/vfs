@@ -1,3 +1,4 @@
+#[cfg(target_os = "linux")]
 mod base_watcher;
 mod cache;
 pub(crate) mod config;
@@ -2878,11 +2879,14 @@ pub fn mount(
     let dispatch_mode = fuse_config.dispatch_mode;
     let uring_config = fuse_config.uring;
     let fs = VfsFuse::new(fs, runtime, fuse_config, opts.uid, opts.gid);
-    let watch_root = fs.fs.external_watch_root();
-    let ignored_watch_paths = fs.fs.external_watch_ignored_paths();
-    let caches = fs.caches.clone();
     let mount_opts = build_mount_options(&opts)?;
-    let prepared_watcher = base_watcher::prepare(watch_root, ignored_watch_paths)?;
+    #[cfg(target_os = "linux")]
+    let prepared_watcher = base_watcher::prepare(
+        fs.fs.external_watch_root(),
+        fs.fs.external_watch_ignored_paths(),
+    )?;
+    #[cfg(target_os = "linux")]
+    let caches = fs.caches.clone();
 
     let mut session = crate::transport::Session::new(
         fs,
@@ -2892,9 +2896,12 @@ pub fn mount(
         uring_config,
     )?;
     let unmounter = session.unmount_callable();
+    #[cfg(target_os = "linux")]
     let base_watcher = prepared_watcher
         .map(|watcher| watcher.start(caches, session.notifier(), unmounter.clone()))
         .transpose()?;
+    #[cfg(not(target_os = "linux"))]
+    let base_watcher = ();
     let thread = std::thread::spawn(move || {
         let _base_watcher = base_watcher;
         session.run().map_err(anyhow::Error::from)

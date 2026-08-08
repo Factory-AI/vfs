@@ -11,7 +11,6 @@ workspace = true
 [dependencies]
 vfs-core = { workspace = true }
 anyhow = { workspace = true }
-inotify = { workspace = true }
 libc = { workspace = true }
 memchr = { workspace = true }
 nix = { workspace = true }
@@ -22,6 +21,9 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 turso = { workspace = true }
 zerocopy = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+inotify = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
