@@ -1,12 +1,21 @@
 # Changelog
 
-## [Unreleased] - Fork era: restructure, rename, and session handoff
+## [1.0.0] - 2026-08-07 - Fork era: restructure, rename, and session handoff
 
-Factory's fork of agentfs diverged after 0.6.4. This section is the
-user-visible summary of three campaigns: the Right-Thing Restructure onto a
-five-crate Rust workspace, the rename of the product surface to `vfs`, and
-the session-handoff pipeline (`seed` → `pack` → `adopt`).
-Behavior-preserving moves are not listed individually.
+First release under Factory's own identity. The fork diverged from agentfs
+after 0.6.4; this is the user-visible summary of three campaigns: the
+Right-Thing Restructure onto a five-crate Rust workspace, the rename of the
+product surface to `vfs`, and the session-handoff pipeline
+(`seed` → `pack` → `adopt`). Behavior-preserving moves are not listed
+individually.
+
+Upgrading from agentfs 0.6.x is not a drop-in swap: the binary, the env vars
+(`VFS_*`), the session store (`~/.vfs/run/`) and the default database
+directory (`.vfs/`) all changed name, and the NFS write-handle magic changed,
+so write handles minted by a pre-rename server are invalid after upgrade.
+The handoff artifact contract is unaffected — `artifactVersion` stays `0.6`
+and `minSupportedArtifactVersion` stays `0.0`, so a 1.0.0 receiver still
+adopts artifacts produced by the 0.6.x fork builds.
 
 ### Added
 
