@@ -8,7 +8,6 @@ import hashlib
 import json
 import os
 import shutil
-import signal
 import socket
 import subprocess
 import sys
@@ -591,6 +590,9 @@ def main():
     args = parser.parse_args()
 
     root = Path.cwd()
+    first_request_started_ns = time.perf_counter_ns()
+    root.stat()
+    first_request_completed_ns = time.perf_counter_ns()
     paths = tracked_files(root)
     large_paths = sorted(paths, key=lambda rel: (root / rel).stat().st_size, reverse=True)[
         : max(1, min(16, len(paths)))
@@ -677,6 +679,14 @@ def main():
             "action_plan_reproducible": args.duration is None,
         },
         "cache_warmup": warmup,
+        "lifecycle": {
+            "first_request_started_ns": first_request_started_ns,
+            "first_request_completed_ns": first_request_completed_ns,
+            "first_request_service_seconds": (
+                first_request_completed_ns - first_request_started_ns
+            )
+            / 1_000_000_000,
+        },
         "git_churn_repositories": {
             str(actor_id): str(path.relative_to(root))
             for actor_id, path in sorted(git_churn_repos.items())
@@ -711,13 +721,6 @@ def at_least_six(value: str) -> int:
     return parsed
 
 
-def non_negative_int(value: str) -> int:
-    parsed = int(value)
-    if parsed < 0:
-        raise argparse.ArgumentTypeError("must be >= 0")
-    return parsed
-
-
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -738,11 +741,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--samples", type=positive_int, default=5)
     parser.add_argument(
         "--warmup",
-        type=non_negative_int,
+        type=common.non_negative_int,
         default=1,
         help="leading samples run but discarded, so a cold fixture cache does not enter the distribution",
     )
     parser.add_argument("--seed", type=int, default=20250808)
+    parser.add_argument(
+        "--leg-order",
+        choices=("alternating", "native-first", "vfs-first"),
+        default="alternating",
+        help="order each native/Vfs pair; alternating balances first-leg cache effects",
+    )
     parser.add_argument("--actors", type=at_least_six, default=6)
     parser.add_argument("--operations", type=positive_int, default=8)
     parser.add_argument(
@@ -753,7 +762,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     for kind in ACTOR_KINDS:
         parser.add_argument(
             f"--{kind.replace('_', '-')}-intensity",
-            type=non_negative_int,
+            type=common.non_negative_int,
             default=1,
             help=f"multiply the base operation count for {kind} actors (0 disables work)",
         )
@@ -779,7 +788,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--keep-temp", action="store_true", default=env_flag("CHAOS_KEEP_TEMP")
     )
     parser.add_argument("--output", help="write the JSON payload to this path")
-    parser.add_argument("--json-indent", type=non_negative_int, default=2)
+    parser.add_argument("--json-indent", type=common.non_negative_int, default=2)
     parser.add_argument(
         "--self-test-base-mutation-guard",
         action="store_true",
@@ -972,26 +981,32 @@ def start_git_daemon(
 ) -> tuple[subprocess.Popen[str], str]:
     port = free_loopback_port()
     root = mirror.parent
-    proc = subprocess.Popen(
-        [
-            env.get("GIT", "git"),
-            "daemon",
-            "--reuseaddr",
-            "--export-all",
-            "--verbose",
-            "--informative-errors",
-            "--listen=127.0.0.1",
-            f"--port={port}",
-            f"--base-path={root}",
-            str(root),
-        ],
-        cwd=str(root),
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
-    )
+    stdout_path = root / "git-daemon.stdout.log"
+    stderr_path = root / "git-daemon.stderr.log"
+    with (
+        stdout_path.open("w", encoding="utf-8") as stdout,
+        stderr_path.open("w", encoding="utf-8") as stderr,
+    ):
+        proc = subprocess.Popen(
+            [
+                env.get("GIT", "git"),
+                "daemon",
+                "--reuseaddr",
+                "--export-all",
+                "--verbose",
+                "--informative-errors",
+                "--listen=127.0.0.1",
+                f"--port={port}",
+                f"--base-path={root}",
+                str(root),
+            ],
+            cwd=str(root),
+            env=env,
+            text=True,
+            stdout=stdout,
+            stderr=stderr,
+            start_new_session=True,
+        )
     url = f"git://127.0.0.1:{port}/{mirror.name}"
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
@@ -999,155 +1014,14 @@ def start_git_daemon(
         if probe.returncode == 0:
             return proc, url
         if proc.poll() is not None:
-            stdout, stderr = proc.communicate()
             raise RuntimeError(
-                f"git daemon exited before becoming ready\nstdout:\n{stdout}\nstderr:\n{stderr}"
+                "git daemon exited before becoming ready\n"
+                f"stdout:\n{stdout_path.read_text(encoding='utf-8', errors='replace')}\n"
+                f"stderr:\n{stderr_path.read_text(encoding='utf-8', errors='replace')}"
             )
         time.sleep(0.05)
     common.terminate_process_tree(proc)
     raise RuntimeError("timed out waiting for loopback git daemon")
-
-
-def isolate_env(base_env: dict[str, str], leg_root: Path) -> dict[str, str]:
-    """Give one measured leg its own HOME, XDG dirs and TMPDIR.
-
-    A HOME shared across legs carries a session store, git config and caches
-    from one measurement into the next, so a sample can be measuring state its
-    predecessor left behind. Each leg gets a fresh context instead.
-    """
-    env = dict(base_env)
-    home = leg_root / "home"
-    for path in (home, home / ".config", home / ".cache", home / ".local" / "share"):
-        path.mkdir(parents=True, exist_ok=True)
-    env["HOME"] = str(home)
-    env["XDG_CONFIG_HOME"] = str(home / ".config")
-    env["XDG_CACHE_HOME"] = str(home / ".cache")
-    env["XDG_DATA_HOME"] = str(home / ".local" / "share")
-    common.pin_distro_git(env, home, home=home)
-    tmp = leg_root / "tmp"
-    tmp.mkdir(parents=True, exist_ok=True)
-    env["TMPDIR"] = str(tmp)
-    env["TMP"] = str(tmp)
-    env["TEMP"] = str(tmp)
-    return env
-
-
-def mounts_under(root: Path) -> list[str]:
-    """Live mountpoints below one leg context."""
-    prefix = str(root.resolve()).rstrip(os.sep) + os.sep
-    mounts: list[str] = []
-    try:
-        lines = Path("/proc/self/mountinfo").read_text(
-            encoding="utf-8", errors="replace"
-        ).splitlines()
-    except OSError:
-        return mounts
-    for line in lines:
-        fields = line.split(" - ", 1)[0].split()
-        if len(fields) < 5:
-            continue
-        mountpoint = fields[4].replace("\\040", " ")
-        if mountpoint == str(root) or mountpoint.startswith(prefix):
-            mounts.append(mountpoint)
-    return sorted(mounts)
-
-
-def processes_for_leg(session: str, leg_root: Path) -> list[dict[str, Any]]:
-    """Processes retaining a session id or an isolated leg path."""
-    root_bytes = str(leg_root).encode()
-    session_bytes = session.encode()
-    matches: list[dict[str, Any]] = []
-    try:
-        entries = list(Path("/proc").iterdir())
-    except OSError:
-        return matches
-    for entry in entries:
-        if not entry.name.isdigit() or int(entry.name) == os.getpid():
-            continue
-        try:
-            cmdline = (entry / "cmdline").read_bytes()
-            environ = (entry / "environ").read_bytes()
-        except OSError:
-            continue
-        if (
-            session_bytes not in cmdline
-            and session_bytes not in environ
-            and root_bytes not in cmdline
-            and root_bytes not in environ
-        ):
-            continue
-        matches.append(
-            {
-                "pid": int(entry.name),
-                "cmdline": " ".join(
-                    chunk.decode("utf-8", "replace")
-                    for chunk in cmdline.split(b"\0")
-                    if chunk
-                ),
-            }
-        )
-    return matches
-
-
-def wait_for_leg_cleanup(
-    session: str, leg_root: Path, timeout_seconds: float = 2.0
-) -> dict[str, Any]:
-    """Prove a context is idle and recover it before another leg can start."""
-    started = time.monotonic()
-    processes: list[dict[str, Any]] = []
-    mounts: list[str] = []
-    while True:
-        processes = processes_for_leg(session, leg_root)
-        mounts = mounts_under(leg_root)
-        if not processes and not mounts:
-            break
-        if time.monotonic() - started >= timeout_seconds:
-            break
-        time.sleep(0.05)
-    clean_exit = not processes and not mounts
-    initial_processes = processes
-    initial_mounts = mounts
-    if not clean_exit:
-        for process in initial_processes:
-            try:
-                os.kill(int(process["pid"]), signal.SIGTERM)
-            except (OSError, ValueError):
-                pass
-        time.sleep(0.2)
-        for process in processes_for_leg(session, leg_root):
-            try:
-                os.kill(int(process["pid"]), signal.SIGKILL)
-            except (OSError, ValueError):
-                pass
-        fusermount = shutil.which("fusermount3")
-        if fusermount is not None:
-            for mount in sorted(initial_mounts, reverse=True):
-                subprocess.run(
-                    [fusermount, "-uz", mount],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                )
-        recovery_deadline = time.monotonic() + timeout_seconds
-        while True:
-            processes = processes_for_leg(session, leg_root)
-            mounts = mounts_under(leg_root)
-            if not processes and not mounts:
-                break
-            if time.monotonic() >= recovery_deadline:
-                break
-            time.sleep(0.05)
-    return {
-        "ok": clean_exit,
-        "clean_exit": clean_exit,
-        "recovery_attempted": not clean_exit,
-        "final_clean": not processes and not mounts,
-        "initial_processes": initial_processes,
-        "initial_mounts": initial_mounts,
-        "processes": processes,
-        "mounts": mounts,
-        "waited_seconds": time.monotonic() - started,
-    }
 
 
 def prepare_environment(temp_root: Path, profile: bool) -> dict[str, str]:
@@ -1160,7 +1034,7 @@ def prepare_environment(temp_root: Path, profile: bool) -> dict[str, str]:
         env["VFS_PROFILE"] = "1"
     else:
         env.pop("VFS_PROFILE", None)
-    return isolate_env(env, temp_root / "setup")
+    return common.isolate_benchmark_env(env, temp_root / "setup")
 
 
 def workload_argv(args: argparse.Namespace, remote_url: str) -> list[str]:
@@ -1190,7 +1064,16 @@ def workload_argv(args: argparse.Namespace, remote_url: str) -> list[str]:
 
 
 def compact_run(run: dict[str, Any]) -> dict[str, Any]:
-    compact = {key: value for key, value in run.items() if key != "stdout"}
+    compact = {
+        key: value
+        for key, value in run.items()
+        if key
+        not in {
+            "stdout",
+            "started_perf_counter_ns",
+            "finished_perf_counter_ns",
+        }
+    }
     argv = compact.get("argv")
     if isinstance(argv, list) and "-c" in argv:
         index = argv.index("-c")
@@ -1203,50 +1086,38 @@ def compact_run(run: dict[str, Any]) -> dict[str, Any]:
     return compact
 
 
-def profile_counters(summaries: list[dict[str, Any]]) -> dict[str, Any]:
-    max_counters: dict[str, int] = {}
-    by_source: dict[str, dict[str, int]] = {}
-    for summary in summaries:
-        counters = summary.get("counters")
-        if not isinstance(counters, dict):
-            continue
-        numeric = {
-            str(key): int(value)
-            for key, value in counters.items()
-            if isinstance(value, int)
-        }
-        by_source[str(summary.get("source", "unknown"))] = numeric
-        for key, value in numeric.items():
-            max_counters[key] = max(max_counters.get(key, 0), value)
-    per_operation = {
-        key: value
-        for key, value in max_counters.items()
-        if key.startswith(("fuse_", "op_", "fs_"))
-        or key
-        in {
-            "lookup",
-            "getattr",
-            "open",
-            "read",
-            "write",
-            "release",
-            "readdir",
-            "create",
-            "rename",
-            "unlink",
-            "flush",
-            "fsync",
-        }
-    }
+def lifecycle_timing(
+    run: dict[str, Any], workload: Optional[dict[str, Any]]
+) -> Optional[dict[str, float]]:
+    if not isinstance(workload, dict):
+        return None
+    lifecycle = workload.get("lifecycle")
+    started_ns = run.get("started_perf_counter_ns")
+    if not isinstance(lifecycle, dict) or not isinstance(started_ns, int):
+        return None
+    request_started_ns = lifecycle.get("first_request_started_ns")
+    request_completed_ns = lifecycle.get("first_request_completed_ns")
+    request_seconds = lifecycle.get("first_request_service_seconds")
+    if (
+        not isinstance(request_started_ns, int)
+        or not isinstance(request_completed_ns, int)
+        or not isinstance(request_seconds, (int, float))
+        or request_started_ns < started_ns
+        or request_completed_ns < request_started_ns
+    ):
+        return None
     return {
-        "summary_count": len(summaries),
-        "max_counters": max_counters,
-        "fuse_per_operation": per_operation,
-        "last_by_source": by_source,
+        "process_to_request_start_seconds": (request_started_ns - started_ns)
+        / 1_000_000_000,
+        "process_to_first_request_seconds": (request_completed_ns - started_ns)
+        / 1_000_000_000,
+        "first_request_service_seconds": float(request_seconds),
     }
 
 
-def probe_engine(vfs_bin: str, cwd: Path, env: dict[str, str], timeout: float) -> dict[str, Any]:
+def probe_engine(
+    vfs_bin: str, cwd: Path, env: dict[str, str], timeout: float
+) -> dict[str, Any]:
     """Identify the binary under measurement and what it can be asked to do.
 
     The same workload is run against engines that do not share a feature set --
@@ -1255,8 +1126,12 @@ def probe_engine(vfs_bin: str, cwd: Path, env: dict[str, str], timeout: float) -
     state which verifications were actually available, so a reader cannot
     mistake "not checked" for "checked and clean".
     """
-    version = run_subprocess([vfs_bin, "--version"], cwd, env, timeout, keep_stdout=True)
-    run_help = run_subprocess([vfs_bin, "run", "--help"], cwd, env, timeout, keep_stdout=True)
+    version = run_subprocess(
+        [vfs_bin, "--version"], cwd, env, timeout, keep_stdout=True
+    )
+    run_help = run_subprocess(
+        [vfs_bin, "run", "--help"], cwd, env, timeout, keep_stdout=True
+    )
     integrity_help = run_subprocess(
         [vfs_bin, "integrity", "--help"], cwd, env, timeout, keep_stdout=True
     )
@@ -1343,6 +1218,9 @@ def render_summary(result: dict[str, Any]) -> str:
     stats = result.get("absolute_wall_seconds", {})
     native = stats.get("native", {})
     vfs = stats.get("vfs", {})
+    startup = result.get("absolute_startup_seconds", {})
+    native_startup = startup.get("native", {})
+    vfs_startup = startup.get("vfs", {})
     derived = result.get("derived", {})
     ratio = derived.get("vfs_over_native_median")
     ratio_text = f"{ratio:.2f}x" if isinstance(ratio, (int, float)) else "n/a"
@@ -1352,6 +1230,8 @@ def render_summary(result: dict[str, Any]) -> str:
         f"(p25 {native.get('p25', float('nan')):.3f}, p75 {native.get('p75', float('nan')):.3f}, n={native.get('n', 0)})\n"
         f"  vfs    median {vfs.get('median', float('nan')):.3f}s "
         f"(p25 {vfs.get('p25', float('nan')):.3f}, p75 {vfs.get('p75', float('nan')):.3f}, n={vfs.get('n', 0)})\n"
+        f"  startup native {native_startup.get('median', float('nan')):.3f}s; "
+        f"vfs {vfs_startup.get('median', float('nan')):.3f}s\n"
         f"  derived median ratio {ratio_text}; "
         f"total measured ops {result.get('total_ops', 0)}; seed {result.get('seed')}"
     )
@@ -1404,6 +1284,10 @@ def main(argv: list[str]) -> int:
         samples: list[dict[str, Any]] = []
         native_seconds: list[float] = []
         vfs_seconds: list[float] = []
+        native_startup_seconds: list[float] = []
+        vfs_startup_seconds: list[float] = []
+        native_first_request_seconds: list[float] = []
+        vfs_first_request_seconds: list[float] = []
         schedule = []
         total_sample_count = args.warmup + args.samples
         for sample_index in range(total_sample_count):
@@ -1412,19 +1296,31 @@ def main(argv: list[str]) -> int:
             # it into the distribution is what produced medians that moved with
             # whichever engine happened to run first.
             warmup_sample = sample_index < args.warmup
-            for leg in ("native", "vfs"):
+            if args.leg_order == "native-first":
+                legs = ("native", "vfs")
+            elif args.leg_order == "vfs-first":
+                legs = ("vfs", "native")
+            else:
+                legs = ("native", "vfs") if sample_index % 2 == 0 else ("vfs", "native")
+            for leg in legs:
                 if not warmup_sample:
                     schedule.append(leg)
                 leg_root = temp_root / "runs" / f"{sample_index:02d}-{leg}"
                 root = leg_root / "checkout"
                 shutil.copytree(template, root, symlinks=True)
                 session = f"chaos-{sample_index}-{uuid.uuid4().hex}"
-                env = isolate_env(base_env, leg_root)
+                env = common.isolate_benchmark_env(base_env, leg_root)
                 db_path = Path(env["HOME"]) / ".vfs" / "run" / session / "delta.db"
                 base_before = tree_fingerprint(root) if leg == "vfs" else None
                 command = invocation
                 if leg == "vfs":
-                    command = [vfs_bin, "run", "--session", session, "--no-default-allows"]
+                    command = [
+                        vfs_bin,
+                        "run",
+                        "--session",
+                        session,
+                        "--no-default-allows",
+                    ]
                     if engine["capabilities"]["partial_origin"]:
                         command.extend(["--partial-origin", "on"])
                     command.extend(["--", *invocation])
@@ -1435,8 +1331,16 @@ def main(argv: list[str]) -> int:
                     args.timeout,
                     OUTPUT_TAIL_CHARS,
                     keep_stdout=True,
+                    include_timing_origin=True,
                 )
                 workload = parse_json_stdout(run)
+                lifecycle = lifecycle_timing(run, workload)
+                if isinstance(workload, dict) and lifecycle is not None:
+                    workload["lifecycle"] = {
+                        "first_request_service_seconds": lifecycle[
+                            "first_request_service_seconds"
+                        ]
+                    }
                 if (
                     leg == "vfs"
                     and args.self_test_base_mutation_guard
@@ -1454,11 +1358,13 @@ def main(argv: list[str]) -> int:
                 )
                 integrity = (
                     run_integrity(vfs_bin, db_path, root, env, args.timeout)
-                    if leg == "vfs" and db_path.exists() and engine["capabilities"]["integrity"]
+                    if leg == "vfs"
+                    and db_path.exists()
+                    and engine["capabilities"]["integrity"]
                     else None
                 )
                 cleanup = (
-                    wait_for_leg_cleanup(session, leg_root)
+                    common.wait_for_benchmark_cleanup(session, leg_root)
                     if leg == "vfs"
                     else {
                         "ok": True,
@@ -1477,11 +1383,23 @@ def main(argv: list[str]) -> int:
                     (native_seconds if leg == "native" else vfs_seconds).append(
                         measured
                     )
+                if lifecycle is not None and not warmup_sample:
+                    (
+                        native_startup_seconds
+                        if leg == "native"
+                        else vfs_startup_seconds
+                    ).append(lifecycle["process_to_first_request_seconds"])
+                    (
+                        native_first_request_seconds
+                        if leg == "native"
+                        else vfs_first_request_seconds
+                    ).append(lifecycle["first_request_service_seconds"])
                 sample_passed = (
                     run["returncode"] == 0
                     and isinstance(workload, dict)
                     and workload.get("passed") is True
                     and measured is not None
+                    and lifecycle is not None
                     and (leg != "vfs" or base_unchanged is True)
                     and cleanup["ok"] is True
                     # Invariant 2 is enforced for every engine. The integrity
@@ -1503,6 +1421,7 @@ def main(argv: list[str]) -> int:
                         "db_path": str(db_path) if leg == "vfs" else None,
                         "measured_seconds": measured,
                         "outer_seconds": run["duration_seconds"],
+                        "lifecycle": lifecycle,
                         "run": compact_run(run),
                         "workload": workload,
                         "base_tree": (
@@ -1517,7 +1436,9 @@ def main(argv: list[str]) -> int:
                         "integrity": integrity,
                         "cleanup": cleanup,
                         "profile": (
-                            profile_counters(run.get("profile_summaries", []))
+                            common.summarize_profile_counters(
+                                run.get("profile_summaries", [])
+                            )
                             if leg == "vfs" and args.profile
                             else None
                         ),
@@ -1527,9 +1448,13 @@ def main(argv: list[str]) -> int:
                 print(
                     f"[{sample_index + 1}/{total_sample_count}] "
                     f"{'warmup ' if warmup_sample else ''}{leg}: "
-                    f"{measured:.3f}s, ops={workload.get('total_ops')}, "
+                    f"{measured:.3f}s workload, "
+                    f"{lifecycle['process_to_first_request_seconds']:.3f}s startup, "
+                    f"ops={workload.get('total_ops')}, "
                     f"{'PASS' if sample_passed else 'FAIL'}"
-                    if measured is not None and isinstance(workload, dict)
+                    if measured is not None
+                    and isinstance(workload, dict)
+                    and lifecycle is not None
                     else (
                         f"[{sample_index + 1}/{total_sample_count}] "
                         f"{'warmup ' if warmup_sample else ''}{leg}: FAIL"
@@ -1539,12 +1464,14 @@ def main(argv: list[str]) -> int:
                 )
 
         measured_runs = [sample for sample in samples if not sample["warmup"]]
-        native_runs = [
-            sample for sample in measured_runs if sample["leg"] == "native"
-        ]
+        native_runs = [sample for sample in measured_runs if sample["leg"] == "native"]
         vfs_runs = [sample for sample in measured_runs if sample["leg"] == "vfs"]
         native_stats = summarize_floats(native_seconds)
         vfs_stats = summarize_floats(vfs_seconds)
+        native_startup_stats = summarize_floats(native_startup_seconds)
+        vfs_startup_stats = summarize_floats(vfs_startup_seconds)
+        native_request_stats = summarize_floats(native_first_request_seconds)
+        vfs_request_stats = summarize_floats(vfs_first_request_seconds)
         derived_ratio = (
             float(vfs_stats["median"]) / float(native_stats["median"])
             if native_stats.get("n")
@@ -1568,10 +1495,12 @@ def main(argv: list[str]) -> int:
             all(sample["passed"] for sample in samples)
             and len(native_seconds) == args.samples
             and len(vfs_seconds) == args.samples
+            and len(native_startup_seconds) == args.samples
+            and len(vfs_startup_seconds) == args.samples
             and not leaked_git_ai
         )
         result = {
-            "schema_version": 1,
+            "schema_version": 2,
             "benchmark": "chaos-workload",
             "git_commit": git_commit(repo_root),
             "seed": args.seed,
@@ -1583,21 +1512,33 @@ def main(argv: list[str]) -> int:
                 "actors": args.actors,
                 "operations": args.operations,
                 "duration_seconds": args.duration,
+                "leg_order": args.leg_order,
                 "intensities": {
                     kind: getattr(args, f"{kind}_intensity") for kind in ACTOR_KINDS
                 },
                 "partial_origin": (
-                    "on" if engine["capabilities"]["partial_origin"] else "unsupported-by-engine"
+                    "on"
+                    if engine["capabilities"]["partial_origin"]
+                    else "unsupported-by-engine"
                 ),
                 "timeout_seconds": args.timeout,
             },
             "engine": engine,
             "measurement": {
                 "schedule": schedule,
-                "interleaved": schedule
-                == [leg for _ in range(args.samples) for leg in ("native", "vfs")],
+                "interleaved": all(
+                    set(schedule[index : index + 2]) == {"native", "vfs"}
+                    for index in range(0, len(schedule), 2)
+                ),
                 "primary_metric": "absolute measured wall-clock seconds per leg",
                 "ratio_role": "derived from leg medians after aggregation",
+                "startup_metric": (
+                    "parent process spawn through completion of the child workload's "
+                    "first successful stat on its working directory"
+                ),
+                "workload_timer_boundary": (
+                    "after nested checkout preparation and identical cache warmup"
+                ),
                 "performance_threshold": None,
             },
             "cache_control": {
@@ -1610,8 +1551,24 @@ def main(argv: list[str]) -> int:
                 "native": native_stats,
                 "vfs": vfs_stats,
             },
+            "absolute_startup_seconds": {
+                "native": native_startup_stats,
+                "vfs": vfs_startup_stats,
+            },
+            "absolute_first_request_service_seconds": {
+                "native": native_request_stats,
+                "vfs": vfs_request_stats,
+            },
             "derived": {
                 "vfs_over_native_median": derived_ratio,
+                "startup_vfs_over_native_median": (
+                    float(vfs_startup_stats["median"])
+                    / float(native_startup_stats["median"])
+                    if native_startup_stats.get("n")
+                    and vfs_startup_stats.get("n")
+                    and float(native_startup_stats["median"]) > 0
+                    else None
+                ),
                 "warning": "derived ratio; interpret only beside both absolute distributions",
             },
             "per_actor": {
@@ -1649,7 +1606,7 @@ def main(argv: list[str]) -> int:
     except Exception as exc:
         exit_code = 1
         result = {
-            "schema_version": 1,
+            "schema_version": 2,
             "benchmark": "chaos-workload",
             "error": str(exc),
             "passed": False,

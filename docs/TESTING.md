@@ -135,9 +135,13 @@ lines on exit; most harnesses parse and attach them to their JSON reports.
 
 ## Benchmarks (local-only policy)
 
-The codex workload benchmark is a local performance gate, not a CI job. Run
-it serialized on a quiet machine with a fresh release build, and compare
-per-phase medians of 5 runs; single runs are noise:
+The chaos workload is the primary product-level performance scoreboard. The
+older phase benchmark remains a focused regression instrument for identifying
+which Git phase moved; it is not the current end-to-end result. Neither runs
+in CI. Run every benchmark serialized on a quiet machine with a fresh release
+build; single runs are noise.
+
+Focused per-phase regression command:
 
 ```bash
 cargo +nightly build --release --workspace --bins
@@ -210,14 +214,34 @@ python3 scripts/validation/chaos-workload-benchmark.py \
 ```
 
 The default leading sample is run but discarded, so the first cold touch of
-the fixture never enters the distribution. After that, the measured schedule is strictly interleaved
-`native, vfs, native, vfs, ...`. Dropping the global page cache is neither
-available nor appropriate for an unprivileged local harness, so each leg
-performs the same read/status/loopback warmup before its timer starts and the
-payload records that disposition. Read `absolute_wall_seconds.native` and
-`.vfs` first: each reports median, p25, p75, min, max, stdev, and n. The
+the fixture never enters the distribution. After that, each adjacent pair
+contains one native and one Vfs leg. `--leg-order alternating` is the default,
+balancing which engine runs first across measured pairs; fixed
+`native-first` and `vfs-first` modes remain available for diagnosis. Dropping
+the global page cache is neither available nor appropriate for an
+unprivileged local harness, so each leg performs the same
+read/status/loopback warmup before its timer starts and the payload records
+that disposition. Read `absolute_wall_seconds.native` and `.vfs` first: each
+reports median, p25, p75, min, max, stdev, and n. The
 `derived.vfs_over_native_median` value is calculated only after those
 distributions and is not a primary measurement or a gate.
+
+The chaos report is the primary performance record. It separates two timing
+boundaries that must not be conflated:
+
+* `absolute_startup_seconds` measures parent process spawn through completion
+  of the child workload's first successful `stat` on its working directory.
+  This includes Vfs mount startup on the Vfs leg, but also includes the common
+  Python process/import cost visible in the native leg.
+* `absolute_wall_seconds` remains the concurrent workload timer. It starts
+  only after nested checkout preparation and the identical per-leg cache
+  warmup. Clone, mount startup, fixture copying, verification, and teardown
+  are not part of this distribution.
+
+The dedicated startup mini-benchmark below uses a minimal `python -S` probe,
+so use it rather than the chaos startup field when investigating mount
+workers. The chaos field exists to keep the end-to-end lifecycle cost visible
+beside the primary workload result.
 
 Each warmup or measured leg gets a fresh context with sibling `checkout/`,
 `home/`, and `tmp/` trees. HOME, the Vfs session store, XDG caches, Git
@@ -261,7 +285,54 @@ Focused local benchmarks: `git-workload-benchmark.py` (single run with
 `--profile` phase breakdown), `read-path-benchmark.py`,
 `large-edit-benchmark.py` (one-byte edit to a large base file must grow the
 delta DB by O(changed chunks), with `--partial-origin` / `--no-partial-origin`
-legs), `base-read-benchmark.py`, and `vfs-clone-benchmark.py`.
+legs), and `base-read-benchmark.py`.
+
+### Clone mini-benchmark
+
+`vfs-clone-benchmark.py` measures the complete user-visible clone commands
+from one prepared local mirror:
+
+* native: `git clone --no-hardlinks`
+* Vfs: `vfs clone`
+
+The mirror setup and post-command correctness checks are outside the timer.
+Every result must have clean Git status, pass `git fsck --strict`, and match
+the canonical tracked-content hash. Each leg gets a fresh HOME, TMPDIR, XDG
+tree, and destination or database.
+
+```bash
+python3 scripts/validation/vfs-clone-benchmark.py \
+  --samples 10 --warmup 1 \
+  --vfs-bin "$PWD/target/release/vfs" \
+  --output /tmp/vfs-val/clone.json
+```
+
+The fixture rules match the chaos benchmark. With no source flag, the script
+uses the materialized canonical codex fixture or fails rather than silently
+substituting a toy. `source.comparable_to_scoreboard` is true only for that
+fixture. Read `absolute_command_seconds.native` and `.vfs`; the ratio remains
+derived context.
+
+### Mount-startup mini-benchmark
+
+`mount-startup-benchmark.py` isolates startup from the chaos workload:
+
+```bash
+python3 scripts/validation/mount-startup-benchmark.py \
+  --samples 20 --warmup 1 --transport both \
+  --vfs-bin "$PWD/target/release/vfs" \
+  --output /tmp/vfs-val/mount-startup.json
+```
+
+The primary metric is parent process spawn through completion of the probe's
+first successful `stat("probe.txt")`. The native leg runs the same
+`python -S` probe without Vfs, exposing the common process/interpreter floor.
+Transport order alternates each sample. Every Vfs leg uses a fresh session and
+must leave no process or mount behind.
+
+Use `--profile` only for a separate transport-attestation run; profiling is
+kept out of the final timing distribution. A profiled report requires
+`fuse_uring_requests == 0` for legacy and a positive value for io_uring.
 
 ## pjdfstest
 

@@ -43,6 +43,11 @@ def positive_float(value: str) -> float:
     return parsed
 
 
+def non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be >= 0")
+    return parsed
 
 
 def percentile(values: list[float], quantile: float) -> float:
@@ -192,7 +197,11 @@ def pin_distro_git(
     shim_dir = scratch_dir / "git-shim"
     shim_dir.mkdir(parents=True, exist_ok=True)
     real_git = next(
-        (candidate for candidate in ("/usr/bin/git", "/bin/git") if os.access(candidate, os.X_OK)),
+        (
+            candidate
+            for candidate in ("/usr/bin/git", "/bin/git")
+            if os.access(candidate, os.X_OK)
+        ),
         None,
     ) or shutil.which("git")
     if real_git is None:
@@ -209,6 +218,160 @@ def pin_distro_git(
     env["GIT_CONFIG_GLOBAL"] = str(gitconfig)
     env["GIT"] = str(real_git)
     return shim
+
+
+def isolate_benchmark_env(
+    base_env: MutableMapping[str, str], context_root: Path
+) -> dict[str, str]:
+    """Give one benchmark leg independent process and filesystem caches.
+
+    HOME carries the Vfs session store, Git configuration, and user-level
+    caches. Sharing it across samples turns later measurements into tests of
+    state left by earlier legs. TMPDIR must also stay outside any base tree
+    whose immutability the harness verifies.
+    """
+    env = dict(base_env)
+    home = context_root / "home"
+    for path in (
+        home,
+        home / ".config",
+        home / ".cache",
+        home / ".local" / "share",
+    ):
+        path.mkdir(parents=True, exist_ok=True)
+    env["HOME"] = str(home)
+    env["XDG_CONFIG_HOME"] = str(home / ".config")
+    env["XDG_CACHE_HOME"] = str(home / ".cache")
+    env["XDG_DATA_HOME"] = str(home / ".local" / "share")
+    pin_distro_git(env, context_root, home=home)
+    tmp = context_root / "tmp"
+    tmp.mkdir(parents=True, exist_ok=True)
+    env["TMPDIR"] = str(tmp)
+    env["TMP"] = str(tmp)
+    env["TEMP"] = str(tmp)
+    return env
+
+
+def mounts_under(root: Path) -> list[str]:
+    """Return live Linux mountpoints at or below a benchmark context."""
+    prefix = str(root.resolve()).rstrip(os.sep) + os.sep
+    mounts: list[str] = []
+    try:
+        lines = (
+            Path("/proc/self/mountinfo")
+            .read_text(encoding="utf-8", errors="replace")
+            .splitlines()
+        )
+    except OSError:
+        return mounts
+    for line in lines:
+        fields = line.split(" - ", 1)[0].split()
+        if len(fields) < 5:
+            continue
+        mountpoint = fields[4].replace("\\040", " ")
+        if mountpoint == str(root) or mountpoint.startswith(prefix):
+            mounts.append(mountpoint)
+    return sorted(mounts)
+
+
+def processes_for_benchmark_context(
+    session: str, context_root: Path
+) -> list[dict[str, Any]]:
+    """Return processes retaining a session id or isolated context path."""
+    root_bytes = str(context_root).encode()
+    session_bytes = session.encode()
+    matches: list[dict[str, Any]] = []
+    try:
+        entries = list(Path("/proc").iterdir())
+    except OSError:
+        return matches
+    for entry in entries:
+        if not entry.name.isdigit() or int(entry.name) == os.getpid():
+            continue
+        try:
+            cmdline = (entry / "cmdline").read_bytes()
+            environ = (entry / "environ").read_bytes()
+        except OSError:
+            continue
+        if (
+            session_bytes not in cmdline
+            and session_bytes not in environ
+            and root_bytes not in cmdline
+            and root_bytes not in environ
+        ):
+            continue
+        matches.append(
+            {
+                "pid": int(entry.name),
+                "cmdline": " ".join(
+                    chunk.decode("utf-8", "replace")
+                    for chunk in cmdline.split(b"\0")
+                    if chunk
+                ),
+            }
+        )
+    return matches
+
+
+def wait_for_benchmark_cleanup(
+    session: str, context_root: Path, timeout_seconds: float = 2.0
+) -> dict[str, Any]:
+    """Prove a benchmark context is idle, then recover leaked local state."""
+    started = time.monotonic()
+    processes: list[dict[str, Any]] = []
+    mounts: list[str] = []
+    while True:
+        processes = processes_for_benchmark_context(session, context_root)
+        mounts = mounts_under(context_root)
+        if not processes and not mounts:
+            break
+        if time.monotonic() - started >= timeout_seconds:
+            break
+        time.sleep(0.05)
+    clean_exit = not processes and not mounts
+    initial_processes = processes
+    initial_mounts = mounts
+    if not clean_exit:
+        for process in initial_processes:
+            try:
+                os.kill(int(process["pid"]), signal.SIGTERM)
+            except (OSError, ValueError):
+                pass
+        time.sleep(0.2)
+        for process in processes_for_benchmark_context(session, context_root):
+            try:
+                os.kill(int(process["pid"]), signal.SIGKILL)
+            except (OSError, ValueError):
+                pass
+        fusermount = shutil.which("fusermount3")
+        if fusermount is not None:
+            for mount in sorted(initial_mounts, reverse=True):
+                subprocess.run(
+                    [fusermount, "-uz", mount],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+        recovery_deadline = time.monotonic() + timeout_seconds
+        while True:
+            processes = processes_for_benchmark_context(session, context_root)
+            mounts = mounts_under(context_root)
+            if not processes and not mounts:
+                break
+            if time.monotonic() >= recovery_deadline:
+                break
+            time.sleep(0.05)
+    return {
+        "ok": clean_exit,
+        "clean_exit": clean_exit,
+        "recovery_attempted": not clean_exit,
+        "final_clean": not processes and not mounts,
+        "initial_processes": initial_processes,
+        "initial_mounts": initial_mounts,
+        "processes": processes,
+        "mounts": mounts,
+        "waited_seconds": time.monotonic() - started,
+    }
 
 
 def sandbox_python() -> str:
@@ -262,7 +425,7 @@ def git_ai_processes() -> dict[int, dict[str, Any]]:
             environ = b""
         for chunk in environ.split(b"\0"):
             if chunk.startswith(b"HOME="):
-                info["home"] = chunk[len(b"HOME="):].decode("utf-8", "replace")
+                info["home"] = chunk[len(b"HOME=") :].decode("utf-8", "replace")
             elif chunk.startswith(b"VFS_SESSION="):
                 info["vfs_session"] = True
         procs[int(entry.name)] = info
@@ -292,7 +455,11 @@ def git_ai_leaks(
 
 
 def tail_text(value: Any, limit: int = OUTPUT_TAIL_CHARS) -> str:
-    text = value.decode("utf-8", errors="replace") if isinstance(value, bytes) else str(value or "")
+    text = (
+        value.decode("utf-8", errors="replace")
+        if isinstance(value, bytes)
+        else str(value or "")
+    )
     return text if len(text) <= limit else text[-limit:]
 
 
@@ -305,7 +472,11 @@ def extract_profile_summaries(stderr: Any) -> list[dict[str, Any]]:
     """
     if stderr is None:
         return []
-    text = stderr.decode("utf-8", errors="replace") if isinstance(stderr, bytes) else str(stderr)
+    text = (
+        stderr.decode("utf-8", errors="replace")
+        if isinstance(stderr, bytes)
+        else str(stderr)
+    )
     summaries: list[dict[str, Any]] = []
     for line in text.splitlines():
         line = line.strip()
@@ -318,6 +489,50 @@ def extract_profile_summaries(stderr: Any) -> list[dict[str, Any]]:
         if isinstance(value, dict) and value.get("event") == "vfs_profile_summary":
             summaries.append(value)
     return summaries
+
+
+def summarize_profile_counters(summaries: list[dict[str, Any]]) -> dict[str, Any]:
+    """Collapse one process's profile summaries into stable counter maxima."""
+    max_counters: dict[str, int] = {}
+    by_source: dict[str, dict[str, int]] = {}
+    for summary in summaries:
+        counters = summary.get("counters")
+        if not isinstance(counters, dict):
+            continue
+        numeric = {
+            str(key): int(value)
+            for key, value in counters.items()
+            if isinstance(value, int)
+        }
+        by_source[str(summary.get("source", "unknown"))] = numeric
+        for key, value in numeric.items():
+            max_counters[key] = max(max_counters.get(key, 0), value)
+    per_operation = {
+        key: value
+        for key, value in max_counters.items()
+        if key.startswith(("fuse_", "op_", "fs_"))
+        or key
+        in {
+            "lookup",
+            "getattr",
+            "open",
+            "read",
+            "write",
+            "release",
+            "readdir",
+            "create",
+            "rename",
+            "unlink",
+            "flush",
+            "fsync",
+        }
+    }
+    return {
+        "summary_count": len(summaries),
+        "max_counters": max_counters,
+        "fuse_per_operation": per_operation,
+        "last_by_source": by_source,
+    }
 
 
 def terminate_process_tree(proc: subprocess.Popen[str]) -> None:
@@ -350,8 +565,9 @@ def run_subprocess(
     tail_chars: int = OUTPUT_TAIL_CHARS,
     *,
     keep_stdout: bool = False,
+    include_timing_origin: bool = False,
 ) -> dict[str, Any]:
-    started = time.perf_counter()
+    started_ns = time.perf_counter_ns()
     proc = subprocess.Popen(
         argv,
         cwd=str(cwd),
@@ -373,12 +589,16 @@ def run_subprocess(
                 proc.stdout.close()
             if proc.stderr is not None:
                 proc.stderr.close()
-            stdout, stderr = "", "process timed out; output pipes closed after termination"
+            stdout, stderr = (
+                "",
+                "process timed out; output pipes closed after termination",
+            )
         timed_out = True
+    finished_ns = time.perf_counter_ns()
     result = {
         "argv": argv,
         "cwd": str(cwd),
-        "duration_seconds": time.perf_counter() - started,
+        "duration_seconds": (finished_ns - started_ns) / 1_000_000_000,
         "returncode": proc.returncode,
         "timed_out": timed_out,
         "stdout_tail": tail_text(stdout, tail_chars),
@@ -387,6 +607,9 @@ def run_subprocess(
         "stderr_bytes": len((stderr or "").encode("utf-8", errors="replace")),
         "profile_summaries": extract_profile_summaries(stderr),
     }
+    if include_timing_origin:
+        result["started_perf_counter_ns"] = started_ns
+        result["finished_perf_counter_ns"] = finished_ns
     if keep_stdout:
         # A workload's single-line JSON result can exceed the tail once temp
         # paths grow (phase8 nests TMPDIR several levels deep), and a
@@ -456,7 +679,9 @@ def resolve_vfs_bin(vfs_bin: Optional[str], repo_root: Path) -> str:
             found = shutil.which(vfs_bin)
             if found:
                 return found
-        raise RuntimeError(f"configured vfs executable not found or not executable: {vfs_bin}")
+        raise RuntimeError(
+            f"configured vfs executable not found or not executable: {vfs_bin}"
+        )
 
     target_dir = workspace_target_dir(repo_root)
     # Release first: it is what the gates measure and it is rebuilt more often
@@ -469,7 +694,14 @@ def resolve_vfs_bin(vfs_bin: Optional[str], repo_root: Path) -> str:
             return str(candidate)
 
     build = subprocess.run(
-        ["cargo", "build", "-p", "vfs-cli", "--manifest-path", str(repo_root / "Cargo.toml")],
+        [
+            "cargo",
+            "build",
+            "-p",
+            "vfs-cli",
+            "--manifest-path",
+            str(repo_root / "Cargo.toml"),
+        ],
         cwd=str(repo_root),
         text=True,
         stdout=subprocess.PIPE,

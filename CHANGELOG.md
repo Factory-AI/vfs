@@ -1,5 +1,39 @@
 # Changelog
 
+## [1.0.2] - 2026-08-08 - Lifecycle benchmark hardening
+
+This release makes the chaos workload the unambiguous primary performance
+record and adds focused instruments for the lifecycle costs outside its
+workload timer. The handoff wire contract and database schema do not change:
+`artifactVersion` remains `0.6`.
+
+### Added
+
+- `scripts/validation/mount-startup-benchmark.py`, measuring parent process
+  spawn through completion of a minimal child process's first successful
+  filesystem probe. It reports native process overhead beside legacy FUSE and
+  FUSE-over-io_uring distributions, alternates transport order, isolates every
+  sample, and requires clean teardown.
+
+### Changed
+
+- Upgrade the chaos benchmark report to schema version 2. The primary
+  `absolute_wall_seconds` workload distribution retains its post-preparation,
+  post-warmup boundary; `absolute_startup_seconds` now records process spawn
+  through the first successful child request so mount cost remains visible
+  without contaminating the workload timer. Measured pairs alternate which
+  engine runs first, balancing residual first-leg cache effects.
+- Rebuild `vfs-clone-benchmark.py` around the same fixture and isolation
+  contract as the chaos benchmark. It now refuses implicit synthetic
+  substitution, discards leading warmups, interleaves native and Vfs legs,
+  reports absolute distributions before derived ratios, and verifies clean
+  Git status, strict fsck, identical tracked content, and teardown outside the
+  command timer.
+- Consolidate benchmark HOME, XDG, TMPDIR, Git pinning, mount census, process
+  census, and teardown recovery in the shared validation library.
+- Document the chaos workload as the primary scoreboard and define exactly
+  which lifecycle phases each benchmark includes.
+
 ## [1.0.1] - 2026-08-08 - Protocol, cache, and validation hardening
 
 Patch release for two runtime bugs and the benchmark defects found while
