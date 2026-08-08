@@ -12,7 +12,11 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
 VFS_BIN="${VFS_BIN:-$REPO_ROOT/target/release/vfs}"
-RUST_TOOLCHAIN="${RUST_TOOLCHAIN:-nightly}"
+# Default to the channel rust-toolchain.toml pins. A bare `+nightly` overrides
+# that pin, so the gate would silently lint against a different compiler than
+# CI and than every plain `cargo` invocation in the tree.
+PINNED_TOOLCHAIN="$(sed -n 's/^channel = "\(.*\)"/\1/p' "$REPO_ROOT/rust-toolchain.toml")"
+RUST_TOOLCHAIN="${RUST_TOOLCHAIN:-${PINNED_TOOLCHAIN:-nightly}}"
 SHELL_TIMEOUT="${VFS_GATE_SHELL_TIMEOUT:-900}"
 PHASE8_TIMEOUT="${VFS_GATE_PHASE8_TIMEOUT:-20}"
 
