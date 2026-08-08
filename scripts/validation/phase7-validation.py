@@ -93,6 +93,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="path to git-workload-benchmark.py (default: scripts/validation/git-workload-benchmark.py)",
     )
     parser.add_argument(
+        "--git-workload-source",
+        default=os.environ.get("PHASE7_GIT_WORKLOAD_SOURCE"),
+        help=(
+            "repository to measure the git workload against. Without it the embedded run uses "
+            "the synthetic fixture for correctness coverage only, and scoreboard thresholds "
+            "do not apply"
+        ),
+    )
+    parser.add_argument(
         "--strict-file-size-mib",
         type=positive_int,
         default=None,
@@ -416,12 +425,15 @@ def run_git_workload(
         ("--profile", None),
         ("--strict-portable", None),
     ]
-    if not args.full_gates:
-        # The smoke leg exists for correctness coverage (base unchanged,
-        # integrity, portability), not for the scoreboard, and the canonical
-        # fixture is gitignored so CI never has it. Ask for the toy fixture by
-        # name instead of relying on a fallback: the benchmark now refuses to
-        # substitute one workload for another.
+    # The benchmark refuses to guess its workload, so state the intent here.
+    # The embedded run exists for correctness coverage -- base unchanged,
+    # integrity, portability -- and the canonical fixture is gitignored, so CI
+    # and fresh clones never have it. Scoreboard numbers come from running the
+    # benchmark directly against a real repository; point --git-workload-source
+    # at one to make the perf thresholds meaningful here.
+    if args.git_workload_source:
+        optional_args.append(("--source", args.git_workload_source))
+    else:
         optional_args.append(("--synthetic", None))
     if args.full_gates:
         optional_args.append(("--full-gates", None))
@@ -466,13 +478,25 @@ def run_git_workload(
     )
 
     performance = extract_phase_ratios(payload)
-    threshold_failures = [item for item in performance if item.get("passed") is False]
+    # A ratio measured against the toy fixture is not the ratio the thresholds
+    # were set for. Record the numbers either way, but only hold them to the
+    # scoreboard when the benchmark says they belong on it.
+    thresholds_applicable = bool(
+        isinstance(payload, dict) and payload.get("source", {}).get("comparable_to_scoreboard")
+    )
+    threshold_failures = (
+        [item for item in performance if item.get("passed") is False] if thresholds_applicable else []
+    )
     phase_by_name = {str(item.get("phase")): item for item in performance}
-    missing_required_phases = [
-        phase
-        for phase in REQUIRED_GIT_PHASES
-        if not isinstance(phase_by_name.get(phase, {}).get("ratio"), (int, float))
-    ]
+    missing_required_phases = (
+        [
+            phase
+            for phase in REQUIRED_GIT_PHASES
+            if not isinstance(phase_by_name.get(phase, {}).get("ratio"), (int, float))
+        ]
+        if thresholds_applicable
+        else []
+    )
 
     status = "passed" if run["returncode"] == 0 and isinstance(payload, dict) and correctness_ok else "failed"
     if args.full_gates:
@@ -503,6 +527,13 @@ def run_git_workload(
             "db_inspections": db_inspections,
             "performance_thresholds": performance,
             "threshold_failures": threshold_failures,
+            "thresholds_applicable": thresholds_applicable,
+            "thresholds_policy": (
+                "scoreboard thresholds apply"
+                if thresholds_applicable
+                else "measured workload is not comparable to the scoreboard; "
+                "pass --git-workload-source to enforce thresholds"
+            ),
             "missing_required_phases": missing_required_phases,
             "strict_portable_policy": "partial-origin rows are forbidden for a passing full Git gate",
         },

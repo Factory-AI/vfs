@@ -346,6 +346,12 @@ def main(argv: list[str]) -> int:
         if args.smoke:
             git_args.extend(
                 [
+                    # Ask for the toy fixture by name. The geometry below only
+                    # applies to it, so leaving the choice implicit meant this
+                    # leg measured the tuned 12x512B tree on a machine without
+                    # the canonical fixture and the full codex checkout on one
+                    # with it -- two different workloads under one gate name.
+                    "--synthetic",
                     "--fixture-files",
                     "12",
                     "--fixture-dirs",
@@ -372,10 +378,17 @@ def main(argv: list[str]) -> int:
             args.timeout * 3 + 60,
             output_dir,
         )
+        git_result = gates["git_workload_phase8_thresholds"].get("result")
+        # Scoreboard thresholds only mean something against the scoreboard
+        # workload; the benchmark reports whether that is what it measured.
+        git_comparable = bool(
+            isinstance(git_result, dict) and git_result.get("source", {}).get("comparable_to_scoreboard")
+        )
+        enforce_git = enforce_phase8 and git_comparable
         apply_performance_policy(
             gates["git_workload_phase8_thresholds"],
-            git_performance_checks(gates["git_workload_phase8_thresholds"].get("result"), enforce_phase8),
-            enforce=enforce_phase8,
+            git_performance_checks(git_result, enforce_git),
+            enforce=enforce_git,
         )
 
         fuse_args = ["--timeout", str(args.timeout), "--vfs-bin", vfs_bin, "--profile"]
