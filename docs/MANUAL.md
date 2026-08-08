@@ -718,7 +718,7 @@ Adopt prints a one-line JSON manifest:
   "generation": 1,
   "schemaVersion": "0.6",
   "seededPaths": ["src/lib.rs"],
-  "vfsVersion": "1.0.0"
+  "vfsVersion": "1.0.1"
 }
 ```
 

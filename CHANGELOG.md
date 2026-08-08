@@ -1,5 +1,35 @@
 # Changelog
 
+## [1.0.1] - 2026-08-08 - Protocol stream and validation hardening
+
+Patch release for one runtime bug and the benchmark defects found while
+validating it. The handoff wire contract and database schema do not change:
+`artifactVersion` remains `0.6`.
+
+### Fixed
+
+- Send tracing to stderr. The formatter previously wrote diagnostics to
+  stdout, where `vfs run` and `vfs exec` expose the wrapped command's output
+  and `vfs mcp-server` speaks JSON-RPC. An asynchronous mount log could
+  corrupt either data stream.
+- Refuse to substitute the generated 96x1KB repository when the gitignored
+  canonical benchmark fixture is missing. Callers must provide a source,
+  materialize the canonical fixture, or request `--synthetic`; reports state
+  whether their workload is comparable to the scoreboard.
+- Make the Phase 7 and Phase 8 validation callers name their workload and
+  apply scoreboard thresholds only to the canonical workload.
+- Isolate every chaos-benchmark leg with its own checkout, HOME, TMPDIR, XDG
+  directories, Git configuration, and Vfs session store. Discard leading
+  warmups from measurements, and reject legs that leave a mount or
+  session-bound process behind.
+
+### Added
+
+- `scripts/validation/chaos-workload-benchmark.py`, a seeded concurrent local
+  benchmark covering Git churn, scattered edits, tree scans, build-artifact
+  churn, unlink-while-open, and hermetic loopback fetches. It reports absolute
+  distributions before derived ratios and is not part of CI.
+
 ## [1.0.0] - 2026-08-07 - Fork era: restructure, rename, and session handoff
 
 First release under Factory's own identity. The fork diverged from agentfs
