@@ -204,12 +204,13 @@ narrow lock; Git reads and all non-Git actors remain concurrent.
 
 ```bash
 python3 scripts/validation/chaos-workload-benchmark.py \
-  --samples 5 --seed 20250808 --actors 6 --operations 8 --profile \
+  --samples 5 --warmup 1 --seed 20250808 --actors 6 --operations 8 \
   --vfs-bin "$PWD/target/release/vfs" \
   --output /tmp/vfs-val/chaos.json
 ```
 
-The measured schedule is strictly interleaved
+The default leading sample is run but discarded, so the first cold touch of
+the fixture never enters the distribution. After that, the measured schedule is strictly interleaved
 `native, vfs, native, vfs, ...`. Dropping the global page cache is neither
 available nor appropriate for an unprivileged local harness, so each leg
 performs the same read/status/loopback warmup before its timer starts and the
@@ -217,6 +218,13 @@ payload records that disposition. Read `absolute_wall_seconds.native` and
 `.vfs` first: each reports median, p25, p75, min, max, stdev, and n. The
 `derived.vfs_over_native_median` value is calculated only after those
 distributions and is not a primary measurement or a gate.
+
+Each warmup or measured leg gets a fresh context with sibling `checkout/`,
+`home/`, and `tmp/` trees. HOME, the Vfs session store, XDG caches, Git
+configuration, and TMPDIR are therefore never shared between legs and never
+live inside the host base tree being checked. A leg does not pass until its
+base fingerprint is unchanged and no mount or session-bound process remains
+under its context. The final report also rejects leaked `git-ai` processes.
 
 Fixed-operation runs reproduce the same actor action plan for a given seed;
 the payload carries its digest. `--duration` is available for exploratory
@@ -234,12 +242,20 @@ identity. Real fetch egress is available only through `--fetch-url`; the
 default loopback remote is deterministic, and any override also marks
 `source.comparable_to_scoreboard` false.
 
-Every Vfs sample enables partial-origin copy-up and must pass actor read-back
-checks, `git fsck --strict`, a recursive host-base fingerprint comparison, and
-`vfs integrity --check-base --checkpoint`. `--profile` attaches the FUSE
-per-operation counters emitted at teardown. This is a measurement instrument:
-it has no performance threshold and is not part of `gate.sh` or CI. As with
-the corruption-torture tests, never run it beside another mount workload.
+The harness probes the engine named by `--vfs-bin` and records its version and
+capabilities. It enables partial-origin copy-up and requires
+`vfs integrity --check-base --checkpoint` when the engine offers them; an
+older engine reports those checks as unavailable rather than pretending they
+passed. Actor read-back, `git fsck --strict`, host-base immutability, and
+teardown cleanliness remain mandatory for every engine.
+
+Normal performance runs leave profiling off. `--profile` is for diagnosis and
+attaches the FUSE per-operation counters emitted at teardown. For a transport
+A/B, run once with `VFS_FUSE_URING=1` and once with `VFS_FUSE_URING=0`; verify
+`engine.requested_fuse_transport` and `fuse_uring_requests` in the payload
+before reading the times. This is a measurement instrument: it has no
+performance threshold and is not part of `gate.sh` or CI. As with the
+corruption-torture tests, never run it beside another mount workload.
 
 Focused local benchmarks: `git-workload-benchmark.py` (single run with
 `--profile` phase breakdown), `read-path-benchmark.py`,

@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -735,6 +736,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="use a generated toy fixture; payload is marked non-comparable",
     )
     parser.add_argument("--samples", type=positive_int, default=5)
+    parser.add_argument(
+        "--warmup",
+        type=non_negative_int,
+        default=1,
+        help="leading samples run but discarded, so a cold fixture cache does not enter the distribution",
+    )
     parser.add_argument("--seed", type=int, default=20250808)
     parser.add_argument("--actors", type=at_least_six, default=6)
     parser.add_argument("--operations", type=positive_int, default=8)
@@ -1001,6 +1008,148 @@ def start_git_daemon(
     raise RuntimeError("timed out waiting for loopback git daemon")
 
 
+def isolate_env(base_env: dict[str, str], leg_root: Path) -> dict[str, str]:
+    """Give one measured leg its own HOME, XDG dirs and TMPDIR.
+
+    A HOME shared across legs carries a session store, git config and caches
+    from one measurement into the next, so a sample can be measuring state its
+    predecessor left behind. Each leg gets a fresh context instead.
+    """
+    env = dict(base_env)
+    home = leg_root / "home"
+    for path in (home, home / ".config", home / ".cache", home / ".local" / "share"):
+        path.mkdir(parents=True, exist_ok=True)
+    env["HOME"] = str(home)
+    env["XDG_CONFIG_HOME"] = str(home / ".config")
+    env["XDG_CACHE_HOME"] = str(home / ".cache")
+    env["XDG_DATA_HOME"] = str(home / ".local" / "share")
+    common.pin_distro_git(env, home, home=home)
+    tmp = leg_root / "tmp"
+    tmp.mkdir(parents=True, exist_ok=True)
+    env["TMPDIR"] = str(tmp)
+    env["TMP"] = str(tmp)
+    env["TEMP"] = str(tmp)
+    return env
+
+
+def mounts_under(root: Path) -> list[str]:
+    """Live mountpoints below one leg context."""
+    prefix = str(root.resolve()).rstrip(os.sep) + os.sep
+    mounts: list[str] = []
+    try:
+        lines = Path("/proc/self/mountinfo").read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines()
+    except OSError:
+        return mounts
+    for line in lines:
+        fields = line.split(" - ", 1)[0].split()
+        if len(fields) < 5:
+            continue
+        mountpoint = fields[4].replace("\\040", " ")
+        if mountpoint == str(root) or mountpoint.startswith(prefix):
+            mounts.append(mountpoint)
+    return sorted(mounts)
+
+
+def processes_for_leg(session: str, leg_root: Path) -> list[dict[str, Any]]:
+    """Processes retaining a session id or an isolated leg path."""
+    root_bytes = str(leg_root).encode()
+    session_bytes = session.encode()
+    matches: list[dict[str, Any]] = []
+    try:
+        entries = list(Path("/proc").iterdir())
+    except OSError:
+        return matches
+    for entry in entries:
+        if not entry.name.isdigit() or int(entry.name) == os.getpid():
+            continue
+        try:
+            cmdline = (entry / "cmdline").read_bytes()
+            environ = (entry / "environ").read_bytes()
+        except OSError:
+            continue
+        if (
+            session_bytes not in cmdline
+            and session_bytes not in environ
+            and root_bytes not in cmdline
+            and root_bytes not in environ
+        ):
+            continue
+        matches.append(
+            {
+                "pid": int(entry.name),
+                "cmdline": " ".join(
+                    chunk.decode("utf-8", "replace")
+                    for chunk in cmdline.split(b"\0")
+                    if chunk
+                ),
+            }
+        )
+    return matches
+
+
+def wait_for_leg_cleanup(
+    session: str, leg_root: Path, timeout_seconds: float = 2.0
+) -> dict[str, Any]:
+    """Prove a context is idle and recover it before another leg can start."""
+    started = time.monotonic()
+    processes: list[dict[str, Any]] = []
+    mounts: list[str] = []
+    while True:
+        processes = processes_for_leg(session, leg_root)
+        mounts = mounts_under(leg_root)
+        if not processes and not mounts:
+            break
+        if time.monotonic() - started >= timeout_seconds:
+            break
+        time.sleep(0.05)
+    clean_exit = not processes and not mounts
+    initial_processes = processes
+    initial_mounts = mounts
+    if not clean_exit:
+        for process in initial_processes:
+            try:
+                os.kill(int(process["pid"]), signal.SIGTERM)
+            except (OSError, ValueError):
+                pass
+        time.sleep(0.2)
+        for process in processes_for_leg(session, leg_root):
+            try:
+                os.kill(int(process["pid"]), signal.SIGKILL)
+            except (OSError, ValueError):
+                pass
+        fusermount = shutil.which("fusermount3")
+        if fusermount is not None:
+            for mount in sorted(initial_mounts, reverse=True):
+                subprocess.run(
+                    [fusermount, "-uz", mount],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+        recovery_deadline = time.monotonic() + timeout_seconds
+        while True:
+            processes = processes_for_leg(session, leg_root)
+            mounts = mounts_under(leg_root)
+            if not processes and not mounts:
+                break
+            if time.monotonic() >= recovery_deadline:
+                break
+            time.sleep(0.05)
+    return {
+        "ok": clean_exit,
+        "clean_exit": clean_exit,
+        "recovery_attempted": not clean_exit,
+        "final_clean": not processes and not mounts,
+        "initial_processes": initial_processes,
+        "initial_mounts": initial_mounts,
+        "processes": processes,
+        "mounts": mounts,
+        "waited_seconds": time.monotonic() - started,
+    }
+
+
 def prepare_environment(temp_root: Path, profile: bool) -> dict[str, str]:
     env = git_env()
     env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
@@ -1011,20 +1160,7 @@ def prepare_environment(temp_root: Path, profile: bool) -> dict[str, str]:
         env["VFS_PROFILE"] = "1"
     else:
         env.pop("VFS_PROFILE", None)
-    home = temp_root / "home"
-    for path in (home, home / ".config", home / ".cache", home / ".local" / "share"):
-        path.mkdir(parents=True, exist_ok=True)
-    env["HOME"] = str(home)
-    env["XDG_CONFIG_HOME"] = str(home / ".config")
-    env["XDG_CACHE_HOME"] = str(home / ".cache")
-    env["XDG_DATA_HOME"] = str(home / ".local" / "share")
-    common.pin_distro_git(env, home, home=home)
-    tmp = temp_root / "tmp"
-    tmp.mkdir(parents=True, exist_ok=True)
-    env["TMPDIR"] = str(tmp)
-    env["TMP"] = str(tmp)
-    env["TEMP"] = str(tmp)
-    return env
+    return isolate_env(env, temp_root / "setup")
 
 
 def workload_argv(args: argparse.Namespace, remote_url: str) -> list[str]:
@@ -1107,6 +1243,45 @@ def profile_counters(summaries: list[dict[str, Any]]) -> dict[str, Any]:
         "max_counters": max_counters,
         "fuse_per_operation": per_operation,
         "last_by_source": by_source,
+    }
+
+
+def probe_engine(vfs_bin: str, cwd: Path, env: dict[str, str], timeout: float) -> dict[str, Any]:
+    """Identify the binary under measurement and what it can be asked to do.
+
+    The same workload is run against engines that do not share a feature set --
+    a pre-fork agentfs build has neither partial-origin copy-up nor the
+    integrity subcommand. Probing keeps one code path and makes the payload
+    state which verifications were actually available, so a reader cannot
+    mistake "not checked" for "checked and clean".
+    """
+    version = run_subprocess([vfs_bin, "--version"], cwd, env, timeout, keep_stdout=True)
+    run_help = run_subprocess([vfs_bin, "run", "--help"], cwd, env, timeout, keep_stdout=True)
+    integrity_help = run_subprocess(
+        [vfs_bin, "integrity", "--help"], cwd, env, timeout, keep_stdout=True
+    )
+    run_help_text = str(run_help.get("stdout", "")) + str(run_help.get("stderr", ""))
+    uring_setting = env.get("VFS_FUSE_URING")
+    kernel_uring_path = Path("/sys/module/fuse/parameters/enable_uring")
+    try:
+        kernel_uring_enabled = kernel_uring_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        kernel_uring_enabled = None
+    return {
+        "bin": vfs_bin,
+        "version": str(version.get("stdout", "")).strip() or None,
+        "requested_fuse_transport": (
+            "uring"
+            if uring_setting == "1"
+            else "legacy"
+            if uring_setting == "0"
+            else "engine-default"
+        ),
+        "kernel_fuse_uring_enabled": kernel_uring_enabled,
+        "capabilities": {
+            "partial_origin": "--partial-origin" in run_help_text,
+            "integrity": integrity_help["returncode"] == 0,
+        },
     }
 
 
@@ -1200,8 +1375,10 @@ def main(argv: list[str]) -> int:
     result: dict[str, Any]
     git_ai_before = common.git_ai_processes()
     try:
-        env = prepare_environment(temp_root, args.profile)
+        base_env = prepare_environment(temp_root, args.profile)
+        env = base_env
         vfs_bin = resolve_vfs_bin(args.vfs_bin, repo_root)
+        engine = probe_engine(vfs_bin, temp_root, env, args.timeout)
         mirror, template, source = prepare_fixture(args, temp_root, env)
         if args.fetch_url:
             remote_url = args.fetch_url
@@ -1228,27 +1405,29 @@ def main(argv: list[str]) -> int:
         native_seconds: list[float] = []
         vfs_seconds: list[float] = []
         schedule = []
-        for sample_index in range(args.samples):
+        total_sample_count = args.warmup + args.samples
+        for sample_index in range(total_sample_count):
+            # Leading samples are discarded: the first touch of the fixture
+            # pays a cold page cache that no later sample repeats, and letting
+            # it into the distribution is what produced medians that moved with
+            # whichever engine happened to run first.
+            warmup_sample = sample_index < args.warmup
             for leg in ("native", "vfs"):
-                schedule.append(leg)
-                root = temp_root / "runs" / f"{sample_index:02d}-{leg}"
+                if not warmup_sample:
+                    schedule.append(leg)
+                leg_root = temp_root / "runs" / f"{sample_index:02d}-{leg}"
+                root = leg_root / "checkout"
                 shutil.copytree(template, root, symlinks=True)
                 session = f"chaos-{sample_index}-{uuid.uuid4().hex}"
+                env = isolate_env(base_env, leg_root)
                 db_path = Path(env["HOME"]) / ".vfs" / "run" / session / "delta.db"
                 base_before = tree_fingerprint(root) if leg == "vfs" else None
                 command = invocation
                 if leg == "vfs":
-                    command = [
-                        vfs_bin,
-                        "run",
-                        "--session",
-                        session,
-                        "--no-default-allows",
-                        "--partial-origin",
-                        "on",
-                        "--",
-                        *invocation,
-                    ]
+                    command = [vfs_bin, "run", "--session", session, "--no-default-allows"]
+                    if engine["capabilities"]["partial_origin"]:
+                        command.extend(["--partial-origin", "on"])
+                    command.extend(["--", *invocation])
                 run = run_subprocess(
                     command,
                     root,
@@ -1275,8 +1454,18 @@ def main(argv: list[str]) -> int:
                 )
                 integrity = (
                     run_integrity(vfs_bin, db_path, root, env, args.timeout)
-                    if leg == "vfs" and db_path.exists()
+                    if leg == "vfs" and db_path.exists() and engine["capabilities"]["integrity"]
                     else None
+                )
+                cleanup = (
+                    wait_for_leg_cleanup(session, leg_root)
+                    if leg == "vfs"
+                    else {
+                        "ok": True,
+                        "processes": [],
+                        "mounts": [],
+                        "waited_seconds": 0.0,
+                    }
                 )
                 measured = (
                     float(workload["measured_seconds"])
@@ -1284,7 +1473,7 @@ def main(argv: list[str]) -> int:
                     and isinstance(workload.get("measured_seconds"), (int, float))
                     else None
                 )
-                if measured is not None:
+                if measured is not None and not warmup_sample:
                     (native_seconds if leg == "native" else vfs_seconds).append(
                         measured
                     )
@@ -1294,8 +1483,13 @@ def main(argv: list[str]) -> int:
                     and workload.get("passed") is True
                     and measured is not None
                     and (leg != "vfs" or base_unchanged is True)
+                    and cleanup["ok"] is True
+                    # Invariant 2 is enforced for every engine. The integrity
+                    # subcommand is a fork addition, so it gates the sample
+                    # only where the engine offers it.
                     and (
                         leg != "vfs"
+                        or not engine["capabilities"]["integrity"]
                         or integrity is not None
                         and integrity.get("ok") is True
                     )
@@ -1303,6 +1497,7 @@ def main(argv: list[str]) -> int:
                 samples.append(
                     {
                         "sample": sample_index,
+                        "warmup": warmup_sample,
                         "leg": leg,
                         "session": session if leg == "vfs" else None,
                         "db_path": str(db_path) if leg == "vfs" else None,
@@ -1320,6 +1515,7 @@ def main(argv: list[str]) -> int:
                             else None
                         ),
                         "integrity": integrity,
+                        "cleanup": cleanup,
                         "profile": (
                             profile_counters(run.get("profile_summaries", []))
                             if leg == "vfs" and args.profile
@@ -1329,17 +1525,24 @@ def main(argv: list[str]) -> int:
                     }
                 )
                 print(
-                    f"[{sample_index + 1}/{args.samples}] {leg}: "
+                    f"[{sample_index + 1}/{total_sample_count}] "
+                    f"{'warmup ' if warmup_sample else ''}{leg}: "
                     f"{measured:.3f}s, ops={workload.get('total_ops')}, "
                     f"{'PASS' if sample_passed else 'FAIL'}"
                     if measured is not None and isinstance(workload, dict)
-                    else f"[{sample_index + 1}/{args.samples}] {leg}: FAIL",
+                    else (
+                        f"[{sample_index + 1}/{total_sample_count}] "
+                        f"{'warmup ' if warmup_sample else ''}{leg}: FAIL"
+                    ),
                     file=sys.stderr,
                     flush=True,
                 )
 
-        native_runs = [sample for sample in samples if sample["leg"] == "native"]
-        vfs_runs = [sample for sample in samples if sample["leg"] == "vfs"]
+        measured_runs = [sample for sample in samples if not sample["warmup"]]
+        native_runs = [
+            sample for sample in measured_runs if sample["leg"] == "native"
+        ]
+        vfs_runs = [sample for sample in measured_runs if sample["leg"] == "vfs"]
         native_stats = summarize_floats(native_seconds)
         vfs_stats = summarize_floats(vfs_seconds)
         derived_ratio = (
@@ -1357,7 +1560,7 @@ def main(argv: list[str]) -> int:
         reproducible_plans = len(plan_digests) == 1 and args.duration is None
         total_ops = sum(
             int(sample.get("workload", {}).get("total_ops", 0) or 0)
-            for sample in samples
+            for sample in measured_runs
             if isinstance(sample.get("workload"), dict)
         )
         leaked_git_ai = common.git_ai_leaks(git_ai_before, common.git_ai_processes())
@@ -1376,15 +1579,19 @@ def main(argv: list[str]) -> int:
             "network": network,
             "parameters": {
                 "samples": args.samples,
+                "warmup_samples_discarded": args.warmup,
                 "actors": args.actors,
                 "operations": args.operations,
                 "duration_seconds": args.duration,
                 "intensities": {
                     kind: getattr(args, f"{kind}_intensity") for kind in ACTOR_KINDS
                 },
-                "partial_origin": "on",
+                "partial_origin": (
+                    "on" if engine["capabilities"]["partial_origin"] else "unsupported-by-engine"
+                ),
                 "timeout_seconds": args.timeout,
             },
+            "engine": engine,
             "measurement": {
                 "schedule": schedule,
                 "interleaved": schedule
