@@ -21,18 +21,22 @@ import argparse
 import hashlib
 import json
 import os
-import shutil
-import signal
-import subprocess
 import sys
 import tempfile
-import time
 import uuid
 from pathlib import Path
 from typing import Any, Optional
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lib.common import (  # noqa: E402
+    env_flag,
+    parse_json_stdout,
+    positive_float,
+    resolve_vfs_bin,
+    run_subprocess,
+    sandbox_python,
+)
 
-OUTPUT_TAIL_CHARS = 4000
 
 # Operates inside the mount (cwd == base tree root). Performs each mutation class
 # and prints a JSON object describing what it observed through the mount.
@@ -166,17 +170,6 @@ print(json.dumps(out, sort_keys=True))
 '''
 
 
-def positive_float(value: str) -> float:
-    parsed = float(value)
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("must be > 0")
-    return parsed
-
-
-def env_flag(name: str) -> bool:
-    return os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
-
-
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--vfs-bin", default=os.environ.get("VFS_BIN"))
@@ -192,99 +185,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--keep-temp", action="store_true", default=env_flag("KEEP_TEMP"))
     return parser.parse_args(argv)
-
-
-def tail_text(value: Any) -> str:
-    if value is None:
-        return ""
-    text = value.decode("utf-8", errors="replace") if isinstance(value, bytes) else str(value)
-    return text if len(text) <= OUTPUT_TAIL_CHARS else text[-OUTPUT_TAIL_CHARS:]
-
-
-def terminate_process_tree(proc: subprocess.Popen[str]) -> None:
-    if proc.poll() is not None:
-        return
-    try:
-        os.killpg(proc.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    except Exception:
-        proc.terminate()
-    try:
-        proc.wait(timeout=5)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        return
-    except Exception:
-        proc.kill()
-
-
-def run_subprocess(argv: list[str], cwd: Path, env: dict[str, str], timeout: float) -> dict[str, Any]:
-    started = time.perf_counter()
-    proc = subprocess.Popen(
-        argv,
-        cwd=str(cwd),
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
-    )
-    try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-        timed_out = False
-    except subprocess.TimeoutExpired:
-        terminate_process_tree(proc)
-        try:
-            stdout, stderr = proc.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            stdout, stderr = "", "process timed out"
-        timed_out = True
-    return {
-        "argv": argv,
-        "returncode": proc.returncode,
-        "timed_out": timed_out,
-        "duration_seconds": time.perf_counter() - started,
-        "stdout_tail": tail_text(stdout),
-        "stderr_tail": tail_text(stderr),
-    }
-
-
-def parse_json_stdout(run: dict[str, Any]) -> Optional[dict[str, Any]]:
-    for line in reversed(run.get("stdout_tail", "").splitlines()):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(value, dict):
-            return value
-    return None
-
-
-def resolve_vfs_bin(vfs_bin: Optional[str], repo_root: Path) -> str:
-    if vfs_bin:
-        candidate = Path(vfs_bin).expanduser()
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return str(candidate.resolve())
-        if os.sep not in vfs_bin:
-            found = shutil.which(vfs_bin)
-            if found:
-                return found
-        raise RuntimeError(f"vfs binary not found or not executable: {vfs_bin}")
-    for candidate in (
-        repo_root / "cli" / "target" / "release" / "vfs",
-        repo_root / "cli" / "target" / "debug" / "vfs",
-    ):
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return str(candidate)
-    raise RuntimeError("no vfs binary found; pass --vfs-bin or set VFS_BIN")
 
 
 def prepare_environment(temp_root: Path, profile: bool) -> dict[str, str]:
@@ -356,7 +256,7 @@ def vfs_run_command(vfs_bin: str, session: str, workload: str) -> list[str]:
         session,
         "--no-default-allows",
         "--",
-        sys.executable,
+        sandbox_python(),
         "-c",
         workload,
     ]

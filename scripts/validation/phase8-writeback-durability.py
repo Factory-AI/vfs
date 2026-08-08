@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 from lib.common import (  # noqa: E402
     env_flag,
     git_commit,

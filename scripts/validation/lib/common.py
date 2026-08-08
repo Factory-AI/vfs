@@ -16,6 +16,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import MutableMapping
@@ -85,6 +86,27 @@ def pin_distro_git(
     return shim
 
 
+def sandbox_python() -> str:
+    """Interpreter path that stays visible inside an `vfs run` sandbox.
+
+    Same hazard `pin_distro_git` documents, for the interpreter: `vfs run`
+    hides home and temp dirs, so a `sys.executable` under `~/.local` (pyenv,
+    uv, a user-installed CPython) simply does not exist inside the sandbox and
+    the workload dies with exit 127 before it can run. Home-relative
+    interpreters only survive because `~/.local` is a default allow, so any leg
+    passing `--no-default-allows` breaks on exactly the machines whose python
+    is not the distro one.
+
+    Prefer a system interpreter on a read-only system path, which the sandbox
+    always exposes; fall back to ``sys.executable`` when there is none (the
+    caller is then no worse off than before).
+    """
+    for candidate in ("/usr/bin/python3", "/bin/python3"):
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return sys.executable
+
+
 def git_ai_processes() -> dict[int, dict[str, Any]]:
     """Live git-ai hook-manager processes, keyed by pid.
 
@@ -144,9 +166,33 @@ def git_ai_leaks(
     return leaks
 
 
-def tail_text(value: Any) -> str:
+def tail_text(value: Any, limit: int = OUTPUT_TAIL_CHARS) -> str:
     text = value.decode("utf-8", errors="replace") if isinstance(value, bytes) else str(value or "")
-    return text if len(text) <= OUTPUT_TAIL_CHARS else text[-OUTPUT_TAIL_CHARS:]
+    return text if len(text) <= limit else text[-limit:]
+
+
+def extract_profile_summaries(stderr: Any) -> list[dict[str, Any]]:
+    """Every `vfs_profile_summary` JSON object a run emitted on stderr.
+
+    Scans the full stderr, not `tail_text` of it: a summary emitted before a
+    chatty workload's output would otherwise fall off the front of the tail
+    and silently vanish from the report.
+    """
+    if stderr is None:
+        return []
+    text = stderr.decode("utf-8", errors="replace") if isinstance(stderr, bytes) else str(stderr)
+    summaries: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or "vfs_profile_summary" not in line:
+            continue
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and value.get("event") == "vfs_profile_summary":
+            summaries.append(value)
+    return summaries
 
 
 def terminate_process_tree(proc: subprocess.Popen[str]) -> None:
@@ -171,7 +217,15 @@ def terminate_process_tree(proc: subprocess.Popen[str]) -> None:
         proc.kill()
 
 
-def run_subprocess(argv: list[str], cwd: Path, env: dict[str, str], timeout: float) -> dict[str, Any]:
+def run_subprocess(
+    argv: list[str],
+    cwd: Path,
+    env: dict[str, str],
+    timeout: float,
+    tail_chars: int = OUTPUT_TAIL_CHARS,
+    *,
+    keep_stdout: bool = False,
+) -> dict[str, Any]:
     started = time.perf_counter()
     proc = subprocess.Popen(
         argv,
@@ -196,21 +250,29 @@ def run_subprocess(argv: list[str], cwd: Path, env: dict[str, str], timeout: flo
                 proc.stderr.close()
             stdout, stderr = "", "process timed out; output pipes closed after termination"
         timed_out = True
-    return {
+    result = {
         "argv": argv,
         "cwd": str(cwd),
         "duration_seconds": time.perf_counter() - started,
         "returncode": proc.returncode,
         "timed_out": timed_out,
-        "stdout_tail": tail_text(stdout),
-        "stderr_tail": tail_text(stderr),
+        "stdout_tail": tail_text(stdout, tail_chars),
+        "stderr_tail": tail_text(stderr, tail_chars),
         "stdout_bytes": len((stdout or "").encode("utf-8", errors="replace")),
         "stderr_bytes": len((stderr or "").encode("utf-8", errors="replace")),
+        "profile_summaries": extract_profile_summaries(stderr),
     }
+    if keep_stdout:
+        # A workload's single-line JSON result can exceed the tail once temp
+        # paths grow (phase8 nests TMPDIR several levels deep), and a
+        # truncated tail is unparseable. Callers that parse it keep the full
+        # text and drop this key before embedding the record in a report.
+        result["stdout"] = stdout or ""
+    return result
 
 
 def parse_json_stdout(run: dict[str, Any]) -> Optional[dict[str, Any]]:
-    text = str(run.get("stdout_tail", "")).strip()
+    text = str(run.get("stdout") or run.get("stdout_tail", "")).strip()
     if text:
         try:
             value = json.loads(text)

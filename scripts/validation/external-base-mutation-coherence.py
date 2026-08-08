@@ -10,7 +10,6 @@ import json
 import os
 import re
 import signal
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -18,35 +17,16 @@ import time
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lib.common import resolve_vfs_bin, tail_text  # noqa: E402
 
-OUTPUT_TAIL_CHARS = 8000
+
 DEFAULT_CLEANUP_TIMEOUT = 10.0
 FINAL_UNMOUNT_SETTLE_TIMEOUT = 0.5
 STALE_BYTES = b"before-base-content\n"
 FRESH_BYTES = b"after-base-content-with-new-size\n"
 MOUNTINFO_ESCAPE_RE = re.compile(r"\\([0-7]{3})")
 EIO_MARKERS = ("Input/output error", "EIO")
-
-
-def tail_text(text: str) -> str:
-    return text if len(text) <= OUTPUT_TAIL_CHARS else text[-OUTPUT_TAIL_CHARS:]
-
-
-def resolve_vfs_bin(vfs_bin: str | None, repo_root: Path) -> str:
-    if vfs_bin:
-        candidate = Path(vfs_bin).expanduser()
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return str(candidate.resolve())
-        if os.sep not in vfs_bin:
-            found = shutil.which(vfs_bin)
-            if found:
-                return found
-        raise RuntimeError(f"vfs binary not found or not executable: {vfs_bin}")
-
-    candidate = repo_root / "target" / "release" / "vfs"
-    if candidate.is_file() and os.access(candidate, os.X_OK):
-        return str(candidate)
-    raise RuntimeError("no release vfs binary found, pass --vfs-bin or build release")
 
 
 def sha256(data: bytes) -> str:

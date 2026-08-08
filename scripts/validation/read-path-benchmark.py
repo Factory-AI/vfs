@@ -8,8 +8,6 @@ import hashlib
 import json
 import os
 import shutil
-import signal
-import subprocess
 import sys
 import tempfile
 import time
@@ -18,9 +16,18 @@ from pathlib import Path
 from statistics import mean
 from typing import Any, Optional
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-OUTPUT_TAIL_CHARS = 4000
-
+from lib.common import (  # noqa: E402
+    env_flag,
+    git_commit,
+    parse_json_stdout,
+    positive_float,
+    positive_int,
+    resolve_vfs_bin,
+    run_subprocess,
+    sandbox_python,
+)
 
 READ_WORKLOAD = r'''
 import argparse
@@ -192,30 +199,11 @@ print(json.dumps({
 '''
 
 
-def positive_int(value: str) -> int:
-    parsed = int(value)
-    if parsed < 1:
-        raise argparse.ArgumentTypeError("must be >= 1")
-    return parsed
-
-
-def positive_float(value: str) -> float:
-    parsed = float(value)
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("must be > 0")
-    return parsed
-
-
 def non_negative_int(value: str) -> int:
     parsed = int(value)
     if parsed < 0:
         raise argparse.ArgumentTypeError("must be >= 0")
     return parsed
-
-
-def env_flag(name: str) -> bool:
-    value = os.environ.get(name, "")
-    return value.lower() in {"1", "true", "yes", "on"}
 
 
 def parse_modes(value: str) -> list[str]:
@@ -346,40 +334,6 @@ Environment:
     return parser.parse_args(argv)
 
 
-def tail_text(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, bytes):
-        text = value.decode("utf-8", errors="replace")
-    else:
-        text = str(value)
-    if len(text) <= OUTPUT_TAIL_CHARS:
-        return text
-    return text[-OUTPUT_TAIL_CHARS:]
-
-
-def extract_profile_summaries(stderr: Any) -> list[dict[str, Any]]:
-    if stderr is None:
-        return []
-    if isinstance(stderr, bytes):
-        text = stderr.decode("utf-8", errors="replace")
-    else:
-        text = str(stderr)
-
-    summaries: list[dict[str, Any]] = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or "vfs_profile_summary" not in line:
-            continue
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(value, dict) and value.get("event") == "vfs_profile_summary":
-            summaries.append(value)
-    return summaries
-
-
 def profile_counter_summary(summaries: list[dict[str, Any]]) -> dict[str, Any]:
     by_source: dict[str, dict[str, Any]] = {}
     max_counters: dict[str, int] = {}
@@ -393,141 +347,6 @@ def profile_counter_summary(summaries: list[dict[str, Any]]) -> dict[str, Any]:
             if isinstance(value, int):
                 max_counters[key] = max(max_counters.get(key, 0), value)
     return {"summary_count": len(summaries), "last_by_source": by_source, "max_counters": max_counters}
-
-
-def terminate_process_tree(proc: subprocess.Popen[str]) -> None:
-    if proc.poll() is not None:
-        return
-    try:
-        os.killpg(proc.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    except Exception:
-        proc.terminate()
-
-    try:
-        proc.wait(timeout=5)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        return
-    except Exception:
-        proc.kill()
-
-
-def run_subprocess(
-    argv: list[str],
-    cwd: Path,
-    env: dict[str, str],
-    timeout: float,
-) -> dict[str, Any]:
-    started = time.perf_counter()
-    proc = subprocess.Popen(
-        argv,
-        cwd=str(cwd),
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
-    )
-    try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-        timed_out = False
-    except subprocess.TimeoutExpired:
-        terminate_process_tree(proc)
-        try:
-            stdout, stderr = proc.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            if proc.stdout is not None:
-                proc.stdout.close()
-            if proc.stderr is not None:
-                proc.stderr.close()
-            stdout, stderr = "", "process timed out; output pipes were closed after termination"
-        timed_out = True
-
-    return {
-        "argv": argv,
-        "cwd": str(cwd),
-        "duration_seconds": time.perf_counter() - started,
-        "returncode": proc.returncode,
-        "timed_out": timed_out,
-        "stdout_tail": tail_text(stdout),
-        "stderr_tail": tail_text(stderr),
-        "stdout_bytes": len((stdout or "").encode("utf-8", errors="replace")),
-        "stderr_bytes": len((stderr or "").encode("utf-8", errors="replace")),
-        "profile_summaries": extract_profile_summaries(stderr),
-    }
-
-
-def parse_json_stdout(run: dict[str, Any]) -> Optional[dict[str, Any]]:
-    for line in reversed(run.get("stdout_tail", "").splitlines()):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(value, dict):
-            return value
-    return None
-
-
-def resolve_vfs_bin(vfs_bin: Optional[str], repo_root: Path) -> str:
-    if vfs_bin:
-        candidate_path = Path(vfs_bin).expanduser()
-        if candidate_path.is_file() and os.access(candidate_path, os.X_OK):
-            return str(candidate_path.resolve())
-        if os.sep not in vfs_bin:
-            found = shutil.which(vfs_bin)
-            if found:
-                return found
-        raise RuntimeError(f"configured vfs executable not found or not executable: {vfs_bin}")
-
-    for candidate_path in (
-        repo_root / "cli" / "target" / "debug" / "vfs",
-        repo_root / "cli" / "target" / "release" / "vfs",
-    ):
-        if candidate_path.is_file() and os.access(candidate_path, os.X_OK):
-            return str(candidate_path)
-
-    build = subprocess.run(
-        ["cargo", "build", "--manifest-path", str(repo_root / "cli" / "Cargo.toml")],
-        cwd=str(repo_root / "cli"),
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    if build.returncode != 0:
-        raise RuntimeError(
-            "failed to build repo-local vfs binary; set VFS_BIN to an explicit binary\n"
-            f"stdout:\n{tail_text(build.stdout)}\n"
-            f"stderr:\n{tail_text(build.stderr)}"
-        )
-
-    built = repo_root / "cli" / "target" / "debug" / "vfs"
-    if built.is_file() and os.access(built, os.X_OK):
-        return str(built)
-
-    raise RuntimeError(f"repo-local build completed but binary was not found: {built}")
-
-
-def git_commit(repo_root: Path) -> Optional[str]:
-    proc = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=str(repo_root),
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-    )
-    if proc.returncode == 0:
-        return proc.stdout.strip()
-    return None
 
 
 def prepare_environment(temp_root: Path, profile: bool) -> dict[str, str]:
@@ -578,7 +397,7 @@ def copy_fixture(source: Path, destination: Path) -> None:
 
 def workload_argv(args: argparse.Namespace) -> list[str]:
     return [
-        sys.executable,
+        sandbox_python(),
         "-c",
         READ_WORKLOAD,
         "--max-files",

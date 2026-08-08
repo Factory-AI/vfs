@@ -23,6 +23,8 @@ from typing import Any, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lib import common  # noqa: E402
 
+from lib.common import git_commit  # noqa: E402
+
 
 def env_float(name: str, default: float) -> float:
     raw = os.environ.get(name)
@@ -110,10 +112,6 @@ def load_json(path: Path) -> Optional[dict[str, Any]]:
     except Exception:
         return None
     return value if isinstance(value, dict) else None
-
-
-def git_commit(repo_root: Path) -> Optional[str]:
-    return common.git_commit(repo_root)
 
 
 def tool_path(name: str) -> Optional[str]:

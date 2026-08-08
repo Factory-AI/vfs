@@ -9,8 +9,6 @@ import json
 import os
 import shlex
 import shutil
-import signal
-import subprocess
 import sys
 import tempfile
 import time
@@ -18,8 +16,16 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lib.common import (  # noqa: E402
+    env_flag,
+    parse_json_stdout,
+    positive_float,
+    positive_int,
+    resolve_vfs_bin,
+    run_subprocess,
+)
 
-OUTPUT_TAIL_CHARS = 4000
 
 CONCURRENT_READ_WORKLOAD = r'''
 import argparse
@@ -108,25 +114,6 @@ print(json.dumps({
 '''
 
 
-def positive_int(value: str) -> int:
-    parsed = int(value)
-    if parsed < 1:
-        raise argparse.ArgumentTypeError("must be >= 1")
-    return parsed
-
-
-def positive_float(value: str) -> float:
-    parsed = float(value)
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("must be > 0")
-    return parsed
-
-
-def env_flag(name: str) -> bool:
-    value = os.environ.get(name, "")
-    return value.lower() in {"1", "true", "yes", "on"}
-
-
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -183,26 +170,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def tail_text(value: Any) -> str:
-    text = value.decode("utf-8", errors="replace") if isinstance(value, bytes) else str(value or "")
-    return text if len(text) <= OUTPUT_TAIL_CHARS else text[-OUTPUT_TAIL_CHARS:]
-
-
-def extract_profile_summaries(stderr: Any) -> list[dict[str, Any]]:
-    text = stderr.decode("utf-8", errors="replace") if isinstance(stderr, bytes) else str(stderr or "")
-    summaries: list[dict[str, Any]] = []
-    for line in text.splitlines():
-        if "vfs_profile_summary" not in line:
-            continue
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(value, dict) and value.get("event") == "vfs_profile_summary":
-            summaries.append(value)
-    return summaries
-
-
 def max_profile_counters(summaries: list[dict[str, Any]]) -> dict[str, int]:
     counters: dict[str, int] = {}
     for summary in summaries:
@@ -213,105 +180,6 @@ def max_profile_counters(summaries: list[dict[str, Any]]) -> dict[str, int]:
             if isinstance(item, int):
                 counters[key] = max(counters.get(key, 0), item)
     return counters
-
-
-def terminate_process_tree(proc: subprocess.Popen[str]) -> None:
-    if proc.poll() is not None:
-        return
-    try:
-        os.killpg(proc.pid, signal.SIGTERM)
-    except Exception:
-        proc.terminate()
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except Exception:
-            proc.kill()
-
-
-def run_subprocess(argv: list[str], cwd: Path, env: dict[str, str], timeout: float) -> dict[str, Any]:
-    started = time.perf_counter()
-    proc = subprocess.Popen(
-        argv,
-        cwd=str(cwd),
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
-    )
-    try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-        timed_out = False
-    except subprocess.TimeoutExpired:
-        terminate_process_tree(proc)
-        stdout, stderr = proc.communicate(timeout=5)
-        timed_out = True
-    return {
-        "argv": argv,
-        "cwd": str(cwd),
-        "duration_seconds": time.perf_counter() - started,
-        "returncode": proc.returncode,
-        "timed_out": timed_out,
-        "stdout_tail": tail_text(stdout),
-        "stderr_tail": tail_text(stderr),
-        "profile_summaries": extract_profile_summaries(stderr),
-    }
-
-
-def parse_json_stdout(run: dict[str, Any]) -> Optional[dict[str, Any]]:
-    for line in reversed(run.get("stdout_tail", "").splitlines()):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(value, dict):
-            return value
-    return None
-
-
-def resolve_vfs_bin(vfs_bin: Optional[str], repo_root: Path) -> str:
-    if vfs_bin:
-        path = Path(vfs_bin).expanduser()
-        if path.is_file() and os.access(path, os.X_OK):
-            return str(path.resolve())
-        if os.sep not in vfs_bin:
-            found = shutil.which(vfs_bin)
-            if found:
-                return found
-        raise RuntimeError(f"vfs executable not found: {vfs_bin}")
-
-    for path in (
-        repo_root / "cli" / "target" / "debug" / "vfs",
-        repo_root / "cli" / "target" / "release" / "vfs",
-    ):
-        if path.is_file() and os.access(path, os.X_OK):
-            return str(path)
-
-    build = subprocess.run(
-        [
-            "cargo",
-            "build",
-            "--manifest-path",
-            str(repo_root / "cli" / "Cargo.toml"),
-            "--no-default-features",
-        ],
-        cwd=str(repo_root),
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    if build.returncode != 0:
-        raise RuntimeError(f"failed to build vfs\n{tail_text(build.stderr)}")
-    built = repo_root / "cli" / "target" / "debug" / "vfs"
-    if not built.is_file():
-        raise RuntimeError(f"built vfs binary missing: {built}")
-    return str(built)
 
 
 def prepare_environment(temp_root: Path, profile: bool) -> dict[str, str]:

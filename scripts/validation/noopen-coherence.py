@@ -42,7 +42,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from lib.common import resolve_vfs_bin, tail_text  # noqa: E402
+
+from lib.common import resolve_vfs_bin, sandbox_python, tail_text  # noqa: E402
 
 EXEC_WORKLOAD = r'''
 import ctypes
@@ -337,7 +338,7 @@ def main() -> int:
                 session_id,
                 "--no-default-allows",
                 "--",
-                sys.executable,
+                sandbox_python(),
                 "-c",
                 OVERLAY_WORKLOAD,
             ]

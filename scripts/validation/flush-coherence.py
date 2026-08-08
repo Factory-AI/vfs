@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 from lib.common import resolve_vfs_bin, tail_text  # noqa: E402
 
 WORKLOAD = r'''

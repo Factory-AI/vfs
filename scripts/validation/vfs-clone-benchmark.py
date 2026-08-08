@@ -26,6 +26,9 @@ import tempfile
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lib.common import resolve_vfs_bin  # noqa: E402
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 CONTENT_HASH_CMD = "git ls-files -z | sort -z | xargs -0 sha256sum | sha256sum"
@@ -38,18 +41,6 @@ def run(cmd: list[str], cwd: Path | None = None, timeout: int = 300) -> subproce
 def require(proc: subprocess.CompletedProcess, what: str) -> None:
     if proc.returncode != 0:
         raise RuntimeError(f"{what} failed (rc={proc.returncode}): {proc.stderr.strip()[:500]}")
-
-
-def resolve_vfs_bin(arg: str | None) -> str:
-    if arg:
-        return arg
-    for candidate in (
-        REPO_ROOT / "cli" / "target" / "release" / "vfs",
-        REPO_ROOT / "cli" / "target" / "debug" / "vfs",
-    ):
-        if candidate.is_file():
-            return str(candidate)
-    raise RuntimeError("vfs binary not found; build cli or pass --vfs-bin")
 
 
 def content_hash_native(workdir: Path) -> str:
@@ -84,7 +75,7 @@ def main() -> int:
     parser.add_argument("--output")
     args = parser.parse_args()
 
-    vfs_bin = resolve_vfs_bin(args.vfs_bin)
+    vfs_bin = resolve_vfs_bin(args.vfs_bin, REPO_ROOT)
     temp_root = Path(tempfile.mkdtemp(prefix="vfs-clone-bench-"))
     results: dict = {"iterations": [], "source": args.source}
     try:
