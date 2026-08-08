@@ -25,7 +25,7 @@ pub struct ProcInfo {
 /// Get the path to the procs directory for a session.
 fn procs_dir(session_id: &str) -> PathBuf {
     let home = dirs::home_dir().expect("home directory");
-    home.join(".vfs").join("run").join(session_id).join("procs")
+    super::run::SessionPaths::new(&home, session_id).procs_dir
 }
 
 /// Get the path to a proc file.
@@ -181,7 +181,7 @@ fn list_sessions() -> Vec<SessionInfo> {
         None => return vec![],
     };
 
-    let run_dir = home.join(".vfs").join("run");
+    let run_dir = super::run::sessions_root(&home);
     let entries = match std::fs::read_dir(&run_dir) {
         Ok(e) => e,
         Err(_) => return vec![],
@@ -191,7 +191,7 @@ fn list_sessions() -> Vec<SessionInfo> {
         .flatten()
         .filter_map(|entry| {
             let session_id = entry.file_name().to_string_lossy().to_string();
-            let procs_dir = entry.path().join("procs");
+            let procs_dir = super::run::SessionPaths::new(&home, &session_id).procs_dir;
 
             if !procs_dir.exists() {
                 return None;

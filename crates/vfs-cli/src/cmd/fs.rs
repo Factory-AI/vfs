@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use anyhow::{Context, Result as AnyhowResult};
+use anyhow::{Context, Error as AnyhowError, Result as AnyhowResult};
 use turso::Value;
 use vfs_core::{EncryptionConfig, VfsOptions};
 
@@ -263,13 +263,42 @@ fn path_exists_in_base(base_path: &str, rel_path: &str) -> bool {
     std::path::Path::new(&full_path).exists()
 }
 
+/// Resolve a `diff` target, which may name a run session as well as an agent
+/// or a database path.
+///
+/// Agent databases keep precedence, so an id that resolves both ways behaves
+/// as it always has; a run session is only consulted once ordinary resolution
+/// has failed. Returns the resolved options and the label to report.
+fn resolve_diff_target(id_or_path: &str) -> AnyhowResult<(VfsOptions, String)> {
+    let agent_error = match VfsOptions::resolve(id_or_path) {
+        Ok(options) => return Ok((options, id_or_path.to_string())),
+        Err(err) => err,
+    };
+
+    let Some(db_path) = super::run::session_db_path(id_or_path) else {
+        // Only an id-shaped argument could have named a session; saying so for
+        // a path the user clearly meant as a path would be noise.
+        if id_or_path.contains(std::path::MAIN_SEPARATOR) {
+            return Err(agent_error.into());
+        }
+        return Err(AnyhowError::from(agent_error).context(format!(
+            "no run session named '{}' either; `vfs ps` lists active sessions",
+            id_or_path
+        )));
+    };
+
+    let label = db_path.display().to_string();
+    let options = VfsOptions::resolve(&label)?;
+    Ok((options, label))
+}
+
 pub async fn diff_filesystem(id_or_path: String) -> AnyhowResult<()> {
-    let options = VfsOptions::resolve(&id_or_path)?;
-    eprintln!("Using agent: {}", id_or_path);
+    let (options, label) = resolve_diff_target(&id_or_path)?;
+    eprintln!("Using agent: {}", label);
 
     let agent = open_vfs(options)
         .await
-        .map_err(|err| super::migrate::open_error_with_guidance(err, &id_or_path))?;
+        .map_err(|err| super::migrate::open_error_with_guidance(err, &label))?;
     let result = diff_opened(&agent).await;
     finalize_readonly(&agent).await;
     result

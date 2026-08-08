@@ -62,8 +62,9 @@ async fn adopt_session(
     }
     super::seed::ensure_git_repository(&base_path)?;
 
-    let session_dir = home.join(".vfs").join("run").join(&session_id);
-    let db_path = session_dir.join("delta.db");
+    let paths = super::run::SessionPaths::new(home, &session_id);
+    let session_dir = paths.run_dir.clone();
+    let db_path = paths.db_path.clone();
     if db_path.is_file() {
         bail!("session already exists: {}", session_dir.display());
     }
@@ -81,7 +82,7 @@ async fn adopt_session(
     if db_path.is_file() {
         bail!("session already exists: {}", session_dir.display());
     }
-    super::pack::ensure_session_inactive(&session_dir)?;
+    super::pack::ensure_session_inactive(&paths)?;
 
     let staging =
         StagedArtifact::new(session_dir.join(format!(".delta.db.adopt-{}.tmp", Uuid::new_v4())));
@@ -113,10 +114,10 @@ async fn adopt_session(
         );
     }
 
-    let base_path_file = session_dir.join("base_path");
-    fs::write(&base_path_file, base_path.to_string_lossy().as_bytes())
+    let base_path_file = &paths.base_path_file;
+    fs::write(base_path_file, base_path.to_string_lossy().as_bytes())
         .context("Failed to publish session base path")?;
-    super::pack::sync_file_and_parent(&base_path_file)?;
+    super::pack::sync_file_and_parent(base_path_file)?;
     fs::rename(staging.path(), &db_path).with_context(|| {
         format!(
             "Failed to install adopted session database {}",

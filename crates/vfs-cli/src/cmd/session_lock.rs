@@ -2,7 +2,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Advisory lock held for the lifetime of a run, seed, or pack operation.
 pub(crate) struct SessionLock {
@@ -21,6 +21,14 @@ impl Drop for SessionLock {
 }
 
 impl SessionLock {
+    /// Path of the advisory lock file guarding `session_dir`.
+    ///
+    /// This module owns the lock file name; callers that need to test for its
+    /// presence ask here rather than joining the literal themselves.
+    pub(crate) fn lock_path(session_dir: &Path) -> PathBuf {
+        session_dir.join(".session.lock")
+    }
+
     /// Acquire a shared lock for a run owner or joiner.
     pub(crate) fn try_shared(session_dir: &Path) -> io::Result<Self> {
         Self::try_acquire(session_dir, libc::LOCK_SH)
@@ -52,7 +60,7 @@ impl SessionLock {
             use std::os::unix::fs::OpenOptionsExt;
             options.custom_flags(libc::O_CLOEXEC);
         }
-        let file = options.open(session_dir.join(".session.lock"))?;
+        let file = options.open(Self::lock_path(session_dir))?;
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;

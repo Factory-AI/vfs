@@ -232,6 +232,24 @@ assert set(status) == {
 }, status
 PY
 
+# `vfs run` tells the user to inspect a session with `vfs diff <session-id>`,
+# so that has to resolve the run store and not just the `.vfs/<id>.db` agent
+# convention.
+TARGET_DIFF="$TEST_ROOT/target-diff.txt"
+run_from "$OTHER" diff "$TARGET_ID" >"$TARGET_DIFF" 2>/dev/null ||
+    fail "diff by session id failed"
+grep -q "persisted.txt" "$TARGET_DIFF" ||
+    fail "diff by session id did not report the session's delta"
+
+# An id that names neither an agent nor a session must say so, rather than
+# reporting only the agent-database miss.
+DIFF_ERR="$TEST_ROOT/diff-missing.txt"
+if run_from "$OTHER" diff "no-such-thing-$$" >/dev/null 2>"$DIFF_ERR"; then
+    fail "diff accepted an unknown id"
+fi
+grep -q "no run session named" "$DIFF_ERR" ||
+    fail "diff error does not mention the run session lookup"
+
 # A genuinely live incarnation accepts joiners without being mistaken for
 # stale state or opening the database a second time.
 (

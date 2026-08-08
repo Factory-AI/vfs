@@ -549,10 +549,11 @@ fn setup_run_directory(
     if !VfsOptions::validate_agent_id(&run_id) {
         return Err(super::InvalidRunSession::new(format!("invalid session ID: {run_id}")).into());
     }
-    let run_dir = home.join(".vfs").join("run").join(&run_id);
+    let paths = super::SessionPaths::new(home, &run_id);
+    let run_dir = paths.run_dir.clone();
     let existed = run_dir.exists();
     std::fs::create_dir_all(&run_dir).context("Failed to create run directory")?;
-    let lock_file_existed = run_dir.join(".session.lock").is_file();
+    let lock_file_existed = paths.lock_file().is_file();
     let (session_lock, owns_runtime) = if acquire_lock {
         match crate::cmd::session_lock::SessionLock::try_exclusive(&run_dir) {
             Ok(lock) => (Some(lock), true),
@@ -575,10 +576,13 @@ fn setup_run_directory(
         (None, false)
     };
 
-    let db_path = run_dir.join("delta.db");
-    let mountpoint = run_dir.join("mnt");
-    let runtime_status_file = run_dir.join("runtime-status.json");
-    let base_path_file = run_dir.join("base_path");
+    let super::SessionPaths {
+        db_path,
+        mountpoint,
+        runtime_status_file,
+        base_path_file,
+        ..
+    } = paths;
     if owns_runtime {
         crate::cmd::pack::recover_interrupted_publication(&db_path)?;
     }

@@ -89,20 +89,31 @@ impl std::fmt::Display for InvalidRunSession {
 
 impl std::error::Error for InvalidRunSession {}
 
+/// Root of the run session store under `home`.
+pub(crate) fn sessions_root(home: &Path) -> PathBuf {
+    home.join(".vfs").join("run")
+}
+
+/// Every path that makes up one run session directory.
+///
+/// This is the single authority for the run store layout. Nothing outside
+/// this type should join `.vfs`, `run`, or any session file name: the layout
+/// is private to `vfs` (installed only through `vfs adopt`), and a second
+/// hand-rolled copy is how a platform path silently stops matching the rest.
 #[derive(Debug, Clone)]
-struct SessionPaths {
-    session_id: String,
-    run_dir: PathBuf,
-    db_path: PathBuf,
-    mountpoint: PathBuf,
-    base_path_file: PathBuf,
-    procs_dir: PathBuf,
-    runtime_status_file: PathBuf,
+pub(crate) struct SessionPaths {
+    pub(crate) session_id: String,
+    pub(crate) run_dir: PathBuf,
+    pub(crate) db_path: PathBuf,
+    pub(crate) mountpoint: PathBuf,
+    pub(crate) base_path_file: PathBuf,
+    pub(crate) procs_dir: PathBuf,
+    pub(crate) runtime_status_file: PathBuf,
 }
 
 impl SessionPaths {
-    fn new(home: &Path, session_id: &str) -> Self {
-        let run_dir = home.join(".vfs").join("run").join(session_id);
+    pub(crate) fn new(home: &Path, session_id: &str) -> Self {
+        let run_dir = sessions_root(home).join(session_id);
         Self {
             session_id: session_id.to_string(),
             db_path: run_dir.join("delta.db"),
@@ -113,6 +124,24 @@ impl SessionPaths {
             run_dir,
         }
     }
+
+    /// Advisory lock file guarding this session.
+    pub(crate) fn lock_file(&self) -> PathBuf {
+        crate::cmd::session_lock::SessionLock::lock_path(&self.run_dir)
+    }
+
+    /// The session's delta database, if it is actually installed.
+    fn installed_db(self) -> Option<PathBuf> {
+        self.db_path.is_file().then_some(self.db_path)
+    }
+}
+
+/// Delta database of an installed run session in the current user's store.
+///
+/// Commands that accept a session id alongside agent ids and database paths
+/// resolve through here instead of rebuilding the layout at the call site.
+pub(crate) fn session_db_path(session_id: &str) -> Option<PathBuf> {
+    SessionPaths::new(&dirs::home_dir()?, session_id).installed_db()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,7 +212,7 @@ fn prepare_session(
         .into());
     }
     std::fs::create_dir_all(&paths.run_dir).context("Failed to create run directory")?;
-    let lock_file_existed = paths.run_dir.join(".session.lock").is_file();
+    let lock_file_existed = paths.lock_file().is_file();
     let exclusive = match crate::cmd::session_lock::SessionLock::try_exclusive(&paths.run_dir) {
         Ok(lock) => lock,
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {

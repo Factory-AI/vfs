@@ -133,7 +133,8 @@ async fn pack_session(
         anyhow::bail!("--chunk-size must be at least 1 byte");
     }
 
-    let session_dir = home.join(".vfs").join("run").join(&session_id);
+    let paths = super::run::SessionPaths::new(home, &session_id);
+    let session_dir = paths.run_dir.clone();
     if !session_dir.is_dir() {
         anyhow::bail!("session not found: {}", session_dir.display());
     }
@@ -145,21 +146,21 @@ async fn pack_session(
                 anyhow::Error::new(error).context("Failed to lock session for packing")
             }
         })?;
-    let db_path = session_dir.join("delta.db");
+    let db_path = paths.db_path.clone();
     recover_interrupted_publication(&db_path)?;
     if !db_path.is_file() {
         anyhow::bail!("session database not found: {}", db_path.display());
     }
-    let base_path = read_base_path(&session_dir)?;
+    let base_path = read_base_path(&paths)?;
     let output = normalize_output_path(output, &db_path)?;
     validate_output_target(output.as_deref(), &db_path)?;
 
-    ensure_session_inactive(&session_dir)?;
+    ensure_session_inactive(&paths)?;
 
     let staging =
         TempDatabase::new(session_dir.join(format!(".delta.db.pack-{}.tmp", Uuid::new_v4())));
     copy_database_family(&db_path, staging.path())?;
-    ensure_session_inactive(&session_dir)?;
+    ensure_session_inactive(&paths)?;
 
     migrate_staging_database(staging.path()).await?;
     let vfs = Vfs::open(VfsOptions::with_path(staging.path().to_string_lossy()))
@@ -208,7 +209,7 @@ async fn pack_session(
         .map(|path| create_output_temp(staging.path(), path))
         .transpose()?;
 
-    ensure_session_inactive(&session_dir)?;
+    ensure_session_inactive(&paths)?;
     let backup_path = publish_live_database(staging.path(), &db_path)?;
     if let Err(error) = verify_packed_metadata(&db_path, &metadata)
         .await
@@ -300,19 +301,18 @@ async fn read_metadata_value(conn: &turso::Connection, key: &str) -> Result<Opti
     Ok(rows.next().await?.map(|row| row.get(0)).transpose()?)
 }
 
-pub(crate) fn ensure_session_inactive(session_dir: &Path) -> Result<()> {
-    let mountpoint = session_dir.join("mnt");
-    if vfs_mount::is_mountpoint(&mountpoint)
-        || super::ps::procs_dir_has_live_processes(&session_dir.join("procs"))
+pub(crate) fn ensure_session_inactive(paths: &super::run::SessionPaths) -> Result<()> {
+    if vfs_mount::is_mountpoint(&paths.mountpoint)
+        || super::ps::procs_dir_has_live_processes(&paths.procs_dir)
     {
         return Err(SessionStillRunning.into());
     }
     Ok(())
 }
 
-fn read_base_path(session_dir: &Path) -> Result<PathBuf> {
-    let base_path_file = session_dir.join("base_path");
-    let raw = fs::read_to_string(&base_path_file)
+fn read_base_path(paths: &super::run::SessionPaths) -> Result<PathBuf> {
+    let base_path_file = &paths.base_path_file;
+    let raw = fs::read_to_string(base_path_file)
         .with_context(|| format!("Failed to read {}", base_path_file.display()))?;
     let path = PathBuf::from(raw.trim());
     if !path.is_absolute() {

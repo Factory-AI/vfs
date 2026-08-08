@@ -78,7 +78,8 @@ pub(crate) async fn seed_session(
         bail!("invalid session ID: {session_id}");
     }
 
-    let session_dir = home.join(".vfs").join("run").join(session_id);
+    let paths = crate::cmd::run::SessionPaths::new(home, session_id);
+    let session_dir = paths.run_dir.clone();
     if !session_dir.is_dir() {
         if create_database {
             fs::create_dir_all(&session_dir).context("Failed to create run session directory")?;
@@ -95,10 +96,10 @@ pub(crate) async fn seed_session(
             }
         })?;
     crate::cmd::run::recover_stale_session_runtime(home, session_id)?;
-    ensure_session_inactive(&session_dir)?;
+    super::pack::ensure_session_inactive(&paths)?;
 
-    let (base_path, publish_base_path) = resolve_base_path(&session_dir, requested_base_path)?;
-    let db_path = session_dir.join("delta.db");
+    let (base_path, publish_base_path) = resolve_base_path(&paths, requested_base_path)?;
+    let db_path = paths.db_path.clone();
     recover_interrupted_publication(&db_path)?;
     if !db_path.is_file() && !create_database {
         bail!("session database not found: {}", db_path.display());
@@ -162,10 +163,10 @@ pub(crate) async fn seed_session(
         .context("Failed to finalize seeded session database")?;
     drop(vfs);
     super::safety::remove_sqlite_sidecars_after_checkpoint(staging.path())?;
-    ensure_session_inactive(&session_dir)?;
+    super::pack::ensure_session_inactive(&paths)?;
     if publish_base_path {
         fs::write(
-            session_dir.join("base_path"),
+            &paths.base_path_file,
             base_path.to_string_lossy().as_bytes(),
         )
         .context("Failed to publish session base path")?;
@@ -765,11 +766,11 @@ fn materialize_entry(planned: &PlannedEntry) -> Result<ImportEntry> {
 }
 
 fn resolve_base_path(
-    session_dir: &Path,
+    paths: &crate::cmd::run::SessionPaths,
     requested_base_path: Option<&Path>,
 ) -> Result<(PathBuf, bool)> {
-    let path_file = session_dir.join("base_path");
-    let existing = match fs::read_to_string(&path_file) {
+    let path_file = &paths.base_path_file;
+    let existing = match fs::read_to_string(path_file) {
         Ok(raw) => Some(PathBuf::from(raw.trim())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => {
@@ -837,15 +838,6 @@ fn recover_interrupted_publication(live: &Path) -> Result<()> {
 
 fn seed_backup_path(live: &Path) -> PathBuf {
     live.with_file_name(".delta.db.seed-backup")
-}
-
-fn ensure_session_inactive(session_dir: &Path) -> Result<()> {
-    if vfs_mount::is_mountpoint(&session_dir.join("mnt"))
-        || super::ps::procs_dir_has_live_processes(&session_dir.join("procs"))
-    {
-        return Err(SessionStillRunning.into());
-    }
-    Ok(())
 }
 
 fn git_capture_text(base_path: &Path, args: &[&str]) -> Result<String> {
