@@ -430,8 +430,15 @@ async fn mount_session_fs(
         .parent()
         .context("Control socket has no parent directory")?
         .to_path_buf();
-    let ctl_server = super::ctl::CtlServer::spawn(session.ctl_socket.clone(), session_dir, vfs)
-        .context("Failed to start the session control socket")?;
+    let remote_config =
+        crate::config::remote_config().filter(|config| config.stream_interval_ms > 0);
+    let ctl_server = super::ctl::CtlServer::spawn_with_remote(
+        session.ctl_socket.clone(),
+        session_dir,
+        vfs,
+        remote_config,
+    )
+    .context("Failed to start the session control socket")?;
     Ok((mount_handle, ctl_server))
 }
 

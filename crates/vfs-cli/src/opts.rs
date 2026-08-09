@@ -439,6 +439,16 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Publish a consistent run-session point to the configured remote tier
+    Checkpoint {
+        /// Run session identifier
+        #[arg(value_name = "SESSION_ID")]
+        session_id: String,
+
+        /// Emit a one-line machine-readable JSON report
+        #[arg(long)]
+        json: bool,
+    },
     /// Capture a run session's live git state into its portable delta.
     ///
     /// Compares the session base checkout with --pin, imports dirty files and
@@ -947,6 +957,18 @@ mod tests {
         match args.command {
             Command::Pack { chunk_size, .. } => assert_eq!(chunk_size, 65_536),
             other => panic!("expected pack command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn checkpoint_options_parse() {
+        let args = Args::try_parse_from(["vfs", "checkpoint", "session-1", "--json"]).unwrap();
+        match args.command {
+            Command::Checkpoint { session_id, json } => {
+                assert_eq!(session_id, "session-1");
+                assert!(json);
+            }
+            other => panic!("expected checkpoint command, got {other:?}"),
         }
     }
 

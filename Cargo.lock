@@ -3699,6 +3699,7 @@ name = "vfs-cli"
 version = "1.0.2"
 dependencies = [
  "anyhow",
+ "async-trait",
  "base64",
  "blake3",
  "bytes",

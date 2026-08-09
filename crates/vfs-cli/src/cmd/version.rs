@@ -23,6 +23,7 @@ pub struct VersionInfo {
 struct VersionFeatures {
     uid_squash_run: bool,
     pack: bool,
+    checkpoint: bool,
     seed: bool,
     adopt: bool,
     branch: bool,
@@ -40,6 +41,7 @@ pub fn handle_version_command(stdout: &mut impl Write, json: bool) -> Result<()>
         features: VersionFeatures {
             uid_squash_run: cfg!(target_os = "linux"),
             pack: true,
+            checkpoint: true,
             seed: true,
             adopt: true,
             branch: cfg!(unix),
@@ -75,6 +77,7 @@ mod tests {
         );
         assert_eq!(value["features"]["uidSquashRun"], cfg!(target_os = "linux"));
         assert_eq!(value["features"]["pack"], true);
+        assert_eq!(value["features"]["checkpoint"], true);
         assert_eq!(value["features"]["seed"], true);
         assert_eq!(value["features"]["adopt"], true);
         assert_eq!(value["features"]["branch"], cfg!(unix));

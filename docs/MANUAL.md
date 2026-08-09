@@ -365,6 +365,22 @@ vfs pack [OPTIONS] <SESSION_ID>
 - `--chunk-size <BYTES>` — Byte size of the per-chunk verification digests reported in the manifest's `chunks` list [default: 4194304]
 - `--json` — Emit machine-readable JSON (pack output is always JSON)
 
+### vfs checkpoint
+
+Publish a consistent run-session point to the configured remote tier
+
+```
+vfs checkpoint [OPTIONS] <SESSION_ID>
+```
+
+**Arguments:**
+
+- `<SESSION_ID>` — Run session identifier
+
+**Options:**
+
+- `--json` — Emit a one-line machine-readable JSON report
+
 ### vfs seed
 
 Capture a run session's live git state into its portable delta.

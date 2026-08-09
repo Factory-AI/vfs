@@ -41,6 +41,42 @@ pub struct SessionStatusMetadata {
 }
 
 impl Vfs {
+    /// Enumerate the content-addressed chunks currently stored in this database.
+    pub async fn chunk_digests(&self) -> Result<Vec<[u8; 32]>> {
+        let conn = self.pool.get_connection().await?;
+        let mut rows = conn.query("SELECT digest FROM fs_chunk", ()).await?;
+        let mut digests = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let digest = row.get::<Vec<u8>>(0)?;
+            let length = digest.len();
+            digests.push(
+                <[u8; 32]>::try_from(digest).map_err(|_| Error::InvalidChunkDigest { length })?,
+            );
+        }
+        Ok(digests)
+    }
+
+    /// Read one content-addressed chunk, if it is still present.
+    pub async fn chunk_data(&self, digest: &[u8; 32]) -> Result<Option<Vec<u8>>> {
+        let conn = self.pool.get_connection().await?;
+        let mut rows = conn
+            .query(
+                "SELECT data FROM fs_chunk WHERE digest = ?",
+                (Value::Blob(digest.to_vec()),),
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => match row.get_value(0)? {
+                Value::Blob(data) => Ok(Some(data)),
+                value => Err(Error::Internal(format!(
+                    "invalid fs_chunk data for {}: {value:?}",
+                    blake3::Hash::from_bytes(*digest).to_hex()
+                ))),
+            },
+            None => Ok(None),
+        }
+    }
+
     /// Read persistent session handoff metadata.
     pub async fn session_metadata(&self) -> Result<SessionMetadata> {
         let conn = self.pool.get_connection().await?;
@@ -402,6 +438,67 @@ mod tests {
 
     use super::*;
     use crate::VfsOptions;
+
+    #[tokio::test]
+    async fn chunk_accessors_enumerate_and_read_content() -> Result<()> {
+        let dir = tempdir()?;
+        let db_path = dir.path().join("session.db");
+        let vfs = Vfs::open(VfsOptions::with_path(db_path.to_string_lossy())).await?;
+        let content: Vec<u8> = (0..100_000).map(|index| (index % 251) as u8).collect();
+        let (_, file) = vfs.fs.create_file("/chunked.bin", 0o100644, 0, 0).await?;
+        file.pwrite(0, &content).await?;
+        file.fsync().await?;
+        drop(file);
+
+        let digests = vfs.chunk_digests().await?;
+        assert!(!digests.is_empty());
+
+        let conn = vfs.get_connection().await?;
+        let mut rows = conn.query("SELECT digest FROM fs_chunk", ()).await?;
+        let mut expected = std::collections::HashSet::new();
+        while let Some(row) = rows.next().await? {
+            expected.insert(row.get::<Vec<u8>>(0)?);
+        }
+        drop(rows);
+        drop(conn);
+        assert_eq!(
+            digests
+                .iter()
+                .map(|digest| digest.to_vec())
+                .collect::<std::collections::HashSet<_>>(),
+            expected
+        );
+
+        for digest in &digests {
+            let data = vfs
+                .chunk_data(digest)
+                .await?
+                .expect("enumerated chunk must still exist");
+            assert_eq!(blake3::hash(&data).as_bytes(), digest);
+        }
+        assert_eq!(vfs.chunk_data(&[0xff; 32]).await?, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chunk_digests_rejects_malformed_rows() -> Result<()> {
+        let dir = tempdir()?;
+        let db_path = dir.path().join("session.db");
+        let vfs = Vfs::open(VfsOptions::with_path(db_path.to_string_lossy())).await?;
+        let conn = vfs.get_connection().await?;
+        conn.execute(
+            "INSERT INTO fs_chunk (digest, data, refcount) VALUES (?, ?, 0)",
+            (Value::Blob(vec![0xaa]), Value::Blob(vec![0xbb])),
+        )
+        .await?;
+        drop(conn);
+
+        assert!(matches!(
+            vfs.chunk_digests().await,
+            Err(Error::InvalidChunkDigest { length: 1 })
+        ));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn metadata_defaults_and_generation_is_monotonic() -> Result<()> {

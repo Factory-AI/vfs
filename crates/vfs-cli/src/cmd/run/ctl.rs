@@ -145,6 +145,7 @@ fn addressable_socket_path(socket_path: &Path) -> Result<(Option<std::fs::File>,
 pub(crate) struct CtlServer {
     socket_path: PathBuf,
     task: tokio::task::JoinHandle<()>,
+    remote_streamer: Option<crate::cmd::remote::streamer::RemoteStreamer>,
 }
 
 #[cfg(target_os = "linux")]
@@ -153,7 +154,18 @@ impl CtlServer {
     ///
     /// Any pre-existing socket file is a leftover from a dead owner (the
     /// caller already holds the session lock) and is replaced.
+    #[cfg(test)]
     pub(crate) fn spawn(socket_path: PathBuf, session_dir: PathBuf, vfs: Arc<Vfs>) -> Result<Self> {
+        Self::spawn_with_remote(socket_path, session_dir, vfs, None)
+    }
+
+    /// Bind the control socket and optionally couple a remote streamer to it.
+    pub(crate) fn spawn_with_remote(
+        socket_path: PathBuf,
+        session_dir: PathBuf,
+        vfs: Arc<Vfs>,
+        remote_config: Option<crate::cmd::remote::RemoteConfig>,
+    ) -> Result<Self> {
         match std::fs::remove_file(&socket_path) {
             Ok(()) => debug!(socket = %socket_path.display(), "removed stale control socket"),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -174,13 +186,30 @@ impl CtlServer {
             )
         })?;
         drop(dir_handle);
+        let remote_streamer = match remote_config
+            .map(|config| crate::cmd::remote::streamer::RemoteStreamer::spawn(vfs.clone(), config))
+            .transpose()
+        {
+            Ok(streamer) => streamer,
+            Err(error) => {
+                let _ = std::fs::remove_file(&socket_path);
+                return Err(error).context("Failed to start the remote chunk streamer");
+            }
+        };
         let task = tokio::spawn(accept_loop(listener, Arc::new(session_dir), vfs));
-        Ok(Self { socket_path, task })
+        Ok(Self {
+            socket_path,
+            task,
+            remote_streamer,
+        })
     }
 
     /// Stop serving and remove the socket file.
     pub(crate) async fn shutdown(self) {
         self.task.abort();
+        if let Some(streamer) = self.remote_streamer {
+            streamer.shutdown();
+        }
         let _ = self.task.await;
         let _ = std::fs::remove_file(&self.socket_path);
     }

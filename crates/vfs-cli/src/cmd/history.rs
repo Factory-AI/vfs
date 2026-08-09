@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use uuid::Uuid;
 use vfs_core::{Vfs, VfsOptions};
 
@@ -104,7 +104,7 @@ async fn history_session(
     let staging = paths
         .run_dir
         .join(format!(".history-{}.tmp", Uuid::new_v4()));
-    let _cleanup = SnapshotCleanup(staging.clone());
+    let _cleanup = super::branch::SnapshotCleanup::armed(staging.clone());
     super::branch::snapshot_parent(&paths, &staging)
         .await
         .context("Failed to snapshot the session for history inspection")?;
@@ -211,14 +211,6 @@ async fn read_entries(
         }
     }
     Ok(entries)
-}
-
-struct SnapshotCleanup(PathBuf);
-
-impl Drop for SnapshotCleanup {
-    fn drop(&mut self) {
-        super::pack::remove_database_family(&self.0);
-    }
 }
 
 #[cfg(test)]

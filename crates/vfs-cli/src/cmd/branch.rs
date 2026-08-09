@@ -115,7 +115,7 @@ pub(crate) async fn branch_session(
     let staging = parent
         .run_dir
         .join(format!(".branch-{}.tmp", Uuid::new_v4()));
-    let staging_cleanup = RemoveOnDrop::armed(staging.clone());
+    let staging_cleanup = SnapshotCleanup::armed(staging.clone());
     let parent_live = snapshot_parent(&parent, &staging).await?;
     let reconstruction = reconstruct_branch_target(&staging, target_seq).await?;
 
@@ -166,6 +166,14 @@ pub(crate) async fn branch_session(
 /// capability channel to whoever holds the shared lock. The single retry
 /// covers the owner exiting between classification and connect.
 pub(crate) async fn snapshot_parent(parent: &SessionPaths, staging: &Path) -> Result<bool> {
+    snapshot_parent_with_config(parent, staging, crate::config::core_config_from_env()).await
+}
+
+pub(crate) async fn snapshot_parent_with_config(
+    parent: &SessionPaths,
+    staging: &Path,
+    core_config: vfs_core::CoreConfig,
+) -> Result<bool> {
     for attempt in 0..2 {
         match SessionLock::try_exclusive(&parent.run_dir) {
             Ok(_lock) => {
@@ -180,12 +188,12 @@ pub(crate) async fn snapshot_parent(parent: &SessionPaths, staging: &Path) -> Re
                         parent.db_path.display()
                     )
                 })?;
-                let vfs = Vfs::open(
-                    VfsOptions::with_path(db_path)
-                        .with_core_config(crate::config::core_config_from_env()),
-                )
-                .await
-                .map_err(|error| super::migrate::open_error_with_guidance(error, db_path))?;
+                let vfs =
+                    Vfs::open(VfsOptions::with_path(db_path).with_core_config(core_config.clone()))
+                        .await
+                        .map_err(|error| {
+                            super::migrate::open_error_with_guidance(error, db_path)
+                        })?;
                 let result = vfs.snapshot_into(staging).await;
                 vfs.fs
                     .finalize()
@@ -347,19 +355,19 @@ async fn install_branch_session(
 }
 
 /// Removes a staged database family unless disarmed.
-struct RemoveOnDrop(Option<PathBuf>);
+pub(crate) struct SnapshotCleanup(Option<PathBuf>);
 
-impl RemoveOnDrop {
-    fn armed(path: PathBuf) -> Self {
+impl SnapshotCleanup {
+    pub(crate) fn armed(path: PathBuf) -> Self {
         Self(Some(path))
     }
 
-    fn disarm(mut self) {
+    pub(crate) fn disarm(mut self) {
         self.0 = None;
     }
 }
 
-impl Drop for RemoveOnDrop {
+impl Drop for SnapshotCleanup {
     fn drop(&mut self) {
         if let Some(path) = self.0.take() {
             super::pack::remove_database_family(&path);

@@ -261,7 +261,11 @@ async fn pack_session(
     Ok(())
 }
 
-async fn materialize_branch_staging(home: &Path, base_path: &Path, vfs: &Vfs) -> Result<()> {
+pub(crate) async fn materialize_branch_staging(
+    home: &Path,
+    base_path: &Path,
+    vfs: &Vfs,
+) -> Result<()> {
     let Some(mut next_digest) = vfs.overlay_parent_artifact().await? else {
         return Ok(());
     };

@@ -346,6 +346,14 @@ fn dispatch(args: Args) -> anyhow::Result<()> {
                 json,
             ))
         }
+        Command::Checkpoint { session_id, json } => {
+            let rt = get_runtime();
+            rt.block_on(cmd::checkpoint::handle_checkpoint_command(
+                &mut std::io::stdout(),
+                session_id,
+                json,
+            ))
+        }
         Command::Seed {
             session_id,
             pin,

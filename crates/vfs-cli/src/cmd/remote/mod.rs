@@ -1,6 +1,7 @@
 //! Remote-tier wire vocabulary and object-store access.
 
 mod store;
+pub(crate) mod streamer;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};

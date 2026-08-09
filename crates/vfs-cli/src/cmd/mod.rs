@@ -3,6 +3,7 @@ pub mod adopt;
 pub mod artifacts;
 #[cfg(unix)]
 pub mod branch;
+pub mod checkpoint;
 pub mod completions;
 pub mod fs;
 pub mod history;
