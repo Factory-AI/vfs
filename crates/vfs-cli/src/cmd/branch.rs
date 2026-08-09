@@ -488,6 +488,8 @@ mod tests {
         assert_eq!(count, 1, "identical parent state must share one artifact");
     }
 
+    // The control server exists only where a mount owner serves it.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn branching_a_live_session_uses_the_control_socket() {
         let home = tempfile::tempdir().unwrap();

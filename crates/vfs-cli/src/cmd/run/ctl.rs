@@ -6,22 +6,33 @@
 //! the advisory session lock: a stale socket file left behind by SIGKILL
 //! refuses connections, so the socket never becomes a second liveness signal.
 
+// The server half is compiled only where a mount owner actually serves the
+// socket (`run/linux.rs`); macOS builds carry just the client so `branch`
+// and `prune artifacts` can still classify a live Linux-style session store
+// without dead server code failing -D warnings.
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
-use tracing::{debug, warn};
-use vfs_core::Vfs;
+use tokio::net::UnixStream;
+
+#[cfg(target_os = "linux")]
+use {
+    std::sync::Arc,
+    std::time::Duration,
+    tokio::net::UnixListener,
+    tokio::sync::Mutex,
+    tracing::{debug, warn},
+    vfs_core::Vfs,
+};
 
 /// Reported by `ping`; bump when request or response semantics change.
+#[cfg(target_os = "linux")]
 pub(crate) const CTL_PROTOCOL_VERSION: u32 = 1;
 
 /// Bound on how long the server waits for a connected client's request line.
+#[cfg(target_os = "linux")]
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// One-line JSON request accepted on the control socket.
@@ -55,6 +66,7 @@ pub(crate) struct CtlResponse {
     pub(crate) parent_artifact: Option<String>,
 }
 
+#[cfg(target_os = "linux")]
 impl CtlResponse {
     fn ok() -> Self {
         Self {
@@ -129,11 +141,13 @@ fn addressable_socket_path(socket_path: &Path) -> Result<(Option<std::fs::File>,
 }
 
 /// Running control server; owns the socket file and the session's SDK handle.
+#[cfg(target_os = "linux")]
 pub(crate) struct CtlServer {
     socket_path: PathBuf,
-    task: JoinHandle<()>,
+    task: tokio::task::JoinHandle<()>,
 }
 
+#[cfg(target_os = "linux")]
 impl CtlServer {
     /// Bind the session control socket and serve requests until shutdown.
     ///
@@ -172,6 +186,7 @@ impl CtlServer {
     }
 }
 
+#[cfg(target_os = "linux")]
 async fn accept_loop(listener: UnixListener, session_dir: Arc<PathBuf>, vfs: Arc<Vfs>) {
     // Serializes snapshots: concurrent VACUUM INTO copies of one database
     // multiply IO for no benefit and complicate failure cleanup.
@@ -194,6 +209,7 @@ async fn accept_loop(listener: UnixListener, session_dir: Arc<PathBuf>, vfs: Arc
     }
 }
 
+#[cfg(target_os = "linux")]
 async fn handle_connection(
     stream: UnixStream,
     session_dir: Arc<PathBuf>,
@@ -236,6 +252,7 @@ async fn handle_connection(
     }
 }
 
+#[cfg(target_os = "linux")]
 async fn handle_snapshot(
     session_dir: &Path,
     vfs: &Vfs,
@@ -298,7 +315,8 @@ pub(crate) async fn request(socket_path: &Path, request: &CtlRequest) -> Result<
     serde_json::from_str(line.trim()).context("Invalid control response")
 }
 
-#[cfg(test)]
+// Every test spawns the server, which exists only on Linux.
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use vfs_core::VfsOptions;

@@ -435,6 +435,8 @@ mod tests {
         assert!(report.kept.is_empty());
     }
 
+    // The control server exists only where a mount owner serves it.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn prune_asks_a_live_session_over_its_control_socket() {
         let home = tempfile::tempdir().unwrap();
