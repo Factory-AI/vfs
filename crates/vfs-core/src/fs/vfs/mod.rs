@@ -43,7 +43,7 @@ use caches::{AttrCache, DentryCache, NegativeDentryCache};
 pub use file::VfsFile;
 pub use import::{ImportEntry, ImportOptions, ImportSession, ImportedEntry};
 pub use journal::journal_gc;
-pub(in crate::fs) use journal::{JournalOp, MutationTxn};
+pub(in crate::fs) use journal::{JournalCtx, JournalOp, MutationTxn};
 pub use lifecycle::ReapHook;
 use lifecycle::{Lifecycle, OpenInodeGuard};
 
@@ -155,6 +155,8 @@ pub struct Vfs {
     overlay_reads: bool,
     /// Typed runtime configuration captured once when the filesystem opens.
     core_config: Arc<CoreConfig>,
+    /// Kill-switch state plus the shared next-seq hint for journal commits.
+    journal: journal::JournalCtx,
     /// Open-handle registry, deferred orphan queue, and reap hooks.
     lifecycle: Arc<Lifecycle>,
 }
@@ -238,6 +240,7 @@ impl Vfs {
             import_commit_sizes: Arc::new(Mutex::new(Vec::new())),
             overlay_reads: config.overlay_reads,
             core_config: Arc::new(config),
+            journal: journal::JournalCtx::new(false),
             lifecycle: Arc::new(Lifecycle::default()),
         })
     }
@@ -256,7 +259,8 @@ impl Vfs {
 
         // Initialize or migrate schema first. The schema module owns DDL and
         // stamps SQLite's user-version inside the DDL transaction.
-        Self::initialize_schema(&conn, config.journal_enabled).await?;
+        let journal = journal::JournalCtx::new(config.journal_enabled);
+        Self::initialize_schema(&conn, journal.clone()).await?;
 
         // Get chunk_size from config (or use default)
         let chunk_size = Self::read_chunk_size(&conn).await?;
@@ -282,7 +286,7 @@ impl Vfs {
                 inline_threshold,
                 invalidate,
                 &core_config.batcher,
-                core_config.journal_enabled,
+                journal.clone(),
             ));
             let (pending_view, write_drain) = VfsWriteBatcher::split(&batcher);
             (Some(pending_view), Some(write_drain), Some(batcher))
@@ -295,7 +299,7 @@ impl Vfs {
             lifecycle.register_reap_hook(hook);
         }
         lifecycle
-            .sweep_mount_orphans(&conn, core_config.journal_enabled)
+            .sweep_mount_orphans(&conn, journal.clone())
             .await?;
 
         let overlay_reads = core_config.overlay_reads;
@@ -318,6 +322,7 @@ impl Vfs {
             import_commit_sizes: Arc::new(Mutex::new(Vec::new())),
             overlay_reads,
             core_config,
+            journal,
             lifecycle,
         };
         Ok(fs)
@@ -341,8 +346,8 @@ impl Vfs {
         self.core_config.partial_origin
     }
 
-    pub(crate) fn journal_enabled(&self) -> bool {
-        !self.read_only && self.core_config.journal_enabled
+    pub(in crate::fs) fn journal_ctx(&self) -> journal::JournalCtx {
+        self.journal.clone()
     }
 
     /// Configured journal retention horizon, in retained operations.
@@ -370,9 +375,9 @@ impl Vfs {
     }
 
     /// Initialize the database schema
-    async fn initialize_schema(conn: &Connection, journal_enabled: bool) -> Result<()> {
+    async fn initialize_schema(conn: &Connection, journal: journal::JournalCtx) -> Result<()> {
         schema::require_current(conn).await?;
-        let mut txn = MutationTxn::begin(conn, journal_enabled).await?;
+        let mut txn = MutationTxn::begin(conn, journal).await?;
 
         // Ensure root directory exists with correct ownership
         let mut rows = txn
@@ -703,7 +708,7 @@ impl Vfs {
     pub(crate) async fn process_deferred_reaps(&self) -> Result<()> {
         let reaped = self
             .lifecycle
-            .process_deferred_reaps(&self.pool, self.journal_enabled(), |ino| {
+            .process_deferred_reaps(&self.pool, self.journal_ctx(), |ino| {
                 self.discard_pending_for_reaped_inode(ino);
             })
             .await?;
@@ -1079,7 +1084,7 @@ impl Vfs {
             pending_view: self.pending_view.clone(),
             write_drain: self.write_drain.clone(),
             overlay_reads: self.overlay_reads,
-            journal_enabled: self.journal_enabled(),
+            journal: self.journal_ctx(),
             _open_guard: Some(self.lifecycle.guard(ino)),
         }))
     }

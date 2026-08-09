@@ -27,7 +27,7 @@ pub struct VfsFile {
     /// Same semantics as the field on `Vfs`; cloned at open time so the
     /// hot read/write path doesn't have to chase an extra indirection.
     pub(super) overlay_reads: bool,
-    pub(super) journal_enabled: bool,
+    pub(super) journal: JournalCtx,
     /// Present for user-visible handles so unlink defers inode reaping while
     /// they live. This remains optional until lifecycle extraction flattens
     /// the handle construction API.
@@ -134,16 +134,19 @@ impl File for VfsFile {
         // contract explicit.
         self.drain_writes().await?;
         let conn = self.pool.get_connection().await?;
-        let mut txn = MutationTxn::begin(&conn, self.journal_enabled).await?;
+        let mut txn = MutationTxn::begin(&conn, self.journal.clone()).await?;
         let ranges = [WriteRangeRef { offset, data }];
         let normalized = store::normalize_write_ranges(&ranges)?;
         let result =
             store::write_ranges(txn.conn(), self.ino, self.geometry(), &ranges, false, None).await;
         match result {
             Ok(()) => {
-                txn.record(
-                    JournalOp::write(txn.conn(), self.ino, self.chunk_size, &normalized).await?,
-                );
+                if txn.journaling() {
+                    txn.record(
+                        JournalOp::write(txn.conn(), self.ino, self.chunk_size, &normalized)
+                            .await?,
+                    );
+                }
                 txn.commit().await?;
                 self.attr_cache.remove(self.ino);
                 Ok(())
@@ -170,7 +173,7 @@ impl File for VfsFile {
         self.drain_writes().await?;
 
         let conn = self.pool.get_connection().await?;
-        let mut txn = MutationTxn::begin(&conn, self.journal_enabled).await?;
+        let mut txn = MutationTxn::begin(&conn, self.journal.clone()).await?;
         let range_refs: Vec<_> = ranges
             .iter()
             .map(|range| WriteRangeRef {
@@ -190,9 +193,12 @@ impl File for VfsFile {
         .await;
         match result {
             Ok(()) => {
-                txn.record(
-                    JournalOp::write(txn.conn(), self.ino, self.chunk_size, &normalized).await?,
-                );
+                if txn.journaling() {
+                    txn.record(
+                        JournalOp::write(txn.conn(), self.ino, self.chunk_size, &normalized)
+                            .await?,
+                    );
+                }
                 txn.commit().await?;
                 self.attr_cache.remove(self.ino);
                 Ok(())
@@ -231,13 +237,16 @@ impl File for VfsFile {
         // call exactly matches `new_size`.
         self.drain_writes().await?;
         let conn = self.pool.get_connection().await?;
-        let mut txn = MutationTxn::begin(&conn, self.journal_enabled).await?;
+        let mut txn = MutationTxn::begin(&conn, self.journal.clone()).await?;
         let result = store::truncate(txn.conn(), self.ino, self.geometry(), new_size).await;
         match result {
             Ok(()) => {
-                txn.record(
-                    JournalOp::truncate(txn.conn(), self.ino, self.chunk_size, new_size).await?,
-                );
+                if txn.journaling() {
+                    txn.record(
+                        JournalOp::truncate(txn.conn(), self.ino, self.chunk_size, new_size)
+                            .await?,
+                    );
+                }
                 txn.commit().await?;
                 self.attr_cache.remove(self.ino);
                 Ok(())

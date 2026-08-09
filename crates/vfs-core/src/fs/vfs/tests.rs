@@ -3114,7 +3114,7 @@
                 Arc::new(move |ino| attr_cache.remove(ino))
             },
             &config,
-            fs.journal_enabled(),
+            fs.journal_ctx(),
         ))
     }
 
@@ -4402,7 +4402,7 @@
         )
         .await?;
 
-        let mut old = MutationTxn::begin(&conn, true).await?;
+        let mut old = MutationTxn::begin(&conn, JournalCtx::new(true)).await?;
         old.record(JournalOp::with_digests(
             "write",
             serde_json::json!({ "ino": 10, "ranges": [] }),
@@ -4414,7 +4414,7 @@
         ));
         old.commit().await?;
 
-        let mut boundary = MutationTxn::begin(&conn, true).await?;
+        let mut boundary = MutationTxn::begin(&conn, JournalCtx::new(true)).await?;
         boundary.record(JournalOp::with_digests(
             "write",
             serde_json::json!({ "ino": 11, "ranges": [] }),
@@ -4426,7 +4426,7 @@
         ));
         boundary.commit().await?;
 
-        let mut newest = MutationTxn::begin(&conn, true).await?;
+        let mut newest = MutationTxn::begin(&conn, JournalCtx::new(true)).await?;
         newest.record(JournalOp::new(
             "mkdir",
             serde_json::json!({ "ino": 12 }),
@@ -4461,6 +4461,68 @@
         )
         .await?;
         assert!(report.ok, "post-GC integrity report must pass");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn journal_txn_id_equals_first_seq_even_after_a_stale_hint() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        let conn = fs.pool.get_connection().await?;
+        let ctx = fs.journal_ctx();
+
+        for _ in 0..2 {
+            let mut txn = MutationTxn::begin(&conn, ctx.clone()).await?;
+            txn.record(JournalOp::new(
+                "setattr",
+                serde_json::json!({ "ino": 1, "fields": { "mode": true } }),
+            ));
+            txn.record(JournalOp::new(
+                "setattr",
+                serde_json::json!({ "ino": 2, "fields": { "mode": true } }),
+            ));
+            txn.commit().await?;
+        }
+
+        // Another opener appends a row the shared hint never saw; the next
+        // seam commit must detect the stale hint and patch its own rows.
+        conn.execute(
+            "INSERT INTO fs_op_journal (txn_id, op, payload, wallclock_ms)
+             VALUES (0, 'setattr', '{}', 0)",
+            (),
+        )
+        .await?;
+        conn.execute("UPDATE fs_op_journal SET txn_id = seq WHERE txn_id = 0", ())
+            .await?;
+
+        let mut txn = MutationTxn::begin(&conn, ctx.clone()).await?;
+        txn.record(JournalOp::new(
+            "setattr",
+            serde_json::json!({ "ino": 3, "fields": { "mode": true } }),
+        ));
+        txn.record(JournalOp::new(
+            "setattr",
+            serde_json::json!({ "ino": 4, "fields": { "mode": true } }),
+        ));
+        txn.commit().await?;
+
+        let mut rows = conn
+            .query(
+                "SELECT txn_id, MIN(seq), COUNT(*) FROM fs_op_journal GROUP BY txn_id",
+                (),
+            )
+            .await?;
+        let mut groups = 0;
+        while let Some(row) = rows.next().await? {
+            assert_eq!(
+                row.get::<i64>(0)?,
+                row.get::<i64>(1)?,
+                "every group's txn_id must equal its first seq"
+            );
+            groups += 1;
+        }
+        // root_init + two seam commits + the out-of-band row + the healed
+        // commit; the healed group must not have merged into a neighbor.
+        assert_eq!(groups, 5);
         Ok(())
     }
 

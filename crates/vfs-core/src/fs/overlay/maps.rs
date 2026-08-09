@@ -248,7 +248,7 @@ impl OverlayFS {
     pub(super) async fn add_origin_mapping(&self, delta_ino: i64, base_ino: i64) -> Result<()> {
         let conn = self.delta.get_connection().await?;
         let mut txn =
-            super::super::vfs::MutationTxn::begin(&conn, self.delta.journal_enabled()).await?;
+            super::super::vfs::MutationTxn::begin(&conn, self.delta.journal_ctx()).await?;
         Self::add_origin_mapping_with_conn(txn.conn(), delta_ino, base_ino).await?;
         txn.record(super::super::vfs::JournalOp::new(
             "origin_map",

@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use turso::Connection;
 
-use super::journal::{JournalOp, MutationTxn};
+use super::journal::{JournalCtx, JournalOp, MutationTxn};
 
 /// Hook invoked in the same SQLite transaction that reaps an inode.
 ///
@@ -60,14 +60,14 @@ impl Lifecycle {
     pub(crate) async fn sweep_mount_orphans(
         &self,
         conn: &Connection,
-        journal_enabled: bool,
+        journal: JournalCtx,
     ) -> Result<Vec<i64>> {
         let inos = self.nlink_zero_inos(conn).await?;
         if inos.is_empty() {
             return Ok(Vec::new());
         }
 
-        let mut txn = MutationTxn::begin(conn, journal_enabled).await?;
+        let mut txn = MutationTxn::begin(conn, journal).await?;
         let result: Result<Vec<i64>> = async {
             let mut reaped = Vec::new();
             for ino in &inos {
@@ -101,7 +101,7 @@ impl Lifecycle {
     pub(crate) async fn process_deferred_reaps<F>(
         &self,
         pool: &ConnectionPool,
-        journal_enabled: bool,
+        journal: JournalCtx,
         before_reap: F,
     ) -> Result<Vec<i64>>
     where
@@ -115,7 +115,7 @@ impl Lifecycle {
             before_reap(*ino);
         }
         let conn = pool.get_connection().await?;
-        let mut txn = MutationTxn::begin(&conn, journal_enabled).await?;
+        let mut txn = MutationTxn::begin(&conn, journal).await?;
         let result: Result<Vec<i64>> = async {
             let mut reaped = Vec::new();
             for ino in &inos {

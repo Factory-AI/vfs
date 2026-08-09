@@ -221,7 +221,7 @@ impl File for OverlayPartialFile {
         }
         let conn = self.delta.get_connection().await?;
         let mut txn =
-            super::super::vfs::MutationTxn::begin(&conn, self.delta.journal_enabled()).await?;
+            super::super::vfs::MutationTxn::begin(&conn, self.delta.journal_ctx()).await?;
         let range_refs: Vec<_> = ranges
             .iter()
             .map(|range| WriteRangeRef {
@@ -247,15 +247,17 @@ impl File for OverlayPartialFile {
 
         match result {
             Ok(()) => {
-                txn.record(
-                    super::super::vfs::JournalOp::write(
-                        txn.conn(),
-                        self.delta_ino,
-                        self.chunk_size,
-                        &normalized,
-                    )
-                    .await?,
-                );
+                if txn.journaling() {
+                    txn.record(
+                        super::super::vfs::JournalOp::write(
+                            txn.conn(),
+                            self.delta_ino,
+                            self.chunk_size,
+                            &normalized,
+                        )
+                        .await?,
+                    );
+                }
                 let mut override_indexes = BTreeSet::new();
                 for range in &normalized {
                     let start = range.offset / self.chunk_size as u64;
@@ -285,7 +287,7 @@ impl File for OverlayPartialFile {
     async fn truncate(&self, size: u64) -> Result<()> {
         let conn = self.delta.get_connection().await?;
         let mut txn =
-            super::super::vfs::MutationTxn::begin(&conn, self.delta.journal_enabled()).await?;
+            super::super::vfs::MutationTxn::begin(&conn, self.delta.journal_ctx()).await?;
         let hooks = PartialOriginChunkHooks { file: self };
 
         let result: Result<()> = async {
@@ -308,15 +310,17 @@ impl File for OverlayPartialFile {
 
         match result {
             Ok(()) => {
-                txn.record(
-                    super::super::vfs::JournalOp::truncate(
-                        txn.conn(),
-                        self.delta_ino,
-                        self.chunk_size,
-                        size,
-                    )
-                    .await?,
-                );
+                if txn.journaling() {
+                    txn.record(
+                        super::super::vfs::JournalOp::truncate(
+                            txn.conn(),
+                            self.delta_ino,
+                            self.chunk_size,
+                            size,
+                        )
+                        .await?,
+                    );
+                }
                 txn.commit().await?;
                 self.delta.invalidate_attr(self.delta_ino);
                 Ok(())

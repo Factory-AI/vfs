@@ -172,7 +172,7 @@ impl Vfs {
             // parent ino -> nlink bump from new subdirectories ("..").
             let mut parent_bumps: HashMap<i64, i64> = HashMap::new();
 
-            let mut txn = MutationTxn::begin(conn, self.journal_enabled()).await?;
+            let mut txn = MutationTxn::begin(conn, self.journal_ctx()).await?;
             for entry in &entries[idx..batch_end] {
                 let (parent_path, name) = match entry.path.rsplit_once('/') {
                     Some((parent, name)) => (parent, name),

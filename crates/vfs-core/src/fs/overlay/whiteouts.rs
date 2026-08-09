@@ -19,7 +19,7 @@ impl OverlayFS {
     pub(super) async fn create_whiteout(&self, path: &str) -> Result<()> {
         let conn = self.delta.get_connection().await?;
         let mut txn =
-            super::super::vfs::MutationTxn::begin(&conn, self.delta.journal_enabled()).await?;
+            super::super::vfs::MutationTxn::begin(&conn, self.delta.journal_ctx()).await?;
         let parent_path = parent_path_for_whiteout(path);
         let (now, _) = current_timestamp()?;
 
@@ -59,7 +59,7 @@ impl OverlayFS {
 
         let conn = self.delta.get_connection().await?;
         let mut txn =
-            super::super::vfs::MutationTxn::begin(&conn, self.delta.journal_enabled()).await?;
+            super::super::vfs::MutationTxn::begin(&conn, self.delta.journal_ctx()).await?;
         let result: Result<()> = async {
             conn.execute("DELETE FROM fs_whiteout WHERE path = ?", (path,))
                 .await?;

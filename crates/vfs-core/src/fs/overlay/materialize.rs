@@ -198,7 +198,7 @@ impl OverlayFS {
     async fn restore_materialized_metadata(&self, metadata: HashMap<i64, Stats>) -> Result<()> {
         let conn = self.delta.get_connection().await?;
         let mut txn =
-            super::super::vfs::MutationTxn::begin(&conn, self.delta.journal_enabled()).await?;
+            super::super::vfs::MutationTxn::begin(&conn, self.delta.journal_ctx()).await?;
         let mut restored = Vec::with_capacity(metadata.len());
         for (ino, stats) in metadata {
             txn.conn()

@@ -1,5 +1,7 @@
 use serde_json::{json, Map, Value as JsonValue};
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use turso::transaction::{Transaction, TransactionBehavior};
 use turso::{Connection, Value};
@@ -12,6 +14,29 @@ use super::{store::NormalizedWriteRange, STORAGE_INLINE};
 /// keep prepared-statement variety low while bounding SQL length.
 const JOURNAL_INSERT_ROWS: usize = 64;
 const JOURNAL_PIN_INSERT_ROWS: usize = 128;
+
+/// Shared journal context: the kill-switch state plus an optimistic hint for
+/// the next journal seq.
+///
+/// The hint spares each commit the tip lookup that dominated the journal's
+/// per-commit fixed cost. `0` means unknown (fresh open, or invalidated by a
+/// failed commit); a commit that finds its hint disagreeing with the seq
+/// AUTOINCREMENT actually assigned patches its own rows, so the txn_id ==
+/// first-seq contract holds regardless of hint staleness.
+#[derive(Clone)]
+pub(in crate::fs) struct JournalCtx {
+    enabled: bool,
+    next_seq: Arc<AtomicI64>,
+}
+
+impl JournalCtx {
+    pub(in crate::fs) fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            next_seq: Arc::new(AtomicI64::new(0)),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub(in crate::fs) struct JournalOp {
@@ -150,18 +175,15 @@ impl JournalOp {
 
 pub(in crate::fs) struct MutationTxn<'conn> {
     txn: Transaction<'conn>,
-    journal_enabled: bool,
+    journal: JournalCtx,
     records: Vec<JournalOp>,
 }
 
 impl<'conn> MutationTxn<'conn> {
-    pub(in crate::fs) async fn begin(
-        conn: &'conn Connection,
-        journal_enabled: bool,
-    ) -> Result<Self> {
+    pub(in crate::fs) async fn begin(conn: &'conn Connection, journal: JournalCtx) -> Result<Self> {
         Ok(Self {
             txn: Transaction::new_unchecked(conn, TransactionBehavior::Immediate).await?,
-            journal_enabled,
+            journal,
             records: Vec::new(),
         })
     }
@@ -170,8 +192,15 @@ impl<'conn> MutationTxn<'conn> {
         &self.txn
     }
 
+    /// Whether this transaction will journal recorded ops. Callers gate the
+    /// payload builders that read the database on this, so the kill switch
+    /// removes their cost instead of discarding their result.
+    pub(in crate::fs) fn journaling(&self) -> bool {
+        self.journal.enabled
+    }
+
     pub(in crate::fs) fn record(&mut self, op: JournalOp) {
-        if self.journal_enabled {
+        if self.journal.enabled {
             self.records.push(op);
         }
     }
@@ -179,11 +208,16 @@ impl<'conn> MutationTxn<'conn> {
     pub(in crate::fs) async fn commit(self) -> Result<()> {
         let Self {
             txn,
-            journal_enabled,
+            journal,
             records,
         } = self;
-        if journal_enabled && !records.is_empty() {
-            let txn_id = next_txn_id(&txn).await?;
+        if journal.enabled && !records.is_empty() {
+            let hint = journal.next_seq.load(Ordering::Acquire);
+            let mut txn_id = if hint > 0 {
+                hint
+            } else {
+                next_txn_id(&txn).await?
+            };
             let wallclock_ms = wallclock_ms()?;
             // Bulk imports journal thousands of rows in one commit, and
             // per-row statements made clone-import ~60% slower; multi-row
@@ -192,6 +226,8 @@ impl<'conn> MutationTxn<'conn> {
             // seqs of one insert are contiguous and recoverable from
             // last_insert_rowid.
             let mut pins: Vec<(i64, Vec<u8>)> = Vec::new();
+            let mut first_batch = true;
+            let mut last = 0;
             for batch in records.chunks(JOURNAL_INSERT_ROWS) {
                 let placeholders = vec!["(?, ?, ?, ?)"; batch.len()].join(", ");
                 let sql = format!(
@@ -207,8 +243,22 @@ impl<'conn> MutationTxn<'conn> {
                 }
                 let mut stmt = txn.prepare_cached(&sql).await?;
                 stmt.execute(params).await?;
-                let last = txn.last_insert_rowid();
+                last = txn.last_insert_rowid();
                 let first = last - batch.len() as i64 + 1;
+                if first_batch {
+                    first_batch = false;
+                    if first != txn_id {
+                        // Stale hint (a rolled-back commit, or another opener
+                        // wrote in between). Only this commit's rows can have
+                        // seq >= first inside the exclusive transaction, so
+                        // one patch restores txn_id == first-seq.
+                        let mut stmt = txn
+                            .prepare_cached("UPDATE fs_op_journal SET txn_id = ? WHERE seq >= ?")
+                            .await?;
+                        stmt.execute((first, first)).await?;
+                        txn_id = first;
+                    }
+                }
                 for (index, record) in batch.iter().enumerate() {
                     let seq = first + index as i64;
                     for digest in &record.digests {
@@ -228,6 +278,11 @@ impl<'conn> MutationTxn<'conn> {
                 let mut stmt = txn.prepare_cached(&sql).await?;
                 stmt.execute(params).await?;
             }
+            // Stored before the SQLite commit: a failed commit leaves the
+            // hint one group too high, which the next commit detects and
+            // patches. Waiters serialize on the IMMEDIATE lock, so no one
+            // reads the hint before this store.
+            journal.next_seq.store(last + 1, Ordering::Release);
         }
         txn.commit().await?;
         Ok(())

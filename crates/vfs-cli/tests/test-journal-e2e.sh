@@ -377,7 +377,10 @@ PY
 OLD_ARTIFACT="$TEST_ROOT/v0_4-artifact.db"
 cp "$FIXTURES/v0_4.db" "$OLD_ARTIFACT"
 chmod 600 "$OLD_ARTIFACT"
-run_vfs adopt "$ADOPT_ID" --db "$OLD_ARTIFACT" --base "$BASE" --pin "$BASE_PIN" \
+# The whole section runs under the kill switch: adopt's forward migration
+# journals a root_init row when the runner's uid differs from the fixture
+# creator's, which made a bare row-count assertion uid-dependent.
+run_vfs_without_journal adopt "$ADOPT_ID" --db "$OLD_ARTIFACT" --base "$BASE" --pin "$BASE_PIN" \
     --json >"$TEST_ROOT/adopt-old.json" ||
     fail "adopt failed to migrate the v0.4 artifact"
 python3 - "$TEST_ROOT/adopt-old.json" "$ADOPT_ID" <<'PY' || fail "old-artifact adopt manifest was malformed"

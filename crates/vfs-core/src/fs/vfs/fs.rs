@@ -390,7 +390,7 @@ impl FileSystem for Vfs {
         // transactions instead of racing them as an autocommit statement
         // (turso reports such write/write races as "database snapshot is
         // stale" instead of waiting on the write lock).
-        let mut txn = MutationTxn::begin(&conn, self.journal_enabled()).await?;
+        let mut txn = MutationTxn::begin(&conn, self.journal_ctx()).await?;
         let result: Result<()> = async {
             // Get current mode to preserve file type bits
             let current_mode = store::mode(&conn, ino).await?.ok_or(FsError::NotFound)?;
@@ -438,7 +438,7 @@ impl FileSystem for Vfs {
         let conn = self.pool.get_connection().await?;
         // BEGIN IMMEDIATE: see `chmod` — avoid autocommit write/write races
         // with concurrent batcher drain transactions.
-        let mut txn = MutationTxn::begin(&conn, self.journal_enabled()).await?;
+        let mut txn = MutationTxn::begin(&conn, self.journal_ctx()).await?;
         let result: Result<()> = async {
             // Verify inode exists
             let mut stmt = conn
@@ -542,7 +542,7 @@ impl FileSystem for Vfs {
         let conn = self.pool.get_connection().await?;
         // BEGIN IMMEDIATE: see `chmod` — avoid autocommit write/write races
         // with concurrent batcher drain transactions.
-        let mut txn = MutationTxn::begin(&conn, self.journal_enabled()).await?;
+        let mut txn = MutationTxn::begin(&conn, self.journal_ctx()).await?;
         let result: Result<()> = async {
             // Verify inode exists
             let mut stmt = conn
@@ -640,7 +640,7 @@ impl FileSystem for Vfs {
             pending_view: self.pending_view.clone(),
             write_drain: self.write_drain.clone(),
             overlay_reads: self.overlay_reads,
-            journal_enabled: self.journal_enabled(),
+            journal: self.journal_ctx(),
             _open_guard: Some(self.lifecycle.guard(ino)),
         }))
     }
@@ -661,7 +661,7 @@ impl FileSystem for Vfs {
         // must not run as autocommit statements that race the write batcher's
         // drain transactions (turso reports such write/write races as
         // "database snapshot is stale" instead of waiting on the write lock).
-        let mut txn = MutationTxn::begin(&conn, self.journal_enabled()).await?;
+        let mut txn = MutationTxn::begin(&conn, self.journal_ctx()).await?;
         let result: Result<Stats> = async {
             // Check if already exists
             if self.lookup_child(&conn, parent_ino, name).await?.is_some() {
@@ -781,7 +781,7 @@ impl FileSystem for Vfs {
         // rolls back the inode row). Saves one SELECT on the synchronous
         // create path that every git-clone file pays.
 
-        let mut txn = MutationTxn::begin(&conn, self.journal_enabled()).await?;
+        let mut txn = MutationTxn::begin(&conn, self.journal_ctx()).await?;
 
         // Parent mtime/ctime: stash into the batcher overlay (committed by the
         // next group drain, served immediately via merge_pending_view) instead
@@ -837,7 +837,7 @@ impl FileSystem for Vfs {
             pending_view: self.pending_view.clone(),
             write_drain: self.write_drain.clone(),
             overlay_reads: self.overlay_reads,
-            journal_enabled: self.journal_enabled(),
+            journal: self.journal_ctx(),
             _open_guard: Some(self.lifecycle.guard(ino)),
         });
 
@@ -859,7 +859,7 @@ impl FileSystem for Vfs {
         let conn = self.pool.get_connection().await?;
         // BEGIN IMMEDIATE: see `mkdir` — never race the batcher's drain
         // transactions with autocommit metadata writes.
-        let mut txn = MutationTxn::begin(&conn, self.journal_enabled()).await?;
+        let mut txn = MutationTxn::begin(&conn, self.journal_ctx()).await?;
         let result: Result<Stats> = async {
             // Check if already exists
             if self.lookup_child(&conn, parent_ino, name).await?.is_some() {
@@ -972,7 +972,7 @@ impl FileSystem for Vfs {
         let conn = self.pool.get_connection().await?;
         // BEGIN IMMEDIATE: see `mkdir` — never race the batcher's drain
         // transactions with autocommit metadata writes.
-        let mut txn = MutationTxn::begin(&conn, self.journal_enabled()).await?;
+        let mut txn = MutationTxn::begin(&conn, self.journal_ctx()).await?;
         let result: Result<Stats> = async {
             // Check if entry already exists
             if self.lookup_child(&conn, parent_ino, name).await?.is_some() {
@@ -1086,7 +1086,7 @@ impl FileSystem for Vfs {
         // raced the write batcher's drain transactions (git unlinking
         // `.git/config.lock` during a clone). The transaction also makes the
         // dentry/nlink/inode removal atomic.
-        let mut txn = MutationTxn::begin(&conn, self.journal_enabled()).await?;
+        let mut txn = MutationTxn::begin(&conn, self.journal_ctx()).await?;
         let result: Result<(i64, Option<i64>)> = async {
             // Look up the child inode
             let ino = self
@@ -1183,7 +1183,7 @@ impl FileSystem for Vfs {
         let conn = self.pool.get_connection().await?;
         // BEGIN IMMEDIATE: see `unlink` — never race the batcher's drain
         // transactions with autocommit metadata writes.
-        let mut txn = MutationTxn::begin(&conn, self.journal_enabled()).await?;
+        let mut txn = MutationTxn::begin(&conn, self.journal_ctx()).await?;
         let result: Result<i64> = async {
             // Look up the child inode
             let ino = self
@@ -1289,7 +1289,7 @@ impl FileSystem for Vfs {
         let conn = self.pool.get_connection().await?;
         // BEGIN IMMEDIATE: see `unlink` — never race the batcher's drain
         // transactions with autocommit metadata writes.
-        let mut txn = MutationTxn::begin(&conn, self.journal_enabled()).await?;
+        let mut txn = MutationTxn::begin(&conn, self.journal_ctx()).await?;
         let result: Result<Stats> = async {
             // Check if source inode exists and is not a directory
             if let Some(mode) = store::mode(&conn, ino).await? {
@@ -1408,7 +1408,7 @@ impl FileSystem for Vfs {
             .await?
             .ok_or(FsError::NotFound)?;
 
-        let mut txn = MutationTxn::begin(&conn, self.journal_enabled()).await?;
+        let mut txn = MutationTxn::begin(&conn, self.journal_ctx()).await?;
 
         let result: Result<(Option<i64>, Option<i64>)> = async {
             let mut replaced_dst_ino = None;
