@@ -362,7 +362,7 @@ mod tests {
     async fn branching_an_inactive_session_installs_artifact_and_branch() {
         let home = tempfile::tempdir().unwrap();
         let base = tempfile::tempdir().unwrap();
-        seed_parent_session(home.path(), "parent-1", base.path()).await;
+        let parent = seed_parent_session(home.path(), "parent-1", base.path()).await;
 
         let mut out = Vec::new();
         branch_session(
@@ -432,9 +432,12 @@ mod tests {
             .unwrap()
             .is_none());
         drop(branch_vfs);
+        // The branch inherits the parent's recorded base path verbatim; on
+        // macOS canonicalizing would resolve /var -> /private/var and no
+        // longer match what the parent recorded.
         assert_eq!(
             std::fs::read_to_string(&branch.base_path_file).unwrap(),
-            base.path().canonicalize().unwrap().to_string_lossy()
+            std::fs::read_to_string(&parent.base_path_file).unwrap()
         );
 
         // No staging leftovers in the parent session dir.

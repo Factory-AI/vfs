@@ -11,7 +11,11 @@ first failing command and runs, in order:
 
 1. `cargo +nightly fmt --all -- --check`
 2. `cargo +nightly clippy --workspace --all-targets -- -D warnings`
-3. `cargo +nightly test --workspace`
+3. `cargo +nightly test --workspace`, then the workspace `--lib` tests again
+   with `TMPDIR` routed through a symlink — macOS serves its temp dir through
+   the `/private` symlink, so a test that canonicalizes one side of a path
+   comparison passes on plain-Linux `TMPDIR` and fails only on macOS CI; the
+   symlinked re-run surfaces that class on Linux
 4. `cargo +nightly build --release --workspace --bins`
 5. `crates/vfs-cli/tests/all.sh` with `VFS_GATE_STRICT=1` and
    `VFS_BIN` pointing at the release binary

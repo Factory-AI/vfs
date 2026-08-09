@@ -237,14 +237,16 @@ mod tests {
         make_session(home.path(), base.path(), "p2").await;
         branch(home.path(), "p2", "b2").await;
 
-        // Corrupt the installed artifact in place.
+        // Corrupt the installed artifact in place. The store also holds its
+        // advisory lock file and read_dir order is filesystem-dependent, so
+        // select the artifact by extension rather than enumeration order.
         let root = artifacts::artifacts_root(home.path());
         let artifact = std::fs::read_dir(&root)
             .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "db"))
+            .expect("artifact store must hold one artifact");
         let perms = {
             use std::os::unix::fs::PermissionsExt;
             std::fs::Permissions::from_mode(0o600)

@@ -84,6 +84,14 @@ if want cargo; then
     run_cargo fmt --all -- --check
     run_cargo clippy --workspace --all-targets -- -D warnings
     run_cargo test --workspace
+    # macOS reaches the default temp dir through the /private symlink, so a
+    # test that canonicalizes one side of a path comparison passes on Linux
+    # and fails only on macOS CI. Re-running the unit tests with TMPDIR
+    # routed through a symlink surfaces that class here.
+    mkdir -p "$GATE_TMPDIR/real-tmp"
+    ln -sfn real-tmp "$GATE_TMPDIR/link-tmp"
+    TMPDIR="$GATE_TMPDIR/link-tmp" TMP="$GATE_TMPDIR/link-tmp" TEMP="$GATE_TMPDIR/link-tmp" \
+        run_cargo test --workspace --lib
     run_cargo build --release --workspace --bins
 fi
 
