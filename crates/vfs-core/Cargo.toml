@@ -29,6 +29,7 @@ tempfile = { workspace = true }
 proptest = { workspace = true }
 criterion = { workspace = true }
 rand = { workspace = true }
+sha2 = { workspace = true }
 
 [[bench]]
 name = "overlayfs"

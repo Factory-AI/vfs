@@ -68,6 +68,7 @@ const FILE_BACKED_SETUP_SQL: &[&str] = &[
     WAL_MODE_SQL,
     BASELINE_SYNCHRONOUS_SQL,
 ];
+const READ_ONLY_FILE_BACKED_SETUP_SQL: &[&str] = &[TEMP_STORE_MEMORY_SQL];
 const MEMORY_SETUP_SQL: &[&str] = &[TEMP_STORE_MEMORY_SQL];
 const ATTR_CACHE_MAX_SIZE: usize = 10000;
 
@@ -76,6 +77,16 @@ pub(crate) fn file_backed_connection_pool_options() -> PoolOptions {
     PoolOptions {
         max_connections: FILE_BACKED_MAX_CONNECTIONS,
         ..PoolOptions::default().with_setup_sql(FILE_BACKED_SETUP_SQL.iter().copied())
+    }
+}
+
+/// Connection-pool options that cannot mutate a frozen database file family.
+pub(crate) fn read_only_file_backed_connection_pool_options() -> PoolOptions {
+    PoolOptions {
+        max_connections: FILE_BACKED_MAX_CONNECTIONS,
+        ..PoolOptions::default()
+            .with_setup_sql(READ_ONLY_FILE_BACKED_SETUP_SQL.iter().copied())
+            .with_connection_busy_timeout(std::time::Duration::from_millis(5000))
     }
 }
 
@@ -116,6 +127,7 @@ fn remove_checkpointed_sidecars(path: &Path) -> Result<()> {
 pub struct Vfs {
     pool: ConnectionPool,
     db_path: Option<Arc<PathBuf>>,
+    read_only: bool,
     chunk_size: usize,
     inline_threshold: usize,
     /// Cache for directory entry lookups (shared across clones)
@@ -188,6 +200,46 @@ impl Vfs {
         Self::from_pool_with_path_config_and_reap_hooks(pool, db_path, config, Vec::new()).await
     }
 
+    pub(crate) async fn from_read_only_pool(
+        pool: ConnectionPool,
+        db_path: PathBuf,
+        mut config: CoreConfig,
+    ) -> Result<Self> {
+        let db_path = std::path::absolute(db_path)?;
+        let conn = pool.get_connection().await?;
+        schema::check_schema_version(&conn).await?;
+
+        let chunk_size = Self::read_chunk_size(&conn).await?;
+        let inline_threshold = Self::read_inline_threshold(&conn).await?;
+        config.geometry = Geometry {
+            chunk_size,
+            inline_threshold,
+        };
+        drop(conn);
+
+        Ok(Self {
+            pool,
+            db_path: Some(Arc::new(db_path)),
+            read_only: true,
+            chunk_size,
+            inline_threshold,
+            dentry_cache: Arc::new(DentryCache::new(DENTRY_CACHE_MAX_SIZE)),
+            negative_dentry_cache: Arc::new(NegativeDentryCache::new(
+                NEGATIVE_DENTRY_CACHE_MAX_SIZE,
+            )),
+            attr_cache: Arc::new(AttrCache::new(ATTR_CACHE_MAX_SIZE)),
+            pending_view: None,
+            write_drain: None,
+            #[cfg(test)]
+            write_batcher: None,
+            #[cfg(test)]
+            import_commit_sizes: Arc::new(Mutex::new(Vec::new())),
+            overlay_reads: config.overlay_reads,
+            core_config: Arc::new(config),
+            lifecycle: Arc::new(Lifecycle::default()),
+        })
+    }
+
     pub(crate) async fn from_pool_with_path_config_and_reap_hooks(
         pool: ConnectionPool,
         db_path: Option<PathBuf>,
@@ -245,6 +297,7 @@ impl Vfs {
         let fs = Self {
             pool,
             db_path: db_path.map(Arc::new),
+            read_only: false,
             chunk_size,
             inline_threshold,
             dentry_cache: Arc::new(DentryCache::new(DENTRY_CACHE_MAX_SIZE)),
@@ -585,6 +638,9 @@ impl Vfs {
 
     /// Drain all pending batched writes for this Vfs instance.
     pub async fn drain_all(&self) -> Result<()> {
+        if self.read_only {
+            return Ok(());
+        }
         if let Some(drain) = &self.write_drain {
             drain.drain_all().await?;
         }
@@ -595,6 +651,9 @@ impl Vfs {
 
     /// Drain all writes and leave the database in single-file journal mode for clean shutdown.
     pub async fn finalize(&self) -> Result<()> {
+        if self.read_only {
+            return Ok(());
+        }
         self.process_deferred_reaps().await?;
         self.drain_all().await?;
         if let Some(path) = &self.db_path {

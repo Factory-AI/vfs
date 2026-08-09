@@ -713,7 +713,54 @@ CREATE TABLE fs_overlay_config (
 |-----|-------------|
 | `base_path` | Canonical path to the read-only base directory |
 
+**Optional Configuration:**
+
+| Key | Description |
+|-----|-------------|
+| `parent_artifact` | sha256 (64 lowercase hex chars) of the frozen parent artifact a branch delta reads through |
+
 Copy migration MUST preserve this table when migrating an overlay delta database. Without it, a migrated overlay database would mount as a plain Vfs database and lose base-layer visibility.
+
+### Branch Deltas and the Artifact Store
+
+`vfs branch` forks a run session by snapshotting the parent database
+(`VACUUM INTO` through a read transaction, drained first, so a live parent
+is never stopped), publishing the snapshot as an immutable content-addressed
+artifact at `~/.vfs/artifacts/<sha256>.db` (chmod `0444`, published by
+same-filesystem rename after the bytes are durable), and creating a new
+session whose delta records the artifact digest under `parent_artifact`.
+Because the store is content-addressed, branches taken at the same parent
+state share one artifact.
+
+A delta carrying `parent_artifact` mounts as a stacked overlay:
+
+```
+overlay(branch delta, overlay(parent artifact, ... , host base))
+```
+
+Every mount surface resolves the chain the same way (one shared stack
+builder). Chain semantics:
+
+- Parent artifacts are opened strictly read-only; their `finalize`/drain are
+  no-ops and nothing in-process may hold a writable handle to the store.
+- Before opening, each artifact is re-hashed and compared against the digest
+  recorded by its child. A missing or drifted artifact refuses the mount
+  (invariant: the branched state is reproduced exactly, or not at all).
+  `vfs run` reports this refusal with the invalid-session exit status `5`.
+- Chains recurse (a parent may itself record `parent_artifact`) up to a
+  depth of 8, refused beyond that.
+- Partial-origin copy-up is forced Off on branch mounts: partial-origin rows
+  fingerprint real base files, and a branch's base is a virtual stack.
+- Packed artifacts never carry `parent_artifact`: `vfs pack` materializes the
+  parent chain into the staged database, so the handoff wire contract and
+  `artifactVersion` are unchanged by branching.
+- Store GC (`vfs prune artifacts`) deletes only artifacts unreachable from
+  any installed session's chain. Reachability is computed conservatively —
+  inactive sessions read under the exclusive session lock, live sessions
+  answered over the control socket, anything unclassifiable aborts the
+  prune — and an advisory lock on the store directory serializes GC against
+  in-flight branch publication (a fork holds it shared from artifact install
+  until the referencing session is installed).
 
 ### Operations
 

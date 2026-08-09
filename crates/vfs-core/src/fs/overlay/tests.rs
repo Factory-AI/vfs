@@ -24,6 +24,450 @@
     }
 
     #[tokio::test]
+    async fn test_overlay_stacks_two_levels_across_host_parent_and_branch() -> Result<()> {
+        let base_dir = tempdir()?;
+        for (name, content) in [
+            ("host-only.txt", b"host only".as_slice()),
+            ("host-write.txt", b"host original".as_slice()),
+            ("host-unlink.txt", b"host unlink".as_slice()),
+            ("parent-whiteout.txt", b"hidden by parent".as_slice()),
+        ] {
+            std::fs::write(base_dir.path().join(name), content)?;
+        }
+
+        let parent_delta_dir = tempdir()?;
+        let parent_db = parent_delta_dir.path().join("parent.db");
+        let parent_delta = Vfs::new(parent_db.to_str().unwrap()).await?;
+        let parent_overlay = Arc::new(OverlayFS::new_with_partial_origin_policy(
+            Arc::new(HostFS::new(base_dir.path())?),
+            parent_delta,
+            PartialOriginPolicy::new(PartialOriginMode::Off),
+        ));
+        parent_overlay
+            .init(base_dir.path().to_str().unwrap())
+            .await?;
+
+        for (name, content) in [
+            ("parent-only.txt", b"parent only".as_slice()),
+            ("parent-write.txt", b"parent original".as_slice()),
+            ("parent-unlink.txt", b"parent unlink".as_slice()),
+            ("parent-rename.txt", b"parent rename".as_slice()),
+        ] {
+            let (_, file) = parent_overlay
+                .create_file(ROOT_INO, name, DEFAULT_FILE_MODE, 0, 0)
+                .await?;
+            file.pwrite(0, content).await?;
+            file.fsync().await?;
+        }
+        parent_overlay
+            .unlink(ROOT_INO, "parent-whiteout.txt")
+            .await?;
+
+        let branch_delta_dir = tempdir()?;
+        let branch_db = branch_delta_dir.path().join("branch.db");
+        let branch_delta = Vfs::new(branch_db.to_str().unwrap()).await?;
+        let parent_base: Arc<dyn FileSystem> = parent_overlay.clone();
+        let branch_overlay = OverlayFS::new_with_partial_origin_policy(
+            parent_base,
+            branch_delta,
+            PartialOriginPolicy::new(PartialOriginMode::Off),
+        );
+        branch_overlay.init("overlay://parent-session").await?;
+
+        let (_, branch_file) = branch_overlay
+            .create_file(
+                ROOT_INO,
+                "branch-only.txt",
+                DEFAULT_FILE_MODE,
+                0,
+                0,
+            )
+            .await?;
+        branch_file.pwrite(0, b"branch only").await?;
+        branch_file.fsync().await?;
+
+        for (name, expected) in [
+            ("host-only.txt", b"host only".as_slice()),
+            ("parent-only.txt", b"parent only".as_slice()),
+            ("branch-only.txt", b"branch only".as_slice()),
+        ] {
+            let first = branch_overlay
+                .lookup(ROOT_INO, name)
+                .await?
+                .unwrap_or_else(|| panic!("missing {name} through branch overlay"));
+            let second = branch_overlay
+                .lookup(ROOT_INO, name)
+                .await?
+                .unwrap_or_else(|| panic!("missing {name} on repeated lookup"));
+            assert_eq!(
+                second.ino, first.ino,
+                "{name} should keep one outer-overlay inode"
+            );
+            let attrs = branch_overlay
+                .getattr(first.ino)
+                .await?
+                .unwrap_or_else(|| panic!("missing getattr for {name}"));
+            assert_eq!(attrs.ino, first.ino);
+            let file = branch_overlay.open(first.ino, libc::O_RDONLY).await?;
+            assert_eq!(file.pread(0, attrs.size as u64).await?, expected);
+        }
+
+        for (name, replacement) in [
+            ("host-write.txt", b"branch host".as_slice()),
+            ("parent-write.txt", b"branch parent".as_slice()),
+        ] {
+            let stats = branch_overlay
+                .lookup(ROOT_INO, name)
+                .await?
+                .unwrap_or_else(|| panic!("missing copy-up source {name}"));
+            let file = branch_overlay.open(stats.ino, libc::O_RDWR).await?;
+            file.truncate(0).await?;
+            file.pwrite(0, replacement).await?;
+            file.fsync().await?;
+            assert_eq!(file.pread(0, replacement.len() as u64).await?, replacement);
+
+            let after = branch_overlay.lookup(ROOT_INO, name).await?.unwrap();
+            assert_eq!(
+                after.ino, stats.ino,
+                "{name} should keep its outer inode after copy-up"
+            );
+        }
+
+        branch_overlay
+            .unlink(ROOT_INO, "host-unlink.txt")
+            .await?;
+        branch_overlay
+            .unlink(ROOT_INO, "parent-unlink.txt")
+            .await?;
+        for name in ["host-unlink.txt", "parent-unlink.txt"] {
+            assert!(
+                branch_overlay.lookup(ROOT_INO, name).await?.is_none(),
+                "{name} should be hidden by a branch whiteout"
+            );
+        }
+
+        branch_overlay
+            .rename(
+                ROOT_INO,
+                "parent-rename.txt",
+                ROOT_INO,
+                "branch-renamed.txt",
+            )
+            .await?;
+        assert!(
+            branch_overlay
+                .lookup(ROOT_INO, "parent-rename.txt")
+                .await?
+                .is_none()
+        );
+        let renamed = branch_overlay
+            .lookup(ROOT_INO, "branch-renamed.txt")
+            .await?
+            .expect("renamed parent-delta file");
+        let renamed_file = branch_overlay.open(renamed.ino, libc::O_RDONLY).await?;
+        assert_eq!(renamed_file.pread(0, 100).await?, b"parent rename");
+
+        assert!(
+            branch_overlay
+                .lookup(ROOT_INO, "parent-whiteout.txt")
+                .await?
+                .is_none(),
+            "the inner overlay's private whiteout must be reflected through its FileSystem surface"
+        );
+
+        let expected_entries = vec![
+            "branch-only.txt".to_string(),
+            "branch-renamed.txt".to_string(),
+            "host-only.txt".to_string(),
+            "host-write.txt".to_string(),
+            "parent-only.txt".to_string(),
+            "parent-write.txt".to_string(),
+        ];
+        assert_eq!(
+            branch_overlay.readdir(ROOT_INO).await?.unwrap(),
+            expected_entries
+        );
+        let plus_entries = branch_overlay
+            .readdir_plus(ROOT_INO)
+            .await?
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect::<Vec<_>>();
+        assert_eq!(plus_entries, expected_entries);
+
+        assert_eq!(
+            std::fs::read(base_dir.path().join("host-write.txt"))?,
+            b"host original",
+            "branch copy-up must not modify the host base"
+        );
+        assert!(
+            base_dir.path().join("host-unlink.txt").exists(),
+            "branch unlink must not modify the host base"
+        );
+
+        let parent_write = parent_overlay
+            .lookup(ROOT_INO, "parent-write.txt")
+            .await?
+            .expect("parent copy remains visible in frozen parent");
+        let parent_write_file = parent_overlay
+            .open(parent_write.ino, libc::O_RDONLY)
+            .await?;
+        assert_eq!(parent_write_file.pread(0, 100).await?, b"parent original");
+        assert!(
+            parent_overlay
+                .lookup(ROOT_INO, "parent-unlink.txt")
+                .await?
+                .is_some(),
+            "branch whiteout must not modify the parent delta"
+        );
+        assert!(
+            parent_overlay
+                .lookup(ROOT_INO, "parent-rename.txt")
+                .await?
+                .is_some(),
+            "branch rename must not modify the parent delta"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn materialize_base_changes_folds_visible_parent_state_only() -> Result<()> {
+        let base_dir = tempdir()?;
+        std::fs::write(base_dir.path().join("host-only.txt"), b"host only")?;
+        std::fs::write(base_dir.path().join("deleted.txt"), b"delete me")?;
+        std::fs::write(base_dir.path().join("recreated.txt"), b"host original")?;
+
+        let parent_dir = tempdir()?;
+        let parent_delta = Vfs::new(parent_dir.path().join("parent.db").to_str().unwrap()).await?;
+        let parent_overlay = Arc::new(OverlayFS::new_with_partial_origin_policy(
+            Arc::new(HostFS::new(base_dir.path())?),
+            parent_delta,
+            PartialOriginPolicy::default(),
+        ));
+        parent_overlay.init(base_dir.path().to_str().unwrap()).await?;
+        let (_, parent_file) = parent_overlay
+            .create_file(ROOT_INO, "parent-only.txt", DEFAULT_FILE_MODE, 11, 12)
+            .await?;
+        parent_file.pwrite(0, b"parent only").await?;
+        parent_file.fsync().await?;
+        let parent_only = parent_overlay
+            .lookup(ROOT_INO, "parent-only.txt")
+            .await?
+            .unwrap();
+        parent_overlay.chmod(parent_only.ino, 0o640).await?;
+
+        let empty_dir = parent_overlay
+            .mkdir(ROOT_INO, "empty-dir", 0o750, 21, 22)
+            .await?;
+        assert!(empty_dir.is_directory());
+        parent_overlay
+            .symlink(ROOT_INO, "parent-link", "parent-only.txt", 31, 32)
+            .await?;
+        parent_overlay
+            .mknod(
+                ROOT_INO,
+                "parent-pipe",
+                crate::S_IFIFO | 0o600,
+                0,
+                33,
+                34,
+            )
+            .await?;
+        let (_, linked_file) = parent_overlay
+            .create_file(ROOT_INO, "linked-a", DEFAULT_FILE_MODE, 41, 42)
+            .await?;
+        linked_file.pwrite(0, b"linked").await?;
+        linked_file.fsync().await?;
+        let linked_a = parent_overlay.lookup(ROOT_INO, "linked-a").await?.unwrap();
+        parent_overlay
+            .link(linked_a.ino, ROOT_INO, "linked-b")
+            .await?;
+        parent_overlay.unlink(ROOT_INO, "deleted.txt").await?;
+        parent_overlay.unlink(ROOT_INO, "recreated.txt").await?;
+        let (_, recreated) = parent_overlay
+            .create_file(ROOT_INO, "recreated.txt", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        recreated.pwrite(0, b"parent replacement").await?;
+        recreated.fsync().await?;
+
+        let inherited_paths = HashSet::from([
+            "/empty-dir".to_string(),
+            "/linked-a".to_string(),
+            "/linked-b".to_string(),
+            "/parent-link".to_string(),
+            "/parent-only.txt".to_string(),
+            "/parent-pipe".to_string(),
+            "/recreated.txt".to_string(),
+        ]);
+        let inherited_whiteouts = HashSet::from(["/deleted.txt".to_string()]);
+
+        let branch_dir = tempdir()?;
+        let branch_delta = Vfs::new(branch_dir.path().join("branch.db").to_str().unwrap()).await?;
+        let parent_base: Arc<dyn FileSystem> = parent_overlay;
+        let branch_overlay = OverlayFS::new_with_partial_origin_policy(
+            parent_base,
+            branch_delta,
+            PartialOriginPolicy::default(),
+        );
+        branch_overlay.init("overlay://parent").await?;
+        let (_, branch_override) = branch_overlay
+            .create_file(ROOT_INO, "parent-only.txt", DEFAULT_FILE_MODE, 51, 52)
+            .await?;
+        branch_override.pwrite(0, b"branch override").await?;
+        branch_override.fsync().await?;
+
+        branch_overlay
+            .materialize_base_changes(&inherited_paths, &inherited_whiteouts)
+            .await?;
+
+        let delta = branch_overlay.delta();
+        assert_eq!(
+            delta.read_file("/parent-only.txt").await?.as_deref(),
+            Some(b"branch override".as_slice())
+        );
+        assert_eq!(
+            delta.read_file("/recreated.txt").await?.as_deref(),
+            Some(b"parent replacement".as_slice())
+        );
+        assert!(
+            delta.read_file("/host-only.txt").await?.is_none(),
+            "host-base fallthrough must not be materialized"
+        );
+        assert_eq!(
+            scalar_i64(
+                &branch_overlay,
+                "SELECT COUNT(*) FROM fs_whiteout WHERE path = '/deleted.txt'"
+            )
+            .await?,
+            1
+        );
+        let linked_a = FileSystem::lookup(delta, ROOT_INO, "linked-a")
+            .await?
+            .unwrap();
+        let linked_b = FileSystem::lookup(delta, ROOT_INO, "linked-b")
+            .await?
+            .unwrap();
+        assert_eq!(linked_a.ino, linked_b.ino);
+        assert_eq!(linked_a.nlink, 2);
+
+        let flattened = OverlayFS::new(
+            Arc::new(HostFS::new(base_dir.path())?),
+            branch_overlay.delta().clone(),
+        );
+        flattened.load().await?;
+        assert!(flattened.lookup(ROOT_INO, "deleted.txt").await?.is_none());
+        assert_eq!(
+            flattened
+                .readlink(
+                    flattened
+                        .lookup(ROOT_INO, "parent-link")
+                        .await?
+                        .unwrap()
+                        .ino
+                )
+                .await?
+                .as_deref(),
+            Some("parent-only.txt")
+        );
+        let empty_dir = flattened.lookup(ROOT_INO, "empty-dir").await?.unwrap();
+        assert_eq!(empty_dir.mode & 0o7777, 0o750);
+        assert_eq!(empty_dir.uid, 21);
+        assert_eq!(empty_dir.gid, 22);
+        let pipe = flattened.lookup(ROOT_INO, "parent-pipe").await?.unwrap();
+        assert_eq!(pipe.mode & crate::S_IFMT, crate::S_IFIFO);
+        assert_eq!(pipe.mode & 0o7777, 0o600);
+        assert_eq!(pipe.uid, 33);
+        assert_eq!(pipe.gid, 34);
+        let host_only = flattened.lookup(ROOT_INO, "host-only.txt").await?.unwrap();
+        let host_file = flattened.open(host_only.ino, libc::O_RDONLY).await?;
+        assert_eq!(host_file.pread(0, 100).await?, b"host only");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_stacked_overlay_partial_origin_runtime_works_but_host_integrity_check_fails(
+    ) -> Result<()> {
+        let base_dir = tempdir()?;
+
+        let parent_delta_dir = tempdir()?;
+        let parent_db = parent_delta_dir.path().join("parent.db");
+        let parent_delta = Vfs::new(parent_db.to_str().unwrap()).await?;
+        let parent_overlay = Arc::new(OverlayFS::new_with_partial_origin_policy(
+            Arc::new(HostFS::new(base_dir.path())?),
+            parent_delta,
+            PartialOriginPolicy::new(PartialOriginMode::Off),
+        ));
+        parent_overlay
+            .init(base_dir.path().to_str().unwrap())
+            .await?;
+
+        let (_, parent_file) = parent_overlay
+            .create_file(
+                ROOT_INO,
+                "parent-only.txt",
+                DEFAULT_FILE_MODE,
+                0,
+                0,
+            )
+            .await?;
+        parent_file.pwrite(0, b"parent database bytes").await?;
+        parent_file.fsync().await?;
+
+        let branch_delta_dir = tempdir()?;
+        let branch_db = branch_delta_dir.path().join("branch.db");
+        let branch_delta = Vfs::new(branch_db.to_str().unwrap()).await?;
+        let parent_base: Arc<dyn FileSystem> = parent_overlay.clone();
+        let branch_overlay = OverlayFS::new_with_partial_origin_policy(
+            parent_base,
+            branch_delta,
+            PartialOriginPolicy::new(PartialOriginMode::On),
+        );
+        branch_overlay.init("overlay://parent-session").await?;
+
+        let stats = branch_overlay
+            .lookup(ROOT_INO, "parent-only.txt")
+            .await?
+            .expect("parent-delta file through branch");
+        let file = branch_overlay.open(stats.ino, libc::O_RDWR).await?;
+        file.pwrite(7, b"branch").await?;
+        file.fsync().await?;
+        assert_eq!(file.pread(0, 21).await?, b"parent branchse bytes");
+        assert_eq!(
+            scalar_i64(
+                &branch_overlay,
+                "SELECT COUNT(*) FROM fs_partial_origin"
+            )
+            .await?,
+            1,
+            "db-backed outer bases can serve partial-origin reads at runtime"
+        );
+
+        let conn = branch_overlay.delta().get_connection().await?;
+        let report = crate::schema::integrity::check(
+            &conn,
+            &crate::schema::integrity::CheckOpts::new(&branch_db).check_base(true),
+        )
+        .await?;
+        let fingerprint_check = report
+            .checks
+            .iter()
+            .find(|check| check.name == "overlay.partial_origin_base_fingerprints")
+            .expect("partial-origin fingerprint integrity check");
+        assert!(!fingerprint_check.ok);
+        assert!(
+            fingerprint_check
+                .detail
+                .contains("Failed to canonicalize base root"),
+            "current integrity tooling assumes fs_overlay_config.base_path is a host directory: {}",
+            fingerprint_check.detail
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_overlay_lookup_base() -> Result<()> {
         let (overlay, _base_dir, _delta_dir) = create_test_overlay().await?;
 

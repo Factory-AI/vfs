@@ -7,8 +7,7 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::sync::Arc;
-use turso::value::Value;
-use vfs_core::{EncryptionConfig, FileSystem, HostFS, OverlayFS, VfsOptions};
+use vfs_core::{EncryptionConfig, FileSystem, HostFS, VfsOptions};
 
 use crate::cmd::init::open_vfs;
 use crate::opts::MountBackend;
@@ -39,38 +38,17 @@ pub async fn handle_exec_command(
         .await
         .map_err(|err| super::migrate::open_error_with_guidance(err, &id_or_path))?;
 
-    // Check for overlay configuration
-    let fs: Arc<dyn FileSystem> = {
-        let conn = vfs.get_connection().await?;
-
-        // Check if fs_overlay_config table exists and has base_path
-        let query = "SELECT value FROM fs_overlay_config WHERE key = 'base_path'";
-        let base_path: Option<String> = match conn.query(query, ()).await {
-            Ok(mut rows) => {
-                if let Ok(Some(row)) = rows.next().await {
-                    row.get_value(0).ok().and_then(|v| {
-                        if let Value::Text(s) = v {
-                            Some(s.clone())
-                        } else {
-                            None
-                        }
-                    })
-                } else {
-                    None
-                }
-            }
-            Err(_) => None,
-        };
-
-        if let Some(base_path) = base_path {
-            eprintln!("Using overlay filesystem with base: {}", base_path);
-            let hostfs = HostFS::new(&base_path)?;
-            let overlay = OverlayFS::new(Arc::new(hostfs), vfs.fs);
-            overlay.load().await?; // Load persisted whiteouts and origin mappings
-            Arc::new(overlay) as Arc<dyn FileSystem>
-        } else {
-            Arc::new(vfs.fs) as Arc<dyn FileSystem>
-        }
+    let fs: Arc<dyn FileSystem> = if let Some(base_path) = vfs.overlay_base_path().await? {
+        // Overlay database: stack over the recorded base (and the branch
+        // parent chain, when the delta records one).
+        eprintln!("Using overlay filesystem with base: {}", base_path);
+        let hostfs = HostFS::new(&base_path)?;
+        let home = dirs::home_dir().context("Failed to get home directory")?;
+        let overlay = crate::cmd::stack::build_overlay(&home, Arc::new(hostfs), &vfs, None).await?;
+        overlay.load().await?; // Load persisted whiteouts and origin mappings
+        Arc::new(overlay) as Arc<dyn FileSystem>
+    } else {
+        Arc::new(vfs.fs) as Arc<dyn FileSystem>
     };
 
     // Create a temporary directory for the mount

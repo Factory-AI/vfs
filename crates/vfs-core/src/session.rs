@@ -13,6 +13,13 @@ const GENERATION_KEY: &str = "generation";
 const SEEDED_PATHS_KEY: &str = "seeded_paths";
 const SEED_PIN_KEY: &str = "seed_pin";
 
+/// Key in `fs_overlay_config` recording the sha256 of the frozen parent
+/// artifact a branch session reads through. Presence makes the database a
+/// branch delta: its mount shape is overlay(branch, overlay(parent, base)),
+/// and the mount MUST refuse to serve if the artifact's bytes no longer hash
+/// to this digest.
+const PARENT_ARTIFACT_KEY: &str = "parent_artifact";
+
 /// Persistent handoff metadata stored inside a session database.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -141,10 +148,7 @@ impl Vfs {
 
         let compact_result = async {
             checkpoint_truncate(&conn).await?;
-            let escaped_output = output.to_string_lossy().replace('\'', "''");
-            conn.execute(&format!("VACUUM INTO '{escaped_output}'"), ())
-                .await?;
-            Ok::<(), Error>(())
+            vacuum_into(&conn, output).await
         }
         .await;
 
@@ -152,23 +156,117 @@ impl Vfs {
         compact_result?;
         drop(conn);
         self.fs.finalize().await?;
-        let output_str = output
-            .to_str()
-            .ok_or_else(|| Error::InvalidUtf8Path(output.display().to_string()))?;
-        let output_db = Builder::new_local(output_str).build().await?;
-        let output_conn = output_db.connect()?;
-        checkpoint_truncate(&output_conn).await?;
-        drop(output_conn);
-        drop(output_db);
-        remove_sidecar_if_present(output, "-wal")?;
-        remove_sidecar_if_present(output, "-shm")?;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(output)?
-            .sync_all()?;
+        publish_single_file_artifact(output).await
+    }
+
+    /// Record the frozen parent artifact digest this branch delta reads
+    /// through. Requires the overlay schema to be initialized.
+    pub async fn set_overlay_parent_artifact(&self, digest: &str) -> Result<()> {
+        if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(Error::Internal(format!(
+                "invalid parent artifact digest {digest:?}: expected 64 hex characters"
+            )));
+        }
+        let conn = self.pool.get_connection().await?;
+        conn.execute(
+            "INSERT INTO fs_overlay_config (key, value) VALUES (?, ?)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (PARENT_ARTIFACT_KEY, digest.to_ascii_lowercase()),
+        )
+        .await?;
         Ok(())
     }
+
+    /// Read the frozen parent artifact digest, if this is a branch delta.
+    pub async fn overlay_parent_artifact(&self) -> Result<Option<String>> {
+        self.overlay_config_value(PARENT_ARTIFACT_KEY).await
+    }
+
+    /// Remove the parent artifact reference after its state has been folded
+    /// into this database.
+    pub async fn clear_overlay_parent_artifact(&self) -> Result<()> {
+        let conn = self.pool.get_connection().await?;
+        conn.execute(
+            "DELETE FROM fs_overlay_config WHERE key = ?",
+            (PARENT_ARTIFACT_KEY,),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Read the overlay base directory recorded at initialization, if any.
+    pub async fn overlay_base_path(&self) -> Result<Option<String>> {
+        self.overlay_config_value("base_path").await
+    }
+
+    async fn overlay_config_value(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.pool.get_connection().await?;
+        // A database without the overlay schema is a plain Vfs.
+        let mut tables = conn
+            .query(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'fs_overlay_config'",
+                (),
+            )
+            .await?;
+        if tables.next().await?.is_none() {
+            return Ok(None);
+        }
+        let mut rows = conn
+            .query("SELECT value FROM fs_overlay_config WHERE key = ?", (key,))
+            .await?;
+        match rows.next().await? {
+            Some(row) => match row.get_value(0)? {
+                Value::Text(value) => Ok(Some(value)),
+                value => Err(Error::Internal(format!(
+                    "invalid fs_overlay_config value for {key}: {value:?}"
+                ))),
+            },
+            None => Ok(None),
+        }
+    }
+
+    /// Copy a consistent point-in-time image of a live database into a new
+    /// single-file artifact.
+    ///
+    /// Unlike [`Vfs::compact_local_database_into`], this is safe to call while
+    /// the filesystem is serving a mount: it drains pending batched writes so
+    /// every write acknowledged before the call is included, then copies a
+    /// read-consistent image with `VACUUM INTO` while concurrent writers
+    /// proceed. `output` must not already exist.
+    pub async fn snapshot_into(&self, output: &Path) -> Result<()> {
+        self.fs.drain_all().await?;
+        let conn = self.pool.get_connection().await?;
+        vacuum_into(&conn, output).await?;
+        drop(conn);
+        publish_single_file_artifact(output).await
+    }
+}
+
+async fn vacuum_into(conn: &Connection, output: &Path) -> Result<()> {
+    let escaped_output = output.to_string_lossy().replace('\'', "''");
+    conn.execute(&format!("VACUUM INTO '{escaped_output}'"), ())
+        .await?;
+    Ok(())
+}
+
+/// Checkpoint a freshly written copy into a durable single-file family.
+async fn publish_single_file_artifact(output: &Path) -> Result<()> {
+    let output_str = output
+        .to_str()
+        .ok_or_else(|| Error::InvalidUtf8Path(output.display().to_string()))?;
+    let output_db = Builder::new_local(output_str).build().await?;
+    let output_conn = output_db.connect()?;
+    checkpoint_truncate(&output_conn).await?;
+    drop(output_conn);
+    drop(output_db);
+    remove_sidecar_if_present(output, "-wal")?;
+    remove_sidecar_if_present(output, "-shm")?;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(output)?
+        .sync_all()?;
+    Ok(())
 }
 
 fn remove_sidecar_if_present(path: &Path, suffix: &str) -> Result<()> {
@@ -319,6 +417,74 @@ mod tests {
                 seeded_paths,
             }
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snapshot_into_is_consistent_under_concurrent_writes() -> Result<()> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let dir = tempdir()?;
+        let db_path = dir.path().join("session.db");
+        let vfs = Vfs::open(VfsOptions::with_path(db_path.to_string_lossy())).await?;
+
+        let (_, file) = vfs.fs.create_file("/pinned.txt", 0o100644, 0, 0).await?;
+        file.pwrite(0, b"pinned before snapshot").await?;
+        file.fsync().await?;
+        drop(file);
+
+        // Churn writer racing the snapshot copy: every file it creates is
+        // either absent from the snapshot or fully intact — never torn.
+        let writer_fs = vfs.fs.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer_stop = stop.clone();
+        let writer = tokio::spawn(async move {
+            let mut created = 0u32;
+            while !writer_stop.load(Ordering::Relaxed) {
+                let path = format!("/churn-{created}.txt");
+                let (_, file) = writer_fs.create_file(&path, 0o100644, 0, 0).await?;
+                file.pwrite(0, &[b'x'; 8192]).await?;
+                file.fsync().await?;
+                created += 1;
+            }
+            Ok::<u32, Error>(created)
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let snapshot_path = dir.path().join("snapshot.db");
+        vfs.snapshot_into(&snapshot_path).await?;
+        stop.store(true, Ordering::Relaxed);
+        let created = writer.await.expect("writer task panicked")?;
+        assert!(created > 0, "churn writer made no progress");
+        drop(vfs);
+
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = format!("{}{suffix}", snapshot_path.display());
+            assert!(
+                !Path::new(&sidecar).exists(),
+                "snapshot left sidecar {sidecar}"
+            );
+        }
+
+        let snapshot = Vfs::open(VfsOptions::with_path(snapshot_path.to_string_lossy())).await?;
+        assert_eq!(
+            snapshot.fs.read_file("/pinned.txt").await?.as_deref(),
+            Some(b"pinned before snapshot".as_slice())
+        );
+        let entries = crate::fs::FileSystem::readdir(&snapshot.fs, 1)
+            .await?
+            .expect("snapshot root must list");
+        for entry in entries {
+            if let Some(rest) = entry.strip_prefix("churn-") {
+                let content = snapshot
+                    .fs
+                    .read_file(&format!("/{entry}"))
+                    .await?
+                    .unwrap_or_else(|| panic!("churn file {rest} listed but unreadable"));
+                assert_eq!(content, vec![b'x'; 8192], "torn churn file {entry}");
+            }
+        }
         Ok(())
     }
 

@@ -1,16 +1,18 @@
 //! Atomic transfer preparation for inactive `vfs run` sessions.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
-use vfs_core::{schema, Vfs, VfsOptions};
+use vfs_core::{schema, FileSystem, HostFS, Vfs, VfsOptions};
 
 use super::safety::{
     build_local_database, copy_file_exclusive, remove_sqlite_sidecars_after_checkpoint,
@@ -168,6 +170,7 @@ async fn pack_session(
         .map_err(|error| super::migrate::open_error_with_guidance(error, &session_id))
         .context("Failed to open the staged session database")?;
 
+    materialize_branch_staging(home, &base_path, &vfs).await?;
     let prune_set = build_prune_set(&extra_prunes, no_default_prunes)?;
     let pruned_paths = prune_delta_paths(&vfs, &prune_set).await?;
     let metadata = vfs.increment_session_generation().await?;
@@ -248,6 +251,59 @@ async fn pack_session(
 
     serde_json::to_writer(&mut *stdout, &manifest)?;
     writeln!(stdout)?;
+    Ok(())
+}
+
+async fn materialize_branch_staging(home: &Path, base_path: &Path, vfs: &Vfs) -> Result<()> {
+    let Some(mut next_digest) = vfs.overlay_parent_artifact().await? else {
+        return Ok(());
+    };
+
+    let host: Arc<dyn FileSystem> = Arc::new(
+        HostFS::new(base_path)
+            .with_context(|| format!("Failed to open session base {}", base_path.display()))?,
+    );
+    let overlay = super::stack::build_overlay(home, host, vfs, None)
+        .await
+        .context("Cannot pack branch session because its parent chain is unavailable")?;
+    overlay
+        .load()
+        .await
+        .context("Failed to load the staged branch overlay")?;
+
+    let mut inherited_paths = HashSet::new();
+    let mut inherited_whiteouts = HashSet::new();
+    loop {
+        let artifact = super::artifacts::artifact_path(home, &next_digest);
+        let parent = Vfs::open_read_only(&artifact)
+            .await
+            .with_context(|| format!("Failed to reopen parent artifact {}", artifact.display()))?;
+        inherited_paths.extend(parent.get_delta_paths().await.with_context(|| {
+            format!(
+                "Failed to enumerate parent paths from {}",
+                artifact.display()
+            )
+        })?);
+        inherited_whiteouts.extend(parent.get_whiteouts().await.with_context(|| {
+            format!(
+                "Failed to enumerate parent whiteouts from {}",
+                artifact.display()
+            )
+        })?);
+        match parent.overlay_parent_artifact().await? {
+            Some(digest) => next_digest = digest,
+            None => break,
+        }
+    }
+
+    overlay
+        .materialize_base_changes(&inherited_paths, &inherited_whiteouts)
+        .await
+        .context("Failed to fold branch parent state into the staged database")?;
+    drop(overlay);
+    vfs.clear_overlay_parent_artifact()
+        .await
+        .context("Failed to clear the materialized parent artifact reference")?;
     Ok(())
 }
 
@@ -433,7 +489,7 @@ async fn prune_delta_paths(vfs: &Vfs, prune_set: &GlobSet) -> Result<Vec<String>
 
 /// Hash a published artifact whole-file and over consecutive `chunk_size`
 /// byte ranges in one streaming pass.
-fn hash_file(path: &Path, chunk_size: u64) -> Result<(String, u64, Vec<ArtifactChunk>)> {
+pub(crate) fn hash_file(path: &Path, chunk_size: u64) -> Result<(String, u64, Vec<ArtifactChunk>)> {
     let mut file =
         fs::File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
     let mut hasher = Sha256::new();
@@ -624,7 +680,7 @@ pub(crate) fn sync_file_and_parent(path: &Path) -> Result<()> {
     sync_parent_directory(path)
 }
 
-fn sync_parent_directory(path: &Path) -> Result<()> {
+pub(crate) fn sync_parent_directory(path: &Path) -> Result<()> {
     let Some(parent) = path.parent() else {
         return Ok(());
     };
@@ -698,6 +754,17 @@ mod tests {
         Ok(())
     }
 
+    async fn branch_test_session(home: &Path, parent: &str, branch: &str) -> Result<()> {
+        let mut stdout = Vec::new();
+        super::super::branch::branch_session(
+            &mut stdout,
+            home,
+            parent.to_string(),
+            Some(branch.to_string()),
+        )
+        .await
+    }
+
     async fn read_overlay_file(db_path: &Path, base: &Path, path: &[&str]) -> Result<Vec<u8>> {
         let vfs = Vfs::open(test_options(db_path)).await?;
         let overlay = OverlayFS::new(Arc::new(HostFS::new(base)?), vfs.fs);
@@ -714,6 +781,20 @@ mod tests {
         let stats = stats.context("empty overlay path")?;
         let file = overlay.open(stats.ino, libc::O_RDONLY).await?;
         Ok(file.pread(0, stats.size as u64).await?)
+    }
+
+    async fn overlay_path_exists(db_path: &Path, base: &Path, path: &[&str]) -> Result<bool> {
+        let vfs = Vfs::open(test_options(db_path)).await?;
+        let overlay = OverlayFS::new(Arc::new(HostFS::new(base)?), vfs.fs);
+        overlay.load().await?;
+        let mut ino = 1;
+        for component in path {
+            let Some(stats) = overlay.lookup(ino, component).await? else {
+                return Ok(false);
+            };
+            ino = stats.ino;
+        }
+        Ok(true)
     }
 
     #[tokio::test]
@@ -823,6 +904,229 @@ mod tests {
             &fs::read(&db_path)?,
             DEFAULT_MANIFEST_CHUNK_SIZE,
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pack_materializes_branch_parent_state_without_host_fallthrough() -> Result<()> {
+        let root = tempdir()?;
+        let home = root.path().join("home");
+        let base = root.path().join("base");
+        fs::create_dir_all(&base)?;
+        fs::write(base.join("host-only.txt"), b"host only")?;
+        fs::write(base.join("deleted-by-parent.txt"), b"delete me")?;
+        let parent_db = create_session(&home, "parent-pack", &base).await?;
+
+        {
+            let parent = Vfs::open(test_options(&parent_db)).await?;
+            let overlay = OverlayFS::new(Arc::new(HostFS::new(&base)?), parent.fs.clone());
+            overlay.load().await?;
+            let (_, file) = overlay
+                .create_file(1, "parent-only.txt", DEFAULT_FILE_MODE, 0, 0)
+                .await?;
+            file.pwrite(0, b"parent only").await?;
+            file.fsync().await?;
+            let (_, file) = overlay
+                .create_file(1, "shared.txt", DEFAULT_FILE_MODE, 0, 0)
+                .await?;
+            file.pwrite(0, b"parent shared").await?;
+            file.fsync().await?;
+            overlay.unlink(1, "deleted-by-parent.txt").await?;
+            parent.fs.finalize().await?;
+        }
+        branch_test_session(&home, "parent-pack", "branch-pack").await?;
+        let branch_db = home.join(".vfs/run/branch-pack/delta.db");
+        {
+            let branch = Vfs::open(test_options(&branch_db)).await?;
+            write_delta_file(&branch, "/branch-only.txt", b"branch only").await?;
+            write_delta_file(&branch, "/shared.txt", b"branch override").await?;
+            branch.fs.finalize().await?;
+        }
+
+        let output = root.path().join("branch-packed.db");
+        let mut stdout = Vec::new();
+        pack_session(
+            &mut stdout,
+            &home,
+            "branch-pack".to_string(),
+            Vec::new(),
+            false,
+            Some(output.clone()),
+            DEFAULT_MANIFEST_CHUNK_SIZE,
+        )
+        .await?;
+
+        let packed = Vfs::open(test_options(&output)).await?;
+        assert_eq!(packed.overlay_parent_artifact().await?, None);
+        drop(packed);
+        assert_eq!(
+            read_overlay_file(&output, &base, &["parent-only.txt"]).await?,
+            b"parent only"
+        );
+        assert_eq!(
+            read_overlay_file(&output, &base, &["branch-only.txt"]).await?,
+            b"branch only"
+        );
+        assert_eq!(
+            read_overlay_file(&output, &base, &["shared.txt"]).await?,
+            b"branch override"
+        );
+        assert_eq!(
+            read_overlay_file(&output, &base, &["host-only.txt"]).await?,
+            b"host only"
+        );
+        assert!(
+            !overlay_path_exists(&output, &base, &["deleted-by-parent.txt"]).await?,
+            "parent whiteout must survive branch materialization"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pack_materializes_the_whole_branch_chain() -> Result<()> {
+        let root = tempdir()?;
+        let home = root.path().join("home");
+        let base = root.path().join("base");
+        fs::create_dir_all(&base)?;
+        let parent_db = create_session(&home, "chain-parent", &base).await?;
+        {
+            let parent = Vfs::open(test_options(&parent_db)).await?;
+            write_delta_file(&parent, "/from-parent.txt", b"parent").await?;
+            parent.fs.finalize().await?;
+        }
+        branch_test_session(&home, "chain-parent", "chain-middle").await?;
+        let middle_db = home.join(".vfs/run/chain-middle/delta.db");
+        {
+            let middle = Vfs::open(test_options(&middle_db)).await?;
+            write_delta_file(&middle, "/from-middle.txt", b"middle").await?;
+            middle.fs.finalize().await?;
+        }
+        branch_test_session(&home, "chain-middle", "chain-leaf").await?;
+        let leaf_db = home.join(".vfs/run/chain-leaf/delta.db");
+        {
+            let leaf = Vfs::open(test_options(&leaf_db)).await?;
+            write_delta_file(&leaf, "/from-leaf.txt", b"leaf").await?;
+            leaf.fs.finalize().await?;
+        }
+
+        let mut stdout = Vec::new();
+        pack_session(
+            &mut stdout,
+            &home,
+            "chain-leaf".to_string(),
+            Vec::new(),
+            false,
+            None,
+            DEFAULT_MANIFEST_CHUNK_SIZE,
+        )
+        .await?;
+
+        let packed = Vfs::open(test_options(&leaf_db)).await?;
+        assert_eq!(packed.overlay_parent_artifact().await?, None);
+        drop(packed);
+        for (name, expected) in [
+            ("from-parent.txt", b"parent".as_slice()),
+            ("from-middle.txt", b"middle".as_slice()),
+            ("from-leaf.txt", b"leaf".as_slice()),
+        ] {
+            assert_eq!(read_overlay_file(&leaf_db, &base, &[name]).await?, expected);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pack_refuses_a_missing_branch_parent_without_publication() -> Result<()> {
+        let root = tempdir()?;
+        let home = root.path().join("home");
+        let base = root.path().join("base");
+        fs::create_dir_all(&base)?;
+        let parent_db = create_session(&home, "missing-parent", &base).await?;
+        {
+            let parent = Vfs::open(test_options(&parent_db)).await?;
+            write_delta_file(&parent, "/parent.txt", b"parent").await?;
+            parent.fs.finalize().await?;
+        }
+        branch_test_session(&home, "missing-parent", "missing-branch").await?;
+        let branch_db = home.join(".vfs/run/missing-branch/delta.db");
+        let before = fs::read(&branch_db)?;
+        let branch = Vfs::open(test_options(&branch_db)).await?;
+        let digest = branch
+            .overlay_parent_artifact()
+            .await?
+            .context("branch must record parent artifact")?;
+        drop(branch);
+        fs::remove_file(super::super::artifacts::artifact_path(&home, &digest))?;
+
+        let output = root.path().join("must-not-exist.db");
+        let mut stdout = Vec::new();
+        let error = pack_session(
+            &mut stdout,
+            &home,
+            "missing-branch".to_string(),
+            Vec::new(),
+            false,
+            Some(output.clone()),
+            DEFAULT_MANIFEST_CHUNK_SIZE,
+        )
+        .await
+        .expect_err("missing parent must refuse pack");
+        assert!(format!("{error:#}").contains("is not installed"));
+        assert!(stdout.is_empty());
+        assert!(!output.exists());
+        assert_eq!(fs::read(branch_db)?, before);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pack_refuses_a_drifted_branch_parent_without_publication() -> Result<()> {
+        let root = tempdir()?;
+        let home = root.path().join("home");
+        let base = root.path().join("base");
+        fs::create_dir_all(&base)?;
+        let parent_db = create_session(&home, "drift-parent", &base).await?;
+        {
+            let parent = Vfs::open(test_options(&parent_db)).await?;
+            write_delta_file(&parent, "/parent.txt", b"parent").await?;
+            parent.fs.finalize().await?;
+        }
+        branch_test_session(&home, "drift-parent", "drift-branch").await?;
+        let branch_db = home.join(".vfs/run/drift-branch/delta.db");
+        let before = fs::read(&branch_db)?;
+        let branch = Vfs::open(test_options(&branch_db)).await?;
+        let digest = branch
+            .overlay_parent_artifact()
+            .await?
+            .context("branch must record parent artifact")?;
+        drop(branch);
+        let artifact = super::super::artifacts::artifact_path(&home, &digest);
+        let mut permissions = fs::metadata(&artifact)?.permissions();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(0o600);
+        }
+        fs::set_permissions(&artifact, permissions)?;
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&artifact)?
+            .write_all(b"drift")?;
+
+        let output = root.path().join("must-not-exist.db");
+        let mut stdout = Vec::new();
+        let error = pack_session(
+            &mut stdout,
+            &home,
+            "drift-branch".to_string(),
+            Vec::new(),
+            false,
+            Some(output.clone()),
+            DEFAULT_MANIFEST_CHUNK_SIZE,
+        )
+        .await
+        .expect_err("drifted parent must refuse pack");
+        assert!(format!("{error:#}").contains("drifted parent state"));
+        assert!(stdout.is_empty());
+        assert!(!output.exists());
+        assert_eq!(fs::read(branch_db)?, before);
         Ok(())
     }
 

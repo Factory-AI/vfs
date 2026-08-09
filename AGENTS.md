@@ -160,13 +160,20 @@ them is a breaking change requiring a coordinated rollout, not a refactor.
   `artifactVersion`, `minSupportedArtifactVersion`, and the `features` map.
   Bumping the artifact version without extending `adopt`'s forward migration
   strands every receiver on an older build.
-* **Manifest shapes**: the one-line JSON emitted by `pack`, `adopt`, and
-  `status --json`. Fields are additive; renaming or removing one breaks the
-  receiver.
+* **Manifest shapes**: the one-line JSON emitted by `pack`, `adopt`,
+  `status --json`, `branch`, and `prune artifacts`. Fields are additive;
+  renaming or removing one breaks the receiver.
 * **Session store layout** (`~/.vfs/run/<id>/`): owned by `vfs`. Sessions are
   *installed* only through `adopt` — the previous hand-written materialization
   contract is exactly what `adopt` replaced, so do not re-document the layout
   as something a receiver may assemble itself.
+* **Artifact store** (`~/.vfs/artifacts/<sha256>.db`): owned by `vfs`,
+  written only by `branch`, collected only by `prune artifacts`. Artifacts
+  are immutable (0444, content-addressed): every branch mount re-hashes its
+  parent against the digest recorded in the delta and refuses on mismatch, so
+  nothing may ever open one writable or edit one in place. Packed artifacts
+  never reference the store — `pack` materializes the chain — which is what
+  keeps the transfer wire contract branch-agnostic.
 * **Schema versions**: `vfs migrate` must land any supported old schema at
   CURRENT. A new schema version needs a migration path from every version
   still in `minSupportedArtifactVersion` range.
@@ -192,7 +199,19 @@ The pipeline most changes touch, in order:
 
 Liveness is derived from advisory locks plus proc records, both released by
 the kernel on process death; that is what makes the classification
-crash-consistent. Do not add a liveness signal that survives `SIGKILL`.
+crash-consistent. Do not add a liveness signal that survives `SIGKILL`. The
+session control socket (`ctl.sock`, served by the mount owner) is a
+capability channel to whoever holds the shared lock — `vfs branch` uses it to
+snapshot a live session, `prune artifacts` to read a live session's parent
+digest — never a liveness signal: a stale socket file refuses connections and
+classification stays lock-derived.
+
+`vfs branch` forks off this pipeline at any point: it snapshots the parent
+(via the control socket when live, under the exclusive lock when not),
+publishes the snapshot to the content-addressed artifact store, and installs
+a new session whose delta records the parent digest. Branch mounts stack the
+delta over the read-only parent chain; `pack` folds the chain back into a
+single self-contained artifact so step 3 onward is unchanged.
 
 ## Known gaps and gotchas
 

@@ -16,8 +16,8 @@
 //! bypassing the FUSE mount entirely.
 
 use super::{
-    default_allowed_paths, group_paths_by_parent, prepare_session, prepared_seeded_session,
-    write_runtime_status, StartState, MOUNT_FAILURE_EXIT_CODE,
+    ctl, default_allowed_paths, group_paths_by_parent, prepare_session, prepared_seeded_session,
+    write_runtime_status, StartState, INVALID_SESSION_EXIT_CODE, MOUNT_FAILURE_EXIT_CODE,
 };
 use crate::opts::RunOptions;
 use anyhow::{bail, Context, Result};
@@ -32,7 +32,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use vfs_core::{EncryptionConfig, HostFS, OverlayFS, PartialOriginPolicy, Vfs, VfsOptions};
+use vfs_core::{EncryptionConfig, HostFS, PartialOriginPolicy, Vfs, VfsOptions};
 
 use vfs_mount::{is_mountpoint, mount_fs, Backend, MountHandle, MountOpts};
 
@@ -176,7 +176,7 @@ pub fn run(options: RunOptions) -> Result<()> {
     // FUSE mount is guaranteed live before the child bind-mounts it.
     let rt = crate::get_runtime();
     let audit_encryption = encryption.clone();
-    let mount_handle = match rt.block_on(mount_session_fs(
+    let (mount_handle, ctl_server) = match rt.block_on(mount_session_fs(
         &cwd,
         &session,
         encryption,
@@ -188,7 +188,18 @@ pub fn run(options: RunOptions) -> Result<()> {
         Ok(handle) => handle,
         Err(e) => {
             eprintln!("Error: {e:#}");
-            abort_child(pipe_to_child[1], child_pid, MOUNT_FAILURE_EXIT_CODE);
+            // A refused branch parent chain is a malformed session on this
+            // machine, not a mount-machinery failure; the handoff daemon
+            // must not retry it as one.
+            let exit_code = if e
+                .downcast_ref::<crate::cmd::stack::BranchRefusal>()
+                .is_some()
+            {
+                INVALID_SESSION_EXIT_CODE
+            } else {
+                MOUNT_FAILURE_EXIT_CODE
+            };
+            abort_child(pipe_to_child[1], child_pid, exit_code);
         }
     };
 
@@ -198,6 +209,7 @@ pub fn run(options: RunOptions) -> Result<()> {
         abort_child_with_teardown(
             &rt,
             mount_handle,
+            ctl_server,
             pipe_to_child[1],
             child_pid,
             MOUNT_FAILURE_EXIT_CODE,
@@ -210,6 +222,7 @@ pub fn run(options: RunOptions) -> Result<()> {
         abort_child_with_teardown(
             &rt,
             mount_handle,
+            ctl_server,
             pipe_to_child[1],
             child_pid,
             MOUNT_FAILURE_EXIT_CODE,
@@ -237,7 +250,12 @@ pub fn run(options: RunOptions) -> Result<()> {
         }
     };
 
-    let exit_code = rt.block_on(run_parent(child_pid, mount_handle, &session.run_id))?;
+    let exit_code = rt.block_on(run_parent(
+        child_pid,
+        mount_handle,
+        ctl_server,
+        &session.run_id,
+    ))?;
 
     // The mount is torn down and the delta DB finalized, so the session's own
     // audit row can be written through a plain reopen without a second opener
@@ -330,7 +348,7 @@ async fn mount_session_fs(
     uid: libc::uid_t,
     gid: libc::gid_t,
     system: bool,
-) -> Result<MountHandle> {
+) -> Result<(MountHandle, super::ctl::CtlServer)> {
     // Open the directory BEFORE mounting FUSE on top of it.
     // This fd lets us access the underlying directory through /proc/self/fd/N,
     // bypassing the FUSE mount that will be placed on top. HostFS dups the fd
@@ -348,10 +366,12 @@ async fn mount_session_fs(
     if let Some(encryption) = encryption {
         options = options.with_encryption(encryption);
     }
-    let vfs = Vfs::open(options)
-        .await
-        .map_err(|err| crate::cmd::migrate::open_error_with_guidance(err, db_path_str))
-        .context("Failed to create delta Vfs")?;
+    let vfs = Arc::new(
+        Vfs::open(options)
+            .await
+            .map_err(|err| crate::cmd::migrate::open_error_with_guidance(err, db_path_str))
+            .context("Failed to create delta Vfs")?,
+    );
     let metadata = vfs
         .session_status_metadata()
         .await
@@ -366,12 +386,13 @@ async fn mount_session_fs(
         hostfs.with_fuse_mountpoint(mountpoint_inode)
     };
 
-    let base = Arc::new(hostfs);
-    let overlay = if let Some(policy) = partial_origin_policy {
-        OverlayFS::new_with_partial_origin_policy(base, vfs.fs, policy)
-    } else {
-        OverlayFS::new(base, vfs.fs)
-    };
+    // The overlay gets a clone of the delta filesystem (shared pool and
+    // batcher); the SDK handle itself stays alive in the control server so
+    // snapshot requests drain the same pending state the mount serves.
+    let home = dirs::home_dir().context("Failed to get home directory")?;
+    let overlay =
+        crate::cmd::stack::build_overlay(&home, Arc::new(hostfs), &vfs, partial_origin_policy)
+            .await?;
 
     let cwd_str = cwd
         .to_str()
@@ -404,7 +425,14 @@ async fn mount_session_fs(
         metadata.generation,
         metadata.seeded,
     )?;
-    Ok(mount_handle)
+    let session_dir = session
+        .ctl_socket
+        .parent()
+        .context("Control socket has no parent directory")?
+        .to_path_buf();
+    let ctl_server = super::ctl::CtlServer::spawn(session.ctl_socket.clone(), session_dir, vfs)
+        .context("Failed to start the session control socket")?;
+    Ok((mount_handle, ctl_server))
 }
 
 /// Run a command through an existing session's FUSE mount.
@@ -534,6 +562,8 @@ struct RunSession {
     base_path_file: PathBuf,
     /// Machine-readable metadata used while Turso exclusively owns the DB.
     runtime_status_file: PathBuf,
+    /// Control socket served for the lifetime of this mount (see `run::ctl`).
+    ctl_socket: PathBuf,
     /// Validated base checkout used for every incarnation of this session.
     base_path: PathBuf,
     /// Whether startup removed runtime state left by a dead owner.
@@ -549,6 +579,7 @@ impl From<super::PreparedSession> for RunSession {
             fuse_mountpoint: session.paths.mountpoint,
             base_path_file: session.paths.base_path_file,
             runtime_status_file: session.paths.runtime_status_file,
+            ctl_socket: session.paths.ctl_socket,
             base_path: session.base_path,
             start_state: session.start_state,
         }
@@ -603,11 +634,13 @@ fn abort_child(pipe_write_fd: libc::c_int, child_pid: libc::pid_t, exit_code: i3
 fn abort_child_with_teardown(
     rt: &tokio::runtime::Runtime,
     mount_handle: MountHandle,
+    ctl_server: ctl::CtlServer,
     pipe_write_fd: libc::c_int,
     child_pid: libc::pid_t,
     exit_code: i32,
 ) -> ! {
     reap_child(pipe_write_fd, child_pid);
+    rt.block_on(ctl_server.shutdown());
     if let Err(error) = rt.block_on(mount_handle.unmount()) {
         eprintln!("Warning: Failed to tear down the FUSE session during abort: {error:#}");
     }
@@ -1195,7 +1228,12 @@ fn unescape_mountinfo(s: &str) -> String {
 }
 
 /// Parent process: wait for child to exit, then clean up.
-async fn run_parent(child_pid: i32, mount_handle: MountHandle, session_id: &str) -> Result<i32> {
+async fn run_parent(
+    child_pid: i32,
+    mount_handle: MountHandle,
+    ctl_server: ctl::CtlServer,
+    session_id: &str,
+) -> Result<i32> {
     // Get mountpoint before dropping handle
     let fuse_mountpoint = mount_handle.mountpoint().to_path_buf();
 
@@ -1208,6 +1246,10 @@ async fn run_parent(child_pid: i32, mount_handle: MountHandle, session_id: &str)
         ),
     )
     .await;
+
+    // Supervision has unmounted and finalized the delta; stop serving
+    // control requests before the session's runtime state is cleaned up.
+    ctl_server.shutdown().await;
 
     // Clean up the FUSE mountpoint directory (but keep the delta database)
     if let Err(e) = std::fs::remove_dir_all(&fuse_mountpoint) {

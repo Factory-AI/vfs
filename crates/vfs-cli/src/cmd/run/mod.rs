@@ -12,6 +12,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use vfs_core::VfsOptions;
 
+#[cfg(unix)]
+pub(crate) mod ctl;
 #[cfg(target_os = "macos")]
 mod darwin;
 #[cfg(target_os = "linux")]
@@ -109,6 +111,8 @@ pub(crate) struct SessionPaths {
     pub(crate) base_path_file: PathBuf,
     pub(crate) procs_dir: PathBuf,
     pub(crate) runtime_status_file: PathBuf,
+    /// Control socket served by the live mount owner (see `run::ctl`).
+    pub(crate) ctl_socket: PathBuf,
 }
 
 impl SessionPaths {
@@ -121,6 +125,7 @@ impl SessionPaths {
             base_path_file: run_dir.join("base_path"),
             procs_dir: run_dir.join("procs"),
             runtime_status_file: run_dir.join("runtime-status.json"),
+            ctl_socket: run_dir.join("ctl.sock"),
             run_dir,
         }
     }

@@ -1,7 +1,6 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use std::{path::PathBuf, sync::Arc};
-use turso::value::Value;
-use vfs_core::{EncryptionConfig, FileSystem, HostFS, OverlayFS, PartialOriginPolicy, VfsOptions};
+use vfs_core::{EncryptionConfig, FileSystem, HostFS, PartialOriginPolicy, VfsOptions};
 use vfs_mount::{mount_fs, Backend, MountOpts};
 
 #[cfg(target_os = "linux")]
@@ -173,40 +172,22 @@ fn mount_fuse(args: MountArgs) -> Result<()> {
             .block_on(open_vfs(opts))
             .map_err(|err| super::migrate::open_error_with_guidance(err, &id_or_path))?;
 
-        // Check for overlay configuration
         let fs: Arc<dyn FileSystem> = rt.block_on(async {
-            // Query base_path in a separate scope so connection is released
-            let base_path: Option<String> = {
-                let conn = vfs.get_connection().await?;
-                let query = "SELECT value FROM fs_overlay_config WHERE key = 'base_path'";
-                match conn.query(query, ()).await {
-                    Ok(mut rows) => {
-                        if let Ok(Some(row)) = rows.next().await {
-                            row.get_value(0).ok().and_then(|v| {
-                                if let Value::Text(s) = v {
-                                    Some(s.clone())
-                                } else {
-                                    None
-                                }
-                            })
-                        } else {
-                            None
-                        }
-                    }
-                    Err(_) => None, // Table doesn't exist or query failed
-                }
-            }; // conn is dropped here
-
-            if let Some(base_path) = base_path {
-                // Create OverlayFS with HostFS base, loading existing whiteouts
+            if let Some(base_path) = vfs.overlay_base_path().await? {
+                // Overlay database: stack over the recorded base (and the
+                // branch parent chain, when the delta records one).
                 eprintln!("Using overlay filesystem with base: {}", base_path);
                 let hostfs = HostFS::new(&base_path)?;
                 let hostfs = hostfs.with_fuse_mountpoint(mountpoint_ino);
-                let overlay = if let Some(policy) = partial_origin_policy {
-                    OverlayFS::new_with_partial_origin_policy(Arc::new(hostfs), vfs.fs, policy)
-                } else {
-                    OverlayFS::new(Arc::new(hostfs), vfs.fs)
-                };
+                let home =
+                    dirs::home_dir().ok_or_else(|| anyhow!("Failed to get home directory"))?;
+                let overlay = crate::cmd::stack::build_overlay(
+                    &home,
+                    Arc::new(hostfs),
+                    &vfs,
+                    partial_origin_policy,
+                )
+                .await?;
                 overlay.load().await?; // Load persisted whiteouts and origin mappings
                 Ok::<Arc<dyn FileSystem>, anyhow::Error>(Arc::new(overlay))
             } else {
@@ -269,38 +250,19 @@ async fn mount_nfs_backend(args: MountArgs, mountpoint: PathBuf) -> Result<()> {
         .await
         .map_err(|err| super::migrate::open_error_with_guidance(err, &args.id_or_path))?;
 
-    // Check for overlay configuration
-    // Query base_path in a separate scope so connection is released before load_whiteouts
-    let base_path: Option<String> = {
-        let conn = vfs.get_connection().await?;
-        let query = "SELECT value FROM fs_overlay_config WHERE key = 'base_path'";
-        match conn.query(query, ()).await {
-            Ok(mut rows) => {
-                if let Ok(Some(row)) = rows.next().await {
-                    row.get_value(0).ok().and_then(|v| {
-                        if let Value::Text(s) = v {
-                            Some(s.clone())
-                        } else {
-                            None
-                        }
-                    })
-                } else {
-                    None
-                }
-            }
-            Err(_) => None, // Table doesn't exist or query failed
-        }
-    }; // conn is dropped here
-
-    let fs: Arc<dyn FileSystem> = if let Some(base_path) = base_path {
-        // Create OverlayFS with HostFS base, loading existing whiteouts
+    let fs: Arc<dyn FileSystem> = if let Some(base_path) = vfs.overlay_base_path().await? {
+        // Overlay database: stack over the recorded base (and the branch
+        // parent chain, when the delta records one).
         eprintln!("Using overlay filesystem with base: {}", base_path);
         let hostfs = HostFS::new(&base_path)?;
-        let overlay = if let Some(policy) = args.partial_origin_policy {
-            OverlayFS::new_with_partial_origin_policy(Arc::new(hostfs), vfs.fs, policy)
-        } else {
-            OverlayFS::new(Arc::new(hostfs), vfs.fs)
-        };
+        let home = dirs::home_dir().ok_or_else(|| anyhow!("Failed to get home directory"))?;
+        let overlay = crate::cmd::stack::build_overlay(
+            &home,
+            Arc::new(hostfs),
+            &vfs,
+            args.partial_origin_policy,
+        )
+        .await?;
         overlay.load().await?; // Load persisted whiteouts and origin mappings
         Arc::new(overlay) as Arc<dyn FileSystem>
     } else {

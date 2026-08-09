@@ -25,6 +25,8 @@ pub struct PoolOptions {
     pub(crate) timeout: Duration,
     /// SQL statements applied once to every newly-created connection.
     pub(crate) setup_sql: Vec<String>,
+    /// Connection-local busy timeout applied without issuing SQL.
+    pub(crate) connection_busy_timeout: Option<Duration>,
 }
 
 impl Default for PoolOptions {
@@ -33,6 +35,7 @@ impl Default for PoolOptions {
             max_connections: DEFAULT_MAX_CONNECTIONS,
             timeout: DEFAULT_TIMEOUT,
             setup_sql: Vec::new(),
+            connection_busy_timeout: None,
         }
     }
 }
@@ -53,6 +56,12 @@ impl PoolOptions {
         S: Into<String>,
     {
         self.setup_sql = setup_sql.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Set the busy timeout directly on each newly-created connection.
+    pub(crate) fn with_connection_busy_timeout(mut self, timeout: Duration) -> Self {
+        self.connection_busy_timeout = Some(timeout);
         self
     }
 }
@@ -85,6 +94,8 @@ struct ConnectionPoolInner {
     timeout: Duration,
     /// SQL statements applied once to each newly-created connection
     setup_sql: Vec<String>,
+    /// Busy timeout applied directly to each newly-created connection.
+    connection_busy_timeout: Option<Duration>,
 }
 
 impl ConnectionPool {
@@ -97,6 +108,7 @@ impl ConnectionPool {
                 semaphore: Arc::new(Semaphore::new(options.max_connections.max(1))),
                 timeout: options.timeout,
                 setup_sql: options.setup_sql,
+                connection_busy_timeout: options.connection_busy_timeout,
             }),
         }
     }
@@ -175,6 +187,9 @@ impl ConnectionPool {
             DatabaseType::Sync(db) => db.connect().await?,
         };
 
+        if let Some(timeout) = self.inner.connection_busy_timeout {
+            conn.busy_timeout(timeout)?;
+        }
         for sql in &self.inner.setup_sql {
             let mut rows = conn.query(sql.as_str(), ()).await?;
             while rows.next().await?.is_some() {}

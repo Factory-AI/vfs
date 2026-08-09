@@ -433,6 +433,25 @@ vfs seed [OPTIONS] <SESSION_ID>
 - `--pin <COMMIT>` — Git commit used as the pristine portable base
 - `--json` — Emit machine-readable JSON (seed output is always JSON)
 
+### vfs branch
+
+Fork a run session into a new session at its current state.
+
+Snapshots the parent session (live sessions are snapshotted through the mount without stopping them), publishes the snapshot as an immutable content-addressed artifact under ~/.vfs/artifacts, and installs a new session whose overlay reads fall through to that artifact. Branches taken at the same state share one artifact, so forking N times is cheap. The branch refuses to mount if the artifact no longer matches its recorded digest.
+
+```
+vfs branch [OPTIONS] <SESSION_ID>
+```
+
+**Arguments:**
+
+- `<SESSION_ID>` — Parent run session identifier
+
+**Options:**
+
+- `--session <ID>` — Identifier for the new branch session (default: generated)
+- `--json` — Emit machine-readable JSON (branch output is always JSON)
+
 ### vfs adopt
 
 Install an externally transferred run session.
@@ -511,6 +530,20 @@ vfs prune mounts [OPTIONS]
 **Options:**
 
 - `--force` — Skip confirmation prompt and unmount immediately
+
+#### vfs prune artifacts
+
+Remove branch parent artifacts no session references
+
+Walks every installed run session (live sessions are asked over their control socket) and the artifact chains they reference, then deletes unreferenced artifacts from ~/.vfs/artifacts. Refuses to guess: a session that cannot be classified aborts the prune. Output is a one-line JSON report.
+
+```
+vfs prune artifacts [OPTIONS]
+```
+
+**Options:**
+
+- `--dry-run` — Report what would be removed without deleting anything
 
 ### vfs integrity
 
@@ -631,6 +664,51 @@ base provenance; `vfs adopt` verifies the receiving base checkout against it.
 Seed is a birth-time operation. A second call fails with
 `session already seeded`, and a live mount or wrapped process fails with the
 same exit-code-3 teardown gate used by `vfs pack`.
+
+## Branching run sessions
+
+`vfs branch <session-id> [--session <new-id>]` forks a session into a new,
+independent session that starts at the parent's exact current state. The
+parent keeps running: a live parent is snapshotted through its mount's
+control socket (`~/.vfs/run/<id>/ctl.sock`) as a drained `VACUUM INTO` copy,
+so every write acknowledged before the branch call is included and the agent
+inside the session never stalls beyond the drain. An inactive parent is
+snapshotted directly under the exclusive session lock.
+
+The snapshot is published write-protected into a content-addressed store at
+`~/.vfs/artifacts/<sha256>.db`, and the new session's delta records that
+digest as its parent. The store deduplicates: forking the same state N times
+publishes one artifact. Note that any run of the parent between two forks is
+a new state (each run appends an audit row), so back-to-back forks share an
+artifact while fork–run–fork does not.
+
+A branch session mounts as a stacked overlay — branch delta over the frozen
+parent chain over the host base — on every surface. At mount time each
+parent artifact is re-hashed against the digest its child recorded; a
+missing or drifted artifact refuses the mount (`vfs run` exits `5`), because
+serving anything other than the branched state would be a silent lie.
+Branch-of-branch chains are supported to a depth of 8. Branch writes land
+only in the branch delta; the parent never observes them.
+
+Branches resume only on the machine that created them until packed:
+`vfs pack` of a branch folds the parent chain into the staged database, so
+the published artifact is self-contained and adopts anywhere a normal packed
+session does. Partial-origin copy-up is forced off on branch mounts (its
+fingerprints describe real base files, and a branch's base is a virtual
+stack).
+
+Branch prints a one-line JSON manifest: `sessionId`, `parentSessionId`,
+`parentArtifactSha256`, `artifactPath`, `basePath`, `seedPin` (inherited
+from the parent when recorded), `parentLive`, and `vfsVersion`.
+
+Artifacts are collected with `vfs prune artifacts` (`--dry-run` to preview),
+which removes every artifact no installed session's chain references and
+prints a one-line JSON report. It refuses to guess: an inactive session is
+read under the exclusive session lock, a live session is asked over its
+control socket, and a session that cannot be classified either way aborts
+the prune untouched. Prune and an in-flight `vfs branch` publication exclude
+each other through an advisory lock on the store, so a freshly installed
+artifact can never be collected before the branch referencing it lands.
 
 ## Packing run sessions
 
@@ -770,7 +848,7 @@ these reserved statuses before the wrapped command begins:
 | `2` | Command-line usage or argument parsing failure |
 | `3` | The requested session is genuinely live; `run`, `pack`, `seed`, or `adopt` cannot take exclusive ownership |
 | `4` | `vfs run` could not create, recover, or install the session mount/sandbox |
-| `5` | The requested run session ID or adopted session directory is missing, malformed, or invalid |
+| `5` | The requested run session ID or adopted session directory is missing, malformed, or invalid — including a branch session whose parent artifact is missing or no longer matches its recorded digest |
 | `126` | The wrapped command was found but could not be executed |
 | `127` | The wrapped command was not found |
 

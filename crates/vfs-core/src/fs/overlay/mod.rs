@@ -8,6 +8,7 @@
 mod copyup;
 mod fs;
 mod maps;
+mod materialize;
 mod partial;
 mod whiteouts;
 

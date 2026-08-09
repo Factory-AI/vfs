@@ -444,7 +444,11 @@ impl FileSystem for OverlayFS {
     }
 
     fn external_watch_ignored_paths(&self) -> Vec<std::path::PathBuf> {
-        self.delta.external_watch_ignored_paths()
+        // Merge both layers: with a stacked base (branch mounts) the parent
+        // overlay's delta database must also be excluded from the watcher.
+        let mut ignored = self.delta.external_watch_ignored_paths();
+        ignored.extend(self.base.external_watch_ignored_paths());
+        ignored
     }
 
     async fn open(&self, ino: i64, flags: i32) -> Result<BoxedFile> {

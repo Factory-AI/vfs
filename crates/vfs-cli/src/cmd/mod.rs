@@ -1,4 +1,8 @@
 pub mod adopt;
+#[cfg(unix)]
+pub mod artifacts;
+#[cfg(unix)]
+pub mod branch;
 pub mod completions;
 pub mod fs;
 pub mod init;
@@ -10,6 +14,8 @@ pub mod ps;
 pub mod safety;
 pub mod seed;
 mod session_lock;
+#[cfg(unix)]
+pub(crate) mod stack;
 pub mod sync;
 pub mod timeline;
 pub mod version;

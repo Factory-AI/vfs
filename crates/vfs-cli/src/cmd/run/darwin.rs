@@ -15,7 +15,7 @@ use crate::opts::RunOptions;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use vfs_core::{FileSystem, HostFS, OverlayFS, Vfs, VfsOptions};
+use vfs_core::{FileSystem, HostFS, Vfs, VfsOptions};
 
 use vfs_mount::supervise::{
     exit_code_for_spawn_error, exit_code_for_status, run_supervised, supervise_command,
@@ -401,13 +401,28 @@ pub async fn run(options: RunOptions) -> Result<()> {
         .await
         .context("Failed to read run status metadata")?;
 
-    // Create overlay filesystem with CWD as base
+    // Create overlay filesystem with CWD as base, stacking the branch
+    // parent chain when the delta records one.
     let base_str = session.cwd.to_string_lossy().to_string();
     let hostfs = HostFS::new(&base_str).context("Failed to create HostFS")?;
-    let overlay = if let Some(policy) = partial_origin_policy {
-        OverlayFS::new_with_partial_origin_policy(Arc::new(hostfs), vfs.fs, policy)
-    } else {
-        OverlayFS::new(Arc::new(hostfs), vfs.fs)
+    let home = dirs::home_dir().context("Failed to get home directory")?;
+    let overlay = match crate::cmd::stack::build_overlay(
+        &home,
+        Arc::new(hostfs),
+        &vfs,
+        partial_origin_policy,
+    )
+    .await
+    {
+        Ok(overlay) => overlay,
+        Err(error)
+            if error
+                .downcast_ref::<crate::cmd::stack::BranchRefusal>()
+                .is_some() =>
+        {
+            return Err(super::InvalidRunSession::new(format!("{error:#}")).into());
+        }
+        Err(error) => return Err(error),
     };
 
     // Initialize the overlay (copies directory structure)

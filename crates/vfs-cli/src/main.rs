@@ -395,6 +395,20 @@ fn dispatch(args: Args) -> anyhow::Result<()> {
                 json,
             ))
         }
+        #[cfg(unix)]
+        Command::Branch {
+            parent_session_id,
+            session,
+            json,
+        } => {
+            let rt = get_runtime();
+            rt.block_on(cmd::branch::handle_branch_command(
+                &mut std::io::stdout(),
+                parent_session_id,
+                session,
+                json,
+            ))
+        }
         Command::Status {
             session_id,
             json,
@@ -417,6 +431,14 @@ fn dispatch(args: Args) -> anyhow::Result<()> {
         Command::Ps => cmd::ps::list_ps(&mut std::io::stdout()),
         Command::Prune { command } => match command {
             PruneCommand::Mounts { force } => cmd::mount::prune_mounts(force),
+            #[cfg(unix)]
+            PruneCommand::Artifacts { dry_run } => {
+                let rt = get_runtime();
+                rt.block_on(cmd::artifacts::handle_prune_artifacts(
+                    &mut std::io::stdout(),
+                    dry_run,
+                ))
+            }
         },
         Command::Integrity {
             id_or_path,

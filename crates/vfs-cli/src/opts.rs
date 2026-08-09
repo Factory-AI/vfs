@@ -483,6 +483,29 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Fork a run session into a new session at its current state.
+    ///
+    /// Snapshots the parent session (live sessions are snapshotted through
+    /// the mount without stopping them), publishes the snapshot as an
+    /// immutable content-addressed artifact under ~/.vfs/artifacts, and
+    /// installs a new session whose overlay reads fall through to that
+    /// artifact. Branches taken at the same state share one artifact, so
+    /// forking N times is cheap. The branch refuses to mount if the artifact
+    /// no longer matches its recorded digest.
+    #[cfg(unix)]
+    Branch {
+        /// Parent run session identifier
+        #[arg(value_name = "SESSION_ID")]
+        parent_session_id: String,
+
+        /// Identifier for the new branch session (default: generated)
+        #[arg(long = "session", value_name = "ID")]
+        session: Option<String>,
+
+        /// Emit machine-readable JSON (branch output is always JSON)
+        #[arg(long)]
+        json: bool,
+    },
     /// Install an externally transferred run session.
     ///
     /// Verifies a packed session database against the receiver's base git
@@ -737,6 +760,19 @@ pub enum PruneCommand {
         /// Skip confirmation prompt and unmount immediately
         #[arg(long)]
         force: bool,
+    },
+    /// Remove branch parent artifacts no session references
+    ///
+    /// Walks every installed run session (live sessions are asked over their
+    /// control socket) and the artifact chains they reference, then deletes
+    /// unreferenced artifacts from ~/.vfs/artifacts. Refuses to guess: a
+    /// session that cannot be classified aborts the prune. Output is a
+    /// one-line JSON report.
+    #[cfg(unix)]
+    Artifacts {
+        /// Report what would be removed without deleting anything
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 

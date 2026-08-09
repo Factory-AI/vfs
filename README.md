@@ -45,6 +45,38 @@ Error: base checkout ./some-other-commit is at 3cf0b0a…, but the session requi
 pin 6b8da73…; check out the pin before adopting
 ```
 
+## Forking a live session
+
+Try a risky refactor without betting the session on it. `vfs branch` forks a
+session into an independent one that starts at the parent's exact current
+state — including a *running* parent, snapshotted through its mount without
+stopping it:
+
+```console
+$ vfs branch demo --session probe
+{"manifestVersion":1,"sessionId":"probe","parentSessionId":"demo",
+ "parentArtifactSha256":"4b0dc4a…","artifactPath":"…/.vfs/artifacts/4b0dc4a….db",
+ "basePath":"/home/you/src/checkout","seedPin":"6b8da73…","parentLive":true,
+ "vfsVersion":"1.0.2"}
+
+$ vfs run --session probe -- bash -c 'printf "risky refactor\n" > experiment.txt'
+
+$ vfs run --session demo -- cat experiment.txt
+cat: experiment.txt: No such file or directory
+```
+
+The fork is a delta over a frozen, content-addressed snapshot in
+`~/.vfs/artifacts/<sha256>.db`, so branches taken at the same state share one
+artifact and the branch itself starts empty. Any run of the parent is a new
+state (every run leaves an audit row), so fork–run–fork produces two
+artifacts. The branch mounts as a stack — its delta over the read-only parent
+snapshot over the host base — and every mount re-hashes the snapshot first: a
+missing or tampered parent refuses to serve rather than presenting a view
+that is not the branched state. Branches of branches chain the same way, and
+`vfs pack` of a branch folds the whole chain into one self-contained
+artifact, so a forked session teleports like any other. Unreferenced
+snapshots are collected with `vfs prune artifacts`.
+
 ## Why it's a database
 
 Vfs stores everything an agent does — every file it writes, every piece of
@@ -245,7 +277,7 @@ $ vfs diff my-session
 * `--key` / `--cipher` — local at-rest encryption.
 * `vfs backup`, `integrity`, `migrate`, `materialize`, `prune` — portable
   backups, corruption checks, schema migration, partial-origin
-  materialization, mount cleanup.
+  materialization, mount and artifact-store cleanup.
 
 The **[User Manual](docs/MANUAL.md)** documents every command; its reference
 is generated from the CLI's own argument definitions, so it cannot drift from

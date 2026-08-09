@@ -40,7 +40,7 @@ use error::{Error, Result};
 use pool::{ConnectionPool, DatabaseType, PoolOptions, PooledConnection};
 use std::{
     collections::{HashSet, VecDeque},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 use turso::{Builder, EncryptionOpts, Value};
@@ -84,6 +84,45 @@ pub struct Vfs {
 }
 
 impl Vfs {
+    /// Open an immutable, digest-addressed Vfs artifact without modifying its
+    /// SQLite file family.
+    ///
+    /// This constructor uses Turso's strict read-only open flags, applies only
+    /// connection-local non-writing pragmas, validates the existing schema,
+    /// and omits write batching and mount-orphan recovery. Its filesystem
+    /// lifecycle barriers are no-ops, so reads and shutdown neither checkpoint
+    /// nor remove `-wal`/`-shm` sidecars.
+    ///
+    /// Turso 0.5.3 caches databases by canonical path without considering open
+    /// flags. Therefore the same path must never be opened writable in this
+    /// process. Artifact paths passed here must be immutable and
+    /// digest-addressed, and this API must be their only in-process open path.
+    pub async fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Err(Error::DatabaseNotFound(path.display().to_string()));
+        }
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| Error::InvalidUtf8Path(path.display().to_string()))?;
+        let db = Builder::new_local(path_str).read_only(true).build().await?;
+        let pool = ConnectionPool::with_options(
+            DatabaseType::Local(db),
+            fs::vfs::read_only_file_backed_connection_pool_options(),
+        );
+        let fs =
+            fs::Vfs::from_read_only_pool(pool.clone(), path.to_path_buf(), CoreConfig::from_env())
+                .await?;
+
+        Ok(Self {
+            pool: pool.clone(),
+            sync_db: None,
+            kv: KvStore::from_read_only_pool(pool.clone()),
+            fs,
+            tools: ToolCalls::from_read_only_pool(pool),
+        })
+    }
+
     /// Open a Vfs instance
     ///
     /// # Arguments
@@ -561,12 +600,120 @@ impl Vfs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
+    use std::collections::BTreeMap;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    async fn create_frozen_artifact(temp_dir: &Path) -> PathBuf {
+        let source_path = temp_dir.join("source.db");
+        {
+            let source = fs::Vfs::new(source_path.to_str().unwrap()).await.unwrap();
+            let (_, file) =
+                FileSystem::create_file(&source, 1, "artifact.txt", DEFAULT_FILE_MODE, 1000, 1000)
+                    .await
+                    .unwrap();
+            file.pwrite(0, b"frozen artifact").await.unwrap();
+            source.finalize().await.unwrap();
+        }
+
+        let artifact_path = temp_dir.join("artifact.db");
+        std::fs::copy(source_path, &artifact_path).unwrap();
+        artifact_path
+    }
+
+    fn file_family_snapshot(path: &Path) -> BTreeMap<String, Option<[u8; 32]>> {
+        ["", "-wal", "-shm"]
+            .into_iter()
+            .map(|suffix| {
+                let family_path = PathBuf::from(format!("{}{suffix}", path.display()));
+                let hash = family_path.exists().then(|| {
+                    let bytes = std::fs::read(&family_path).unwrap();
+                    Sha256::digest(bytes).into()
+                });
+                (suffix.to_string(), hash)
+            })
+            .collect()
+    }
 
     #[tokio::test]
     async fn test_vfs_creation() {
         let vfs = Vfs::open(VfsOptions::ephemeral()).await.unwrap();
         // Just verify we can get the connection
         let _conn = vfs.get_connection().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn open_read_only_preserves_single_file_artifact_family() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let artifact_path = create_frozen_artifact(temp_dir.path()).await;
+        let before = file_family_snapshot(&artifact_path);
+
+        {
+            let vfs = Vfs::open_read_only(&artifact_path).await.unwrap();
+            let stats = FileSystem::lookup(&vfs.fs, 1, "artifact.txt")
+                .await
+                .unwrap()
+                .unwrap();
+            let file = FileSystem::open(&vfs.fs, stats.ino, libc::O_RDONLY)
+                .await
+                .unwrap();
+            assert_eq!(file.pread(0, 64).await.unwrap(), b"frozen artifact");
+            assert_eq!(
+                FileSystem::readdir(&vfs.fs, 1).await.unwrap().unwrap(),
+                vec!["artifact.txt"]
+            );
+            FileSystem::finalize(&vfs.fs).await.unwrap();
+        }
+
+        assert_eq!(file_family_snapshot(&artifact_path), before);
+        assert!(!PathBuf::from(format!("{}-wal", artifact_path.display())).exists());
+        assert!(!PathBuf::from(format!("{}-shm", artifact_path.display())).exists());
+    }
+
+    #[tokio::test]
+    async fn open_read_only_rejects_filesystem_write_without_mutating_family() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let artifact_path = create_frozen_artifact(temp_dir.path()).await;
+        let before = file_family_snapshot(&artifact_path);
+
+        {
+            let vfs = Vfs::open_read_only(&artifact_path).await.unwrap();
+            let error = FileSystem::mkdir(&vfs.fs, 1, "forbidden", DEFAULT_DIR_MODE, 1000, 1000)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, Error::Database(turso::Error::Readonly(_))),
+                "unexpected write error: {error:?}"
+            );
+            FileSystem::drain_all(&vfs.fs).await.unwrap();
+        }
+
+        assert_eq!(file_family_snapshot(&artifact_path), before);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn open_read_only_reads_chmod_0444_artifact() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let artifact_path = create_frozen_artifact(temp_dir.path()).await;
+        std::fs::set_permissions(&artifact_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let before = file_family_snapshot(&artifact_path);
+
+        {
+            let vfs = Vfs::open_read_only(&artifact_path).await.unwrap();
+            let stats = FileSystem::lookup(&vfs.fs, 1, "artifact.txt")
+                .await
+                .unwrap()
+                .unwrap();
+            let file = FileSystem::open(&vfs.fs, stats.ino, libc::O_RDONLY)
+                .await
+                .unwrap();
+            assert_eq!(file.pread(0, 64).await.unwrap(), b"frozen artifact");
+        }
+
+        assert_eq!(file_family_snapshot(&artifact_path), before);
     }
 
     #[tokio::test]

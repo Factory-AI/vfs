@@ -1,5 +1,55 @@
 # Changelog
 
+## [Unreleased] - Session branching
+
+`vfs branch` forks a run session into an independent session that starts at
+the parent's exact current state. The handoff wire contract and database
+schema do not change: `artifactVersion` remains `0.6`, and packed artifacts
+stay self-contained.
+
+### Added
+
+- `vfs branch <SESSION_ID> [--session <ID>]` forks a session. A live parent
+  is snapshotted through its mount's control socket without stopping it (the
+  snapshot is a drained `VACUUM INTO` copy, so every write acknowledged
+  before the call is included); an inactive parent is snapshotted under the
+  exclusive session lock. The command emits a one-line JSON manifest
+  (`sessionId`, `parentSessionId`, `parentArtifactSha256`, `artifactPath`,
+  `basePath`, `seedPin`, `parentLive`, `vfsVersion`).
+- Frozen parent artifacts live in a content-addressed store at
+  `~/.vfs/artifacts/<sha256>.db`, published write-protected (0444) by
+  same-filesystem rename. Branches taken at the same parent state share one
+  artifact.
+- Branch sessions mount as a stacked overlay — branch delta over the
+  read-only parent chain over the host base — on every surface (`vfs run`,
+  `vfs mount`, `vfs exec`, FUSE and NFS). Parent artifacts are re-hashed at
+  mount time; a missing or drifted artifact refuses the mount, and `vfs run`
+  reports that refusal with the invalid-session exit status `5`.
+- Branch-of-branch chains are supported to a depth of 8.
+- `vfs pack` of a branch session materializes the parent chain into the
+  staged database, so the published artifact is self-contained and `vfs
+  adopt` on a receiver without the artifact store reconstructs the branched
+  view exactly. Pack refuses to publish if a parent artifact is missing or
+  drifted.
+- `vfs version --json` advertises `features.branch`.
+- `vfs prune artifacts [--dry-run]` collects artifacts no session chain
+  references and emits a one-line JSON report (`removed`, `kept`,
+  `reclaimedBytes`). Classification is conservative: inactive sessions are
+  read under the exclusive lock, live sessions are asked over their control
+  socket, and any session that cannot be classified aborts the prune. A
+  store-level advisory lock makes prune and a concurrent `vfs branch`
+  publication mutually exclusive.
+- Each `vfs run` session now exposes a control socket
+  (`~/.vfs/run/<id>/ctl.sock`) accepting snapshot and parent-digest requests
+  from same-machine tooling while the session is live.
+
+### Changed
+
+- The bundled turso SDK crates (`turso`, `turso_sdk_kit` 0.5.3) are vendored
+  under `third_party/` with a patch adding a read-only open mode, used to
+  guarantee parent artifacts are never opened writable. `turso_core` is
+  unchanged.
+
 ## [1.0.2] - 2026-08-08 - Lifecycle benchmark hardening
 
 This release makes the chaos workload the unambiguous primary performance

@@ -103,6 +103,10 @@ impl ToolCalls {
         Ok(tc)
     }
 
+    pub(crate) fn from_read_only_pool(pool: ConnectionPool) -> Self {
+        Self { pool }
+    }
+
     /// Initialize the database schema
     async fn initialize(&self) -> Result<()> {
         let conn = self.pool.get_connection().await?;
