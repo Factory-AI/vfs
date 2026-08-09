@@ -1,7 +1,7 @@
 #!/bin/sh
 #
 # Operation journal and content-addressed chunk storage end to end:
-# mounted mutations, live-chunk dedupe, journal kill switch, pack retention,
+# mounted mutations, live-chunk dedupe, journal kill switch, pack floor,
 # and forward migration of an old artifact through adopt.
 #
 set -eu
@@ -311,10 +311,13 @@ assert counts == {
     "fs_op_journal": 0,
     "fs_journal_chunk": 0,
 }, counts
+assert conn.execute(
+    "SELECT value FROM fs_config WHERE key = 'history_valid'"
+).fetchone() == ("0",)
 conn.close()
 PY
 
-# --- Pack retention ---------------------------------------------------------
+# --- Pack establishes a fresh history floor ---------------------------------
 run_vfs run --session "$RETENTION_ID" -- /bin/bash -c '
 set -e
 i=0
@@ -353,13 +356,18 @@ import sys
 
 conn = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
 pre = int(sys.argv[2])
-post, minimum = conn.execute(
-    "SELECT COUNT(*), COALESCE(MIN(seq), 0) FROM fs_op_journal"
-).fetchone()
-assert 1 <= post < pre, (pre, post)
-assert post <= 20, f"whole-transaction retention slack is unexpectedly large: {post}"
-assert post * 2 < pre, (pre, post)
-assert minimum > 1, minimum
+post = conn.execute("SELECT COUNT(*) FROM fs_op_journal").fetchone()[0]
+assert post == 0, (pre, post)
+floor = int(conn.execute(
+    "SELECT value FROM fs_config WHERE key = 'history_floor_seq'"
+).fetchone()[0])
+roots = conn.execute(
+    """SELECT through_seq, reason, history_epoch
+       FROM fs_snapshot
+       ORDER BY snapshot_id"""
+).fetchall()
+assert roots == [(floor, "pack", 1)], roots
+assert floor > 1, floor
 orphans = conn.execute(
     """SELECT COUNT(*)
        FROM fs_journal_chunk c

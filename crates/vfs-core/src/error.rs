@@ -81,6 +81,76 @@ pub enum Error {
     /// Schema version mismatch - database schema version doesn't match expected version
     #[error("schema version mismatch: database is version {found}, expected {expected}")]
     SchemaVersionMismatch { found: String, expected: String },
+
+    /// Durable history markers record a journaling gap.
+    #[error(
+        "filesystem history epoch {epoch} is not replayable (available range {floor_seq}..={head_seq})"
+    )]
+    HistoryInvalid {
+        epoch: i64,
+        floor_seq: i64,
+        head_seq: i64,
+    },
+
+    /// A requested history target is outside the retained range.
+    #[error(
+        "history target {target_seq} is outside the available range {floor_seq}..={head_seq} in epoch {epoch}"
+    )]
+    HistoryTargetOutOfRange {
+        target_seq: i64,
+        floor_seq: i64,
+        head_seq: i64,
+        epoch: i64,
+    },
+
+    /// A requested sequence would expose only part of a committed mutation.
+    #[error(
+        "history target {target_seq} is inside transaction {txn_id}; use complete target {transaction_end_seq} (available range {floor_seq}..={head_seq}, epoch {epoch})"
+    )]
+    HistoryTargetMidTransaction {
+        target_seq: i64,
+        txn_id: i64,
+        transaction_end_seq: i64,
+        floor_seq: i64,
+        head_seq: i64,
+        epoch: i64,
+    },
+
+    /// No root snapshot can seed replay to the requested target.
+    #[error(
+        "history target {target_seq} has no covering root snapshot in epoch {epoch} (available range {floor_seq}..={head_seq})"
+    )]
+    HistorySnapshotMissing {
+        target_seq: i64,
+        floor_seq: i64,
+        head_seq: i64,
+        epoch: i64,
+    },
+
+    /// The retained journal is not contiguous after its covering snapshot.
+    #[error(
+        "history target {target_seq} has a journal gap after root {snapshot_seq}: expected seq {expected_seq}, found {found_seq:?} (available range {floor_seq}..={head_seq}, epoch {epoch})"
+    )]
+    HistoryGap {
+        target_seq: i64,
+        snapshot_seq: i64,
+        expected_seq: i64,
+        found_seq: Option<i64>,
+        floor_seq: i64,
+        head_seq: i64,
+        epoch: i64,
+    },
+
+    /// A reconstructed row references content that is no longer retained.
+    #[error("history reconstruction is missing chunk {digest} referenced by {referenced_by}")]
+    HistoryMissingChunk {
+        digest: String,
+        referenced_by: String,
+    },
+
+    /// The reconstructed filesystem failed relational or visible-tree checks.
+    #[error("history reconstruction failed integrity checks: {0}")]
+    HistoryIntegrity(String),
 }
 
 /// Result type alias using the SDK Error type.

@@ -1038,6 +1038,8 @@ CREATE INDEX idx_fs_op_journal_txn_id ON fs_op_journal(txn_id)
   content is represented by lowercase hexadecimal BLAKE3 digests, never
   embedded bytes. An `fs_inode` upsert carries every inode column except raw
   `data_inline`; inline bytes are normalized to `data_inline_digest`.
+  `fs_dentry` upserts include the stable dentry `id` as well as
+  `(parent_ino,name,ino)`.
 - `wallclock_ms` - Commit-associated Unix epoch timestamp in milliseconds
 
 One logical mutation may produce several row deltas. Deltas from one commit
@@ -1047,11 +1049,12 @@ rows with one `txn_id` as a unit. Writers construct post-images from mutation
 inputs and mutation-statement results inside the transaction; they MUST NOT
 issue follow-up reads merely to build journal rows.
 
-Transaction IDs need no allocator state: a group's `txn_id` is the `seq`
-AUTOINCREMENT assigns to its first row, which the writer derives as
-`MAX(seq) + 1` inside its exclusive transaction. This holds because seqs are
-never reused and collection always retains the newest whole group; a writer
-MUST NOT delete the highest-`seq` row while the journal is non-empty.
+Transaction IDs need no separate allocator state: a group's `txn_id` is the
+`seq` AUTOINCREMENT assigns to its first row. Writers maintain an optimistic
+next-sequence hint, verify it against the assigned first `seq`, and repair a
+stale hint inside the same exclusive transaction. A cold writer finds the
+head with `ORDER BY seq DESC LIMIT 1`; it does not run an aggregate on the hot
+commit path.
 
 ### Table: `fs_journal_chunk`
 
@@ -1113,6 +1116,96 @@ Migration to v0.8 discards the non-replayable v0.7 journal and its pins,
 creates a `migrate` snapshot at epoch 1 through sequence 0, and sets
 `history_epoch=1`, `history_valid=1`, and `history_floor_seq=0`. In-place and
 copy migration establish the same history boundary.
+
+## History Range, Epochs, and Reconstruction
+
+`history_floor_seq` and the current journal/snapshot head define the inclusive
+advertised range. A target is replayable only when all of the following hold:
+
+1. `history_valid=1`;
+2. the target is within `[history_floor_seq, history_head_seq]`;
+3. the target equals the final `seq` of a complete transaction group, or is
+   exactly the floor root;
+4. a current-epoch snapshot exists at or before the target; and
+5. journal rows after that snapshot through the target are contiguous and
+   contain only whole transaction groups.
+
+Consumers MUST reject targets outside the range, targets inside a transaction,
+invalid epochs, missing roots, and journal gaps. They MUST NOT silently choose
+the nearest available state.
+
+Reconstruction operates only on a private writable staging database. It loads
+the nearest current-epoch root at or before the target into isolated replay
+state, applies complete row-delta groups in ascending `seq`, then atomically
+replaces these live tables:
+
+- `fs_inode`
+- `fs_dentry`
+- `fs_data`
+- `fs_symlink`
+- `fs_whiteout`
+- `fs_origin`
+- `fs_partial_origin`
+- `fs_chunk_override`
+
+For `fs_overlay_config`, replay replaces only `parent_artifact`; `base_path`
+belongs to the receiving staging database and MUST remain unchanged. Snapshot
+provenance restores `seed_pin` and `seeded_paths`. `kv_store`, `tool_calls`,
+and session `generation` are outside filesystem-history scope and MUST remain
+untouched.
+
+Inline inode bytes are rematerialized from `fs_chunk` through
+`data_inline_digest`. Reconstruction MUST fail if any inline or `fs_data`
+digest is missing. After replay it removes future journal rows and snapshots,
+rebuilds the journal AUTOINCREMENT table so the next group begins at
+`target+1`, recomputes every chunk refcount from live `fs_data`, and collects
+only chunks satisfying the three-way rule:
+
+```text
+refcount == 0
+AND no fs_journal_chunk pin
+AND no fs_snapshot_chunk pin
+```
+
+The inode allocator MUST remain above every inode that appeared anywhere in
+the retained pre-reconstruction live state, snapshots, or journal, so a
+reverted lineage never reuses an inode identity. Before publication,
+reconstruction MUST pass current-schema integrity checks and a visible-tree
+walk from inode 1.
+
+### Durable epoch invalidation
+
+The journaling kill switch is recorded durably, not inferred from the current
+environment:
+
+- the first writable open with journaling disabled changes
+  `history_valid` from `1` to `0`;
+- later disabled opens do not rewrite the marker;
+- read-only opens never change history markers;
+- the first writable open after journaling is re-enabled increments
+  `history_epoch`, removes the stale journal, pins, and snapshots, captures an
+  `epoch` root at the current state, publishes that root as the new floor, and
+  sets `history_valid=1`.
+
+No target from an invalidated or prior epoch remains available after
+revalidation.
+
+### Snapshot-covered retention and pack floors
+
+Journal collection computes the sequence horizon as
+`history_head_seq - VFS_JOURNAL_RETENTION_OPS` and chooses the greatest
+complete transaction boundary at or below it. If that boundary advances the
+floor, collection reconstructs state at the boundary in isolated replay
+state, captures a new `gc` root there, publishes the new floor, then removes
+journal groups through the boundary and older/superseded roots in one
+transaction. Therefore every advertised target always has a covering root and
+a contiguous journal suffix.
+
+`vfs pack` is a generation boundary. On its private staging database it first
+materializes any branch-parent chain and applies configured prunes, then
+captures a `pack` root at the current head, removes all older journal targets
+and snapshots, and sets that root as the fresh floor. Pre-pack targets are
+intentionally unavailable from the packed generation.
 
 ## Key-Value Data
 

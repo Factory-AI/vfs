@@ -57,9 +57,10 @@ pub use config::{
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use fs::HostFS;
 pub use fs::{
-    journal_gc, BoxedFile, DirEntry, File, FileSystem, FilesystemStats, FsError, ImportEntry,
-    ImportOptions, ImportSession, ImportedEntry, OverlayFS, PartialOriginMode, PartialOriginPolicy,
-    Stats, TimeChange, WriteRange, DEFAULT_DIR_MODE, DEFAULT_FILE_MODE,
+    journal_gc, BoxedFile, DirEntry, File, FileSystem, FilesystemStats, FsError, HistoryStatus,
+    HistoryTarget, ImportEntry, ImportOptions, ImportSession, ImportedEntry, OverlayFS,
+    PartialOriginMode, PartialOriginPolicy, ReconstructionInfo, SnapshotHeader, Stats, TimeChange,
+    ValidatedHistoryTarget, WriteRange, DEFAULT_DIR_MODE, DEFAULT_FILE_MODE,
     DEFAULT_PARTIAL_ORIGIN_THRESHOLD_BYTES, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT,
     S_IFREG, S_IFSOCK,
 };
@@ -333,6 +334,58 @@ impl Vfs {
     /// Get the connection pool
     pub fn get_pool(&self) -> ConnectionPool {
         self.pool.clone()
+    }
+
+    /// Capture an immutable root at the acknowledged journal head.
+    pub async fn capture_root(&self, reason: &str) -> Result<SnapshotHeader> {
+        self.fs.drain_all().await?;
+        let conn = self.pool.get_connection().await?;
+        fs::history::capture_root(&conn, reason).await
+    }
+
+    /// Return the retained replay range and complete transaction targets.
+    pub async fn history_status(&self) -> Result<HistoryStatus> {
+        let conn = self.pool.get_connection().await?;
+        fs::history::status(&conn).await
+    }
+
+    /// Validate that `target_seq` is a complete, reconstructible history target.
+    pub async fn validate_target(&self, target_seq: i64) -> Result<ValidatedHistoryTarget> {
+        let conn = self.pool.get_connection().await?;
+        fs::history::validate_target(&conn, target_seq).await
+    }
+
+    /// Replace the filesystem state in a private staged database with a target.
+    ///
+    /// The path must name a caller-owned staging copy that is not open
+    /// elsewhere in this process. This constructor deliberately bypasses the
+    /// normal writable-open epoch transition: replay validates and transforms
+    /// the staged copy's already-recorded durable history markers.
+    pub async fn reconstruct_to(
+        staging_path: impl AsRef<Path>,
+        target_seq: i64,
+    ) -> Result<ReconstructionInfo> {
+        let staging_path = staging_path.as_ref();
+        if !staging_path.is_file() {
+            return Err(Error::DatabaseNotFound(staging_path.display().to_string()));
+        }
+        let path = staging_path
+            .to_str()
+            .ok_or_else(|| Error::InvalidUtf8Path(staging_path.display().to_string()))?;
+        let db = Builder::new_local(path).build().await?;
+        let conn = db.connect()?;
+        schema::require_current(&conn).await?;
+        let info = fs::history::reconstruct(&conn, staging_path, target_seq).await?;
+        let mut rows = conn.query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await?;
+        while rows.next().await?.is_some() {}
+        Ok(info)
+    }
+
+    /// Establish the current state as a fresh generation-scoped history floor.
+    pub async fn establish_history_floor(&self, reason: &str) -> Result<SnapshotHeader> {
+        self.fs.drain_all().await?;
+        let conn = self.pool.get_connection().await?;
+        fs::history::establish_fresh_floor(&conn, reason).await
     }
 
     /// Check if sync is enabled for this database

@@ -367,7 +367,7 @@ impl OverlayFS {
         let conn = self.delta.get_connection().await?;
         let mut txn =
             super::super::vfs::MutationTxn::begin(&conn, self.delta.journal_ctx()).await?;
-        let (stats, parent) = self
+        let (stats, parent, dentry_id) = self
             .delta
             .create_file_with_conn(
                 txn.conn(),
@@ -432,7 +432,7 @@ impl OverlayFS {
         )
         .await?;
         txn.record(super::super::vfs::JournalDelta::dentry_upsert(
-            "copyup", parent_ino, name, delta_ino,
+            "copyup", dentry_id, parent_ino, name, delta_ino,
         ));
         if let Some(parent) = parent {
             txn.record_inode("copyup", parent).await?;

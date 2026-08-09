@@ -14,6 +14,7 @@ use super::*;
 
 struct JournalImport {
     inode: InodeRow,
+    dentry_id: i64,
     parent_ino: i64,
     name: String,
     symlink_target: Option<String>,
@@ -248,6 +249,7 @@ impl Vfs {
                     Err(turso::Error::Constraint(_)) => return Err(FsError::AlreadyExists.into()),
                     Err(error) => return Err(error.into()),
                 }
+                let dentry_id = conn.last_insert_rowid();
 
                 let (journal_digests, symlink_target) = match kind {
                     S_IFDIR => {
@@ -310,6 +312,7 @@ impl Vfs {
                             (storage_kind == STORAGE_INLINE).then(|| entry.data.clone()),
                             storage_kind,
                         ),
+                        dentry_id,
                         parent_ino,
                         name: name.to_string(),
                         symlink_target,
@@ -346,6 +349,7 @@ impl Vfs {
                 txn.record_inode("import", import.inode).await?;
                 txn.record(JournalDelta::dentry_upsert(
                     "import",
+                    import.dentry_id,
                     import.parent_ino,
                     &import.name,
                     ino,

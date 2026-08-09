@@ -262,6 +262,7 @@ impl Vfs {
         // stamps SQLite's user-version inside the DDL transaction.
         let journal = journal::JournalCtx::new(config.journal_enabled);
         Self::initialize_schema(&conn, journal.clone()).await?;
+        super::history::reconcile_epoch(&conn, config.journal_enabled).await?;
 
         // Get chunk_size from config (or use default)
         let chunk_size = Self::read_chunk_size(&conn).await?;
@@ -784,7 +785,7 @@ impl Vfs {
         mode: u32,
         ownership: (u32, u32),
         update_parent_times: bool,
-    ) -> Result<(Stats, Option<InodeRow>)> {
+    ) -> Result<(Stats, Option<InodeRow>, i64)> {
         let (uid, gid) = ownership;
         let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
         let now_secs = dur.as_secs() as i64;
@@ -829,6 +830,7 @@ impl Vfs {
             Err(turso::Error::Constraint(_)) => return Err(FsError::AlreadyExists.into()),
             Err(error) => return Err(error.into()),
         }
+        let dentry_id = conn.last_insert_rowid();
 
         let parent = if update_parent_times {
             let mut rows = conn
@@ -866,6 +868,7 @@ impl Vfs {
                 rdev: 0,
             },
             parent,
+            dentry_id,
         ))
     }
 

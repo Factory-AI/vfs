@@ -18,6 +18,21 @@ pack/adopt manifest shapes and all other wire contracts remain unchanged.
 - In-place and copy migration from v0.7 discard the old semantic journal,
   initialize history markers, and establish one migration root at epoch 1
   through sequence 0.
+- `vfs-core` now exposes root capture, history status and target validation,
+  and exact reconstruction of a private staged database to any retained
+  complete-transaction boundary. Reconstruction restores filesystem and
+  overlay state, verifies all content digests, recomputes chunk refcounts,
+  preserves inode allocator high-water marks, trims the future timeline, and
+  runs relational plus visible-tree integrity checks.
+- Journal retention is snapshot-covered: GC rolls the root forward to a
+  complete boundary before removing older groups, so every advertised target
+  remains reconstructible. Pack establishes a fresh `pack` root and history
+  floor after parent-chain materialization, making pre-pack targets
+  intentionally unavailable in the new generation.
+- The journaling kill switch now has a durable epoch contract. A writable open
+  with journaling disabled marks history invalid; re-enabling journaling bumps
+  the epoch, removes stale history, and captures the current state as a fresh
+  root. Read-only opens never write these markers.
 
 - `vfs branch <SESSION_ID> [--session <ID>]` forks a session. A live parent
   is snapshotted through its mount's control socket without stopping it (the

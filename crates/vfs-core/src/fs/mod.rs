@@ -1,3 +1,4 @@
+pub mod history;
 pub mod host;
 pub mod overlay;
 pub mod vfs;
@@ -9,6 +10,9 @@ use std::sync::Arc;
 use thiserror::Error;
 
 // Re-export implementations
+pub use history::{
+    HistoryStatus, HistoryTarget, ReconstructionInfo, SnapshotHeader, ValidatedHistoryTarget,
+};
 #[cfg(target_os = "macos")]
 pub use host::HostFS;
 #[cfg(target_os = "linux")]

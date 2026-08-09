@@ -76,6 +76,7 @@ impl JournalDelta {
 
     pub(crate) fn dentry_upsert(
         label: &'static str,
+        id: i64,
         parent_ino: i64,
         name: &str,
         ino: i64,
@@ -84,7 +85,7 @@ impl JournalDelta {
             label,
             "fs_dentry",
             "upsert",
-            json!({ "parent_ino": parent_ino, "name": name, "ino": ino }),
+            json!({ "id": id, "parent_ino": parent_ino, "name": name, "ino": ino }),
         )
     }
 
@@ -552,63 +553,5 @@ fn hex_digest(digest: &[u8]) -> String {
 }
 
 pub async fn journal_gc(conn: &Connection, retention_ops: usize) -> Result<()> {
-    if retention_ops == 0 {
-        return Err(Error::Internal(
-            "journal retention must be positive".to_string(),
-        ));
-    }
-
-    let txn = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).await?;
-    let mut max_rows = txn
-        .query("SELECT COALESCE(MAX(seq), 0) FROM fs_op_journal", ())
-        .await?;
-    let max_seq = max_rows
-        .next()
-        .await?
-        .ok_or_else(|| Error::Internal("journal max sequence query returned no row".to_string()))?
-        .get_value(0)
-        .ok()
-        .and_then(|value| value.as_integer().copied())
-        .unwrap_or(0);
-    drop(max_rows);
-    let retention_ops = i64::try_from(retention_ops)
-        .map_err(|_| Error::Internal("journal retention is too large".to_string()))?;
-    let horizon = max_seq.saturating_sub(retention_ops);
-
-    if horizon > 0 {
-        txn.execute(
-            "DELETE FROM fs_journal_chunk
-             WHERE seq IN (
-                 SELECT seq FROM fs_op_journal
-                 WHERE txn_id IN (
-                     SELECT txn_id FROM fs_op_journal
-                     GROUP BY txn_id
-                     HAVING MAX(seq) <= ?
-                 )
-             )",
-            (horizon,),
-        )
-        .await?;
-        txn.execute(
-            "DELETE FROM fs_op_journal
-             WHERE txn_id IN (
-                 SELECT txn_id FROM fs_op_journal
-                 GROUP BY txn_id
-                 HAVING MAX(seq) <= ?
-             )",
-            (horizon,),
-        )
-        .await?;
-    }
-
-    txn.execute(
-        "DELETE FROM fs_chunk
-         WHERE refcount = 0
-           AND digest NOT IN (SELECT digest FROM fs_journal_chunk)
-           AND digest NOT IN (SELECT digest FROM fs_snapshot_chunk)",
-        (),
-    )
-    .await?;
-    txn.commit().await?;
-    Ok(())
+    super::super::history::journal_gc(conn, retention_ops).await
 }

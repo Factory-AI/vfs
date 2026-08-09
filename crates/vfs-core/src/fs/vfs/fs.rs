@@ -659,7 +659,7 @@ impl FileSystem for Vfs {
         // drain transactions (turso reports such write/write races as
         // "database snapshot is stale" instead of waiting on the write lock).
         let mut txn = MutationTxn::begin(&conn, self.journal_ctx()).await?;
-        let result: Result<(Stats, InodeRow)> = async {
+        let result: Result<(Stats, InodeRow, i64)> = async {
             // Check if already exists
             if self.lookup_child(&conn, parent_ino, name).await?.is_some() {
                 return Err(FsError::AlreadyExists.into());
@@ -701,6 +701,7 @@ impl FileSystem for Vfs {
                 .prepare_cached("INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, ?, ?)")
                 .await?;
             stmt.execute((name, parent_ino, ino)).await?;
+            let dentry_id = conn.last_insert_rowid();
 
             // Set nlink to 2 for new directory (self "." + parent's dentry)
             let mut stmt = conn
@@ -724,30 +725,34 @@ impl FileSystem for Vfs {
                 0,
             )?;
 
-            Ok((Stats {
-                ino,
-                mode: dir_mode,
-                nlink: 2,
-                uid,
-                gid,
-                size: 0,
-                atime: now_secs,
-                mtime: now_secs,
-                ctime: now_secs,
-                atime_nsec: now_nsec as u32,
-                mtime_nsec: now_nsec as u32,
-                ctime_nsec: now_nsec as u32,
-                rdev: 0,
-            }, parent))
+            Ok((
+                Stats {
+                    ino,
+                    mode: dir_mode,
+                    nlink: 2,
+                    uid,
+                    gid,
+                    size: 0,
+                    atime: now_secs,
+                    mtime: now_secs,
+                    ctime: now_secs,
+                    atime_nsec: now_nsec as u32,
+                    mtime_nsec: now_nsec as u32,
+                    ctime_nsec: now_nsec as u32,
+                    rdev: 0,
+                },
+                parent,
+                dentry_id,
+            ))
         }
         .await;
 
         match result {
-            Ok((stats, parent)) => {
+            Ok((stats, parent, dentry_id)) => {
                 txn.record_inode("mkdir", InodeRow::from_stats(&stats, None, STORAGE_CHUNKED))
                     .await?;
                 txn.record(JournalDelta::dentry_upsert(
-                    "mkdir", parent_ino, name, stats.ino,
+                    "mkdir", dentry_id, parent_ino, name, stats.ino,
                 ));
                 txn.record_inode("mkdir", parent).await?;
                 txn.commit().await?;
@@ -790,7 +795,7 @@ impl FileSystem for Vfs {
         // of paying an UPDATE on the synchronous create path. Falls back to
         // the in-transaction UPDATE when the overlay cannot serve reads.
         let stash_parent_times = self.overlay_reads && self.write_drain.is_some();
-        let (stats, parent) = self
+        let (stats, parent, dentry_id) = self
             .create_file_with_conn(
                 txn.conn(),
                 parent_ino,
@@ -809,6 +814,7 @@ impl FileSystem for Vfs {
         .await?;
         txn.record(JournalDelta::dentry_upsert(
             "create_file",
+            dentry_id,
             parent_ino,
             name,
             ino,
@@ -868,7 +874,7 @@ impl FileSystem for Vfs {
         // BEGIN IMMEDIATE: see `mkdir` — never race the batcher's drain
         // transactions with autocommit metadata writes.
         let mut txn = MutationTxn::begin(&conn, self.journal_ctx()).await?;
-        let result: Result<(Stats, InodeRow)> = async {
+        let result: Result<(Stats, InodeRow, i64)> = async {
             // Check if already exists
             if self.lookup_child(&conn, parent_ino, name).await?.is_some() {
                 return Err(FsError::AlreadyExists.into());
@@ -910,6 +916,7 @@ impl FileSystem for Vfs {
                 .prepare_cached("INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, ?, ?)")
                 .await?;
             stmt.execute((name, parent_ino, ino)).await?;
+            let dentry_id = conn.last_insert_rowid();
 
             // Increment link count
             let mut stmt = conn
@@ -933,30 +940,34 @@ impl FileSystem for Vfs {
                 0,
             )?;
 
-            Ok((Stats {
-                ino,
-                mode,
-                nlink: 1,
-                uid,
-                gid,
-                size: 0,
-                atime: now_secs,
-                mtime: now_secs,
-                ctime: now_secs,
-                atime_nsec: now_nsec as u32,
-                mtime_nsec: now_nsec as u32,
-                ctime_nsec: now_nsec as u32,
-                rdev,
-            }, parent))
+            Ok((
+                Stats {
+                    ino,
+                    mode,
+                    nlink: 1,
+                    uid,
+                    gid,
+                    size: 0,
+                    atime: now_secs,
+                    mtime: now_secs,
+                    ctime: now_secs,
+                    atime_nsec: now_nsec as u32,
+                    mtime_nsec: now_nsec as u32,
+                    ctime_nsec: now_nsec as u32,
+                    rdev,
+                },
+                parent,
+                dentry_id,
+            ))
         }
         .await;
 
         match result {
-            Ok((stats, parent)) => {
+            Ok((stats, parent, dentry_id)) => {
                 txn.record_inode("mknod", InodeRow::from_stats(&stats, None, STORAGE_CHUNKED))
                     .await?;
                 txn.record(JournalDelta::dentry_upsert(
-                    "mknod", parent_ino, name, stats.ino,
+                    "mknod", dentry_id, parent_ino, name, stats.ino,
                 ));
                 txn.record_inode("mknod", parent).await?;
                 txn.commit().await?;
@@ -988,7 +999,7 @@ impl FileSystem for Vfs {
         // BEGIN IMMEDIATE: see `mkdir` — never race the batcher's drain
         // transactions with autocommit metadata writes.
         let mut txn = MutationTxn::begin(&conn, self.journal_ctx()).await?;
-        let result: Result<(Stats, InodeRow)> = async {
+        let result: Result<(Stats, InodeRow, i64)> = async {
             // Check if entry already exists
             if self.lookup_child(&conn, parent_ino, name).await?.is_some() {
                 return Err(FsError::AlreadyExists.into());
@@ -1033,6 +1044,7 @@ impl FileSystem for Vfs {
                 (name, parent_ino, ino),
             )
             .await?;
+            let dentry_id = conn.last_insert_rowid();
 
             // Increment link count
             conn.execute(
@@ -1057,26 +1069,30 @@ impl FileSystem for Vfs {
                 0,
             )?;
 
-            Ok((Stats {
-                ino,
-                mode,
-                nlink: 1,
-                uid,
-                gid,
-                size,
-                atime: now_secs,
-                mtime: now_secs,
-                ctime: now_secs,
-                atime_nsec: now_nsec as u32,
-                mtime_nsec: now_nsec as u32,
-                ctime_nsec: now_nsec as u32,
-                rdev: 0,
-            }, parent))
+            Ok((
+                Stats {
+                    ino,
+                    mode,
+                    nlink: 1,
+                    uid,
+                    gid,
+                    size,
+                    atime: now_secs,
+                    mtime: now_secs,
+                    ctime: now_secs,
+                    atime_nsec: now_nsec as u32,
+                    mtime_nsec: now_nsec as u32,
+                    ctime_nsec: now_nsec as u32,
+                    rdev: 0,
+                },
+                parent,
+                dentry_id,
+            ))
         }
         .await;
 
         match result {
-            Ok((stats, parent)) => {
+            Ok((stats, parent, dentry_id)) => {
                 txn.record_inode(
                     "symlink",
                     InodeRow::from_stats(&stats, None, STORAGE_CHUNKED),
@@ -1084,7 +1100,7 @@ impl FileSystem for Vfs {
                 .await?;
                 txn.record(JournalDelta::symlink_upsert("symlink", stats.ino, target));
                 txn.record(JournalDelta::dentry_upsert(
-                    "symlink", parent_ino, name, stats.ino,
+                    "symlink", dentry_id, parent_ino, name, stats.ino,
                 ));
                 txn.record_inode("symlink", parent).await?;
                 txn.commit().await?;
@@ -1336,7 +1352,7 @@ impl FileSystem for Vfs {
         // BEGIN IMMEDIATE: see `unlink` — never race the batcher's drain
         // transactions with autocommit metadata writes.
         let mut txn = MutationTxn::begin(&conn, self.journal_ctx()).await?;
-        let result: Result<(Stats, InodeRow, InodeRow)> = async {
+        let result: Result<(Stats, InodeRow, InodeRow, i64)> = async {
             // Check if source inode exists and is not a directory
             if let Some(mode) = store::mode(&conn, ino).await? {
                 if (mode & S_IFMT) == super::S_IFDIR {
@@ -1361,6 +1377,7 @@ impl FileSystem for Vfs {
                 (newname, newparent_ino, ino),
             )
             .await?;
+            let dentry_id = conn.last_insert_rowid();
 
             // Increment link count and update ctime
             let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
@@ -1394,14 +1411,15 @@ impl FileSystem for Vfs {
                 .await?;
             let parent = InodeRow::from_row(&rows.next().await?.ok_or(FsError::NotFound)?, 0)?;
 
-            Ok((stats, inode, parent))
+            Ok((stats, inode, parent, dentry_id))
         }
         .await;
 
         match result {
-            Ok((stats, inode, parent)) => {
+            Ok((stats, inode, parent, dentry_id)) => {
                 txn.record(JournalDelta::dentry_upsert(
                     "link",
+                    dentry_id,
                     newparent_ino,
                     newname,
                     ino,
@@ -1473,6 +1491,7 @@ impl FileSystem for Vfs {
             InodeRow,
             InodeRow,
             Option<InodeRow>,
+            i64,
         )> = async {
             let mut replaced_dst_ino = None;
             let mut replaced_inode = None;
@@ -1511,7 +1530,10 @@ impl FileSystem for Vfs {
             // Check if destination exists
             if let Some(dst_ino) = self.lookup_child(&conn, newparent_ino, newname).await? {
                 replaced_dst_ino = Some(dst_ino);
-                let dst_stats = self.getattr_with_conn(&conn, dst_ino).await?.ok_or(FsError::NotFound)?;
+                let dst_stats = self
+                    .getattr_with_conn(&conn, dst_ino)
+                    .await?
+                    .ok_or(FsError::NotFound)?;
 
                 // Can't replace directory with non-directory
                 if dst_stats.is_directory() && !src_stats.is_directory() {
@@ -1581,11 +1603,16 @@ impl FileSystem for Vfs {
             // Update the dentry: change parent and/or name
             let mut stmt = conn
                 .prepare_cached(
-                    "UPDATE fs_dentry SET parent_ino = ?, name = ? WHERE parent_ino = ? AND name = ?",
+                    "UPDATE fs_dentry
+                     SET parent_ino = ?, name = ?
+                     WHERE parent_ino = ? AND name = ?
+                     RETURNING id",
                 )
                 .await?;
-            stmt.execute((newparent_ino, newname, oldparent_ino, oldname))
-                .await?;
+            let dentry_id: i64 = stmt
+                .query_row((newparent_ino, newname, oldparent_ino, oldname))
+                .await?
+                .get(0)?;
 
             // If renaming a directory across parents, adjust parent nlink counts
             // (the ".." link moves from old parent to new parent)
@@ -1616,10 +1643,7 @@ impl FileSystem for Vfs {
                     (now_secs, now_nsec, src_ino),
                 )
                 .await?;
-            let source = InodeRow::from_row(
-                &rows.next().await?.ok_or(FsError::NotFound)?,
-                0,
-            )?;
+            let source = InodeRow::from_row(&rows.next().await?.ok_or(FsError::NotFound)?, 0)?;
             drop(rows);
 
             // Update source parent directory timestamps
@@ -1633,10 +1657,7 @@ impl FileSystem for Vfs {
                     (now_secs, now_secs, now_nsec, now_nsec, oldparent_ino),
                 )
                 .await?;
-            let old_parent = InodeRow::from_row(
-                &rows.next().await?.ok_or(FsError::NotFound)?,
-                0,
-            )?;
+            let old_parent = InodeRow::from_row(&rows.next().await?.ok_or(FsError::NotFound)?, 0)?;
             drop(rows);
 
             // Update destination parent directory timestamps
@@ -1666,6 +1687,7 @@ impl FileSystem for Vfs {
                 source,
                 old_parent,
                 new_parent,
+                dentry_id,
             ))
         }
         .await;
@@ -1678,6 +1700,7 @@ impl FileSystem for Vfs {
                 source,
                 old_parent,
                 new_parent,
+                dentry_id,
             )) => {
                 if replaced_dst_ino.is_some() {
                     txn.record(JournalDelta::dentry_delete(
@@ -1693,6 +1716,7 @@ impl FileSystem for Vfs {
                 ));
                 txn.record(JournalDelta::dentry_upsert(
                     "rename",
+                    dentry_id,
                     newparent_ino,
                     newname,
                     src_ino,

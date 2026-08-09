@@ -176,6 +176,9 @@ async fn pack_session(
     vfs.collect_journal()
         .await
         .context("Failed to collect the staged session journal")?;
+    vfs.establish_history_floor("pack")
+        .await
+        .context("Failed to establish the packed session history floor")?;
     let metadata = vfs.increment_session_generation().await?;
     vfs.fs
         .finalize()

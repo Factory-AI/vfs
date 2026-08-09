@@ -4442,6 +4442,7 @@
         let conn = fs.pool.get_connection().await?;
         conn.execute("DELETE FROM fs_journal_chunk", ()).await?;
         conn.execute("DELETE FROM fs_op_journal", ()).await?;
+        crate::schema::rebuild_journal_allocator(&conn, 0).await?;
 
         let x = vec![0x11; 32];
         let y = vec![0x22; 32];
@@ -4490,7 +4491,9 @@
         while let Some(row) = rows.next().await? {
             chunks.push(row.get::<Vec<u8>>(0)?);
         }
-        assert_eq!(chunks, vec![x]);
+        // The rolled-forward floor root pins both digests needed to recreate
+        // state at that boundary; the retained suffix also pins x.
+        assert_eq!(chunks, vec![x, y]);
 
         let report = crate::schema::integrity::check(
             &conn,

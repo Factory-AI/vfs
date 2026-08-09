@@ -1208,6 +1208,50 @@ pub async fn capture_root_raw(
     Ok(snapshot_id)
 }
 
+/// Rebuild the retained row-delta journal so its AUTOINCREMENT allocator
+/// resumes immediately after `through_seq`.
+///
+/// Historical reconstruction trims a future suffix. Turso rejects direct
+/// writes to `sqlite_sequence`, so rebuilding the table is the only supported
+/// way to prevent the next committed group from leaving a false gap.
+pub async fn rebuild_journal_allocator(conn: &Connection, through_seq: i64) -> Result<()> {
+    conn.execute(
+        "CREATE TABLE fs_op_journal_rebuilt (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            txn_id INTEGER NOT NULL,
+            label TEXT NOT NULL,
+            tbl TEXT NOT NULL,
+            verb TEXT NOT NULL,
+            row TEXT NOT NULL,
+            wallclock_ms INTEGER NOT NULL
+        )",
+        (),
+    )
+    .await?;
+    conn.execute(
+        "INSERT INTO fs_op_journal_rebuilt
+         (seq, txn_id, label, tbl, verb, row, wallclock_ms)
+         SELECT seq, txn_id, label, tbl, verb, row, wallclock_ms
+         FROM fs_op_journal
+         WHERE seq <= ?
+         ORDER BY seq",
+        (through_seq,),
+    )
+    .await?;
+    conn.execute("DROP TABLE fs_op_journal", ()).await?;
+    conn.execute(
+        "ALTER TABLE fs_op_journal_rebuilt RENAME TO fs_op_journal",
+        (),
+    )
+    .await?;
+    conn.execute(
+        "CREATE INDEX idx_fs_op_journal_txn_id ON fs_op_journal(txn_id)",
+        (),
+    )
+    .await?;
+    Ok(())
+}
+
 /// Replace any initial empty root with the migrated target's populated root.
 ///
 /// Copy migration creates a current-schema target before copying source rows;
