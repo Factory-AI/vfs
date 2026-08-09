@@ -18,6 +18,12 @@ repository = "https://github.com/Factory-AI/vfs"
 # across an .await; enforced structurally, not by review.
 [workspace.lints.clippy]
 await_holding_lock = "deny"
+# nightly-2026-08-07 clippy fires double_must_use on code generated inside
+# #[async_trait] expansions (a `#[must_use]` the macro adds to fns already
+# returning a must-use type). Allow until clippy stops linting that
+# expansion; hand-written double #[must_use] is not a pattern this workspace
+# uses.
+double_must_use = "allow"
 
 [workspace.dependencies]
 vfs-core = { path = "crates/vfs-core" }
@@ -68,6 +74,10 @@ zerocopy = { version = "0.8", features = ["derive"] }
 # forcing the `pure-rust` feature, which skips the C/NEON backend that fails
 # with Apple clang (`veor3q_u8` in `aegis128l_neon_sha3.c`).
 aegis = { version = "0.9.6", features = ["pure-rust"] }
+
+[patch.crates-io]
+turso = { path = "third_party/turso" }
+turso_sdk_kit = { path = "third_party/turso_sdk_kit" }
 
 # The profile that `dist` will build with.
 [profile.dist]
