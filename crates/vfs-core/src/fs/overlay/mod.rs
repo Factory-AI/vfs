@@ -23,10 +23,7 @@ use std::{
 };
 use turso::{Connection, Value};
 
-use super::{
-    vfs::{ReapHook, Vfs},
-    BoxedFile, File, FileSystem, Stats, WriteRange,
-};
+use super::{vfs::Vfs, BoxedFile, File, FileSystem, Stats, WriteRange};
 
 use maps::{InodeInfo, Layer, OverlayMaps};
 use partial::{OverlayPartialFile, PartialOrigin};
@@ -158,25 +155,6 @@ impl File for MountVisibleFile {
     }
 }
 
-struct OverlaySidecarReapHook;
-
-#[async_trait]
-impl ReapHook for OverlaySidecarReapHook {
-    fn dedup_key(&self) -> Option<&'static str> {
-        Some("overlay-sidecar")
-    }
-
-    async fn on_reap(&self, conn: &Connection, ino: i64) -> Result<()> {
-        conn.execute("DELETE FROM fs_origin WHERE delta_ino = ?", (ino,))
-            .await?;
-        conn.execute("DELETE FROM fs_chunk_override WHERE delta_ino = ?", (ino,))
-            .await?;
-        conn.execute("DELETE FROM fs_partial_origin WHERE delta_ino = ?", (ino,))
-            .await?;
-        Ok(())
-    }
-}
-
 /// A copy-on-write overlay filesystem using inode-based operations.
 ///
 /// Combines a read-only base layer with a writable delta layer (`Vfs`).
@@ -245,8 +223,6 @@ impl OverlayFS {
         delta: Vfs,
         partial_origin_policy: PartialOriginPolicy,
     ) -> Self {
-        delta.register_reap_hook(Self::sidecar_reap_hook());
-
         Self {
             base,
             delta,
@@ -257,10 +233,6 @@ impl OverlayFS {
             #[cfg(test)]
             whiteout_fault: Mutex::new(None),
         }
-    }
-
-    pub(crate) fn sidecar_reap_hook() -> Arc<dyn ReapHook> {
-        Arc::new(OverlaySidecarReapHook)
     }
 
     /// Initialize the overlay filesystem schema

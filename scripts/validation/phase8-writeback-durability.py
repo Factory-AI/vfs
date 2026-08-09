@@ -309,8 +309,10 @@ def run_integrity(vfs_bin: str, db_path: Path, cwd: Path, env: dict[str, str], t
         cwd,
         env,
         timeout,
+        keep_stdout=True,
     )
     payload = parse_json_stdout(run)
+    run.pop("stdout", None)
     return {
         "run": run,
         "result": payload,

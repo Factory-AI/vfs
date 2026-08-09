@@ -43,7 +43,8 @@ use caches::{AttrCache, DentryCache, NegativeDentryCache};
 pub use file::VfsFile;
 pub use import::{ImportEntry, ImportOptions, ImportSession, ImportedEntry};
 pub use journal::journal_gc;
-pub(in crate::fs) use journal::{JournalCtx, JournalOp, MutationTxn};
+pub(in crate::fs) use journal::JournalCtx;
+pub(crate) use journal::{InodeRow, JournalDelta, MutationTxn, PartialOriginRow};
 pub use lifecycle::ReapHook;
 use lifecycle::{Lifecycle, OpenInodeGuard};
 
@@ -346,7 +347,7 @@ impl Vfs {
         self.core_config.partial_origin
     }
 
-    pub(in crate::fs) fn journal_ctx(&self) -> journal::JournalCtx {
+    pub(crate) fn journal_ctx(&self) -> journal::JournalCtx {
         self.journal.clone()
     }
 
@@ -407,25 +408,44 @@ impl Vfs {
                 (ROOT_INO, DEFAULT_DIR_MODE as i64, uid, gid, now_secs, now_secs, now_secs, now_nsec, now_nsec, now_nsec),
             )
             .await?;
-            true
+            Some(InodeRow {
+                ino: ROOT_INO,
+                mode: DEFAULT_DIR_MODE as i64,
+                nlink: 2,
+                uid: uid as i64,
+                gid: gid as i64,
+                size: 0,
+                atime: now_secs,
+                mtime: now_secs,
+                ctime: now_secs,
+                rdev: 0,
+                atime_nsec: now_nsec,
+                mtime_nsec: now_nsec,
+                ctime_nsec: now_nsec,
+                data_inline: None,
+                storage_kind: STORAGE_CHUNKED,
+            })
         } else if root_ownership != Some((uid, gid)) {
             // Update existing root inode ownership to current user
-            txn.conn()
-                .execute(
-                    "UPDATE fs_inode SET uid = ?, gid = ? WHERE ino = ?",
+            let mut rows = txn
+                .conn()
+                .query(
+                    "UPDATE fs_inode SET uid = ?, gid = ? WHERE ino = ?
+                     RETURNING ino, mode, nlink, uid, gid, size, atime, mtime, ctime, rdev,
+                               atime_nsec, mtime_nsec, ctime_nsec, data_inline, storage_kind",
                     (uid, gid, ROOT_INO),
                 )
                 .await?;
-            true
+            let row = rows.next().await?.ok_or_else(|| {
+                Error::Internal("root ownership update returned no row".to_string())
+            })?;
+            Some(InodeRow::from_row(&row, 0)?)
         } else {
-            false
+            None
         };
 
-        if changed {
-            txn.record(JournalOp::new(
-                "root_init",
-                serde_json::json!({ "ino": ROOT_INO }),
-            ));
+        if let Some(root) = changed {
+            txn.record_inode("root_init", root).await?;
         }
         txn.commit().await?;
         Ok(())
@@ -718,7 +738,11 @@ impl Vfs {
         Ok(())
     }
 
-    async fn reap_inode_with_conn(&self, conn: &Connection, ino: i64) -> Result<bool> {
+    async fn reap_inode_with_conn(
+        &self,
+        conn: &Connection,
+        ino: i64,
+    ) -> Result<Option<lifecycle::ReapChanges>> {
         self.lifecycle.reap_inode_with_conn(conn, ino).await
     }
 
@@ -760,7 +784,7 @@ impl Vfs {
         mode: u32,
         ownership: (u32, u32),
         update_parent_times: bool,
-    ) -> Result<Stats> {
+    ) -> Result<(Stats, Option<InodeRow>)> {
         let (uid, gid) = ownership;
         let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
         let now_secs = dur.as_secs() as i64;
@@ -806,29 +830,43 @@ impl Vfs {
             Err(error) => return Err(error.into()),
         }
 
-        if update_parent_times {
-            conn.execute(
-                "UPDATE fs_inode SET ctime = ?, mtime = ?, ctime_nsec = ?, mtime_nsec = ? WHERE ino = ?",
-                (now_secs, now_secs, now_nsec, now_nsec, parent_ino),
-            )
-            .await?;
-        }
+        let parent = if update_parent_times {
+            let mut rows = conn
+                .query(
+                    "UPDATE fs_inode
+                     SET ctime = ?, mtime = ?, ctime_nsec = ?, mtime_nsec = ?
+                     WHERE ino = ?
+                     RETURNING ino, mode, nlink, uid, gid, size, atime, mtime, ctime, rdev,
+                               atime_nsec, mtime_nsec, ctime_nsec, data_inline, storage_kind",
+                    (now_secs, now_secs, now_nsec, now_nsec, parent_ino),
+                )
+                .await?;
+            let row = rows.next().await?.ok_or_else(|| {
+                Error::Internal("create parent update returned no row".to_string())
+            })?;
+            Some(InodeRow::from_row(&row, 0)?)
+        } else {
+            None
+        };
 
-        Ok(Stats {
-            ino,
-            mode: file_mode,
-            nlink: 1,
-            uid,
-            gid,
-            size: 0,
-            atime: now_secs,
-            mtime: now_secs,
-            ctime: now_secs,
-            atime_nsec: now_nsec as u32,
-            mtime_nsec: now_nsec as u32,
-            ctime_nsec: now_nsec as u32,
-            rdev: 0,
-        })
+        Ok((
+            Stats {
+                ino,
+                mode: file_mode,
+                nlink: 1,
+                uid,
+                gid,
+                size: 0,
+                atime: now_secs,
+                mtime: now_secs,
+                ctime: now_secs,
+                atime_nsec: now_nsec as u32,
+                mtime_nsec: now_nsec as u32,
+                ctime_nsec: now_nsec as u32,
+                rdev: 0,
+            },
+            parent,
+        ))
     }
 
     pub(crate) fn publish_created_file(&self, parent_ino: i64, name: &str, stats: &Stats) {

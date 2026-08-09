@@ -4,11 +4,20 @@
 
 `vfs branch` forks a run session into an independent session that starts at
 the parent's exact current state. This release also advances the database and
-artifact schema to v0.7. `artifactVersion` changes from `0.6` to `0.7`;
+artifact schema to v0.8. `artifactVersion` changes from `0.7` to `0.8`;
 `adopt` migrates supported older artifacts forward automatically, while the
 pack/adopt manifest shapes and all other wire contracts remain unchanged.
 
 ### Added
+
+- Schema v0.8 makes filesystem history replayable: journal entries are
+  complete table-row post-images grouped by SQLite transaction, and immutable
+  root snapshots cover inode, namespace, content, overlay, and provenance
+  state. Inline bytes remain content-addressed and pinned rather than embedded
+  in history JSON.
+- In-place and copy migration from v0.7 discard the old semantic journal,
+  initialize history markers, and establish one migration root at epoch 1
+  through sequence 0.
 
 - `vfs branch <SESSION_ID> [--session <ID>]` forks a session. A live parent
   is snapshotted through its mount's control socket without stopping it (the

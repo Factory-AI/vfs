@@ -3,10 +3,10 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-use turso::transaction::{Transaction, TransactionBehavior};
 use turso::{Builder, Connection, Value};
 
 use crate::error::{Error, Result};
+use crate::fs::vfs::{JournalDelta, MutationTxn};
 use crate::Vfs;
 
 const GENERATION_KEY: &str = "generation";
@@ -108,23 +108,30 @@ impl Vfs {
         pin: &str,
     ) -> Result<()> {
         let conn = self.pool.get_connection().await?;
-        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+        let mut txn = MutationTxn::begin(&conn, self.fs.journal_ctx()).await?;
         let result = async {
             let created_at = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_secs() as i64;
             for path in whiteout_paths {
                 let parent_path = crate::fs::overlay::parent_path_for_whiteout(path);
-                conn.execute(
-                    "INSERT OR REPLACE INTO fs_whiteout (path, parent_path, created_at)
+                txn.conn()
+                    .execute(
+                        "INSERT OR REPLACE INTO fs_whiteout (path, parent_path, created_at)
                      VALUES (?, ?, ?)",
-                    (path.as_str(), parent_path, created_at),
-                )
-                .await?;
+                        (path.as_str(), parent_path.as_str(), created_at),
+                    )
+                    .await?;
+                txn.record(JournalDelta::whiteout_upsert(
+                    "seed_whiteout",
+                    path,
+                    &parent_path,
+                    created_at,
+                ));
             }
-            write_metadata_value(&conn, SEED_PIN_KEY, pin.to_string()).await?;
+            write_metadata_value(txn.conn(), SEED_PIN_KEY, pin.to_string()).await?;
             let value = serde_json::to_string(seeded_paths)?;
-            write_metadata_value(&conn, SEEDED_PATHS_KEY, value).await
+            write_metadata_value(txn.conn(), SEEDED_PATHS_KEY, value).await
         }
         .await;
 
@@ -168,12 +175,20 @@ impl Vfs {
             )));
         }
         let conn = self.pool.get_connection().await?;
-        conn.execute(
-            "INSERT INTO fs_overlay_config (key, value) VALUES (?, ?)
+        let mut txn = MutationTxn::begin(&conn, self.fs.journal_ctx()).await?;
+        txn.conn()
+            .execute(
+                "INSERT INTO fs_overlay_config (key, value) VALUES (?, ?)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (PARENT_ARTIFACT_KEY, digest.to_ascii_lowercase()),
-        )
-        .await?;
+                (PARENT_ARTIFACT_KEY, digest.to_ascii_lowercase()),
+            )
+            .await?;
+        txn.record(JournalDelta::overlay_config_upsert(
+            "parent_artifact",
+            PARENT_ARTIFACT_KEY,
+            &digest.to_ascii_lowercase(),
+        ));
+        txn.commit().await?;
         Ok(())
     }
 
@@ -186,11 +201,21 @@ impl Vfs {
     /// into this database.
     pub async fn clear_overlay_parent_artifact(&self) -> Result<()> {
         let conn = self.pool.get_connection().await?;
-        conn.execute(
-            "DELETE FROM fs_overlay_config WHERE key = ?",
-            (PARENT_ARTIFACT_KEY,),
-        )
-        .await?;
+        let mut txn = MutationTxn::begin(&conn, self.fs.journal_ctx()).await?;
+        let changed = txn
+            .conn()
+            .execute(
+                "DELETE FROM fs_overlay_config WHERE key = ?",
+                (PARENT_ARTIFACT_KEY,),
+            )
+            .await?;
+        if changed > 0 {
+            txn.record(JournalDelta::overlay_config_delete(
+                "parent_artifact_clear",
+                PARENT_ARTIFACT_KEY,
+            ));
+        }
+        txn.commit().await?;
         Ok(())
     }
 
@@ -460,6 +485,10 @@ mod tests {
                 file.pwrite(0, &[b'x'; 8192]).await?;
                 file.fsync().await?;
                 created += 1;
+                // Keep the writer concurrent without starving turso's
+                // VACUUM INTO I/O completion loop on the current-thread test
+                // runtime.
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
             Ok::<u32, Error>(created)
         });

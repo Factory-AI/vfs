@@ -83,7 +83,7 @@ if run_vfs --help 2>/dev/null | grep -q 'migrate-v0-5'; then
 fi
 
 # --- One migrate per supported old schema -----------------------------------
-for name in v0_0 v0_2 v0_4 v0_6; do
+for name in v0_0 v0_2 v0_4 v0_6 v0_7; do
     DB="$ROOT/$name.db"
     cp "$FIXTURES/$name.db" "$DB"
 
@@ -100,16 +100,16 @@ for name in v0_0 v0_2 v0_4 v0_6; do
         || fail "$name: migrate failed: $(cat "$ROOT/$name-migrate.out")"
     grep -q 'Migration completed successfully.' "$ROOT/$name-migrate.out" \
         || fail "$name: migrate output missing completion line"
-    grep -q 'Target schema version: 0.7 (CURRENT)' "$ROOT/$name-migrate.out" \
+    grep -q 'Target schema version: 0.8 (CURRENT)' "$ROOT/$name-migrate.out" \
         || fail "$name: migrate output missing CURRENT target line"
 
     UV="$(user_version_of "$DB")"
-    [ "$UV" = "7" ] || fail "$name: user_version after migrate is $UV, expected 7"
+    [ "$UV" = "8" ] || fail "$name: user_version after migrate is $UV, expected 8"
 
     # Idempotent second run.
     run_vfs migrate "$DB" >"$ROOT/$name-migrate2.out" 2>&1 \
         || fail "$name: second migrate failed"
-    grep -q 'Database is already at schema 0.7.' "$ROOT/$name-migrate2.out" \
+    grep -q 'Database is already at schema 0.8.' "$ROOT/$name-migrate2.out" \
         || fail "$name: second migrate is not idempotent: $(cat "$ROOT/$name-migrate2.out")"
 
     run_vfs integrity "$DB" >"$ROOT/$name-integrity.out" 2>&1 \
@@ -118,7 +118,37 @@ for name in v0_0 v0_2 v0_4 v0_6; do
         || fail "$name: fs ls failed after migrate"
     grep -q 'small.txt' "$ROOT/$name-ls-after.out" \
         || fail "$name: migrated filesystem lost its contents"
+    python3 - "$DB" <<'PY' || fail "$name: migrate root snapshot missing"
+import sqlite3, sys
+conn = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+assert conn.execute(
+    "SELECT COUNT(*) FROM fs_snapshot WHERE reason = 'migrate' AND history_epoch = 1 AND through_seq = 0"
+).fetchone()[0] == 1
+conn.close()
+PY
 done
+
+# --- v0.7 copy migration reads CAS-backed source data -----------------------
+COPY_SOURCE="$ROOT/v0_7-copy-source.db"
+COPY_TARGET="$ROOT/v0_7-copy-target.db"
+cp "$FIXTURES/v0_7.db" "$COPY_SOURCE"
+run_vfs migrate "$COPY_SOURCE" --copy "$COPY_TARGET" --verify \
+    >"$ROOT/v0_7-copy.out" 2>&1 \
+    || fail "v0_7: copy migration failed: $(cat "$ROOT/v0_7-copy.out")"
+[ "$(user_version_of "$COPY_SOURCE")" = "7" ] \
+    || fail "v0_7: copy migration modified the source"
+[ "$(user_version_of "$COPY_TARGET")" = "8" ] \
+    || fail "v0_7: copy migration target did not land at user_version 8"
+run_vfs integrity "$COPY_TARGET" >/dev/null 2>&1 \
+    || fail "v0_7: copy migration target failed integrity"
+python3 - "$COPY_TARGET" <<'PY' || fail "v0_7: copy migration root missing"
+import sqlite3, sys
+conn = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+assert conn.execute(
+    "SELECT COUNT(*) FROM fs_snapshot WHERE reason = 'migrate' AND history_epoch = 1 AND through_seq = 0"
+).fetchone()[0] == 1
+conn.close()
+PY
 
 # --- Encrypted old database migrates with --key/--cipher --------------------
 ENC_DB="$ROOT/v0_4-encrypted.db"

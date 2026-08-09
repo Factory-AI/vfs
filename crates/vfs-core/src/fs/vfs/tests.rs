@@ -2037,7 +2037,10 @@
 
         let conn = fs.pool.get_connection().await?;
         let mut rows = conn
-            .query("SELECT COUNT(*), MAX(refcount) FROM fs_chunk", ())
+            .query(
+                "SELECT COUNT(*), MAX(refcount) FROM fs_chunk WHERE refcount > 0",
+                (),
+            )
             .await?;
         let row = rows.next().await?.unwrap();
         assert_eq!(row.get::<i64>(0)?, 1);
@@ -2052,18 +2055,35 @@
         let (_, file) = fs
             .create_file("/overwrite.bin", DEFAULT_FILE_MODE, 0, 0)
             .await?;
-        file.pwrite(0, &vec![0x11; fs.chunk_size()]).await?;
+        let old_data = vec![0x11; fs.chunk_size()];
+        let new_data = vec![0x22; fs.chunk_size()];
+        file.pwrite(0, &old_data).await?;
         file.fsync().await?;
-        file.pwrite(0, &vec![0x22; fs.chunk_size()]).await?;
+        file.pwrite(0, &new_data).await?;
         file.fsync().await?;
 
         let conn = fs.pool.get_connection().await?;
         let mut rows = conn
-            .query("SELECT refcount FROM fs_chunk ORDER BY refcount", ())
+            .query(
+                "SELECT digest, refcount FROM fs_chunk WHERE digest IN (?, ?)",
+                (
+                    Value::Blob(blake3::hash(&old_data).as_bytes().to_vec()),
+                    Value::Blob(blake3::hash(&new_data).as_bytes().to_vec()),
+                ),
+            )
             .await?;
-        assert_eq!(rows.next().await?.unwrap().get::<i64>(0)?, 0);
-        assert_eq!(rows.next().await?.unwrap().get::<i64>(0)?, 1);
-        assert!(rows.next().await?.is_none());
+        let mut refcounts = std::collections::HashMap::new();
+        while let Some(row) = rows.next().await? {
+            refcounts.insert(row.get::<Vec<u8>>(0)?, row.get::<i64>(1)?);
+        }
+        assert_eq!(
+            refcounts[blake3::hash(&old_data).as_bytes().as_slice()],
+            0
+        );
+        assert_eq!(
+            refcounts[blake3::hash(&new_data).as_bytes().as_slice()],
+            1
+        );
         drop(rows);
         assert_cas_refcounts_exact(&fs).await
     }
@@ -2074,7 +2094,8 @@
         let (_, file) = fs
             .create_file("/reap-cas.bin", DEFAULT_FILE_MODE, 0, 0)
             .await?;
-        file.pwrite(0, &vec![0x33; fs.chunk_size()]).await?;
+        let data = vec![0x33; fs.chunk_size()];
+        file.pwrite(0, &data).await?;
         file.fsync().await?;
         drop(file);
 
@@ -2082,11 +2103,13 @@
 
         let conn = fs.pool.get_connection().await?;
         let mut rows = conn
-            .query("SELECT COUNT(*), MAX(refcount) FROM fs_chunk", ())
+            .query(
+                "SELECT refcount FROM fs_chunk WHERE digest = ?",
+                (Value::Blob(blake3::hash(&data).as_bytes().to_vec()),),
+            )
             .await?;
         let row = rows.next().await?.unwrap();
-        assert_eq!(row.get::<i64>(0)?, 1);
-        assert_eq!(row.get::<i64>(1)?, 0);
+        assert_eq!(row.get::<i64>(0)?, 0);
         drop(rows);
         assert_cas_refcounts_exact(&fs).await
     }
@@ -4145,21 +4168,23 @@
     async fn journal_rows_after(
         conn: &Connection,
         seq: i64,
-    ) -> Result<Vec<(i64, i64, String, serde_json::Value)>> {
+    ) -> Result<Vec<(i64, i64, String, String, String, serde_json::Value)>> {
         let mut rows = conn
             .query(
-                "SELECT seq, txn_id, op, payload
+                "SELECT seq, txn_id, label, tbl, verb, row
                  FROM fs_op_journal WHERE seq > ? ORDER BY seq",
                 (seq,),
             )
             .await?;
         let mut result = Vec::new();
         while let Some(row) = rows.next().await? {
-            let payload: String = row.get(3)?;
+            let payload: String = row.get(5)?;
             result.push((
                 row.get(0)?,
                 row.get(1)?,
                 row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
                 serde_json::from_str(&payload)?,
             ));
         }
@@ -4239,6 +4264,34 @@
             assert!(ops.contains(&required), "missing journal op {required}: {ops:?}");
         }
 
+        let inline_write = rows
+            .iter()
+            .find(|row| {
+                row.2 == "write"
+                    && row.3 == "fs_inode"
+                    && row.5["data_inline_digest"].is_string()
+            })
+            .expect("inline write must journal a normalized inode post-image");
+        assert!(
+            inline_write.5.get("data_inline").is_none(),
+            "inline bytes must not be embedded in journal JSON"
+        );
+        let inline_digest = inline_write.5["data_inline_digest"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut pin_rows = conn
+            .query(
+                "SELECT lower(hex(digest)) FROM fs_journal_chunk WHERE seq = ?",
+                (inline_write.0,),
+            )
+            .await?;
+        assert_eq!(
+            pin_rows.next().await?.unwrap().get::<String>(0)?,
+            inline_digest
+        );
+        drop(pin_rows);
+
         let unlink_txn = rows
             .iter()
             .find(|row| row.2 == "unlink")
@@ -4246,7 +4299,12 @@
             .unwrap();
         let reap_txn = rows
             .iter()
-            .find(|row| row.2 == "reap" && row.3["ino"] == created.ino)
+            .find(|row| {
+                row.2 == "reap"
+                    && row.3 == "fs_inode"
+                    && row.4 == "delete"
+                    && row.5["ino"] == created.ino
+            })
             .map(|row| row.1)
             .unwrap();
         assert_eq!(unlink_txn, reap_txn, "unlink and immediate reap must be atomic");
@@ -4260,10 +4318,9 @@
 
         let write = rows
             .iter()
-            .find(|row| row.2 == "write" && row.3.get("inline").is_none())
+            .find(|row| row.2 == "write" && row.3 == "fs_data" && row.4 == "upsert")
             .unwrap();
-        assert_eq!(write.3["ino"], created.ino);
-        assert!(write.3["ranges"].as_array().is_some());
+        assert_eq!(write.5["ino"], created.ino);
         let mut pin_rows = conn
             .query(
                 "SELECT digest FROM fs_journal_chunk WHERE seq = ? ORDER BY digest",
@@ -4275,13 +4332,10 @@
             pins.push(row.get::<Vec<u8>>(0)?);
         }
         assert!(!pins.is_empty(), "chunked write must pin referenced digests");
-        let payload_digests = write.3["ranges"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .flat_map(|range| range["digests"].as_array().unwrap())
-            .map(|digest| digest.as_str().unwrap().to_string())
-            .collect::<std::collections::BTreeSet<_>>();
+        let payload_digests =
+            [write.5["digest"].as_str().unwrap().to_string()]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>();
         let pinned_digests = pins
             .iter()
             .map(|digest| digest_hex(digest))
@@ -4311,14 +4365,14 @@
         let first_rows = journal_rows_after(&conn, baseline).await?;
         let writes = first_rows
             .iter()
-            .filter(|row| row.2 == "write")
+            .filter(|row| row.2 == "write" && row.3 == "fs_inode")
             .collect::<Vec<_>>();
         assert_eq!(writes.len(), 2);
         assert_eq!(writes[0].1, writes[1].1);
         assert_eq!(
             writes
                 .iter()
-                .map(|row| row.3["ino"].as_i64().unwrap())
+                .map(|row| row.5["ino"].as_i64().unwrap())
                 .collect::<std::collections::BTreeSet<_>>(),
             [a.ino, b.ino].into_iter().collect()
         );
@@ -4403,34 +4457,17 @@
         .await?;
 
         let mut old = MutationTxn::begin(&conn, JournalCtx::new(true)).await?;
-        old.record(JournalOp::with_digests(
-            "write",
-            serde_json::json!({ "ino": 10, "ranges": [] }),
-            vec![y.clone()],
-        ));
-        old.record(JournalOp::new(
-            "setattr",
-            serde_json::json!({ "ino": 10, "fields": { "mode": true } }),
-        ));
+        old.record(JournalDelta::data_upsert("write", 10, 0, y.clone()));
+        old.record(JournalDelta::dentry_delete("setattr", 1, "old"));
         old.commit().await?;
 
         let mut boundary = MutationTxn::begin(&conn, JournalCtx::new(true)).await?;
-        boundary.record(JournalOp::with_digests(
-            "write",
-            serde_json::json!({ "ino": 11, "ranges": [] }),
-            vec![x.clone()],
-        ));
-        boundary.record(JournalOp::new(
-            "setattr",
-            serde_json::json!({ "ino": 11, "fields": { "mode": true } }),
-        ));
+        boundary.record(JournalDelta::data_upsert("write", 11, 0, x.clone()));
+        boundary.record(JournalDelta::dentry_delete("setattr", 1, "boundary"));
         boundary.commit().await?;
 
         let mut newest = MutationTxn::begin(&conn, JournalCtx::new(true)).await?;
-        newest.record(JournalOp::new(
-            "mkdir",
-            serde_json::json!({ "ino": 12 }),
-        ));
+        newest.record(JournalDelta::inode_delete("mkdir", 12));
         newest.commit().await?;
 
         journal_gc(&conn, 2).await?;
@@ -4472,22 +4509,16 @@
 
         for _ in 0..2 {
             let mut txn = MutationTxn::begin(&conn, ctx.clone()).await?;
-            txn.record(JournalOp::new(
-                "setattr",
-                serde_json::json!({ "ino": 1, "fields": { "mode": true } }),
-            ));
-            txn.record(JournalOp::new(
-                "setattr",
-                serde_json::json!({ "ino": 2, "fields": { "mode": true } }),
-            ));
+            txn.record(JournalDelta::inode_delete("setattr", 1));
+            txn.record(JournalDelta::inode_delete("setattr", 2));
             txn.commit().await?;
         }
 
         // Another opener appends a row the shared hint never saw; the next
         // seam commit must detect the stale hint and patch its own rows.
         conn.execute(
-            "INSERT INTO fs_op_journal (txn_id, op, payload, wallclock_ms)
-             VALUES (0, 'setattr', '{}', 0)",
+            "INSERT INTO fs_op_journal (txn_id, label, tbl, verb, row, wallclock_ms)
+             VALUES (0, 'setattr', 'fs_inode', 'delete', '{}', 0)",
             (),
         )
         .await?;
@@ -4495,14 +4526,8 @@
             .await?;
 
         let mut txn = MutationTxn::begin(&conn, ctx.clone()).await?;
-        txn.record(JournalOp::new(
-            "setattr",
-            serde_json::json!({ "ino": 3, "fields": { "mode": true } }),
-        ));
-        txn.record(JournalOp::new(
-            "setattr",
-            serde_json::json!({ "ino": 4, "fields": { "mode": true } }),
-        ));
+        txn.record(JournalDelta::inode_delete("setattr", 3));
+        txn.record(JournalDelta::inode_delete("setattr", 4));
         txn.commit().await?;
 
         let mut rows = conn

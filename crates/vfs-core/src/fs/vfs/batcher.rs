@@ -20,7 +20,7 @@ use crate::fs::{FsError, Stats, WriteRange};
 use crate::pool::ConnectionPool;
 
 use super::current_timestamp;
-use super::journal::{fields, JournalCtx, JournalOp, MutationTxn};
+use super::journal::{InodeRow, JournalCtx, MutationTxn};
 use super::store::{self, normalize_write_ranges, NormalizedWriteRange, WriteRangeRef};
 
 pub(super) type Invalidate = Arc<dyn Fn(i64) + Send + Sync + 'static>;
@@ -156,10 +156,17 @@ impl PendingTimeChange {
 /// one, mtime/ctime are stamped with the commit time unless `preserve_times`
 /// (an explicit setattr landed after the writes and its values must not be
 /// clobbered); atime is only ever written explicitly.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct ResolvedWriteTimes {
+    pub(super) atime: Option<(i64, i64)>,
+    pub(super) mtime: Option<(i64, i64)>,
+    pub(super) ctime: Option<(i64, i64)>,
+}
+
 pub(super) fn write_commit_time_sets(
     preserve_times: bool,
     explicit_times: Option<&PendingTimeChange>,
-) -> Result<(Vec<&'static str>, Vec<Value>)> {
+) -> Result<(Vec<&'static str>, Vec<Value>, ResolvedWriteTimes)> {
     let explicit_atime = explicit_times.and_then(|t| t.atime);
     let explicit_mtime = explicit_times.and_then(|t| t.mtime);
     let explicit_ctime = explicit_times.and_then(|t| t.ctime);
@@ -170,25 +177,29 @@ pub(super) fn write_commit_time_sets(
     };
     let mut sets = Vec::new();
     let mut values = Vec::new();
+    let mut resolved = ResolvedWriteTimes::default();
     if let Some((secs, nsec)) = explicit_atime {
         sets.push("atime = ?");
         values.push(Value::Integer(secs));
         sets.push("atime_nsec = ?");
         values.push(Value::Integer(nsec));
+        resolved.atime = Some((secs, nsec));
     }
     if let Some((secs, nsec)) = explicit_mtime.or(stamp) {
         sets.push("mtime = ?");
         values.push(Value::Integer(secs));
         sets.push("mtime_nsec = ?");
         values.push(Value::Integer(nsec));
+        resolved.mtime = Some((secs, nsec));
     }
     if let Some((secs, nsec)) = explicit_ctime.or(stamp) {
         sets.push("ctime = ?");
         values.push(Value::Integer(secs));
         sets.push("ctime_nsec = ?");
         values.push(Value::Integer(nsec));
+        resolved.ctime = Some((secs, nsec));
     }
-    Ok((sets, values))
+    Ok((sets, values, resolved))
 }
 
 /// Apply a stashed `PendingTimeChange` to fs_inode using the drain
@@ -200,7 +211,7 @@ async fn apply_pending_times_with_conn(
     conn: &Connection,
     ino: i64,
     times: &PendingTimeChange,
-) -> Result<()> {
+) -> Result<Option<InodeRow>> {
     let mut updates = Vec::new();
     let mut values: Vec<Value> = Vec::new();
     if let Some((secs, nsec)) = times.atime {
@@ -222,12 +233,20 @@ async fn apply_pending_times_with_conn(
         values.push(Value::Integer(nsec));
     }
     if updates.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     values.push(Value::Integer(ino));
-    let sql = format!("UPDATE fs_inode SET {} WHERE ino = ?", updates.join(", "));
-    conn.execute(&sql, values).await?;
-    Ok(())
+    let sql = format!(
+        "UPDATE fs_inode SET {} WHERE ino = ?
+         RETURNING ino, mode, nlink, uid, gid, size, atime, mtime, ctime, rdev,
+                   atime_nsec, mtime_nsec, ctime_nsec, data_inline, storage_kind",
+        updates.join(", ")
+    );
+    let mut rows = conn.query(&sql, values).await?;
+    match rows.next().await? {
+        Some(row) => Ok(Some(InodeRow::from_row(&row, 0)?)),
+        None => Ok(None),
+    }
 }
 
 struct PendingInodeWrites {
@@ -738,6 +757,7 @@ impl VfsWriteBatcher {
 
         for (ino, _count, normalized) in &to_commit {
             let mut inode_missing = false;
+            let mut storage_changes = None;
             if !normalized.is_empty() {
                 let normalized_refs: Vec<_> = normalized
                     .iter()
@@ -760,7 +780,7 @@ impl VfsWriteBatcher {
                 )
                 .await
                 {
-                    Ok(()) => {}
+                    Ok(changes) => storage_changes = Some(changes),
                     // The file was unlinked / renamed-over while its writes were
                     // still pending (git lock and temp files routinely live and
                     // die within the batch window). Its data is moot: skip it and
@@ -789,10 +809,18 @@ impl VfsWriteBatcher {
             if !inode_missing {
                 if let Some(times) = pending_times.get(ino) {
                     if normalized.is_empty() {
-                        if let Err(error) = apply_pending_times_with_conn(&conn, *ino, times).await
-                        {
-                            let _ = txn.rollback().await;
-                            return Err(error);
+                        match apply_pending_times_with_conn(&conn, *ino, times).await {
+                            Ok(Some(inode)) => {
+                                if let Err(error) = txn.record_inode("setattr", inode).await {
+                                    let _ = txn.rollback().await;
+                                    return Err(error);
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                let _ = txn.rollback().await;
+                                return Err(error);
+                            }
                         }
                     }
                     applied_times.push((*ino, *times));
@@ -800,23 +828,8 @@ impl VfsWriteBatcher {
             }
 
             if !inode_missing {
-                if txn.journaling() && !normalized.is_empty() {
-                    txn.record(
-                        JournalOp::write(txn.conn(), *ino, self.chunk_size, normalized).await?,
-                    );
-                }
-                if let Some(times) = pending_times.get(ino) {
-                    let mut changed = Vec::new();
-                    if times.atime.is_some() {
-                        changed.push(("atime", serde_json::Value::Bool(true)));
-                    }
-                    if times.mtime.is_some() {
-                        changed.push(("mtime", serde_json::Value::Bool(true)));
-                    }
-                    if times.ctime.is_some() {
-                        changed.push(("ctime", serde_json::Value::Bool(true)));
-                    }
-                    txn.record(JournalOp::setattr(*ino, fields(changed)));
+                if let Some(changes) = storage_changes {
+                    txn.record_storage_changes("write", changes).await?;
                 }
             }
         }

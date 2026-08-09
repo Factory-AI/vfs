@@ -391,7 +391,7 @@ impl FileSystem for Vfs {
         // (turso reports such write/write races as "database snapshot is
         // stale" instead of waiting on the write lock).
         let mut txn = MutationTxn::begin(&conn, self.journal_ctx()).await?;
-        let result: Result<()> = async {
+        let result: Result<InodeRow> = async {
             // Get current mode to preserve file type bits
             let current_mode = store::mode(&conn, ino).await?.ok_or(FsError::NotFound)?;
 
@@ -401,23 +401,22 @@ impl FileSystem for Vfs {
             let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
             let now_secs = dur.as_secs() as i64;
             let now_nsec = dur.subsec_nanos() as i64;
-            let mut stmt = conn
-                .prepare_cached(
-                    "UPDATE fs_inode SET mode = ?, ctime = ?, ctime_nsec = ? WHERE ino = ?",
+            let mut rows = conn
+                .query(
+                    "UPDATE fs_inode SET mode = ?, ctime = ?, ctime_nsec = ? WHERE ino = ?
+                     RETURNING ino, mode, nlink, uid, gid, size, atime, mtime, ctime, rdev,
+                               atime_nsec, mtime_nsec, ctime_nsec, data_inline, storage_kind",
+                    (new_mode as i64, now_secs, now_nsec, ino),
                 )
                 .await?;
-            stmt.execute((new_mode as i64, now_secs, now_nsec, ino))
-                .await?;
-            Ok(())
+            let row = rows.next().await?.ok_or(FsError::NotFound)?;
+            InodeRow::from_row(&row, 0)
         }
         .await;
 
         match result {
-            Ok(()) => {
-                txn.record(JournalOp::setattr(
-                    ino,
-                    journal::fields([("mode", serde_json::Value::Bool(true))]),
-                ));
+            Ok(inode) => {
+                txn.record_inode("setattr", inode).await?;
                 txn.commit().await?;
                 self.invalidate_attr(ino);
                 Ok(())
@@ -439,7 +438,7 @@ impl FileSystem for Vfs {
         // BEGIN IMMEDIATE: see `chmod` — avoid autocommit write/write races
         // with concurrent batcher drain transactions.
         let mut txn = MutationTxn::begin(&conn, self.journal_ctx()).await?;
-        let result: Result<()> = async {
+        let result: Result<InodeRow> = async {
             // Verify inode exists
             let mut stmt = conn
                 .prepare_cached("SELECT ino FROM fs_inode WHERE ino = ?")
@@ -473,21 +472,20 @@ impl FileSystem for Vfs {
 
             values.push(Value::Integer(ino));
             let sql = format!("UPDATE fs_inode SET {} WHERE ino = ?", updates.join(", "));
-            conn.execute(&sql, values).await?;
-            Ok(())
+            let sql = format!(
+                "{} RETURNING ino, mode, nlink, uid, gid, size, atime, mtime, ctime, rdev,
+                 atime_nsec, mtime_nsec, ctime_nsec, data_inline, storage_kind",
+                sql
+            );
+            let mut rows = conn.query(&sql, values).await?;
+            let row = rows.next().await?.ok_or(FsError::NotFound)?;
+            InodeRow::from_row(&row, 0)
         }
         .await;
 
         match result {
-            Ok(()) => {
-                let mut changed = Vec::new();
-                if uid.is_some() {
-                    changed.push(("uid", serde_json::Value::Bool(true)));
-                }
-                if gid.is_some() {
-                    changed.push(("gid", serde_json::Value::Bool(true)));
-                }
-                txn.record(JournalOp::setattr(ino, journal::fields(changed)));
+            Ok(inode) => {
+                txn.record_inode("setattr", inode).await?;
                 txn.commit().await?;
                 self.invalidate_attr(ino);
                 Ok(())
@@ -543,7 +541,7 @@ impl FileSystem for Vfs {
         // BEGIN IMMEDIATE: see `chmod` — avoid autocommit write/write races
         // with concurrent batcher drain transactions.
         let mut txn = MutationTxn::begin(&conn, self.journal_ctx()).await?;
-        let result: Result<()> = async {
+        let result: Result<InodeRow> = async {
             // Verify inode exists
             let mut stmt = conn
                 .prepare_cached("SELECT ino FROM fs_inode WHERE ino = ?")
@@ -592,21 +590,20 @@ impl FileSystem for Vfs {
 
             values.push(Value::Integer(ino));
             let sql = format!("UPDATE fs_inode SET {} WHERE ino = ?", updates.join(", "));
-            conn.execute(&sql, values).await?;
-            Ok(())
+            let sql = format!(
+                "{} RETURNING ino, mode, nlink, uid, gid, size, atime, mtime, ctime, rdev,
+                 atime_nsec, mtime_nsec, ctime_nsec, data_inline, storage_kind",
+                sql
+            );
+            let mut rows = conn.query(&sql, values).await?;
+            let row = rows.next().await?.ok_or(FsError::NotFound)?;
+            InodeRow::from_row(&row, 0)
         }
         .await;
 
         match result {
-            Ok(()) => {
-                let mut changed = vec![("ctime", serde_json::Value::Bool(true))];
-                if !matches!(atime, TimeChange::Omit) {
-                    changed.push(("atime", serde_json::Value::Bool(true)));
-                }
-                if !matches!(mtime, TimeChange::Omit) {
-                    changed.push(("mtime", serde_json::Value::Bool(true)));
-                }
-                txn.record(JournalOp::setattr(ino, journal::fields(changed)));
+            Ok(inode) => {
+                txn.record_inode("setattr", inode).await?;
                 txn.commit().await?;
                 self.invalidate_attr(ino);
                 Ok(())
@@ -662,7 +659,7 @@ impl FileSystem for Vfs {
         // drain transactions (turso reports such write/write races as
         // "database snapshot is stale" instead of waiting on the write lock).
         let mut txn = MutationTxn::begin(&conn, self.journal_ctx()).await?;
-        let result: Result<Stats> = async {
+        let result: Result<(Stats, InodeRow)> = async {
             // Check if already exists
             if self.lookup_child(&conn, parent_ino, name).await?.is_some() {
                 return Err(FsError::AlreadyExists.into());
@@ -712,15 +709,22 @@ impl FileSystem for Vfs {
             stmt.execute((ino,)).await?;
 
             // Increment parent nlink (new directory's ".." link) and update timestamps
-            let mut stmt = conn
-                .prepare_cached(
-                    "UPDATE fs_inode SET nlink = nlink + 1, ctime = ?, mtime = ?, ctime_nsec = ?, mtime_nsec = ? WHERE ino = ?",
+            let mut rows = conn
+                .query(
+                    "UPDATE fs_inode
+                     SET nlink = nlink + 1, ctime = ?, mtime = ?, ctime_nsec = ?, mtime_nsec = ?
+                     WHERE ino = ?
+                     RETURNING ino, mode, nlink, uid, gid, size, atime, mtime, ctime, rdev,
+                               atime_nsec, mtime_nsec, ctime_nsec, data_inline, storage_kind",
+                    (now_secs, now_secs, now_nsec, now_nsec, parent_ino),
                 )
                 .await?;
-            stmt.execute((now_secs, now_secs, now_nsec, now_nsec, parent_ino))
-                .await?;
+            let parent = InodeRow::from_row(
+                &rows.next().await?.ok_or(FsError::NotFound)?,
+                0,
+            )?;
 
-            Ok(Stats {
+            Ok((Stats {
                 ino,
                 mode: dir_mode,
                 nlink: 2,
@@ -734,20 +738,18 @@ impl FileSystem for Vfs {
                 mtime_nsec: now_nsec as u32,
                 ctime_nsec: now_nsec as u32,
                 rdev: 0,
-            })
+            }, parent))
         }
         .await;
 
         match result {
-            Ok(stats) => {
-                txn.record(JournalOp::new(
-                    "mkdir",
-                    serde_json::json!({
-                        "ino": stats.ino,
-                        "parent_ino": parent_ino,
-                        "name": name,
-                    }),
+            Ok((stats, parent)) => {
+                txn.record_inode("mkdir", InodeRow::from_stats(&stats, None, STORAGE_CHUNKED))
+                    .await?;
+                txn.record(JournalDelta::dentry_upsert(
+                    "mkdir", parent_ino, name, stats.ino,
                 ));
+                txn.record_inode("mkdir", parent).await?;
                 txn.commit().await?;
                 // Populate dentry cache only after the transaction is durable.
                 self.cache_dentry(parent_ino, name, stats.ino);
@@ -788,7 +790,7 @@ impl FileSystem for Vfs {
         // of paying an UPDATE on the synchronous create path. Falls back to
         // the in-transaction UPDATE when the overlay cannot serve reads.
         let stash_parent_times = self.overlay_reads && self.write_drain.is_some();
-        let stats = self
+        let (stats, parent) = self
             .create_file_with_conn(
                 txn.conn(),
                 parent_ino,
@@ -800,14 +802,20 @@ impl FileSystem for Vfs {
             .await?;
         let ino = stats.ino;
 
-        txn.record(JournalOp::new(
+        txn.record_inode(
             "create_file",
-            serde_json::json!({
-                "ino": ino,
-                "parent_ino": parent_ino,
-                "name": name,
-            }),
+            InodeRow::from_stats(&stats, Some(Vec::new()), STORAGE_INLINE),
+        )
+        .await?;
+        txn.record(JournalDelta::dentry_upsert(
+            "create_file",
+            parent_ino,
+            name,
+            ino,
         ));
+        if let Some(parent) = parent {
+            txn.record_inode("create_file", parent).await?;
+        }
         txn.commit().await?;
 
         if stash_parent_times {
@@ -860,7 +868,7 @@ impl FileSystem for Vfs {
         // BEGIN IMMEDIATE: see `mkdir` — never race the batcher's drain
         // transactions with autocommit metadata writes.
         let mut txn = MutationTxn::begin(&conn, self.journal_ctx()).await?;
-        let result: Result<Stats> = async {
+        let result: Result<(Stats, InodeRow)> = async {
             // Check if already exists
             if self.lookup_child(&conn, parent_ino, name).await?.is_some() {
                 return Err(FsError::AlreadyExists.into());
@@ -910,13 +918,22 @@ impl FileSystem for Vfs {
             stmt.execute((ino,)).await?;
 
             // Update parent directory ctime and mtime
-            let mut stmt = conn
-                .prepare_cached("UPDATE fs_inode SET ctime = ?, mtime = ?, ctime_nsec = ?, mtime_nsec = ? WHERE ino = ?")
+            let mut rows = conn
+                .query(
+                    "UPDATE fs_inode
+                     SET ctime = ?, mtime = ?, ctime_nsec = ?, mtime_nsec = ?
+                     WHERE ino = ?
+                     RETURNING ino, mode, nlink, uid, gid, size, atime, mtime, ctime, rdev,
+                               atime_nsec, mtime_nsec, ctime_nsec, data_inline, storage_kind",
+                    (now_secs, now_secs, now_nsec, now_nsec, parent_ino),
+                )
                 .await?;
-            stmt.execute((now_secs, now_secs, now_nsec, now_nsec, parent_ino))
-                .await?;
+            let parent = InodeRow::from_row(
+                &rows.next().await?.ok_or(FsError::NotFound)?,
+                0,
+            )?;
 
-            Ok(Stats {
+            Ok((Stats {
                 ino,
                 mode,
                 nlink: 1,
@@ -930,20 +947,18 @@ impl FileSystem for Vfs {
                 mtime_nsec: now_nsec as u32,
                 ctime_nsec: now_nsec as u32,
                 rdev,
-            })
+            }, parent))
         }
         .await;
 
         match result {
-            Ok(stats) => {
-                txn.record(JournalOp::new(
-                    "mknod",
-                    serde_json::json!({
-                        "ino": stats.ino,
-                        "parent_ino": parent_ino,
-                        "name": name,
-                    }),
+            Ok((stats, parent)) => {
+                txn.record_inode("mknod", InodeRow::from_stats(&stats, None, STORAGE_CHUNKED))
+                    .await?;
+                txn.record(JournalDelta::dentry_upsert(
+                    "mknod", parent_ino, name, stats.ino,
                 ));
+                txn.record_inode("mknod", parent).await?;
                 txn.commit().await?;
                 // Populate dentry cache only after the transaction is durable.
                 self.cache_dentry(parent_ino, name, stats.ino);
@@ -973,7 +988,7 @@ impl FileSystem for Vfs {
         // BEGIN IMMEDIATE: see `mkdir` — never race the batcher's drain
         // transactions with autocommit metadata writes.
         let mut txn = MutationTxn::begin(&conn, self.journal_ctx()).await?;
-        let result: Result<Stats> = async {
+        let result: Result<(Stats, InodeRow)> = async {
             // Check if entry already exists
             if self.lookup_child(&conn, parent_ino, name).await?.is_some() {
                 return Err(FsError::AlreadyExists.into());
@@ -1027,13 +1042,22 @@ impl FileSystem for Vfs {
             .await?;
 
             // Update parent directory ctime and mtime
-            conn.execute(
-                "UPDATE fs_inode SET ctime = ?, mtime = ?, ctime_nsec = ?, mtime_nsec = ? WHERE ino = ?",
-                (now_secs, now_secs, now_nsec, now_nsec, parent_ino),
-            )
-            .await?;
+            let mut rows = conn
+                .query(
+                    "UPDATE fs_inode
+                     SET ctime = ?, mtime = ?, ctime_nsec = ?, mtime_nsec = ?
+                     WHERE ino = ?
+                     RETURNING ino, mode, nlink, uid, gid, size, atime, mtime, ctime, rdev,
+                               atime_nsec, mtime_nsec, ctime_nsec, data_inline, storage_kind",
+                    (now_secs, now_secs, now_nsec, now_nsec, parent_ino),
+                )
+                .await?;
+            let parent = InodeRow::from_row(
+                &rows.next().await?.ok_or(FsError::NotFound)?,
+                0,
+            )?;
 
-            Ok(Stats {
+            Ok((Stats {
                 ino,
                 mode,
                 nlink: 1,
@@ -1047,20 +1071,22 @@ impl FileSystem for Vfs {
                 mtime_nsec: now_nsec as u32,
                 ctime_nsec: now_nsec as u32,
                 rdev: 0,
-            })
+            }, parent))
         }
         .await;
 
         match result {
-            Ok(stats) => {
-                txn.record(JournalOp::new(
+            Ok((stats, parent)) => {
+                txn.record_inode(
                     "symlink",
-                    serde_json::json!({
-                        "ino": stats.ino,
-                        "parent_ino": parent_ino,
-                        "name": name,
-                    }),
+                    InodeRow::from_stats(&stats, None, STORAGE_CHUNKED),
+                )
+                .await?;
+                txn.record(JournalDelta::symlink_upsert("symlink", stats.ino, target));
+                txn.record(JournalDelta::dentry_upsert(
+                    "symlink", parent_ino, name, stats.ino,
                 ));
+                txn.record_inode("symlink", parent).await?;
                 txn.commit().await?;
                 // Populate dentry cache only after the transaction is durable.
                 self.cache_dentry(parent_ino, name, stats.ino);
@@ -1087,7 +1113,7 @@ impl FileSystem for Vfs {
         // `.git/config.lock` during a clone). The transaction also makes the
         // dentry/nlink/inode removal atomic.
         let mut txn = MutationTxn::begin(&conn, self.journal_ctx()).await?;
-        let result: Result<(i64, Option<i64>)> = async {
+        let result: Result<(i64, InodeRow, InodeRow, Option<lifecycle::ReapChanges>)> = async {
             // Look up the child inode
             let ino = self
                 .lookup_child(&conn, parent_ino, name)
@@ -1113,50 +1139,59 @@ impl FileSystem for Vfs {
             let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
             let now_secs = dur.as_secs() as i64;
             let now_nsec = dur.subsec_nanos() as i64;
-            let mut stmt = conn
-                .prepare_cached("UPDATE fs_inode SET mtime = ?, ctime = ?, mtime_nsec = ?, ctime_nsec = ? WHERE ino = ?")
-                .await?;
-            stmt.execute((now_secs, now_secs, now_nsec, now_nsec, parent_ino))
-                .await?;
-
-            // Decrement link count and update ctime
-            let mut stmt = conn
-                .prepare_cached(
-                    "UPDATE fs_inode SET nlink = nlink - 1, ctime = ?, ctime_nsec = ? WHERE ino = ?",
+            let mut rows = conn
+                .query(
+                    "UPDATE fs_inode
+                     SET mtime = ?, ctime = ?, mtime_nsec = ?, ctime_nsec = ?
+                     WHERE ino = ?
+                     RETURNING ino, mode, nlink, uid, gid, size, atime, mtime, ctime, rdev,
+                               atime_nsec, mtime_nsec, ctime_nsec, data_inline, storage_kind",
+                    (now_secs, now_secs, now_nsec, now_nsec, parent_ino),
                 )
                 .await?;
-            stmt.execute((now_secs, now_nsec, ino)).await?;
+            let parent = InodeRow::from_row(&rows.next().await?.ok_or(FsError::NotFound)?, 0)?;
+            drop(rows);
+
+            // Decrement link count and update ctime
+            let mut rows = conn
+                .query(
+                    "UPDATE fs_inode
+                     SET nlink = nlink - 1, ctime = ?, ctime_nsec = ?
+                     WHERE ino = ?
+                     RETURNING ino, mode, nlink, uid, gid, size, atime, mtime, ctime, rdev,
+                               atime_nsec, mtime_nsec, ctime_nsec, data_inline, storage_kind",
+                    (now_secs, now_nsec, ino),
+                )
+                .await?;
+            let inode = InodeRow::from_row(&rows.next().await?.ok_or(FsError::NotFound)?, 0)?;
+            drop(rows);
 
             // Check if this was the last link to the inode. POSIX: while
             // open handles exist the nlink=0 rows stay alive; the last
             // handle drop queues the orphan for process_deferred_reaps.
             let link_count = self.get_link_count(&conn, ino).await?;
             let removed = link_count == 0 && !self.lifecycle.defer_reap_if_open(ino);
-            let reaped_ino = if removed && self.reap_inode_with_conn(&conn, ino).await? {
-                Some(ino)
+            let reap_changes = if removed {
+                self.reap_inode_with_conn(&conn, ino).await?
             } else {
                 None
             };
 
-            Ok((ino, reaped_ino))
+            Ok((ino, inode, parent, reap_changes))
         }
         .await;
 
         match result {
-            Ok((ino, reaped_ino)) => {
-                txn.record(JournalOp::new(
-                    "unlink",
-                    serde_json::json!({
-                        "ino": ino,
-                        "parent_ino": parent_ino,
-                        "name": name,
-                    }),
-                ));
-                if let Some(reaped_ino) = reaped_ino {
-                    txn.record(JournalOp::new(
-                        "reap",
-                        serde_json::json!({ "ino": reaped_ino }),
-                    ));
+            Ok((ino, inode, parent, reap_changes)) => {
+                txn.record(JournalDelta::dentry_delete("unlink", parent_ino, name));
+                txn.record_inode("unlink", parent).await?;
+                let reaped_ino = reap_changes.as_ref().map(|_| ino);
+                if let Some(changes) = reap_changes {
+                    for delta in changes.deltas {
+                        txn.record(delta);
+                    }
+                } else {
+                    txn.record_inode("unlink", inode).await?;
                 }
                 txn.commit().await?;
                 if let Some(reaped_ino) = reaped_ino {
@@ -1184,7 +1219,7 @@ impl FileSystem for Vfs {
         // BEGIN IMMEDIATE: see `unlink` — never race the batcher's drain
         // transactions with autocommit metadata writes.
         let mut txn = MutationTxn::begin(&conn, self.journal_ctx()).await?;
-        let result: Result<i64> = async {
+        let result: Result<(i64, InodeRow, InodeRow, bool)> = async {
             // Look up the child inode
             let ino = self
                 .lookup_child(&conn, parent_ino, name)
@@ -1228,46 +1263,57 @@ impl FileSystem for Vfs {
             stmt.execute((parent_ino, name)).await?;
 
             // Decrement link count on removed directory
-            let mut stmt = conn
-                .prepare_cached("UPDATE fs_inode SET nlink = nlink - 1 WHERE ino = ?")
+            let mut rows = conn
+                .query(
+                    "UPDATE fs_inode SET nlink = nlink - 1 WHERE ino = ?
+                     RETURNING ino, mode, nlink, uid, gid, size, atime, mtime, ctime, rdev,
+                               atime_nsec, mtime_nsec, ctime_nsec, data_inline, storage_kind",
+                    (ino,),
+                )
                 .await?;
-            stmt.execute((ino,)).await?;
+            let inode = InodeRow::from_row(&rows.next().await?.ok_or(FsError::NotFound)?, 0)?;
+            drop(rows);
 
             // Decrement parent nlink (removed directory's ".." link) and update timestamps
             let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
             let now_secs = dur.as_secs() as i64;
             let now_nsec = dur.subsec_nanos() as i64;
-            let mut stmt = conn
-                .prepare_cached(
-                    "UPDATE fs_inode SET nlink = nlink - 1, ctime = ?, mtime = ?, ctime_nsec = ?, mtime_nsec = ? WHERE ino = ?",
+            let mut rows = conn
+                .query(
+                    "UPDATE fs_inode
+                     SET nlink = nlink - 1, ctime = ?, mtime = ?, ctime_nsec = ?, mtime_nsec = ?
+                     WHERE ino = ?
+                     RETURNING ino, mode, nlink, uid, gid, size, atime, mtime, ctime, rdev,
+                               atime_nsec, mtime_nsec, ctime_nsec, data_inline, storage_kind",
+                    (now_secs, now_secs, now_nsec, now_nsec, parent_ino),
                 )
                 .await?;
-            stmt.execute((now_secs, now_secs, now_nsec, now_nsec, parent_ino))
-                .await?;
+            let parent = InodeRow::from_row(&rows.next().await?.ok_or(FsError::NotFound)?, 0)?;
+            drop(rows);
 
             // Delete inode if no more links
             let link_count = self.get_link_count(&conn, ino).await?;
-            if link_count == 0 {
+            let deleted = link_count == 0;
+            if deleted {
                 let mut stmt = conn
                     .prepare_cached("DELETE FROM fs_inode WHERE ino = ?")
                     .await?;
                 stmt.execute((ino,)).await?;
             }
 
-            Ok(ino)
+            Ok((ino, inode, parent, deleted))
         }
         .await;
 
         match result {
-            Ok(ino) => {
-                txn.record(JournalOp::new(
-                    "rmdir",
-                    serde_json::json!({
-                        "ino": ino,
-                        "parent_ino": parent_ino,
-                        "name": name,
-                    }),
-                ));
+            Ok((ino, inode, parent, deleted)) => {
+                txn.record(JournalDelta::dentry_delete("rmdir", parent_ino, name));
+                if deleted {
+                    txn.record(JournalDelta::inode_delete("rmdir", ino));
+                } else {
+                    txn.record_inode("rmdir", inode).await?;
+                }
+                txn.record_inode("rmdir", parent).await?;
                 txn.commit().await?;
                 self.invalidate_dentry(parent_ino, name);
                 self.invalidate_parent_attr(parent_ino);
@@ -1290,7 +1336,7 @@ impl FileSystem for Vfs {
         // BEGIN IMMEDIATE: see `unlink` — never race the batcher's drain
         // transactions with autocommit metadata writes.
         let mut txn = MutationTxn::begin(&conn, self.journal_ctx()).await?;
-        let result: Result<Stats> = async {
+        let result: Result<(Stats, InodeRow, InodeRow)> = async {
             // Check if source inode exists and is not a directory
             if let Some(mode) = store::mode(&conn, ino).await? {
                 if (mode & S_IFMT) == super::S_IFDIR {
@@ -1320,38 +1366,48 @@ impl FileSystem for Vfs {
             let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
             let now_secs = dur.as_secs() as i64;
             let now_nsec = dur.subsec_nanos() as i64;
-            conn.execute(
-                "UPDATE fs_inode SET nlink = nlink + 1, ctime = ?, ctime_nsec = ? WHERE ino = ?",
-                (now_secs, now_nsec, ino),
-            )
-            .await?;
+            let mut rows = conn
+                .query(
+                    "UPDATE fs_inode
+                     SET nlink = nlink + 1, ctime = ?, ctime_nsec = ?
+                     WHERE ino = ?
+                     RETURNING ino, mode, nlink, uid, gid, size, atime, mtime, ctime, rdev,
+                               atime_nsec, mtime_nsec, ctime_nsec, data_inline, storage_kind",
+                    (now_secs, now_nsec, ino),
+                )
+                .await?;
+            let row = rows.next().await?.ok_or(FsError::NotFound)?;
+            let stats = store::stats_from_row(&row)?;
+            let inode = InodeRow::from_row(&row, 0)?;
+            drop(rows);
 
             // Update parent directory ctime and mtime
-            conn.execute(
-                "UPDATE fs_inode SET ctime = ?, mtime = ?, ctime_nsec = ?, mtime_nsec = ? WHERE ino = ?",
-                (now_secs, now_secs, now_nsec, now_nsec, newparent_ino),
-            )
-            .await?;
+            let mut rows = conn
+                .query(
+                    "UPDATE fs_inode
+                     SET ctime = ?, mtime = ?, ctime_nsec = ?, mtime_nsec = ?
+                     WHERE ino = ?
+                     RETURNING ino, mode, nlink, uid, gid, size, atime, mtime, ctime, rdev,
+                               atime_nsec, mtime_nsec, ctime_nsec, data_inline, storage_kind",
+                    (now_secs, now_secs, now_nsec, now_nsec, newparent_ino),
+                )
+                .await?;
+            let parent = InodeRow::from_row(&rows.next().await?.ok_or(FsError::NotFound)?, 0)?;
 
-            // Return updated stats (drop the cached pre-link attr so the read
-            // below reflects the nlink/ctime updates made in this transaction).
-            self.invalidate_attr(ino);
-            self.getattr_with_conn(&conn, ino)
-                .await?
-                .ok_or(FsError::NotFound.into())
+            Ok((stats, inode, parent))
         }
         .await;
 
         match result {
-            Ok(stats) => {
-                txn.record(JournalOp::new(
+            Ok((stats, inode, parent)) => {
+                txn.record(JournalDelta::dentry_upsert(
                     "link",
-                    serde_json::json!({
-                        "ino": ino,
-                        "parent_ino": newparent_ino,
-                        "name": newname,
-                    }),
+                    newparent_ino,
+                    newname,
+                    ino,
                 ));
+                txn.record_inode("link", inode).await?;
+                txn.record_inode("link", parent).await?;
                 txn.commit().await?;
                 // Populate dentry cache only after the transaction is durable.
                 self.cache_dentry(newparent_ino, newname, ino);
@@ -1410,9 +1466,17 @@ impl FileSystem for Vfs {
 
         let mut txn = MutationTxn::begin(&conn, self.journal_ctx()).await?;
 
-        let result: Result<(Option<i64>, Option<i64>)> = async {
+        let result: Result<(
+            Option<i64>,
+            Option<InodeRow>,
+            Option<lifecycle::ReapChanges>,
+            InodeRow,
+            InodeRow,
+            Option<InodeRow>,
+        )> = async {
             let mut replaced_dst_ino = None;
-            let mut reaped_dst_ino = None;
+            let mut replaced_inode = None;
+            let mut reap_changes = None;
 
             if src_stats.is_directory() {
                 let mut ancestor_ino = newparent_ino;
@@ -1490,19 +1554,27 @@ impl FileSystem for Vfs {
                     .unwrap_or_default();
                 let now_dec = dur_dec.as_secs() as i64;
                 let now_dec_nsec = dur_dec.subsec_nanos() as i64;
-                let mut stmt = conn
-                    .prepare_cached("UPDATE fs_inode SET nlink = nlink - 1, ctime = ?, ctime_nsec = ? WHERE ino = ?")
+                let mut rows = conn
+                    .query(
+                        "UPDATE fs_inode
+                         SET nlink = nlink - 1, ctime = ?, ctime_nsec = ?
+                         WHERE ino = ?
+                         RETURNING ino, mode, nlink, uid, gid, size, atime, mtime, ctime, rdev,
+                                   atime_nsec, mtime_nsec, ctime_nsec, data_inline, storage_kind",
+                        (now_dec, now_dec_nsec, dst_ino),
+                    )
                     .await?;
-                stmt.execute((now_dec, now_dec_nsec, dst_ino)).await?;
+                replaced_inode = Some(InodeRow::from_row(
+                    &rows.next().await?.ok_or(FsError::NotFound)?,
+                    0,
+                )?);
+                drop(rows);
 
                 // Clean up destination inode if no more links (deferred while
                 // open handles exist — see lifecycle).
                 let link_count = self.get_link_count(&conn, dst_ino).await?;
-                if link_count == 0
-                    && !self.lifecycle.defer_reap_if_open(dst_ino)
-                    && self.reap_inode_with_conn(&conn, dst_ino).await?
-                {
-                    reaped_dst_ino = Some(dst_ino);
+                if link_count == 0 && !self.lifecycle.defer_reap_if_open(dst_ino) {
+                    reap_changes = self.reap_inode_with_conn(&conn, dst_ino).await?;
                 }
             }
 
@@ -1536,47 +1608,107 @@ impl FileSystem for Vfs {
             let now_secs = dur.as_secs() as i64;
             let now_nsec = dur.subsec_nanos() as i64;
 
-            let mut stmt = conn
-                .prepare_cached("UPDATE fs_inode SET ctime = ?, ctime_nsec = ? WHERE ino = ?")
+            let mut rows = conn
+                .query(
+                    "UPDATE fs_inode SET ctime = ?, ctime_nsec = ? WHERE ino = ?
+                     RETURNING ino, mode, nlink, uid, gid, size, atime, mtime, ctime, rdev,
+                               atime_nsec, mtime_nsec, ctime_nsec, data_inline, storage_kind",
+                    (now_secs, now_nsec, src_ino),
+                )
                 .await?;
-            stmt.execute((now_secs, now_nsec, src_ino)).await?;
+            let source = InodeRow::from_row(
+                &rows.next().await?.ok_or(FsError::NotFound)?,
+                0,
+            )?;
+            drop(rows);
 
             // Update source parent directory timestamps
-            let mut stmt = conn
-                .prepare_cached("UPDATE fs_inode SET mtime = ?, ctime = ?, mtime_nsec = ?, ctime_nsec = ? WHERE ino = ?")
+            let mut rows = conn
+                .query(
+                    "UPDATE fs_inode
+                     SET mtime = ?, ctime = ?, mtime_nsec = ?, ctime_nsec = ?
+                     WHERE ino = ?
+                     RETURNING ino, mode, nlink, uid, gid, size, atime, mtime, ctime, rdev,
+                               atime_nsec, mtime_nsec, ctime_nsec, data_inline, storage_kind",
+                    (now_secs, now_secs, now_nsec, now_nsec, oldparent_ino),
+                )
                 .await?;
-            stmt.execute((now_secs, now_secs, now_nsec, now_nsec, oldparent_ino)).await?;
+            let old_parent = InodeRow::from_row(
+                &rows.next().await?.ok_or(FsError::NotFound)?,
+                0,
+            )?;
+            drop(rows);
 
             // Update destination parent directory timestamps
-            if newparent_ino != oldparent_ino {
-                let mut stmt = conn
-                    .prepare_cached("UPDATE fs_inode SET mtime = ?, ctime = ?, mtime_nsec = ?, ctime_nsec = ? WHERE ino = ?")
+            let new_parent = if newparent_ino != oldparent_ino {
+                let mut rows = conn
+                    .query(
+                        "UPDATE fs_inode
+                         SET mtime = ?, ctime = ?, mtime_nsec = ?, ctime_nsec = ?
+                         WHERE ino = ?
+                         RETURNING ino, mode, nlink, uid, gid, size, atime, mtime, ctime, rdev,
+                                   atime_nsec, mtime_nsec, ctime_nsec, data_inline, storage_kind",
+                        (now_secs, now_secs, now_nsec, now_nsec, newparent_ino),
+                    )
                     .await?;
-                stmt.execute((now_secs, now_secs, now_nsec, now_nsec, newparent_ino)).await?;
-            }
+                Some(InodeRow::from_row(
+                    &rows.next().await?.ok_or(FsError::NotFound)?,
+                    0,
+                )?)
+            } else {
+                None
+            };
 
-            Ok((replaced_dst_ino, reaped_dst_ino))
+            Ok((
+                replaced_dst_ino,
+                replaced_inode,
+                reap_changes,
+                source,
+                old_parent,
+                new_parent,
+            ))
         }
         .await;
 
         match result {
-            Ok((replaced_dst_ino, reaped_dst_ino)) => {
-                txn.record(JournalOp::new(
-                    "rename",
-                    serde_json::json!({
-                        "ino": src_ino,
-                        "old_parent_ino": oldparent_ino,
-                        "old_name": oldname,
-                        "new_parent_ino": newparent_ino,
-                        "new_name": newname,
-                        "replaced_ino": replaced_dst_ino,
-                    }),
-                ));
-                if let Some(reaped_dst_ino) = reaped_dst_ino {
-                    txn.record(JournalOp::new(
-                        "reap",
-                        serde_json::json!({ "ino": reaped_dst_ino }),
+            Ok((
+                replaced_dst_ino,
+                replaced_inode,
+                reap_changes,
+                source,
+                old_parent,
+                new_parent,
+            )) => {
+                if replaced_dst_ino.is_some() {
+                    txn.record(JournalDelta::dentry_delete(
+                        "rename",
+                        newparent_ino,
+                        newname,
                     ));
+                }
+                txn.record(JournalDelta::dentry_delete(
+                    "rename",
+                    oldparent_ino,
+                    oldname,
+                ));
+                txn.record(JournalDelta::dentry_upsert(
+                    "rename",
+                    newparent_ino,
+                    newname,
+                    src_ino,
+                ));
+                txn.record_inode("rename", source).await?;
+                txn.record_inode("rename", old_parent).await?;
+                if let Some(new_parent) = new_parent {
+                    txn.record_inode("rename", new_parent).await?;
+                }
+                let reaped_dst_ino = reap_changes.as_ref().and(replaced_dst_ino);
+                if let Some(changes) = reap_changes {
+                    for delta in changes.deltas {
+                        txn.record(delta);
+                    }
+                } else if let Some(inode) = replaced_inode {
+                    txn.record_inode("rename", inode).await?;
                 }
                 txn.commit().await?;
                 if let Some(reaped_dst_ino) = reaped_dst_ino {

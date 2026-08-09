@@ -123,6 +123,17 @@ pub async fn check(conn: &Connection, opts: &CheckOpts) -> Result<Report> {
         "fs_symlink",
         "fs_op_journal",
         "fs_journal_chunk",
+        "fs_snapshot",
+        "fs_snapshot_inode",
+        "fs_snapshot_dentry",
+        "fs_snapshot_data",
+        "fs_snapshot_symlink",
+        "fs_snapshot_whiteout",
+        "fs_snapshot_origin",
+        "fs_snapshot_partial_origin",
+        "fs_snapshot_chunk_override",
+        "fs_snapshot_chunk",
+        "fs_snapshot_meta",
         "kv_store",
         "tool_calls",
     ];
@@ -158,6 +169,12 @@ pub async fn check(conn: &Connection, opts: &CheckOpts) -> Result<Report> {
     }
     check_portability_status(conn, &mut report, opts.require_portable).await?;
     check_optional_overlay_invariants(conn, &mut report, opts.check_base).await?;
+    if *tables.get("fs_op_journal").unwrap_or(&false)
+        && *tables.get("fs_snapshot").unwrap_or(&false)
+        && has_chunk
+    {
+        check_history_invariants(conn, &mut report).await?;
+    }
 
     Ok(report)
 }
@@ -206,6 +223,127 @@ async fn check_config(conn: &Connection, report: &mut Report) -> Result<()> {
         if inline_ok { Some(0) } else { Some(1) },
     );
 
+    for (key, expected) in [
+        (super::CONFIG_HISTORY_EPOCH_KEY, 1_i64),
+        (super::CONFIG_HISTORY_VALID_KEY, 1_i64),
+        (super::CONFIG_HISTORY_FLOOR_SEQ_KEY, 0_i64),
+    ] {
+        let value = config_i64(conn, key).await?;
+        let ok = match key {
+            super::CONFIG_HISTORY_EPOCH_KEY => value.is_some_and(|value| value >= expected),
+            super::CONFIG_HISTORY_VALID_KEY => value.is_some_and(|value| value == 0 || value == 1),
+            _ => value.is_some_and(|value| value >= expected),
+        };
+        report.push_check(
+            format!("config.{key}"),
+            ok,
+            value
+                .map(|value| format!("found {value}"))
+                .unwrap_or_else(|| "missing or invalid".to_string()),
+            if ok { Some(0) } else { Some(1) },
+        );
+    }
+
+    Ok(())
+}
+
+async fn check_history_invariants(conn: &Connection, report: &mut Report) -> Result<()> {
+    let mut rows = conn
+        .query(
+            "SELECT tbl, verb, row
+             FROM fs_op_journal
+             ORDER BY seq DESC
+             LIMIT 256",
+            (),
+        )
+        .await?;
+    let allowed_tables = [
+        "fs_inode",
+        "fs_dentry",
+        "fs_data",
+        "fs_symlink",
+        "fs_whiteout",
+        "fs_origin",
+        "fs_partial_origin",
+        "fs_chunk_override",
+        "fs_overlay_config",
+    ];
+    let mut sampled = 0_i64;
+    let mut invalid = 0_i64;
+    while let Some(row) = rows.next().await? {
+        sampled += 1;
+        let tbl: String = row.get(0)?;
+        let verb: String = row.get(1)?;
+        let payload: String = row.get(2)?;
+        let json_object = serde_json::from_str::<serde_json::Value>(&payload)
+            .ok()
+            .is_some_and(|value| value.is_object());
+        if !allowed_tables.contains(&tbl.as_str())
+            || !matches!(verb.as_str(), "upsert" | "delete")
+            || !json_object
+        {
+            invalid += 1;
+        }
+    }
+    report.push_check(
+        "history.journal_delta_sample",
+        invalid == 0,
+        format!("sampled {sampled} row(s); {invalid} invalid"),
+        Some(invalid),
+    );
+
+    add_zero_count_check(
+        conn,
+        report,
+        "history.snapshot_pins_reference_chunks",
+        "SELECT COUNT(*)
+         FROM fs_snapshot_chunk s
+         LEFT JOIN fs_chunk c ON c.digest = s.digest
+         WHERE c.digest IS NULL",
+    )
+    .await?;
+    add_zero_count_check(
+        conn,
+        report,
+        "history.snapshot_data_reference_chunks",
+        "SELECT COUNT(*)
+         FROM fs_snapshot_data s
+         LEFT JOIN fs_chunk c ON c.digest = s.digest
+         WHERE c.digest IS NULL",
+    )
+    .await?;
+    add_zero_count_check(
+        conn,
+        report,
+        "history.snapshot_inline_reference_chunks",
+        "SELECT COUNT(*)
+         FROM fs_snapshot_inode s
+         LEFT JOIN fs_chunk c ON c.digest = s.data_inline_digest
+         WHERE s.data_inline_digest IS NOT NULL AND c.digest IS NULL",
+    )
+    .await?;
+    add_zero_count_check(
+        conn,
+        report,
+        "history.snapshot_data_are_pinned",
+        "SELECT COUNT(*)
+         FROM fs_snapshot_data d
+         LEFT JOIN fs_snapshot_chunk p
+           ON p.snapshot_id = d.snapshot_id AND p.digest = d.digest
+         WHERE p.digest IS NULL",
+    )
+    .await?;
+    add_zero_count_check(
+        conn,
+        report,
+        "history.snapshot_inline_are_pinned",
+        "SELECT COUNT(*)
+         FROM fs_snapshot_inode i
+         LEFT JOIN fs_snapshot_chunk p
+           ON p.snapshot_id = i.snapshot_id AND p.digest = i.data_inline_digest
+         WHERE i.data_inline_digest IS NOT NULL AND p.digest IS NULL",
+    )
+    .await?;
     Ok(())
 }
 

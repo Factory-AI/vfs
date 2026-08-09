@@ -70,28 +70,48 @@ impl OverlayFS {
 
         let mut txn =
             super::super::vfs::MutationTxn::begin(&conn, self.delta.journal_ctx()).await?;
-        let mut changed = txn
+        let origin_changed = txn
             .conn()
             .execute("DELETE FROM fs_origin WHERE delta_ino = ?", (delta_ino,))
             .await?;
-        changed += txn
+        let mut override_rows = txn
             .conn()
-            .execute(
-                "DELETE FROM fs_chunk_override WHERE delta_ino = ?",
+            .query(
+                "DELETE FROM fs_chunk_override
+                 WHERE delta_ino = ?
+                 RETURNING chunk_index",
                 (delta_ino,),
             )
             .await?;
-        changed += txn
+        let mut override_indexes = Vec::new();
+        while let Some(row) = override_rows.next().await? {
+            override_indexes.push(row.get::<i64>(0)?);
+        }
+        drop(override_rows);
+        let partial_changed = txn
             .conn()
             .execute(
                 "DELETE FROM fs_partial_origin WHERE delta_ino = ?",
                 (delta_ino,),
             )
             .await?;
-        if changed > 0 {
-            txn.record(super::super::vfs::JournalOp::new(
+        if origin_changed > 0 {
+            txn.record(super::super::vfs::JournalDelta::origin_delete(
                 "partial_cleanup",
-                serde_json::json!({ "delta_ino": delta_ino }),
+                delta_ino,
+            ));
+        }
+        for chunk_index in override_indexes {
+            txn.record(super::super::vfs::JournalDelta::chunk_override_delete(
+                "partial_cleanup",
+                delta_ino,
+                chunk_index,
+            ));
+        }
+        if partial_changed > 0 {
+            txn.record(super::super::vfs::JournalDelta::partial_origin_delete(
+                "partial_cleanup",
+                delta_ino,
             ));
         }
         txn.commit().await?;
@@ -347,7 +367,7 @@ impl OverlayFS {
         let conn = self.delta.get_connection().await?;
         let mut txn =
             super::super::vfs::MutationTxn::begin(&conn, self.delta.journal_ctx()).await?;
-        let stats = self
+        let (stats, parent) = self
             .delta
             .create_file_with_conn(
                 txn.conn(),
@@ -391,28 +411,51 @@ impl OverlayFS {
             now,
         )
         .await?;
-        txn.record(super::super::vfs::JournalOp::new(
-            "create_file",
-            serde_json::json!({
-                "ino": delta_ino,
-                "parent_ino": parent_ino,
-                "name": name,
-            }),
+        let final_stats = Stats {
+            ino: delta_ino,
+            mode: base_stats.mode,
+            nlink: stats.nlink,
+            uid: base_stats.uid,
+            gid: base_stats.gid,
+            size: base_stats.size,
+            atime: base_stats.atime,
+            mtime: base_stats.mtime,
+            ctime: base_stats.ctime,
+            atime_nsec: base_stats.atime_nsec,
+            mtime_nsec: base_stats.mtime_nsec,
+            ctime_nsec: base_stats.ctime_nsec,
+            rdev: stats.rdev,
+        };
+        txn.record_inode(
+            "copyup",
+            super::super::vfs::InodeRow::from_stats(&final_stats, None, STORAGE_CHUNKED),
+        )
+        .await?;
+        txn.record(super::super::vfs::JournalDelta::dentry_upsert(
+            "copyup", parent_ino, name, delta_ino,
         ));
-        txn.record(super::super::vfs::JournalOp::new(
-            "materialize_meta",
-            serde_json::json!({ "ino": delta_ino }),
-        ));
-        txn.record(super::super::vfs::JournalOp::new(
+        if let Some(parent) = parent {
+            txn.record_inode("copyup", parent).await?;
+        }
+        txn.record(super::super::vfs::JournalDelta::origin_upsert(
             "origin_map",
-            serde_json::json!({
-                "delta_ino": delta_ino,
-                "base_ino": info.underlying_ino,
-            }),
+            delta_ino,
+            info.underlying_ino,
         ));
-        txn.record(super::super::vfs::JournalOp::new(
+        txn.record(super::super::vfs::JournalDelta::partial_origin_upsert(
             "partial_origin",
-            serde_json::json!({ "delta_ino": delta_ino }),
+            &super::super::vfs::PartialOriginRow {
+                delta_ino,
+                base_ino: info.underlying_ino,
+                base_path: info.path.clone(),
+                base_size: base_stats.size,
+                base_fingerprint_size: base_stats.size,
+                base_mtime: base_stats.mtime,
+                base_mtime_nsec: base_stats.mtime_nsec as i64,
+                base_ctime: base_stats.ctime,
+                base_ctime_nsec: base_stats.ctime_nsec as i64,
+                created_at: now,
+            },
         ));
         txn.commit().await?;
 

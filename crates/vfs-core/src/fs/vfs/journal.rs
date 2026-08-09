@@ -1,4 +1,5 @@
-use serde_json::{json, Map, Value as JsonValue};
+use serde::Serialize;
+use serde_json::{json, Value as JsonValue};
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
@@ -7,8 +8,9 @@ use turso::transaction::{Transaction, TransactionBehavior};
 use turso::{Connection, Value};
 
 use crate::error::{Error, Result};
+use crate::fs::FsError;
 
-use super::{store::NormalizedWriteRange, STORAGE_INLINE};
+use super::store::{DataDelta, StorageChanges};
 
 /// Rows per multi-row journal insert; two shapes (full batch and remainder)
 /// keep prepared-statement variety low while bounding SQL length.
@@ -24,13 +26,13 @@ const JOURNAL_PIN_INSERT_ROWS: usize = 128;
 /// AUTOINCREMENT actually assigned patches its own rows, so the txn_id ==
 /// first-seq contract holds regardless of hint staleness.
 #[derive(Clone)]
-pub(in crate::fs) struct JournalCtx {
+pub(crate) struct JournalCtx {
     enabled: bool,
     next_seq: Arc<AtomicI64>,
 }
 
 impl JournalCtx {
-    pub(in crate::fs) fn new(enabled: bool) -> Self {
+    pub(crate) fn new(enabled: bool) -> Self {
         Self {
             enabled,
             next_seq: Arc::new(AtomicI64::new(0)),
@@ -39,148 +41,294 @@ impl JournalCtx {
 }
 
 #[derive(Debug)]
-pub(in crate::fs) struct JournalOp {
-    name: &'static str,
-    payload: JsonValue,
+pub(crate) struct JournalDelta {
+    label: &'static str,
+    tbl: &'static str,
+    verb: &'static str,
+    row: JsonValue,
     digests: Vec<Vec<u8>>,
 }
 
-impl JournalOp {
-    pub(in crate::fs) fn new(name: &'static str, payload: JsonValue) -> Self {
+impl JournalDelta {
+    fn new(
+        label: &'static str,
+        tbl: &'static str,
+        verb: &'static str,
+        row: impl Serialize,
+    ) -> Self {
         Self {
-            name,
-            payload,
+            label,
+            tbl,
+            verb,
+            row: serde_json::to_value(row).expect("journal row serialization cannot fail"),
             digests: Vec::new(),
         }
     }
 
-    pub(in crate::fs) fn with_digests(
-        name: &'static str,
-        payload: JsonValue,
-        digests: Vec<Vec<u8>>,
+    fn with_digests(mut self, digests: Vec<Vec<u8>>) -> Self {
+        self.digests = digests;
+        self
+    }
+
+    pub(crate) fn inode_delete(label: &'static str, ino: i64) -> Self {
+        Self::new(label, "fs_inode", "delete", json!({ "ino": ino }))
+    }
+
+    pub(crate) fn dentry_upsert(
+        label: &'static str,
+        parent_ino: i64,
+        name: &str,
+        ino: i64,
     ) -> Self {
-        Self {
-            name,
-            payload,
-            digests,
-        }
-    }
-
-    pub(in crate::fs) fn setattr(ino: i64, fields: JsonValue) -> Self {
-        Self::new("setattr", json!({ "ino": ino, "fields": fields }))
-    }
-
-    pub(in crate::fs) async fn write(
-        conn: &Connection,
-        ino: i64,
-        chunk_size: usize,
-        ranges: &[NormalizedWriteRange],
-    ) -> Result<Self> {
-        let storage_kind = inode_storage_kind(conn, ino).await?;
-        if storage_kind == STORAGE_INLINE {
-            let ranges = ranges
-                .iter()
-                .map(|range| {
-                    json!({
-                        "offset": range.offset,
-                        "len": range.data.len(),
-                        "digests": [],
-                    })
-                })
-                .collect::<Vec<_>>();
-            return Ok(Self::new(
-                "write",
-                json!({ "ino": ino, "ranges": ranges, "inline": true }),
-            ));
-        }
-
-        let mut payload_ranges = Vec::with_capacity(ranges.len());
-        let mut pins = BTreeSet::new();
-        for range in ranges {
-            let len = range.data.len();
-            if len == 0 {
-                continue;
-            }
-            let start_chunk = range.offset / chunk_size as u64;
-            let end_chunk = (range.offset + len as u64 - 1) / chunk_size as u64;
-            let digests = mapping_digests(conn, ino, start_chunk as i64, end_chunk as i64).await?;
-            let digest_hex = digests
-                .iter()
-                .map(|digest| hex_digest(digest))
-                .collect::<Vec<_>>();
-            pins.extend(digests);
-            payload_ranges.push(json!({
-                "offset": range.offset,
-                "len": len,
-                "digests": digest_hex,
-            }));
-        }
-
-        Ok(Self::with_digests(
-            "write",
-            json!({ "ino": ino, "ranges": payload_ranges }),
-            pins.into_iter().collect(),
-        ))
-    }
-
-    pub(in crate::fs) async fn truncate(
-        conn: &Connection,
-        ino: i64,
-        chunk_size: usize,
-        size: u64,
-    ) -> Result<Self> {
-        let storage_kind = inode_storage_kind(conn, ino).await?;
-        if storage_kind == STORAGE_INLINE || size == 0 {
-            return Ok(Self::new(
-                "truncate",
-                json!({ "ino": ino, "size": size, "inline": storage_kind == STORAGE_INLINE }),
-            ));
-        }
-
-        let tail_index = ((size - 1) / chunk_size as u64) as i64;
-        let digests = mapping_digests(conn, ino, tail_index, tail_index).await?;
-        let digest_hex = digests
-            .iter()
-            .map(|digest| hex_digest(digest))
-            .collect::<Vec<_>>();
-        Ok(Self::with_digests(
-            "truncate",
-            json!({ "ino": ino, "size": size, "digests": digest_hex }),
-            digests,
-        ))
-    }
-
-    /// `digests` are the chunk digests the importer just wrote, in chunk
-    /// order; `None` means the content was stored inline. Taking them from
-    /// the writer instead of reading mappings back keeps bulk import free of
-    /// per-file SELECT round trips.
-    pub(in crate::fs) fn import(ino: i64, size: u64, digests: Option<Vec<Vec<u8>>>) -> Self {
-        let Some(digests) = digests else {
-            return Self::new(
-                "import",
-                json!({ "ino": ino, "size": size, "inline": true }),
-            );
-        };
-        let digest_hex = digests
-            .iter()
-            .map(|digest| hex_digest(digest))
-            .collect::<Vec<_>>();
-        Self::with_digests(
-            "import",
-            json!({ "ino": ino, "size": size, "digests": digest_hex }),
-            digests,
+        Self::new(
+            label,
+            "fs_dentry",
+            "upsert",
+            json!({ "parent_ino": parent_ino, "name": name, "ino": ino }),
         )
+    }
+
+    pub(crate) fn dentry_delete(label: &'static str, parent_ino: i64, name: &str) -> Self {
+        Self::new(
+            label,
+            "fs_dentry",
+            "delete",
+            json!({ "parent_ino": parent_ino, "name": name }),
+        )
+    }
+
+    pub(crate) fn data_upsert(
+        label: &'static str,
+        ino: i64,
+        chunk_index: i64,
+        digest: Vec<u8>,
+    ) -> Self {
+        let digest_hex = hex_digest(&digest);
+        Self::new(
+            label,
+            "fs_data",
+            "upsert",
+            json!({ "ino": ino, "chunk_index": chunk_index, "digest": digest_hex }),
+        )
+        .with_digests(vec![digest])
+    }
+
+    pub(crate) fn data_delete(label: &'static str, ino: i64, chunk_index: i64) -> Self {
+        Self::new(
+            label,
+            "fs_data",
+            "delete",
+            json!({ "ino": ino, "chunk_index": chunk_index }),
+        )
+    }
+
+    pub(crate) fn symlink_upsert(label: &'static str, ino: i64, target: &str) -> Self {
+        Self::new(
+            label,
+            "fs_symlink",
+            "upsert",
+            json!({ "ino": ino, "target": target }),
+        )
+    }
+
+    pub(crate) fn symlink_delete(label: &'static str, ino: i64) -> Self {
+        Self::new(label, "fs_symlink", "delete", json!({ "ino": ino }))
+    }
+
+    pub(crate) fn whiteout_upsert(
+        label: &'static str,
+        path: &str,
+        parent_path: &str,
+        created_at: i64,
+    ) -> Self {
+        Self::new(
+            label,
+            "fs_whiteout",
+            "upsert",
+            json!({
+                "path": path,
+                "parent_path": parent_path,
+                "created_at": created_at,
+            }),
+        )
+    }
+
+    pub(crate) fn whiteout_delete(label: &'static str, path: &str) -> Self {
+        Self::new(label, "fs_whiteout", "delete", json!({ "path": path }))
+    }
+
+    pub(crate) fn origin_upsert(label: &'static str, delta_ino: i64, base_ino: i64) -> Self {
+        Self::new(
+            label,
+            "fs_origin",
+            "upsert",
+            json!({ "delta_ino": delta_ino, "base_ino": base_ino }),
+        )
+    }
+
+    pub(crate) fn origin_delete(label: &'static str, delta_ino: i64) -> Self {
+        Self::new(
+            label,
+            "fs_origin",
+            "delete",
+            json!({ "delta_ino": delta_ino }),
+        )
+    }
+
+    pub(crate) fn partial_origin_upsert(label: &'static str, row: &PartialOriginRow) -> Self {
+        Self::new(label, "fs_partial_origin", "upsert", row)
+    }
+
+    pub(crate) fn partial_origin_delete(label: &'static str, delta_ino: i64) -> Self {
+        Self::new(
+            label,
+            "fs_partial_origin",
+            "delete",
+            json!({ "delta_ino": delta_ino }),
+        )
+    }
+
+    pub(crate) fn chunk_override_upsert(
+        label: &'static str,
+        delta_ino: i64,
+        chunk_index: i64,
+    ) -> Self {
+        Self::new(
+            label,
+            "fs_chunk_override",
+            "upsert",
+            json!({ "delta_ino": delta_ino, "chunk_index": chunk_index }),
+        )
+    }
+
+    pub(crate) fn chunk_override_delete(
+        label: &'static str,
+        delta_ino: i64,
+        chunk_index: i64,
+    ) -> Self {
+        Self::new(
+            label,
+            "fs_chunk_override",
+            "delete",
+            json!({ "delta_ino": delta_ino, "chunk_index": chunk_index }),
+        )
+    }
+
+    pub(crate) fn overlay_config_upsert(label: &'static str, key: &str, value: &str) -> Self {
+        Self::new(
+            label,
+            "fs_overlay_config",
+            "upsert",
+            json!({ "key": key, "value": value }),
+        )
+    }
+
+    pub(crate) fn overlay_config_delete(label: &'static str, key: &str) -> Self {
+        Self::new(label, "fs_overlay_config", "delete", json!({ "key": key }))
     }
 }
 
-pub(in crate::fs) struct MutationTxn<'conn> {
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct InodeRow {
+    pub(crate) ino: i64,
+    pub(crate) mode: i64,
+    pub(crate) nlink: i64,
+    pub(crate) uid: i64,
+    pub(crate) gid: i64,
+    pub(crate) size: i64,
+    pub(crate) atime: i64,
+    pub(crate) mtime: i64,
+    pub(crate) ctime: i64,
+    pub(crate) rdev: i64,
+    pub(crate) atime_nsec: i64,
+    pub(crate) mtime_nsec: i64,
+    pub(crate) ctime_nsec: i64,
+    #[serde(skip)]
+    pub(crate) data_inline: Option<Vec<u8>>,
+    pub(crate) storage_kind: i64,
+}
+
+impl InodeRow {
+    pub(crate) fn from_row(row: &turso::Row, start: usize) -> Result<Self> {
+        let integer = |index: usize, name: &str| -> Result<i64> {
+            row.get_value(start + index)
+                .ok()
+                .and_then(|value| value.as_integer().copied())
+                .ok_or_else(|| FsError::Corrupt(format!("invalid fs_inode.{name}")).into())
+        };
+        let data_inline = match row.get_value(start + 13) {
+            Ok(Value::Blob(data)) => Some(data),
+            Ok(Value::Null) => None,
+            Ok(_) | Err(_) => {
+                return Err(FsError::Corrupt("invalid fs_inode.data_inline".to_string()).into())
+            }
+        };
+        Ok(Self {
+            ino: integer(0, "ino")?,
+            mode: integer(1, "mode")?,
+            nlink: integer(2, "nlink")?,
+            uid: integer(3, "uid")?,
+            gid: integer(4, "gid")?,
+            size: integer(5, "size")?,
+            atime: integer(6, "atime")?,
+            mtime: integer(7, "mtime")?,
+            ctime: integer(8, "ctime")?,
+            rdev: integer(9, "rdev")?,
+            atime_nsec: integer(10, "atime_nsec")?,
+            mtime_nsec: integer(11, "mtime_nsec")?,
+            ctime_nsec: integer(12, "ctime_nsec")?,
+            data_inline,
+            storage_kind: integer(14, "storage_kind")?,
+        })
+    }
+
+    pub(crate) fn from_stats(
+        stats: &crate::fs::Stats,
+        data_inline: Option<Vec<u8>>,
+        storage_kind: i64,
+    ) -> Self {
+        Self {
+            ino: stats.ino,
+            mode: stats.mode as i64,
+            nlink: stats.nlink as i64,
+            uid: stats.uid as i64,
+            gid: stats.gid as i64,
+            size: stats.size,
+            atime: stats.atime,
+            mtime: stats.mtime,
+            ctime: stats.ctime,
+            rdev: stats.rdev as i64,
+            atime_nsec: stats.atime_nsec as i64,
+            mtime_nsec: stats.mtime_nsec as i64,
+            ctime_nsec: stats.ctime_nsec as i64,
+            data_inline,
+            storage_kind,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct PartialOriginRow {
+    pub(crate) delta_ino: i64,
+    pub(crate) base_ino: i64,
+    pub(crate) base_path: String,
+    pub(crate) base_size: i64,
+    pub(crate) base_fingerprint_size: i64,
+    pub(crate) base_mtime: i64,
+    pub(crate) base_mtime_nsec: i64,
+    pub(crate) base_ctime: i64,
+    pub(crate) base_ctime_nsec: i64,
+    pub(crate) created_at: i64,
+}
+
+pub(crate) struct MutationTxn<'conn> {
     txn: Transaction<'conn>,
     journal: JournalCtx,
-    records: Vec<JournalOp>,
+    records: Vec<JournalDelta>,
 }
 
 impl<'conn> MutationTxn<'conn> {
-    pub(in crate::fs) async fn begin(conn: &'conn Connection, journal: JournalCtx) -> Result<Self> {
+    pub(crate) async fn begin(conn: &'conn Connection, journal: JournalCtx) -> Result<Self> {
         Ok(Self {
             txn: Transaction::new_unchecked(conn, TransactionBehavior::Immediate).await?,
             journal,
@@ -188,24 +336,83 @@ impl<'conn> MutationTxn<'conn> {
         })
     }
 
-    pub(in crate::fs) fn conn(&self) -> &Connection {
+    pub(crate) fn conn(&self) -> &Connection {
         &self.txn
     }
 
-    /// Whether this transaction will journal recorded ops. Callers gate the
-    /// payload builders that read the database on this, so the kill switch
-    /// removes their cost instead of discarding their result.
-    pub(in crate::fs) fn journaling(&self) -> bool {
+    /// Whether this transaction will journal row deltas. Callers use this to
+    /// skip serialization and inline-content pinning when history is disabled.
+    pub(crate) fn journaling(&self) -> bool {
         self.journal.enabled
     }
 
-    pub(in crate::fs) fn record(&mut self, op: JournalOp) {
+    pub(crate) fn record(&mut self, delta: JournalDelta) {
         if self.journal.enabled {
-            self.records.push(op);
+            self.records.push(delta);
         }
     }
 
-    pub(in crate::fs) async fn commit(self) -> Result<()> {
+    pub(crate) async fn record_inode(&mut self, label: &'static str, row: InodeRow) -> Result<()> {
+        if !self.journal.enabled {
+            return Ok(());
+        }
+        let inline_digest = if let Some(data) = &row.data_inline {
+            let digest = blake3::hash(data).as_bytes().to_vec();
+            self.txn
+                .execute(
+                    "INSERT INTO fs_chunk (digest, data, refcount)
+                     VALUES (?, ?, 0)
+                     ON CONFLICT(digest) DO NOTHING",
+                    (Value::Blob(digest.clone()), Value::Blob(data.clone())),
+                )
+                .await?;
+            Some(digest)
+        } else {
+            None
+        };
+        let mut value = serde_json::to_value(&row)?;
+        let object = value
+            .as_object_mut()
+            .expect("serialized inode journal row must be an object");
+        object.insert(
+            "data_inline_digest".to_string(),
+            inline_digest
+                .as_ref()
+                .map(|digest| JsonValue::String(hex_digest(digest)))
+                .unwrap_or(JsonValue::Null),
+        );
+        self.record(JournalDelta {
+            label,
+            tbl: "fs_inode",
+            verb: "upsert",
+            row: value,
+            digests: inline_digest.into_iter().collect(),
+        });
+        Ok(())
+    }
+
+    pub(crate) async fn record_storage_changes(
+        &mut self,
+        label: &'static str,
+        changes: StorageChanges,
+    ) -> Result<()> {
+        self.record_inode(label, changes.inode).await?;
+        for change in changes.data {
+            match change {
+                DataDelta::Upsert {
+                    ino,
+                    chunk_index,
+                    digest,
+                } => self.record(JournalDelta::data_upsert(label, ino, chunk_index, digest)),
+                DataDelta::Delete { ino, chunk_index } => {
+                    self.record(JournalDelta::data_delete(label, ino, chunk_index))
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn commit(self) -> Result<()> {
         let Self {
             txn,
             journal,
@@ -226,19 +433,22 @@ impl<'conn> MutationTxn<'conn> {
             // seqs of one insert are contiguous and recoverable from
             // last_insert_rowid.
             let mut pins: Vec<(i64, Vec<u8>)> = Vec::new();
+            let mut seen_pins = BTreeSet::new();
             let mut first_batch = true;
             let mut last = 0;
             for batch in records.chunks(JOURNAL_INSERT_ROWS) {
-                let placeholders = vec!["(?, ?, ?, ?)"; batch.len()].join(", ");
+                let placeholders = vec!["(?, ?, ?, ?, ?, ?)"; batch.len()].join(", ");
                 let sql = format!(
-                    "INSERT INTO fs_op_journal (txn_id, op, payload, wallclock_ms)
+                    "INSERT INTO fs_op_journal (txn_id, label, tbl, verb, row, wallclock_ms)
                      VALUES {placeholders}"
                 );
-                let mut params = Vec::with_capacity(batch.len() * 4);
+                let mut params = Vec::with_capacity(batch.len() * 6);
                 for record in batch {
                     params.push(Value::Integer(txn_id));
-                    params.push(Value::Text(record.name.to_string()));
-                    params.push(Value::Text(serde_json::to_string(&record.payload)?));
+                    params.push(Value::Text(record.label.to_string()));
+                    params.push(Value::Text(record.tbl.to_string()));
+                    params.push(Value::Text(record.verb.to_string()));
+                    params.push(Value::Text(serde_json::to_string(&record.row)?));
                     params.push(Value::Integer(wallclock_ms));
                 }
                 let mut stmt = txn.prepare_cached(&sql).await?;
@@ -262,7 +472,9 @@ impl<'conn> MutationTxn<'conn> {
                 for (index, record) in batch.iter().enumerate() {
                     let seq = first + index as i64;
                     for digest in &record.digests {
-                        pins.push((seq, digest.clone()));
+                        if seen_pins.insert(digest.clone()) {
+                            pins.push((seq, digest.clone()));
+                        }
                     }
                 }
             }
@@ -288,7 +500,7 @@ impl<'conn> MutationTxn<'conn> {
         Ok(())
     }
 
-    pub(in crate::fs) async fn rollback(self) -> Result<()> {
+    pub(crate) async fn rollback(self) -> Result<()> {
         self.txn.rollback().await?;
         Ok(())
     }
@@ -327,51 +539,6 @@ fn wallclock_ms() -> Result<i64> {
     let duration = SystemTime::now().duration_since(UNIX_EPOCH)?;
     i64::try_from(duration.as_millis())
         .map_err(|_| Error::Internal("journal wallclock overflow".to_string()))
-}
-
-async fn inode_storage_kind(conn: &Connection, ino: i64) -> Result<i64> {
-    let mut rows = conn
-        .query("SELECT storage_kind FROM fs_inode WHERE ino = ?", (ino,))
-        .await?;
-    rows.next()
-        .await?
-        .ok_or_else(|| Error::Internal(format!("inode {ino} has no storage_kind")))?
-        .get_value(0)
-        .ok()
-        .and_then(|value| value.as_integer().copied())
-        .ok_or_else(|| Error::Internal(format!("inode {ino} has no storage_kind")))
-}
-
-async fn mapping_digests(
-    conn: &Connection,
-    ino: i64,
-    start_chunk: i64,
-    end_chunk: i64,
-) -> Result<Vec<Vec<u8>>> {
-    let mut rows = conn
-        .query(
-            "SELECT digest FROM fs_data
-             WHERE ino = ? AND chunk_index BETWEEN ? AND ?
-             ORDER BY chunk_index",
-            (ino, start_chunk, end_chunk),
-        )
-        .await?;
-    collect_digests(&mut rows).await
-}
-
-async fn collect_digests(rows: &mut turso::Rows) -> Result<Vec<Vec<u8>>> {
-    let mut digests = Vec::new();
-    while let Some(row) = rows.next().await? {
-        match row.get_value(0) {
-            Ok(Value::Blob(digest)) => digests.push(digest),
-            Ok(_) | Err(_) => {
-                return Err(Error::Internal(
-                    "journal encountered a non-blob chunk digest".to_string(),
-                ))
-            }
-        }
-    }
-    Ok(digests)
 }
 
 fn hex_digest(digest: &[u8]) -> String {
@@ -437,22 +604,11 @@ pub async fn journal_gc(conn: &Connection, retention_ops: usize) -> Result<()> {
     txn.execute(
         "DELETE FROM fs_chunk
          WHERE refcount = 0
-           AND digest NOT IN (SELECT digest FROM fs_journal_chunk)",
+           AND digest NOT IN (SELECT digest FROM fs_journal_chunk)
+           AND digest NOT IN (SELECT digest FROM fs_snapshot_chunk)",
         (),
     )
     .await?;
     txn.commit().await?;
     Ok(())
-}
-
-pub(in crate::fs) fn fields(
-    entries: impl IntoIterator<Item = (&'static str, JsonValue)>,
-) -> JsonValue {
-    let mut fields = Map::new();
-    fields.extend(
-        entries
-            .into_iter()
-            .map(|(key, value)| (key.to_string(), value)),
-    );
-    JsonValue::Object(fields)
 }

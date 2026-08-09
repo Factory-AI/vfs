@@ -5,7 +5,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use turso::Connection;
 
-use super::journal::{JournalCtx, JournalOp, MutationTxn};
+use super::journal::{JournalCtx, JournalDelta, MutationTxn};
+
+pub(crate) struct ReapChanges {
+    pub(crate) deltas: Vec<JournalDelta>,
+}
 
 /// Hook invoked in the same SQLite transaction that reaps an inode.
 ///
@@ -71,7 +75,10 @@ impl Lifecycle {
         let result: Result<Vec<i64>> = async {
             let mut reaped = Vec::new();
             for ino in &inos {
-                if self.reap_inode_with_conn(conn, *ino).await? {
+                if let Some(changes) = self.reap_inode_with_conn(conn, *ino).await? {
+                    for delta in changes.deltas {
+                        txn.record(delta);
+                    }
                     reaped.push(*ino);
                 }
             }
@@ -81,9 +88,6 @@ impl Lifecycle {
 
         match result {
             Ok(reaped) => {
-                for ino in &reaped {
-                    txn.record(JournalOp::new("reap", serde_json::json!({ "ino": ino })));
-                }
                 txn.commit().await?;
                 Ok(reaped)
             }
@@ -119,7 +123,10 @@ impl Lifecycle {
         let result: Result<Vec<i64>> = async {
             let mut reaped = Vec::new();
             for ino in &inos {
-                if self.reap_inode_with_conn(&conn, *ino).await? {
+                if let Some(changes) = self.reap_inode_with_conn(&conn, *ino).await? {
+                    for delta in changes.deltas {
+                        txn.record(delta);
+                    }
                     reaped.push(*ino);
                 }
             }
@@ -129,9 +136,6 @@ impl Lifecycle {
 
         match result {
             Ok(reaped) => {
-                for ino in &reaped {
-                    txn.record(JournalOp::new("reap", serde_json::json!({ "ino": ino })));
-                }
                 txn.commit().await?;
                 Ok(reaped)
             }
@@ -146,21 +150,75 @@ impl Lifecycle {
     /// Delete an already-unlinked inode and its core storage rows using the
     /// caller's transaction. The nlink=0 guard makes stale queue entries a
     /// no-op.
-    pub(crate) async fn reap_inode_with_conn(&self, conn: &Connection, ino: i64) -> Result<bool> {
+    pub(crate) async fn reap_inode_with_conn(
+        &self,
+        conn: &Connection,
+        ino: i64,
+    ) -> Result<Option<ReapChanges>> {
         let changed = conn
             .execute("DELETE FROM fs_inode WHERE ino = ? AND nlink = 0", (ino,))
             .await?;
         if changed == 0 {
-            return Ok(false);
+            return Ok(None);
         }
 
+        let mut deltas = vec![JournalDelta::inode_delete("reap", ino)];
+        if conn
+            .execute("DELETE FROM fs_origin WHERE delta_ino = ?", (ino,))
+            .await?
+            > 0
+        {
+            deltas.push(JournalDelta::origin_delete("reap", ino));
+        }
+        let mut override_rows = conn
+            .query(
+                "SELECT chunk_index
+                 FROM fs_chunk_override
+                 WHERE delta_ino = ?
+                 ORDER BY chunk_index",
+                (ino,),
+            )
+            .await?;
+        let mut override_indexes = Vec::new();
+        while let Some(row) = override_rows.next().await? {
+            override_indexes.push(row.get::<i64>(0)?);
+        }
+        drop(override_rows);
+        conn.execute("DELETE FROM fs_chunk_override WHERE delta_ino = ?", (ino,))
+            .await?;
+        for chunk_index in override_indexes {
+            deltas.push(JournalDelta::chunk_override_delete(
+                "reap",
+                ino,
+                chunk_index,
+            ));
+        }
+        if conn
+            .execute("DELETE FROM fs_partial_origin WHERE delta_ino = ?", (ino,))
+            .await?
+            > 0
+        {
+            deltas.push(JournalDelta::partial_origin_delete("reap", ino));
+        }
         for hook in self.hooks_snapshot() {
             hook.on_reap(conn, ino).await?;
         }
-        super::store::delete_all_chunk_mappings(conn, ino).await?;
-        conn.execute("DELETE FROM fs_symlink WHERE ino = ?", (ino,))
-            .await?;
-        Ok(true)
+        for delta in super::store::delete_all_chunk_mappings(conn, ino).await? {
+            match delta {
+                super::store::DataDelta::Upsert { .. } => unreachable!(),
+                super::store::DataDelta::Delete { ino, chunk_index } => {
+                    deltas.push(JournalDelta::data_delete("reap", ino, chunk_index));
+                }
+            }
+        }
+        if conn
+            .execute("DELETE FROM fs_symlink WHERE ino = ?", (ino,))
+            .await?
+            > 0
+        {
+            deltas.push(JournalDelta::symlink_delete("reap", ino));
+        }
+        Ok(Some(ReapChanges { deltas }))
     }
 
     fn hooks_snapshot(&self) -> Vec<Arc<dyn ReapHook>> {

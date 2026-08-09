@@ -66,8 +66,8 @@ impl File for VfsFile {
         let conn = self.pool.get_connection().await?;
         let metadata = store::file_storage(&conn, self.ino).await?;
         let effective_size = match pending_max_end {
-            Some(end) => metadata.size.max(end),
-            None => metadata.size,
+            Some(end) => metadata.size().max(end),
+            None => metadata.size(),
         };
 
         if offset >= effective_size {
@@ -75,8 +75,8 @@ impl File for VfsFile {
         }
         let read_size = size.min(effective_size - offset);
 
-        let base_window = if offset < metadata.size {
-            (metadata.size - offset).min(read_size)
+        let base_window = if offset < metadata.size() {
+            (metadata.size() - offset).min(read_size)
         } else {
             0
         };
@@ -136,17 +136,11 @@ impl File for VfsFile {
         let conn = self.pool.get_connection().await?;
         let mut txn = MutationTxn::begin(&conn, self.journal.clone()).await?;
         let ranges = [WriteRangeRef { offset, data }];
-        let normalized = store::normalize_write_ranges(&ranges)?;
         let result =
             store::write_ranges(txn.conn(), self.ino, self.geometry(), &ranges, false, None).await;
         match result {
-            Ok(()) => {
-                if txn.journaling() {
-                    txn.record(
-                        JournalOp::write(txn.conn(), self.ino, self.chunk_size, &normalized)
-                            .await?,
-                    );
-                }
+            Ok(changes) => {
+                txn.record_storage_changes("write", changes).await?;
                 txn.commit().await?;
                 self.attr_cache.remove(self.ino);
                 Ok(())
@@ -181,7 +175,6 @@ impl File for VfsFile {
                 data: range.data.as_slice(),
             })
             .collect();
-        let normalized = store::normalize_write_ranges(&range_refs)?;
         let result = store::write_ranges(
             txn.conn(),
             self.ino,
@@ -192,13 +185,8 @@ impl File for VfsFile {
         )
         .await;
         match result {
-            Ok(()) => {
-                if txn.journaling() {
-                    txn.record(
-                        JournalOp::write(txn.conn(), self.ino, self.chunk_size, &normalized)
-                            .await?,
-                    );
-                }
+            Ok(changes) => {
+                txn.record_storage_changes("write", changes).await?;
                 txn.commit().await?;
                 self.attr_cache.remove(self.ino);
                 Ok(())
@@ -240,13 +228,8 @@ impl File for VfsFile {
         let mut txn = MutationTxn::begin(&conn, self.journal.clone()).await?;
         let result = store::truncate(txn.conn(), self.ino, self.geometry(), new_size).await;
         match result {
-            Ok(()) => {
-                if txn.journaling() {
-                    txn.record(
-                        JournalOp::truncate(txn.conn(), self.ino, self.chunk_size, new_size)
-                            .await?,
-                    );
-                }
+            Ok(changes) => {
+                txn.record_storage_changes("truncate", changes).await?;
                 txn.commit().await?;
                 self.attr_cache.remove(self.ino);
                 Ok(())

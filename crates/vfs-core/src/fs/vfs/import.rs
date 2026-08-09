@@ -12,8 +12,13 @@ use crate::error::Error;
 
 use super::*;
 
-/// `(ino, size, chunk digests)` captured at write time; `None` = inline.
-type JournalImport = (i64, u64, Option<Vec<Vec<u8>>>);
+struct JournalImport {
+    inode: InodeRow,
+    parent_ino: i64,
+    name: String,
+    symlink_target: Option<String>,
+    data: Vec<(i64, Vec<u8>)>,
+}
 
 /// One node accepted by [`ImportSession::import_chunk`]. `path` is relative to
 /// the import root and '/'-separated; parents must precede their children.
@@ -147,7 +152,11 @@ impl Vfs {
             .await?;
         let mut parent_stmt = conn
             .prepare_cached(
-                "UPDATE fs_inode SET nlink = nlink + ?, ctime = ?, mtime = ?, ctime_nsec = ?, mtime_nsec = ? WHERE ino = ?",
+                "UPDATE fs_inode
+                 SET nlink = nlink + ?, ctime = ?, mtime = ?, ctime_nsec = ?, mtime_nsec = ?
+                 WHERE ino = ?
+                 RETURNING ino, mode, nlink, uid, gid, size, atime, mtime, ctime, rdev,
+                           atime_nsec, mtime_nsec, ctime_nsec, data_inline, storage_kind",
             )
             .await?;
 
@@ -240,18 +249,18 @@ impl Vfs {
                     Err(error) => return Err(error.into()),
                 }
 
-                let journal_digests = match kind {
+                let (journal_digests, symlink_target) = match kind {
                     S_IFDIR => {
                         dir_inos.insert(entry.path.clone(), ino);
                         *parent_bumps.entry(parent_ino).or_insert(0) += 1;
-                        Some(Vec::new())
+                        (Some(Vec::new()), None)
                     }
                     S_IFLNK => {
                         let target = std::str::from_utf8(&entry.data)
                             .map_err(|_| Error::Fs(FsError::InvalidPath))?;
                         symlink_stmt.execute((ino, target)).await?;
                         parent_bumps.entry(parent_ino).or_insert(0);
-                        Some(Vec::new())
+                        (Some(Vec::new()), Some(target.to_string()))
                     }
                     _ => {
                         let digests = if storage_kind == STORAGE_CHUNKED {
@@ -275,30 +284,45 @@ impl Vfs {
                             None
                         };
                         parent_bumps.entry(parent_ino).or_insert(0);
-                        digests
+                        (digests, None)
                     }
                 };
-                journal_imports.push((ino, size, journal_digests));
 
-                staged.push((
-                    parent_ino,
-                    name.to_string(),
-                    Stats {
-                        ino,
-                        mode: entry.mode,
-                        nlink: nlink as u32,
-                        uid: opts.uid,
-                        gid: opts.gid,
-                        size: size as i64,
-                        atime: ts_secs,
-                        mtime: ts_secs,
-                        ctime: ts_secs,
-                        atime_nsec: ts_nsec as u32,
-                        mtime_nsec: ts_nsec as u32,
-                        ctime_nsec: ts_nsec as u32,
-                        rdev: 0,
-                    },
-                ));
+                let stats = Stats {
+                    ino,
+                    mode: entry.mode,
+                    nlink: nlink as u32,
+                    uid: opts.uid,
+                    gid: opts.gid,
+                    size: size as i64,
+                    atime: ts_secs,
+                    mtime: ts_secs,
+                    ctime: ts_secs,
+                    atime_nsec: ts_nsec as u32,
+                    mtime_nsec: ts_nsec as u32,
+                    ctime_nsec: ts_nsec as u32,
+                    rdev: 0,
+                };
+                if txn.journaling() {
+                    journal_imports.push(JournalImport {
+                        inode: InodeRow::from_stats(
+                            &stats,
+                            (storage_kind == STORAGE_INLINE).then(|| entry.data.clone()),
+                            storage_kind,
+                        ),
+                        parent_ino,
+                        name: name.to_string(),
+                        symlink_target,
+                        data: journal_digests
+                            .unwrap_or_default()
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, digest)| (index as i64, digest))
+                            .collect(),
+                    });
+                }
+
+                staged.push((parent_ino, name.to_string(), stats));
                 results.push(ImportedEntry {
                     path: entry.path.clone(),
                     ino,
@@ -307,14 +331,39 @@ impl Vfs {
                 });
             }
 
+            let mut parent_rows = Vec::with_capacity(parent_bumps.len());
             for (parent_ino, bump) in &parent_bumps {
-                parent_stmt
-                    .execute((*bump, ts_secs, ts_secs, ts_nsec, ts_nsec, *parent_ino))
+                let row = parent_stmt
+                    .query_row((*bump, ts_secs, ts_secs, ts_nsec, ts_nsec, *parent_ino))
                     .await?;
+                if txn.journaling() {
+                    parent_rows.push(InodeRow::from_row(&row, 0)?);
+                }
             }
 
-            for (ino, size, digests) in journal_imports {
-                txn.record(JournalOp::import(ino, size, digests));
+            for import in journal_imports {
+                let ino = import.inode.ino;
+                txn.record_inode("import", import.inode).await?;
+                txn.record(JournalDelta::dentry_upsert(
+                    "import",
+                    import.parent_ino,
+                    &import.name,
+                    ino,
+                ));
+                if let Some(target) = import.symlink_target {
+                    txn.record(JournalDelta::symlink_upsert("import", ino, &target));
+                }
+                for (chunk_index, digest) in import.data {
+                    txn.record(JournalDelta::data_upsert(
+                        "import",
+                        ino,
+                        chunk_index,
+                        digest,
+                    ));
+                }
+            }
+            for parent in parent_rows {
+                txn.record_inode("import", parent).await?;
             }
             txn.commit().await?;
             #[cfg(test)]

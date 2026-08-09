@@ -1383,7 +1383,7 @@
     }
 
     #[tokio::test]
-    async fn overlay_reap_hook_cleans_sidecars() -> Result<()> {
+    async fn core_reap_cleans_overlay_sidecars() -> Result<()> {
         let base_dir = tempdir()?;
         let delta_dir = tempdir()?;
         let db_path = delta_dir.path().join("delta.db");
@@ -1475,25 +1475,19 @@
     }
 
     #[tokio::test]
-    async fn overlay_sidecar_reap_hook_registers_once() -> Result<()> {
+    async fn overlay_sidecar_reaping_is_core_owned() -> Result<()> {
         let base_dir = tempdir()?;
         let delta_dir = tempdir()?;
         let db_path = delta_dir.path().join("delta.db");
         let delta = Vfs::new(db_path.to_str().unwrap()).await?;
         assert_eq!(delta.reap_hook_count(), 0);
 
-        assert!(
-            delta.register_reap_hook(OverlayFS::sidecar_reap_hook()),
-            "first constructor-time sidecar hook registration should be accepted"
-        );
-        assert_eq!(delta.reap_hook_count(), 1);
-
         let base = Arc::new(HostFS::new(base_dir.path())?);
         let overlay = OverlayFS::new(base, delta);
         assert_eq!(
             overlay.delta().reap_hook_count(),
-            1,
-            "OverlayFS construction must not duplicate a pre-registered sidecar hook"
+            0,
+            "overlay sidecar reaping is part of the canonical core reap path"
         );
 
         Ok(())
@@ -3310,7 +3304,7 @@
         assert_eq!(
             scalar_i64(
                 &overlay,
-                "SELECT COUNT(*) FROM fs_op_journal WHERE op = 'whiteout'"
+                "SELECT COUNT(*) FROM fs_op_journal WHERE label = 'whiteout'"
             )
             .await?,
             0,
@@ -3470,7 +3464,7 @@
         let conn = overlay.delta().get_connection().await?;
         let mut rows = conn
             .query(
-                "SELECT txn_id, op FROM fs_op_journal WHERE seq > ? ORDER BY seq",
+                "SELECT txn_id, label FROM fs_op_journal WHERE seq > ? ORDER BY seq",
                 (baseline,),
             )
             .await?;
@@ -3480,10 +3474,10 @@
         }
         let copy_up_txns = copy_up
             .iter()
-            .filter(|(_, op)| {
+            .filter(|(_, label)| {
                 matches!(
-                    op.as_str(),
-                    "create_file" | "materialize_meta" | "origin_map" | "partial_origin"
+                    label.as_str(),
+                    "copyup" | "origin_map" | "partial_origin"
                 )
             })
             .map(|(txn_id, _)| *txn_id)
@@ -3495,7 +3489,7 @@
         file.pwrite(chunk_size as u64 + 3, b"journal").await?;
         let mut rows = conn
             .query(
-                "SELECT txn_id, op FROM fs_op_journal WHERE seq > ? ORDER BY seq",
+                "SELECT txn_id, label FROM fs_op_journal WHERE seq > ? ORDER BY seq",
                 (write_baseline,),
             )
             .await?;
@@ -3519,7 +3513,7 @@
         overlay.unlink(ROOT_INO, "hidden.txt").await?;
         let mut rows = conn
             .query(
-                "SELECT op FROM fs_op_journal WHERE seq > ? ORDER BY seq",
+                "SELECT label FROM fs_op_journal WHERE seq > ? ORDER BY seq",
                 (whiteout_baseline,),
             )
             .await?;

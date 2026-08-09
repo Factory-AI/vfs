@@ -201,12 +201,15 @@ impl OverlayFS {
             super::super::vfs::MutationTxn::begin(&conn, self.delta.journal_ctx()).await?;
         let mut restored = Vec::with_capacity(metadata.len());
         for (ino, stats) in metadata {
-            txn.conn()
-                .execute(
+            let mut rows = txn
+                .conn()
+                .query(
                     "UPDATE fs_inode
                  SET mode = ?, uid = ?, gid = ?, atime = ?, mtime = ?, ctime = ?,
                      atime_nsec = ?, mtime_nsec = ?, ctime_nsec = ?, rdev = ?
-                 WHERE ino = ?",
+                 WHERE ino = ?
+                 RETURNING ino, mode, nlink, uid, gid, size, atime, mtime, ctime, rdev,
+                           atime_nsec, mtime_nsec, ctime_nsec, data_inline, storage_kind",
                     (
                         stats.mode as i64,
                         stats.uid as i64,
@@ -222,10 +225,10 @@ impl OverlayFS {
                     ),
                 )
                 .await?;
-            txn.record(super::super::vfs::JournalOp::new(
-                "materialize_meta",
-                serde_json::json!({ "ino": ino }),
-            ));
+            let row = rows.next().await?.ok_or(FsError::NotFound)?;
+            let inode = super::super::vfs::InodeRow::from_row(&row, 0)?;
+            drop(rows);
+            txn.record_inode("materialize_meta", inode).await?;
             restored.push(ino);
         }
         txn.commit().await?;

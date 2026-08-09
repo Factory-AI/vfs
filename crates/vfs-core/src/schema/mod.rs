@@ -7,11 +7,12 @@ pub mod integrity;
 
 use crate::config::{DEFAULT_CHUNK_SIZE, DEFAULT_INLINE_THRESHOLD};
 use crate::error::{Error, Result};
+use std::time::{SystemTime, UNIX_EPOCH};
 use turso::transaction::{Transaction, TransactionBehavior};
 use turso::{Connection, Value};
 
 /// Current schema version.
-pub const CURRENT: SchemaVersion = SchemaVersion::V0_7;
+pub const CURRENT: SchemaVersion = SchemaVersion::V0_8;
 
 /// Oldest schema version with a migration path to [`CURRENT`]; the artifact
 /// version floor for `vfs adopt` and `vfs migrate`.
@@ -22,6 +23,9 @@ pub const VFS_SCHEMA_VERSION: &str = CURRENT.as_str();
 pub const CONFIG_SCHEMA_VERSION_KEY: &str = "schema_version";
 pub const CONFIG_CHUNK_SIZE_KEY: &str = "chunk_size";
 pub const CONFIG_INLINE_THRESHOLD_KEY: &str = "inline_threshold";
+pub const CONFIG_HISTORY_EPOCH_KEY: &str = "history_epoch";
+pub const CONFIG_HISTORY_VALID_KEY: &str = "history_valid";
+pub const CONFIG_HISTORY_FLOOR_SEQ_KEY: &str = "history_floor_seq";
 
 /// Detected schema version based on PRAGMA user_version, with fs_config and
 /// column-sniffing compatibility for pre-user_version databases.
@@ -39,6 +43,8 @@ pub enum SchemaVersion {
     V0_6,
     /// Added content-addressed chunk storage and operation-journal schema
     V0_7,
+    /// Added replayable row-delta history and relational root snapshots
+    V0_8,
 }
 
 impl std::fmt::Display for SchemaVersion {
@@ -57,6 +63,7 @@ impl SchemaVersion {
             SchemaVersion::V0_5 => "0.5",
             SchemaVersion::V0_6 => "0.6",
             SchemaVersion::V0_7 => "0.7",
+            SchemaVersion::V0_8 => "0.8",
         }
     }
 
@@ -69,6 +76,7 @@ impl SchemaVersion {
             SchemaVersion::V0_5 => 5,
             SchemaVersion::V0_6 => 6,
             SchemaVersion::V0_7 => 7,
+            SchemaVersion::V0_8 => 8,
         }
     }
 
@@ -86,6 +94,7 @@ impl SchemaVersion {
             "0.5" => Some(SchemaVersion::V0_5),
             "0.6" => Some(SchemaVersion::V0_6),
             "0.7" => Some(SchemaVersion::V0_7),
+            "0.8" => Some(SchemaVersion::V0_8),
             _ => None,
         }
     }
@@ -98,6 +107,7 @@ impl SchemaVersion {
             5 => Some(SchemaVersion::V0_5),
             6 => Some(SchemaVersion::V0_6),
             7 => Some(SchemaVersion::V0_7),
+            8 => Some(SchemaVersion::V0_8),
             _ => None,
         }
     }
@@ -136,6 +146,11 @@ const MIGRATIONS: &[Migration] = &[
         from: SchemaVersion::V0_6,
         to: SchemaVersion::V0_7,
         description: "content-address file chunks",
+    },
+    Migration {
+        from: SchemaVersion::V0_7,
+        to: SchemaVersion::V0_8,
+        description: "replace semantic journal rows with replayable row deltas and snapshots",
     },
 ];
 
@@ -230,19 +245,107 @@ mod ddl {
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         )",
-        "CREATE TABLE IF NOT EXISTS fs_op_journal (
-            seq INTEGER PRIMARY KEY AUTOINCREMENT,
-            txn_id INTEGER NOT NULL,
-            op TEXT NOT NULL,
-            payload TEXT NOT NULL,
-            wallclock_ms INTEGER NOT NULL
-        )",
+        JOURNAL_V2_DDL,
         "CREATE INDEX IF NOT EXISTS idx_fs_op_journal_txn_id ON fs_op_journal(txn_id)",
         "CREATE TABLE IF NOT EXISTS fs_journal_chunk (
             seq INTEGER NOT NULL,
             digest BLOB NOT NULL
         )",
         "CREATE INDEX IF NOT EXISTS idx_fs_journal_chunk_digest ON fs_journal_chunk(digest)",
+        "CREATE TABLE IF NOT EXISTS fs_snapshot (
+            snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            through_seq INTEGER NOT NULL,
+            created_at_ms INTEGER NOT NULL,
+            reason TEXT NOT NULL,
+            history_epoch INTEGER NOT NULL,
+            UNIQUE(history_epoch, through_seq)
+        )",
+        "CREATE TABLE IF NOT EXISTS fs_snapshot_inode (
+            snapshot_id INTEGER NOT NULL,
+            ino INTEGER NOT NULL,
+            mode INTEGER NOT NULL,
+            nlink INTEGER NOT NULL,
+            uid INTEGER NOT NULL,
+            gid INTEGER NOT NULL,
+            size INTEGER NOT NULL,
+            atime INTEGER NOT NULL,
+            mtime INTEGER NOT NULL,
+            ctime INTEGER NOT NULL,
+            rdev INTEGER NOT NULL,
+            atime_nsec INTEGER NOT NULL,
+            mtime_nsec INTEGER NOT NULL,
+            ctime_nsec INTEGER NOT NULL,
+            data_inline_digest BLOB,
+            storage_kind INTEGER NOT NULL,
+            PRIMARY KEY (snapshot_id, ino)
+        )",
+        "CREATE TABLE IF NOT EXISTS fs_snapshot_dentry (
+            snapshot_id INTEGER NOT NULL,
+            id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            parent_ino INTEGER NOT NULL,
+            ino INTEGER NOT NULL,
+            PRIMARY KEY (snapshot_id, id),
+            UNIQUE(snapshot_id, parent_ino, name)
+        )",
+        "CREATE TABLE IF NOT EXISTS fs_snapshot_data (
+            snapshot_id INTEGER NOT NULL,
+            ino INTEGER NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            digest BLOB NOT NULL,
+            PRIMARY KEY (snapshot_id, ino, chunk_index)
+        )",
+        "CREATE TABLE IF NOT EXISTS fs_snapshot_symlink (
+            snapshot_id INTEGER NOT NULL,
+            ino INTEGER NOT NULL,
+            target TEXT NOT NULL,
+            PRIMARY KEY (snapshot_id, ino)
+        )",
+        "CREATE TABLE IF NOT EXISTS fs_snapshot_whiteout (
+            snapshot_id INTEGER NOT NULL,
+            path TEXT NOT NULL,
+            parent_path TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (snapshot_id, path)
+        )",
+        "CREATE TABLE IF NOT EXISTS fs_snapshot_origin (
+            snapshot_id INTEGER NOT NULL,
+            delta_ino INTEGER NOT NULL,
+            base_ino INTEGER NOT NULL,
+            PRIMARY KEY (snapshot_id, delta_ino)
+        )",
+        "CREATE TABLE IF NOT EXISTS fs_snapshot_partial_origin (
+            snapshot_id INTEGER NOT NULL,
+            delta_ino INTEGER NOT NULL,
+            base_ino INTEGER NOT NULL,
+            base_path TEXT NOT NULL,
+            base_size INTEGER NOT NULL,
+            base_fingerprint_size INTEGER NOT NULL,
+            base_mtime INTEGER NOT NULL,
+            base_mtime_nsec INTEGER NOT NULL,
+            base_ctime INTEGER NOT NULL,
+            base_ctime_nsec INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (snapshot_id, delta_ino)
+        )",
+        "CREATE TABLE IF NOT EXISTS fs_snapshot_chunk_override (
+            snapshot_id INTEGER NOT NULL,
+            delta_ino INTEGER NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            PRIMARY KEY (snapshot_id, delta_ino, chunk_index)
+        )",
+        "CREATE TABLE IF NOT EXISTS fs_snapshot_chunk (
+            snapshot_id INTEGER NOT NULL,
+            digest BLOB NOT NULL,
+            PRIMARY KEY (snapshot_id, digest)
+        )",
+        "CREATE INDEX IF NOT EXISTS idx_fs_snapshot_chunk_digest ON fs_snapshot_chunk(digest)",
+        "CREATE TABLE IF NOT EXISTS fs_snapshot_meta (
+            snapshot_id INTEGER NOT NULL,
+            key TEXT NOT NULL,
+            value TEXT NOT NULL,
+            PRIMARY KEY (snapshot_id, key)
+        )",
         "CREATE TABLE IF NOT EXISTS fs_origin (
             delta_ino INTEGER PRIMARY KEY,
             base_ino INTEGER NOT NULL
@@ -285,6 +388,16 @@ mod ddl {
         "CREATE INDEX IF NOT EXISTS idx_tool_calls_name ON tool_calls(name)",
         "CREATE INDEX IF NOT EXISTS idx_tool_calls_started_at ON tool_calls(started_at)",
     ];
+
+    pub(crate) const JOURNAL_V2_DDL: &str = "CREATE TABLE IF NOT EXISTS fs_op_journal (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        txn_id INTEGER NOT NULL,
+        label TEXT NOT NULL,
+        tbl TEXT NOT NULL,
+        verb TEXT NOT NULL,
+        row TEXT NOT NULL,
+        wallclock_ms INTEGER NOT NULL
+    )";
 }
 
 #[derive(Debug)]
@@ -361,6 +474,34 @@ const CURRENT_COLUMN_SPECS: &[ColumnSpec] = &[
         not_null: true,
         default_value: None,
     },
+    ColumnSpec {
+        table_name: "fs_op_journal",
+        column_name: "label",
+        type_name: "TEXT",
+        not_null: true,
+        default_value: None,
+    },
+    ColumnSpec {
+        table_name: "fs_op_journal",
+        column_name: "tbl",
+        type_name: "TEXT",
+        not_null: true,
+        default_value: None,
+    },
+    ColumnSpec {
+        table_name: "fs_op_journal",
+        column_name: "verb",
+        type_name: "TEXT",
+        not_null: true,
+        default_value: None,
+    },
+    ColumnSpec {
+        table_name: "fs_op_journal",
+        column_name: "row",
+        type_name: "TEXT",
+        not_null: true,
+        default_value: None,
+    },
 ];
 
 const REQUIRED_CURRENT_TABLES: &[&str] = &[
@@ -375,6 +516,17 @@ const REQUIRED_CURRENT_TABLES: &[&str] = &[
     "fs_session_metadata",
     "fs_op_journal",
     "fs_journal_chunk",
+    "fs_snapshot",
+    "fs_snapshot_inode",
+    "fs_snapshot_dentry",
+    "fs_snapshot_data",
+    "fs_snapshot_symlink",
+    "fs_snapshot_whiteout",
+    "fs_snapshot_origin",
+    "fs_snapshot_partial_origin",
+    "fs_snapshot_chunk_override",
+    "fs_snapshot_chunk",
+    "fs_snapshot_meta",
     "fs_origin",
     "fs_partial_origin",
     "fs_chunk_override",
@@ -400,6 +552,10 @@ pub async fn detect_schema_version(conn: &Connection) -> Result<Option<SchemaVer
 
     if !table_exists(conn, "fs_inode").await? {
         return Ok(None);
+    }
+
+    if table_exists(conn, "fs_snapshot").await? {
+        return Ok(Some(SchemaVersion::V0_8));
     }
 
     if table_exists(conn, "fs_chunk").await? {
@@ -494,6 +650,15 @@ pub async fn ensure_current(conn: &Connection) -> Result<()> {
             apply_pending_migrations(conn, version).await?;
         }
         ensure_config_defaults(conn).await?;
+        if detected.is_none() {
+            capture_root_raw(conn, "init", 1, 0)
+                .await
+                .map_err(|error| {
+                    Error::Internal(format!(
+                        "failed to capture initial fs_inode history root: {error}"
+                    ))
+                })?;
+        }
         set_user_version(conn, CURRENT).await?;
         Ok(())
     }
@@ -648,11 +813,26 @@ async fn apply_migration(conn: &Connection, migration: &Migration) -> Result<()>
         (SchemaVersion::V0_6, SchemaVersion::V0_7) => {
             migrate_chunks_to_content_addressed_storage(conn).await
         }
+        (SchemaVersion::V0_7, SchemaVersion::V0_8) => migrate_history_to_row_deltas(conn).await,
         _ => Err(Error::Internal(format!(
             "unsupported schema migration {} -> {}",
             migration.from, migration.to
         ))),
     }
+}
+
+async fn migrate_history_to_row_deltas(conn: &Connection) -> Result<()> {
+    conn.execute("DELETE FROM fs_journal_chunk", ()).await?;
+    conn.execute("DROP TABLE fs_op_journal", ()).await?;
+    conn.execute(ddl::JOURNAL_V2_DDL, ()).await?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_fs_op_journal_txn_id ON fs_op_journal(txn_id)",
+        (),
+    )
+    .await?;
+    initialize_history_markers(conn).await?;
+    capture_root_raw(conn, "migrate", 1, 0).await?;
+    Ok(())
 }
 
 async fn execute_current_ddl(conn: &Connection) -> Result<()> {
@@ -864,7 +1044,192 @@ async fn ensure_config_defaults(conn: &Connection) -> Result<()> {
         ),
     )
     .await?;
+    initialize_history_markers(conn).await?;
     Ok(())
+}
+
+async fn initialize_history_markers(conn: &Connection) -> Result<()> {
+    for (key, value) in [
+        (CONFIG_HISTORY_EPOCH_KEY, "1"),
+        (CONFIG_HISTORY_VALID_KEY, "1"),
+        (CONFIG_HISTORY_FLOOR_SEQ_KEY, "0"),
+    ] {
+        conn.execute(
+            "INSERT OR IGNORE INTO fs_config (key, value) VALUES (?, ?)",
+            (key, value),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Capture the live filesystem and overlay root inside the caller's
+/// transaction. This helper neither drains pending writes nor acquires a
+/// session lock; callers own the consistency boundary.
+pub async fn capture_root_raw(
+    conn: &Connection,
+    reason: &str,
+    epoch: i64,
+    through_seq: i64,
+) -> Result<i64> {
+    let created_at_ms = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())
+        .map_err(|_| Error::Internal("snapshot timestamp overflow".to_string()))?;
+    conn.execute(
+        "INSERT INTO fs_snapshot
+         (through_seq, created_at_ms, reason, history_epoch)
+         VALUES (?, ?, ?, ?)",
+        (through_seq, created_at_ms, reason, epoch),
+    )
+    .await?;
+    let snapshot_id = conn.last_insert_rowid();
+
+    conn.execute(
+        "INSERT INTO fs_snapshot_inode (
+            snapshot_id, ino, mode, nlink, uid, gid, size, atime, mtime, ctime,
+            rdev, atime_nsec, mtime_nsec, ctime_nsec, data_inline_digest, storage_kind
+         )
+         SELECT ?, ino, mode, nlink, uid, gid, size, atime, mtime, ctime,
+                rdev, atime_nsec, mtime_nsec, ctime_nsec, NULL, storage_kind
+         FROM fs_inode",
+        (snapshot_id,),
+    )
+    .await?;
+    conn.execute(
+        "INSERT INTO fs_snapshot_dentry
+         (snapshot_id, id, name, parent_ino, ino)
+         SELECT ?, id, name, parent_ino, ino FROM fs_dentry",
+        (snapshot_id,),
+    )
+    .await?;
+    conn.execute(
+        "INSERT INTO fs_snapshot_data
+         (snapshot_id, ino, chunk_index, digest)
+         SELECT ?, ino, chunk_index, digest FROM fs_data",
+        (snapshot_id,),
+    )
+    .await?;
+    conn.execute(
+        "INSERT INTO fs_snapshot_symlink (snapshot_id, ino, target)
+         SELECT ?, ino, target FROM fs_symlink",
+        (snapshot_id,),
+    )
+    .await?;
+    conn.execute(
+        "INSERT INTO fs_snapshot_whiteout
+         (snapshot_id, path, parent_path, created_at)
+         SELECT ?, path, parent_path, created_at FROM fs_whiteout",
+        (snapshot_id,),
+    )
+    .await?;
+    conn.execute(
+        "INSERT INTO fs_snapshot_origin (snapshot_id, delta_ino, base_ino)
+         SELECT ?, delta_ino, base_ino FROM fs_origin",
+        (snapshot_id,),
+    )
+    .await?;
+    conn.execute(
+        "INSERT INTO fs_snapshot_partial_origin (
+            snapshot_id, delta_ino, base_ino, base_path, base_size,
+            base_fingerprint_size, base_mtime, base_mtime_nsec,
+            base_ctime, base_ctime_nsec, created_at
+         )
+         SELECT ?, delta_ino, base_ino, base_path, base_size,
+                base_fingerprint_size, base_mtime, base_mtime_nsec,
+                base_ctime, base_ctime_nsec, created_at
+         FROM fs_partial_origin",
+        (snapshot_id,),
+    )
+    .await?;
+    conn.execute(
+        "INSERT INTO fs_snapshot_chunk_override
+         (snapshot_id, delta_ino, chunk_index)
+         SELECT ?, delta_ino, chunk_index FROM fs_chunk_override",
+        (snapshot_id,),
+    )
+    .await?;
+    conn.execute(
+        "INSERT INTO fs_snapshot_chunk (snapshot_id, digest)
+         SELECT ?, digest FROM fs_data GROUP BY digest",
+        (snapshot_id,),
+    )
+    .await?;
+
+    let mut rows = conn
+        .query(
+            "SELECT ino, data_inline
+             FROM fs_inode
+             WHERE data_inline IS NOT NULL
+             ORDER BY ino",
+            (),
+        )
+        .await?;
+    let mut inline_rows = Vec::new();
+    while let Some(row) = rows.next().await? {
+        inline_rows.push((row.get::<i64>(0)?, row.get::<Vec<u8>>(1)?));
+    }
+    drop(rows);
+    for (ino, data) in inline_rows {
+        let digest = blake3::hash(&data).as_bytes().to_vec();
+        conn.execute(
+            "INSERT INTO fs_chunk (digest, data, refcount)
+             VALUES (?, ?, 0)
+             ON CONFLICT(digest) DO NOTHING",
+            (Value::Blob(digest.clone()), Value::Blob(data)),
+        )
+        .await?;
+        conn.execute(
+            "UPDATE fs_snapshot_inode
+             SET data_inline_digest = ?
+             WHERE snapshot_id = ? AND ino = ?",
+            (Value::Blob(digest.clone()), snapshot_id, ino),
+        )
+        .await?;
+        conn.execute(
+            "INSERT OR IGNORE INTO fs_snapshot_chunk (snapshot_id, digest)
+             VALUES (?, ?)",
+            (snapshot_id, Value::Blob(digest)),
+        )
+        .await?;
+    }
+
+    for (meta_key, table, source_key) in [
+        ("seed_pin", "fs_session_metadata", "seed_pin"),
+        ("seeded_paths", "fs_session_metadata", "seeded_paths"),
+        ("parent_artifact", "fs_overlay_config", "parent_artifact"),
+    ] {
+        let sql = format!(
+            "INSERT INTO fs_snapshot_meta (snapshot_id, key, value)
+             SELECT ?, ?, value FROM {table} WHERE key = ?"
+        );
+        conn.execute(&sql, (snapshot_id, meta_key, source_key))
+            .await?;
+    }
+
+    Ok(snapshot_id)
+}
+
+/// Replace any initial empty root with the migrated target's populated root.
+///
+/// Copy migration creates a current-schema target before copying source rows;
+/// call this inside that same target transaction once the copy is complete.
+pub async fn reset_history_for_migration(conn: &Connection) -> Result<i64> {
+    conn.execute("DELETE FROM fs_snapshot_meta", ()).await?;
+    conn.execute("DELETE FROM fs_snapshot_chunk", ()).await?;
+    conn.execute("DELETE FROM fs_snapshot_chunk_override", ())
+        .await?;
+    conn.execute("DELETE FROM fs_snapshot_partial_origin", ())
+        .await?;
+    conn.execute("DELETE FROM fs_snapshot_origin", ()).await?;
+    conn.execute("DELETE FROM fs_snapshot_whiteout", ()).await?;
+    conn.execute("DELETE FROM fs_snapshot_symlink", ()).await?;
+    conn.execute("DELETE FROM fs_snapshot_data", ()).await?;
+    conn.execute("DELETE FROM fs_snapshot_dentry", ()).await?;
+    conn.execute("DELETE FROM fs_snapshot_inode", ()).await?;
+    conn.execute("DELETE FROM fs_snapshot", ()).await?;
+    conn.execute("DELETE FROM fs_journal_chunk", ()).await?;
+    conn.execute("DELETE FROM fs_op_journal", ()).await?;
+    initialize_history_markers(conn).await?;
+    capture_root_raw(conn, "migrate", 1, 0).await
 }
 
 async fn read_config_value(conn: &Connection, key: &str) -> Result<Option<String>> {
@@ -1049,6 +1414,7 @@ mod tests {
             SchemaVersion::V0_4,
             SchemaVersion::V0_5,
             SchemaVersion::V0_6,
+            SchemaVersion::V0_7,
         ] {
             let dir = tempdir()?;
             let db_path = dir.path().join(format!("fixture-{}.db", version.as_str()));
@@ -1080,6 +1446,21 @@ mod tests {
                 scalar_i64(&conn, "SELECT MAX(refcount) FROM fs_chunk").await?,
                 2,
                 "duplicate fixture chunks should share one CAS row"
+            );
+            assert_eq!(
+                scalar_i64(
+                    &conn,
+                    "SELECT COUNT(*) FROM fs_snapshot
+                     WHERE reason = 'migrate' AND history_epoch = 1 AND through_seq = 0",
+                )
+                .await?,
+                1,
+                "migration must establish one replay root"
+            );
+            assert_eq!(
+                scalar_i64(&conn, "SELECT COUNT(*) FROM fs_op_journal").await?,
+                0,
+                "pre-v0.8 journal history must not survive migration"
             );
 
             drop(conn);
@@ -1132,6 +1513,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn capture_root_normalizes_and_pins_inline_bytes() -> Result<()> {
+        let dir = tempdir()?;
+        let db_path = dir.path().join("capture-root-inline.db");
+        let db = Builder::new_local(db_path.to_str().unwrap())
+            .build()
+            .await?;
+        let conn = db.connect()?;
+        ensure_current(&conn).await?;
+
+        let inline = b"snapshot-inline".to_vec();
+        let digest = blake3::hash(&inline).as_bytes().to_vec();
+        conn.execute(
+            "INSERT INTO fs_inode (
+                ino, mode, nlink, uid, gid, size, atime, mtime, ctime, rdev,
+                atime_nsec, mtime_nsec, ctime_nsec, data_inline, storage_kind
+             ) VALUES (2, ?, 1, 1, 2, ?, 1, 1, 1, 0, 0, 0, 0, ?, 1)",
+            (
+                S_IFREG | DEFAULT_FILE_MODE as i64,
+                inline.len() as i64,
+                Value::Blob(inline.clone()),
+            ),
+        )
+        .await?;
+        conn.execute(
+            "INSERT INTO fs_dentry (name, parent_ino, ino) VALUES ('inline.txt', 1, 2)",
+            (),
+        )
+        .await?;
+
+        let snapshot_id = capture_root_raw(&conn, "test", 1, 1).await?;
+        let mut rows = conn
+            .query(
+                "SELECT data_inline_digest
+                 FROM fs_snapshot_inode
+                 WHERE snapshot_id = ? AND ino = 2",
+                (snapshot_id,),
+            )
+            .await?;
+        let row = rows.next().await?.expect("snapshot inode must exist");
+        assert_eq!(row.get::<Vec<u8>>(0)?, digest);
+        drop(rows);
+
+        let mut rows = conn
+            .query(
+                "SELECT c.data, c.refcount
+                 FROM fs_snapshot_chunk sc
+                 JOIN fs_chunk c ON c.digest = sc.digest
+                 WHERE sc.snapshot_id = ? AND sc.digest = ?",
+                (snapshot_id, Value::Blob(digest)),
+            )
+            .await?;
+        let row = rows
+            .next()
+            .await?
+            .expect("inline snapshot digest must be pinned");
+        assert_eq!(row.get::<Vec<u8>>(0)?, inline);
+        assert_eq!(row.get::<i64>(1)?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn open_paths_reject_old_schema_without_upgrading() -> Result<()> {
         for version in [
             SchemaVersion::V0_0,
@@ -1139,6 +1581,7 @@ mod tests {
             SchemaVersion::V0_4,
             SchemaVersion::V0_5,
             SchemaVersion::V0_6,
+            SchemaVersion::V0_7,
         ] {
             let dir = tempdir()?;
             let db_path = dir.path().join(format!("old-{}.db", version.as_str()));
@@ -1430,16 +1873,57 @@ mod tests {
             (),
         )
         .await?;
-        conn.execute(
-            "CREATE TABLE fs_data (
-                ino INTEGER NOT NULL,
-                chunk_index INTEGER NOT NULL,
-                data BLOB NOT NULL,
-                PRIMARY KEY (ino, chunk_index)
-            )",
-            (),
-        )
-        .await?;
+        if version >= SchemaVersion::V0_7 {
+            conn.execute(
+                "CREATE TABLE fs_data (
+                    ino INTEGER NOT NULL,
+                    chunk_index INTEGER NOT NULL,
+                    digest BLOB NOT NULL,
+                    PRIMARY KEY (ino, chunk_index)
+                )",
+                (),
+            )
+            .await?;
+            conn.execute(
+                "CREATE TABLE fs_chunk (
+                    digest BLOB PRIMARY KEY,
+                    data BLOB NOT NULL,
+                    refcount INTEGER NOT NULL DEFAULT 0
+                )",
+                (),
+            )
+            .await?;
+            conn.execute(
+                "CREATE TABLE fs_op_journal (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    txn_id INTEGER NOT NULL,
+                    op TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    wallclock_ms INTEGER NOT NULL
+                )",
+                (),
+            )
+            .await?;
+            conn.execute(
+                "CREATE TABLE fs_journal_chunk (
+                    seq INTEGER NOT NULL,
+                    digest BLOB NOT NULL
+                )",
+                (),
+            )
+            .await?;
+        } else {
+            conn.execute(
+                "CREATE TABLE fs_data (
+                    ino INTEGER NOT NULL,
+                    chunk_index INTEGER NOT NULL,
+                    data BLOB NOT NULL,
+                    PRIMARY KEY (ino, chunk_index)
+                )",
+                (),
+            )
+            .await?;
+        }
         conn.execute(
             "CREATE TABLE fs_symlink (ino INTEGER PRIMARY KEY, target TEXT NOT NULL)",
             (),
@@ -1491,18 +1975,58 @@ mod tests {
             (),
         )
         .await?;
-        conn.execute(
-            "INSERT INTO fs_data (ino, chunk_index, data) VALUES
-             (2, 0, ?),
-             (2, 1, ?),
-             (3, 0, ?)",
-            (
-                Value::Blob(b"abcd".to_vec()),
-                Value::Blob(b"ef".to_vec()),
-                Value::Blob(b"abcd".to_vec()),
-            ),
-        )
-        .await?;
+        if version >= SchemaVersion::V0_7 {
+            let abcd = blake3::hash(b"abcd").as_bytes().to_vec();
+            let ef = blake3::hash(b"ef").as_bytes().to_vec();
+            conn.execute(
+                "INSERT INTO fs_chunk (digest, data, refcount) VALUES
+                 (?, ?, 2),
+                 (?, ?, 1)",
+                (
+                    Value::Blob(abcd.clone()),
+                    Value::Blob(b"abcd".to_vec()),
+                    Value::Blob(ef.clone()),
+                    Value::Blob(b"ef".to_vec()),
+                ),
+            )
+            .await?;
+            conn.execute(
+                "INSERT INTO fs_data (ino, chunk_index, digest) VALUES
+                 (2, 0, ?),
+                 (2, 1, ?),
+                 (3, 0, ?)",
+                (
+                    Value::Blob(abcd.clone()),
+                    Value::Blob(ef),
+                    Value::Blob(abcd.clone()),
+                ),
+            )
+            .await?;
+            conn.execute(
+                "INSERT INTO fs_op_journal (txn_id, op, payload, wallclock_ms)
+                 VALUES (1, 'write', '{\"ino\":2,\"ranges\":[]}', 1)",
+                (),
+            )
+            .await?;
+            conn.execute(
+                "INSERT INTO fs_journal_chunk (seq, digest) VALUES (1, ?)",
+                (Value::Blob(abcd),),
+            )
+            .await?;
+        } else {
+            conn.execute(
+                "INSERT INTO fs_data (ino, chunk_index, data) VALUES
+                 (2, 0, ?),
+                 (2, 1, ?),
+                 (3, 0, ?)",
+                (
+                    Value::Blob(b"abcd".to_vec()),
+                    Value::Blob(b"ef".to_vec()),
+                    Value::Blob(b"abcd".to_vec()),
+                ),
+            )
+            .await?;
+        }
         conn.execute(
             "INSERT INTO kv_store (key, value) VALUES ('k', '{\"v\":1}')",
             (),

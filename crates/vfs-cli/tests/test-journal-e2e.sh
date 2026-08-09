@@ -216,27 +216,33 @@ import sys
 
 conn = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
 rows = conn.execute(
-    "SELECT seq, txn_id, op, payload FROM fs_op_journal ORDER BY seq"
+    "SELECT seq, txn_id, label, tbl, verb, row FROM fs_op_journal ORDER BY seq"
 ).fetchall()
 assert rows, "mounted mutations produced no journal rows"
 
-ops = {row[2] for row in rows}
-assert {"create_file", "write", "unlink"} <= ops, sorted(ops)
-assert all(seq > 0 and txn_id > 0 for seq, txn_id, _, _ in rows), rows
-for _, _, _, payload in rows:
-    assert isinstance(json.loads(payload), dict), payload
+labels = {row[2] for row in rows}
+assert {"create_file", "write", "unlink"} <= labels, sorted(labels)
+assert all(seq > 0 and txn_id > 0 for seq, txn_id, *_ in rows), rows
+for _, _, _, tbl, verb, row_json in rows:
+    assert tbl in {
+        "fs_inode", "fs_dentry", "fs_data", "fs_symlink", "fs_whiteout",
+        "fs_origin", "fs_partial_origin", "fs_chunk_override",
+        "fs_overlay_config",
+    }, tbl
+    assert verb in {"upsert", "delete"}, verb
+    assert isinstance(json.loads(row_json), dict), row_json
 
 # Journal rows must form non-interleaved transaction groups, and grouping the
 # rows by txn_id must account for every sequence exactly once.
 seen = set()
 current = None
 groups = {}
-for seq, txn_id, op, _ in rows:
+for seq, txn_id, label, *_ in rows:
     if txn_id != current:
         assert txn_id not in seen, f"txn_id {txn_id} is interleaved"
         seen.add(txn_id)
         current = txn_id
-    groups.setdefault(txn_id, []).append((seq, op))
+    groups.setdefault(txn_id, []).append((seq, label))
 assert sum(len(group) for group in groups.values()) == len(rows)
 for txn_id, group in groups.items():
     assert txn_id == min(seq for seq, _ in group), (txn_id, group)
@@ -388,7 +394,7 @@ import json
 import sys
 manifest = json.load(open(sys.argv[1]))
 assert manifest["sessionId"] == sys.argv[2], manifest
-assert manifest["schemaVersion"] == "0.7", manifest
+assert manifest["schemaVersion"] == "0.8", manifest
 PY
 
 run_vfs_without_journal run --session "$ADOPT_ID" -- /bin/bash -c '
@@ -403,7 +409,7 @@ import sqlite3
 import sys
 
 conn = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
-assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
+assert conn.execute("PRAGMA user_version").fetchone()[0] == 8
 tables = {
     row[0]
     for row in conn.execute(
@@ -414,6 +420,11 @@ required = {
     "fs_chunk",
     "fs_op_journal",
     "fs_journal_chunk",
+    "fs_snapshot",
+    "fs_snapshot_inode",
+    "fs_snapshot_dentry",
+    "fs_snapshot_data",
+    "fs_snapshot_chunk",
 }
 assert required <= tables, sorted(required - tables)
 columns = [row[1] for row in conn.execute("PRAGMA table_info(fs_data)")]
@@ -429,6 +440,9 @@ assert counts == {
     "fs_op_journal": 0,
     "fs_journal_chunk": 0,
 }, counts
+assert conn.execute(
+    "SELECT COUNT(*) FROM fs_snapshot WHERE reason = 'migrate' AND history_epoch = 1 AND through_seq = 0"
+).fetchone()[0] == 1
 conn.close()
 PY
 

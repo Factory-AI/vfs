@@ -273,11 +273,14 @@ async fn copy_migrate_to_current(
         copy_table_common_columns(&source_conn, &target_conn, "fs_symlink").await?;
         copy_optional_whiteouts(&source_conn, &target_conn).await?;
         copy_optional_table_common_columns(&source_conn, &target_conn, "fs_origin").await?;
+        copy_optional_table_common_columns(&source_conn, &target_conn, "fs_partial_origin").await?;
+        copy_optional_table_common_columns(&source_conn, &target_conn, "fs_chunk_override").await?;
         copy_optional_table_common_columns(&source_conn, &target_conn, "fs_overlay_config").await?;
         copy_optional_table_common_columns(&source_conn, &target_conn, "fs_session_metadata")
             .await?;
         copy_table_common_columns(&source_conn, &target_conn, "kv_store").await?;
         copy_table_common_columns(&source_conn, &target_conn, "tool_calls").await?;
+        schema::reset_history_for_migration(&target_conn).await?;
         Ok(())
     }
     .await;
@@ -413,6 +416,7 @@ async fn migrate_inodes_and_file_data(
     // rdev and the *_nsec columns); select zeros for the missing ones so one
     // copy loop serves every supported source version.
     let source_columns = get_table_columns(source, "fs_inode").await?;
+    let source_cas = source_has_column(source, "fs_data", "digest").await?;
     let select_column = |name: &str| {
         if source_columns.iter().any(|column| column == name) {
             quote_identifier(name)
@@ -466,29 +470,35 @@ async fn migrate_inodes_and_file_data(
         };
 
         let is_regular = (mode & S_IFMT) == S_IFREG;
-        let (storage_kind, data_inline) = if is_regular
-            && (size as usize) <= DEFAULT_INLINE_THRESHOLD
-        {
-            let (bytes, dense) = match &source_inline {
-                Some(bytes) => {
-                    let mut content = bytes.clone();
-                    let dense = content.len() == size as usize;
-                    content.resize(size as usize, 0);
-                    content.truncate(size as usize);
-                    (content, dense)
+        let (storage_kind, data_inline) =
+            if is_regular && (size as usize) <= DEFAULT_INLINE_THRESHOLD {
+                let (bytes, dense) = match &source_inline {
+                    Some(bytes) => {
+                        let mut content = bytes.clone();
+                        let dense = content.len() == size as usize;
+                        content.resize(size as usize, 0);
+                        content.truncate(size as usize);
+                        (content, dense)
+                    }
+                    None => {
+                        read_source_file_bytes(
+                            source,
+                            ino,
+                            size as usize,
+                            source_chunk_size,
+                            source_cas,
+                        )
+                        .await?
+                    }
+                };
+                if dense {
+                    (1_i64, Value::Blob(bytes))
+                } else {
+                    (0_i64, Value::Null)
                 }
-                None => {
-                    read_source_file_bytes(source, ino, size as usize, source_chunk_size).await?
-                }
-            };
-            if dense {
-                (1_i64, Value::Blob(bytes))
             } else {
                 (0_i64, Value::Null)
-            }
-        } else {
-            (0_i64, Value::Null)
-        };
+            };
 
         target
             .execute(
@@ -527,6 +537,7 @@ async fn migrate_inodes_and_file_data(
                     ino,
                     size as usize,
                     source_chunk_size,
+                    source_cas,
                 )
                 .await?;
             }
@@ -555,13 +566,18 @@ async fn copy_source_file_chunks_to_target(
     ino: i64,
     size: usize,
     source_chunk_size: usize,
+    source_cas: bool,
 ) -> AnyhowResult<()> {
-    let mut rows = source
-        .query(
-            "SELECT chunk_index, data FROM fs_data WHERE ino = ? ORDER BY chunk_index",
-            (ino,),
-        )
-        .await?;
+    let sql = if source_cas {
+        "SELECT d.chunk_index, c.data
+         FROM fs_data d
+         JOIN fs_chunk c ON c.digest = d.digest
+         WHERE d.ino = ?
+         ORDER BY d.chunk_index"
+    } else {
+        "SELECT chunk_index, data FROM fs_data WHERE ino = ? ORDER BY chunk_index"
+    };
+    let mut rows = source.query(sql, (ino,)).await?;
     let mut target_chunk_index: Option<i64> = None;
     let mut target_chunk = Vec::new();
     let mut target_chunk_has_data = false;
@@ -652,14 +668,19 @@ async fn read_source_file_bytes(
     ino: i64,
     size: usize,
     chunk_size: usize,
+    source_cas: bool,
 ) -> AnyhowResult<(Vec<u8>, bool)> {
     let mut bytes = vec![0; size];
-    let mut rows = conn
-        .query(
-            "SELECT chunk_index, data FROM fs_data WHERE ino = ? ORDER BY chunk_index",
-            (ino,),
-        )
-        .await?;
+    let sql = if source_cas {
+        "SELECT d.chunk_index, c.data
+         FROM fs_data d
+         JOIN fs_chunk c ON c.digest = d.digest
+         WHERE d.ino = ?
+         ORDER BY d.chunk_index"
+    } else {
+        "SELECT chunk_index, data FROM fs_data WHERE ino = ? ORDER BY chunk_index"
+    };
+    let mut rows = conn.query(sql, (ino,)).await?;
     let mut expected_offset = 0usize;
     let mut dense = true;
 
@@ -819,6 +840,31 @@ async fn verify_migration_equivalence(
     compare_table_rows(source, target, "fs_symlink", &["ino", "target"]).await?;
     compare_optional_whiteouts(source, target).await?;
     compare_optional_table_rows(source, target, "fs_origin", &["delta_ino", "base_ino"]).await?;
+    compare_optional_table_rows(
+        source,
+        target,
+        "fs_partial_origin",
+        &[
+            "delta_ino",
+            "base_ino",
+            "base_path",
+            "base_size",
+            "base_fingerprint_size",
+            "base_mtime",
+            "base_mtime_nsec",
+            "base_ctime",
+            "base_ctime_nsec",
+            "created_at",
+        ],
+    )
+    .await?;
+    compare_optional_table_rows(
+        source,
+        target,
+        "fs_chunk_override",
+        &["delta_ino", "chunk_index"],
+    )
+    .await?;
     compare_optional_table_rows(source, target, "fs_overlay_config", &["key", "value"]).await?;
     compare_optional_table_rows(source, target, "fs_session_metadata", &["key", "value"]).await?;
     compare_table_rows(
@@ -896,6 +942,7 @@ async fn compare_regular_file_contents(
     let source_chunk_size = read_config_usize(source, "chunk_size", 4096).await?;
     let target_chunk_size = read_config_usize(target, "chunk_size", DEFAULT_CHUNK_SIZE).await?;
     let source_allows_inline = source_has_column(source, "fs_inode", "storage_kind").await?;
+    let source_cas = source_has_column(source, "fs_data", "digest").await?;
     let mut rows = source
         .query("SELECT ino, mode, size FROM fs_inode ORDER BY ino", ())
         .await?;
@@ -914,7 +961,7 @@ async fn compare_regular_file_contents(
             size,
             source_chunk_size,
             source_allows_inline,
-            false,
+            source_cas,
         )
         .await?;
         let target_hash =
@@ -2277,7 +2324,7 @@ mod tests {
             ("0.5", "pack-agent"),
             ("0.6", "handoff-agent"),
         ] {
-            let guidance = schema_upgrade_guidance(found, "0.7", id_or_path);
+            let guidance = schema_upgrade_guidance(found, "0.8", id_or_path);
             assert!(
                 guidance.contains(&format!("vfs migrate {id_or_path}")),
                 "{found}: {guidance}"
@@ -2285,7 +2332,7 @@ mod tests {
             assert!(!guidance.contains("migrate-v0-5"), "{found}: {guidance}");
         }
 
-        let future = schema_upgrade_guidance("user_version 8", "0.7", "my-agent");
+        let future = schema_upgrade_guidance("user_version 9", "0.8", "my-agent");
         assert!(
             !future.contains("vfs migrate"),
             "future versions must not promise migrate can fix them: {future}"

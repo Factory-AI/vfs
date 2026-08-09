@@ -250,12 +250,10 @@ impl OverlayFS {
         let mut txn =
             super::super::vfs::MutationTxn::begin(&conn, self.delta.journal_ctx()).await?;
         Self::add_origin_mapping_with_conn(txn.conn(), delta_ino, base_ino).await?;
-        txn.record(super::super::vfs::JournalOp::new(
+        txn.record(super::super::vfs::JournalDelta::origin_upsert(
             "origin_map",
-            serde_json::json!({
-                "delta_ino": delta_ino,
-                "base_ino": base_ino,
-            }),
+            delta_ino,
+            base_ino,
         ));
         txn.commit().await?;
         self.origin_map.write().insert(delta_ino, base_ino);

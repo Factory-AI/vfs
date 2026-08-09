@@ -27,6 +27,7 @@ const FIXTURES: &[(&str, SchemaVersion, bool)] = &[
     ("v0_4.db", SchemaVersion::V0_4, false),
     ("v0_4-encrypted.db", SchemaVersion::V0_4, true),
     ("v0_6.db", SchemaVersion::V0_6, false),
+    ("v0_7.db", SchemaVersion::V0_7, false),
 ];
 
 fn fixtures_dir() -> PathBuf {
@@ -59,6 +60,21 @@ async fn regenerate_migrate_fixtures() {
 }
 
 #[tokio::test]
+#[ignore = "rewrites only the committed v0.7 fixture; run explicitly"]
+async fn regenerate_v0_7_fixture() {
+    let path = fixtures_dir().join("v0_7.db");
+    for suffix in ["", "-wal", "-shm"] {
+        let candidate = PathBuf::from(format!("{}{}", path.display(), suffix));
+        match fs::remove_file(&candidate) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => panic!("cannot remove {}: {err}", candidate.display()),
+        }
+    }
+    create_fixture(&path, SchemaVersion::V0_7, false).await;
+}
+
+#[tokio::test]
 async fn committed_fixtures_detect_as_expected_versions() {
     let scratch = tempfile::tempdir().unwrap();
     for (name, version, encrypted) in FIXTURES {
@@ -88,8 +104,8 @@ async fn committed_fixtures_detect_as_expected_versions() {
         let mut rows = conn.query("PRAGMA user_version", ()).await.unwrap();
         let row = rows.next().await.unwrap().unwrap();
         let user_version: i64 = row.get(0).unwrap();
-        let expected_user_version = if *version == SchemaVersion::V0_6 {
-            SchemaVersion::V0_6.user_version()
+        let expected_user_version = if *version >= SchemaVersion::V0_6 {
+            version.user_version()
         } else {
             0
         };
@@ -216,17 +232,59 @@ async fn populate_fixture(conn: &Connection, version: SchemaVersion) {
     )
     .await
     .unwrap();
-    conn.execute(
-        "CREATE TABLE fs_data (
-            ino INTEGER NOT NULL,
-            chunk_index INTEGER NOT NULL,
-            data BLOB NOT NULL,
-            PRIMARY KEY (ino, chunk_index)
-        )",
-        (),
-    )
-    .await
-    .unwrap();
+    if version >= SchemaVersion::V0_7 {
+        conn.execute(
+            "CREATE TABLE fs_data (
+                ino INTEGER NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                digest BLOB NOT NULL,
+                PRIMARY KEY (ino, chunk_index)
+            )",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE fs_chunk (
+                digest BLOB PRIMARY KEY,
+                data BLOB NOT NULL,
+                refcount INTEGER NOT NULL DEFAULT 0
+            )",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE fs_op_journal (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                txn_id INTEGER NOT NULL,
+                op TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                wallclock_ms INTEGER NOT NULL
+            )",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE fs_journal_chunk (seq INTEGER NOT NULL, digest BLOB NOT NULL)",
+            (),
+        )
+        .await
+        .unwrap();
+    } else {
+        conn.execute(
+            "CREATE TABLE fs_data (
+                ino INTEGER NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                data BLOB NOT NULL,
+                PRIMARY KEY (ino, chunk_index)
+            )",
+            (),
+        )
+        .await
+        .unwrap();
+    }
     conn.execute(
         "CREATE TABLE fs_symlink (ino INTEGER PRIMARY KEY, target TEXT NOT NULL)",
         (),
@@ -349,16 +407,47 @@ async fn populate_fixture(conn: &Connection, version: SchemaVersion) {
     )
     .await
     .unwrap();
-    conn.execute(
-        "INSERT INTO fs_data (ino, chunk_index, data) VALUES (3, 0, ?)",
-        (Value::Blob(small),),
-    )
-    .await
-    .unwrap();
-    for (chunk_index, chunk) in large.chunks(4096).enumerate() {
+    let mut fixture_digests = Vec::new();
+    for (ino, content) in [(3_i64, small.as_slice()), (4_i64, large.as_slice())] {
+        for (chunk_index, chunk) in content.chunks(4096).enumerate() {
+            if version >= SchemaVersion::V0_7 {
+                let digest = blake3::hash(chunk).as_bytes().to_vec();
+                conn.execute(
+                    "INSERT INTO fs_chunk (digest, data, refcount)
+                     VALUES (?, ?, 1)
+                     ON CONFLICT(digest) DO UPDATE SET refcount = refcount + 1",
+                    (Value::Blob(digest.clone()), Value::Blob(chunk.to_vec())),
+                )
+                .await
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO fs_data (ino, chunk_index, digest) VALUES (?, ?, ?)",
+                    (ino, chunk_index as i64, Value::Blob(digest.clone())),
+                )
+                .await
+                .unwrap();
+                fixture_digests.push(digest);
+            } else {
+                conn.execute(
+                    "INSERT INTO fs_data (ino, chunk_index, data) VALUES (?, ?, ?)",
+                    (ino, chunk_index as i64, Value::Blob(chunk.to_vec())),
+                )
+                .await
+                .unwrap();
+            }
+        }
+    }
+    if version >= SchemaVersion::V0_7 {
         conn.execute(
-            "INSERT INTO fs_data (ino, chunk_index, data) VALUES (4, ?, ?)",
-            (chunk_index as i64, Value::Blob(chunk.to_vec())),
+            "INSERT INTO fs_op_journal (txn_id, op, payload, wallclock_ms)
+             VALUES (1, 'import', '{\"ino\":3,\"inline\":false}', 1700000000000)",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO fs_journal_chunk (seq, digest) VALUES (1, ?)",
+            (Value::Blob(fixture_digests[0].clone()),),
         )
         .await
         .unwrap();
@@ -389,10 +478,7 @@ async fn populate_fixture(conn: &Connection, version: SchemaVersion) {
         .await
         .unwrap();
         conn.execute(
-            &format!(
-                "PRAGMA user_version = {}",
-                SchemaVersion::V0_6.user_version()
-            ),
+            &format!("PRAGMA user_version = {}", version.user_version()),
             (),
         )
         .await

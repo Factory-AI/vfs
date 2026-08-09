@@ -1,15 +1,15 @@
 # Agent Filesystem Specification
 
-**Version:** 0.7
+**Version:** 0.8
 
 ## Introduction
 
-The Agent Filesystem Specification defines a SQLite schema for representing agent filesystem state. The current v0.7 format content-addresses chunk blobs by raw 32-byte BLAKE3 digest and adds a thin logical-operation journal to the v0.6 handoff-capable layout, with `user_version`-keyed migration from older databases (in place by default, or copy-based re-chunking with `--copy`). The specification consists of five main components:
+The Agent Filesystem Specification defines a SQLite schema for representing agent filesystem state. The current v0.8 format stores replayable row-delta history and immutable root snapshots over the v0.7 content-addressed layout, with `user_version`-keyed migration from older databases (in place by default, or copy-based re-chunking with `--copy`). The specification consists of five main components:
 
 1. **Tool Call Audit Trail**: Captures tool invocations, parameters, and results for debugging, auditing, and performance analysis
 2. **Virtual Filesystem**: Stores agent artifacts (files, documents, outputs) using a Unix-like inode design with support for hard links, proper metadata, and efficient file operations
 3. **Session Handoff Metadata**: Stores the monotonic pack generation and future seed provenance inside the transferable database
-4. **Operation Journal**: Records committed logical mutations without duplicating chunk bytes
+4. **Replayable History**: Records committed table-row post-images and immutable root snapshots without duplicating chunk bytes
 5. **Key-Value Store**: Provides simple get/set operations for agent context, preferences, and structured state that doesn't fit into the filesystem model
 
 All timestamps in this specification use Unix epoch format (seconds since 1970-01-01 00:00:00 UTC) with optional nanosecond precision via separate `_nsec` columns.
@@ -250,14 +250,17 @@ CREATE TABLE fs_config (
 
 | Key | Description | Default |
 |-----|-------------|---------|
-| `schema_version` | On-disk schema version | `0.7` |
+| `schema_version` | On-disk schema version | `0.8` |
 | `chunk_size` | Size of data chunks in bytes | `65536` |
 | `inline_threshold` | Maximum dense regular-file size stored inline in `fs_inode.data_inline` | `16384` |
+| `history_epoch` | Identity of the current replay lineage | `1` |
+| `history_valid` | Whether replay from the retained root and journal is valid | `1` |
+| `history_floor_seq` | Lowest retained sequence boundary | `0` |
 
 **Notes:**
 
 - `chunk_size` determines the fixed size of data chunks in `fs_data`
-- New v0.7 filesystems use 64 KiB chunks by default; legacy databases retain their recorded chunk size until copy-migrated
+- New v0.7+ filesystems use 64 KiB chunks by default; legacy databases retain their recorded chunk size until copy-migrated
 - `inline_threshold` determines when dense regular files may avoid `fs_data` rows entirely
 - Configuration is immutable after filesystem initialization
 - Implementations MAY define additional configuration keys
@@ -398,7 +401,7 @@ CREATE TABLE fs_data (
 - Directories MUST NOT have data chunks
 - Inline regular files MUST NOT have data chunks
 - Chunk size is determined by the `chunk_size` value in `fs_config`
-- New v0.7 filesystems default to 64 KiB chunks
+- New v0.7+ filesystems default to 64 KiB chunks
 - All chunks except the last chunk of a dense chunked file SHOULD be exactly `chunk_size` bytes
 - The last chunk MAY be smaller than `chunk_size`
 - Sparse holes MAY be represented by missing chunk rows and MUST read back as zero bytes
@@ -629,7 +632,7 @@ When creating a new agent database, initialize the filesystem configuration and 
 
 ```sql
 -- Initialize filesystem configuration
-INSERT INTO fs_config (key, value) VALUES ('schema_version', '0.7');
+INSERT INTO fs_config (key, value) VALUES ('schema_version', '0.8');
 INSERT INTO fs_config (key, value) VALUES ('chunk_size', '65536');
 INSERT INTO fs_config (key, value) VALUES ('inline_threshold', '16384');
 
@@ -997,10 +1000,11 @@ keys and all filesystem rows at their pre-pack values.
 
 ## Operation Journal
 
-The v0.7 journal is a thin, ordered record of logical filesystem mutations.
-It does not duplicate file content: operation payloads describe the mutation
-and refer to content by digest, while chunk retention is represented
-separately.
+The v0.8 journal is an ordered row-delta stream. Each row identifies one live
+filesystem table row that was inserted, replaced, or deleted by a committed
+SQLite transaction. Replaying a root snapshot followed by complete transaction
+groups reconstructs the live filesystem state without interpreting
+operation-specific payloads.
 
 ### Table: `fs_op_journal`
 
@@ -1008,8 +1012,10 @@ separately.
 CREATE TABLE fs_op_journal (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
   txn_id INTEGER NOT NULL,
-  op TEXT NOT NULL,
-  payload TEXT NOT NULL,
+  label TEXT NOT NULL,
+  tbl TEXT NOT NULL,
+  verb TEXT NOT NULL,
+  row TEXT NOT NULL,
   wallclock_ms INTEGER NOT NULL
 )
 
@@ -1019,17 +1025,27 @@ CREATE INDEX idx_fs_op_journal_txn_id ON fs_op_journal(txn_id)
 **Fields:**
 
 - `seq` - Monotonic journal sequence number and total operation order
-- `txn_id` - Identifier shared by every logical operation committed in one
+- `txn_id` - Identifier shared by every row delta committed in one
   SQLite transaction; it equals the `seq` of the group's first row
-- `op` - Stable logical operation name
-- `payload` - JSON operation payload; chunk content is represented by
-  lowercase hexadecimal digest references, never embedded bytes
+- `label` - Diagnostic operation label such as `write`, `rename`, or `reap`;
+  replay does not branch on this value
+- `tbl` - One of `fs_inode`, `fs_dentry`, `fs_data`, `fs_symlink`,
+  `fs_whiteout`, `fs_origin`, `fs_partial_origin`, `fs_chunk_override`, or
+  `fs_overlay_config`
+- `verb` - `upsert` for a complete post-image or `delete` for a primary-key
+  tombstone
+- `row` - JSON object containing the complete replayable row shape. Binary
+  content is represented by lowercase hexadecimal BLAKE3 digests, never
+  embedded bytes. An `fs_inode` upsert carries every inode column except raw
+  `data_inline`; inline bytes are normalized to `data_inline_digest`.
 - `wallclock_ms` - Commit-associated Unix epoch timestamp in milliseconds
 
-Each logical mutation produces one row. Operations from one commit MUST share
-one `txn_id`, and journal rows MUST commit atomically with the filesystem rows
-they describe. Consumers replay commits in `seq` order and MUST treat all rows
-with one `txn_id` as a unit.
+One logical mutation may produce several row deltas. Deltas from one commit
+MUST share one `txn_id`, and journal rows MUST commit atomically with the live
+rows they describe. Consumers replay commits in `seq` order and MUST treat all
+rows with one `txn_id` as a unit. Writers construct post-images from mutation
+inputs and mutation-statement results inside the transaction; they MUST NOT
+issue follow-up reads merely to build journal rows.
 
 Transaction IDs need no allocator state: a group's `txn_id` is the `seq`
 AUTOINCREMENT assigns to its first row, which the writer derives as
@@ -1053,7 +1069,50 @@ digest. It is a retention relation, not a second live-mapping refcount:
 `fs_chunk.refcount` continues to equal the number of `fs_data` mappings.
 Collecting a journal range MUST remove its `fs_journal_chunk` rows in the same
 transaction; an `fs_chunk` row is eligible for garbage collection only when
-its live refcount is zero and no retained journal row names its digest.
+its live refcount is zero and neither a retained journal row nor a root
+snapshot names its digest.
+
+## Root Snapshots
+
+A root snapshot is an immutable relational copy of replayable filesystem
+state at a sequence boundary.
+
+```sql
+CREATE TABLE fs_snapshot (
+  snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  through_seq INTEGER NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  reason TEXT NOT NULL,
+  history_epoch INTEGER NOT NULL,
+  UNIQUE(history_epoch, through_seq)
+)
+```
+
+Snapshot row tables mirror the replayable live tables and prefix their keys
+with `snapshot_id`:
+
+- `fs_snapshot_inode`
+- `fs_snapshot_dentry`
+- `fs_snapshot_data`
+- `fs_snapshot_symlink`
+- `fs_snapshot_whiteout`
+- `fs_snapshot_origin`
+- `fs_snapshot_partial_origin`
+- `fs_snapshot_chunk_override`
+
+`fs_snapshot_inode` stores `data_inline_digest` rather than raw inline bytes.
+`fs_snapshot_chunk(snapshot_id, digest)` pins every digest needed by snapshot
+inode and data rows. `fs_snapshot_meta(snapshot_id, key, value)` captures
+replay provenance including `seed_pin`, `seeded_paths`, and
+`parent_artifact`. Snapshot capture runs as direct SQL over the live tables
+inside one transaction; it does not hydrate file contents through runtime
+filesystem read APIs.
+
+A new database starts with an `init` snapshot at epoch 1 through sequence 0.
+Migration to v0.8 discards the non-replayable v0.7 journal and its pins,
+creates a `migrate` snapshot at epoch 1 through sequence 0, and sets
+`history_epoch=1`, `history_valid=1`, and `history_floor_seq=0`. In-place and
+copy migration establish the same history boundary.
 
 ## Key-Value Data
 
@@ -1139,6 +1198,18 @@ Implementations MAY extend the key-value store schema with additional functional
 Such extensions SHOULD use separate tables to maintain referential integrity.
 
 ## Revision History
+
+### Version 0.8
+
+- Replaced operation-specific journal payloads with replayable row-delta
+  post-images grouped atomically by `txn_id`
+- Added immutable root snapshots for inode, namespace, content mapping,
+  symlink, overlay, and provenance state
+- Normalized inline bytes to content-addressed digests in both journal and
+  snapshot rows, with explicit snapshot and journal pins
+- Added history epoch, validity, and floor markers
+- The v0.7 → v0.8 migration discards the old non-replayable journal and
+  establishes one migration root at epoch 1 through sequence 0
 
 ### Version 0.7
 

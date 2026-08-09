@@ -26,7 +26,7 @@ impl OverlayFS {
         let result: Result<()> = async {
             conn.execute(
                 "INSERT OR REPLACE INTO fs_whiteout (path, parent_path, created_at) VALUES (?, ?, ?)",
-                (path, parent_path, now),
+                (path, parent_path.as_str(), now),
             )
             .await?;
             self.maybe_fail_whiteout_for_test()?;
@@ -36,9 +36,11 @@ impl OverlayFS {
 
         match result {
             Ok(()) => {
-                txn.record(super::super::vfs::JournalOp::new(
+                txn.record(super::super::vfs::JournalDelta::whiteout_upsert(
                     "whiteout",
-                    serde_json::json!({ "path": path }),
+                    path,
+                    &parent_path,
+                    now,
                 ));
                 txn.commit().await?;
                 self.whiteouts.write().insert(path.to_string());
@@ -70,9 +72,9 @@ impl OverlayFS {
 
         match result {
             Ok(()) => {
-                txn.record(super::super::vfs::JournalOp::new(
+                txn.record(super::super::vfs::JournalDelta::whiteout_delete(
                     "whiteout_remove",
-                    serde_json::json!({ "path": path }),
+                    path,
                 ));
                 txn.commit().await?;
                 self.whiteouts.write().remove(path);
