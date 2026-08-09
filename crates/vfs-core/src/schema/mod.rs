@@ -1063,6 +1063,85 @@ async fn initialize_history_markers(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Replace the schema-created empty init root after Vfs installs inode 1.
+///
+/// Raw schema creation intentionally leaves live filesystem rows empty so
+/// copy migration can preserve source inode identities. A normal writable Vfs
+/// open then creates inode 1. Only that pristine state may rewrite the
+/// sequence-0 root; repaired/corrupt databases with any journal or populated
+/// snapshot state keep their existing lineage.
+pub(crate) async fn refresh_empty_initial_root(conn: &Connection) -> Result<()> {
+    let mut rows = conn
+        .query(
+            "SELECT
+                 (SELECT COUNT(*) FROM fs_op_journal),
+                 (SELECT COUNT(*) FROM fs_snapshot),
+                 (SELECT COUNT(*) FROM fs_snapshot_inode),
+                 (SELECT COUNT(*) FROM fs_snapshot
+                  WHERE history_epoch = 1 AND through_seq = 0 AND reason = 'init')",
+            (),
+        )
+        .await?;
+    let row = rows
+        .next()
+        .await?
+        .ok_or_else(|| Error::Internal("failed to inspect the initial history root".to_string()))?;
+    let journal_rows: i64 = row.get(0)?;
+    let snapshot_rows: i64 = row.get(1)?;
+    let snapshot_inode_rows: i64 = row.get(2)?;
+    let matching_init_rows: i64 = row.get(3)?;
+    drop(rows);
+    if (
+        journal_rows,
+        snapshot_rows,
+        snapshot_inode_rows,
+        matching_init_rows,
+    ) != (0, 1, 0, 1)
+    {
+        return Ok(());
+    }
+
+    let mut rows = conn
+        .query(
+            "SELECT snapshot_id FROM fs_snapshot
+             WHERE history_epoch = 1 AND through_seq = 0 AND reason = 'init'",
+            (),
+        )
+        .await?;
+    let snapshot_id: i64 = rows
+        .next()
+        .await?
+        .ok_or_else(|| Error::Internal("initial history root disappeared".to_string()))?
+        .get(0)?;
+    drop(rows);
+
+    for table in [
+        "fs_snapshot_inode",
+        "fs_snapshot_dentry",
+        "fs_snapshot_data",
+        "fs_snapshot_symlink",
+        "fs_snapshot_whiteout",
+        "fs_snapshot_origin",
+        "fs_snapshot_partial_origin",
+        "fs_snapshot_chunk_override",
+        "fs_snapshot_chunk",
+        "fs_snapshot_meta",
+    ] {
+        conn.execute(
+            &format!("DELETE FROM {table} WHERE snapshot_id = ?"),
+            (snapshot_id,),
+        )
+        .await?;
+    }
+    conn.execute(
+        "DELETE FROM fs_snapshot WHERE snapshot_id = ?",
+        (snapshot_id,),
+    )
+    .await?;
+    capture_root_raw(conn, "init", 1, 0).await?;
+    Ok(())
+}
+
 /// Capture the live filesystem and overlay root inside the caller's
 /// transaction. This helper neither drains pending writes nor acquires a
 /// session lock; callers own the consistency boundary.

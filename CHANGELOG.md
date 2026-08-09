@@ -1,53 +1,28 @@
 # Changelog
 
-## [Unreleased] - Session branching
+## [Unreleased] - Replayable history and session branching
 
-`vfs branch` forks a run session into an independent session that starts at
-the parent's exact current state. This release also advances the database and
-artifact schema to v0.8. `artifactVersion` changes from `0.7` to `0.8`;
-`adopt` migrates supported older artifacts forward automatically, while the
-pack/adopt manifest shapes and all other wire contracts remain unchanged.
+This release builds one time-travel path from content-addressed storage through
+replayable filesystem history: `vfs branch` can fork the current state or a
+retained historical boundary, `vfs history` exposes those boundaries, and
+offline `vfs revert` publishes a checked reconstruction back over a session.
+The database and artifact schema advances through v0.7 content addressing to
+v0.8 replay history. `artifactVersion` changes from `0.7` to `0.8`; `adopt`
+migrates supported older artifacts forward automatically, while existing
+pack/adopt manifest fields and reserved exit statuses remain unchanged.
 
 ### Added
 
-- Schema v0.8 makes filesystem history replayable: journal entries are
-  complete table-row post-images grouped by SQLite transaction, and immutable
-  root snapshots cover inode, namespace, content, overlay, and provenance
-  state. Inline bytes remain content-addressed and pinned rather than embedded
-  in history JSON.
-- In-place and copy migration from v0.7 discard the old semantic journal,
-  initialize history markers, and establish one migration root at epoch 1
-  through sequence 0.
-- `vfs-core` now exposes root capture, history status and target validation,
-  and exact reconstruction of a private staged database to any retained
-  complete-transaction boundary. Reconstruction restores filesystem and
-  overlay state, verifies all content digests, recomputes chunk refcounts,
-  preserves inode allocator high-water marks, trims the future timeline, and
-  runs relational plus visible-tree integrity checks.
-- Journal retention is snapshot-covered: GC rolls the root forward to a
-  complete boundary before removing older groups, so every advertised target
-  remains reconstructible. Pack establishes a fresh `pack` root and history
-  floor after parent-chain materialization, making pre-pack targets
-  intentionally unavailable in the new generation.
-- The journaling kill switch now has a durable epoch contract. A writable open
-  with journaling disabled marks history invalid; re-enabling journaling bumps
-  the epoch, removes stale history, and captures the current state as a fresh
-  root. Read-only opens never write these markers.
-- `vfs history <SESSION_ID> [--limit N | --all] [--json]` lists retained
-  complete-transaction targets newest-first with the durable epoch,
-  valid/invalid marker, available floor/head range, diagnostic label, wall
-  clock, touched tables, and row-delta count.
-- `vfs branch <SESSION_ID> --to <SEQ>` reconstructs the branch's private
-  parent snapshot to a retained transaction boundary before immutable artifact
-  publication. Historical branch manifests add `targetSeq`, `sourceHeadSeq`,
-  and `rootSnapshotSeq`; plain branch behavior and manifest shape are
-  unchanged.
-- `vfs revert <SESSION_ID> --to <SEQ>` performs an offline, staged,
-  integrity-checked filesystem rewind with exit-status-3 live-session refusal,
-  generation increment, a fresh `revert` history floor, backup-rename
-  publication, rollback, and run/resume crash recovery. KV and tool-call rows
-  remain outside the rewind.
-
+- Schema v0.7 replaces per-file chunk blobs with a content-addressed
+  `fs_chunk` store keyed by raw 32-byte BLAKE3 digests. `fs_data` maps
+  `(ino, chunk_index)` to a digest, identical chunks deduplicate, and exact
+  live-mapping refcounts support safe reclamation.
+- The v0.7 journal records logical mutations in commit groups and pins chunk
+  digests without duplicating bytes. Pack bounds the retained journal on its
+  staging copy. On the codex workload (median-of-5), the CAS reshape holds the
+  git-clone phase at the pre-v0.7 time and journaling adds about 26µs per
+  logical operation (+395ms over ~19,600 operations);
+  `VFS_JOURNAL=0` removes that cost.
 - `vfs branch <SESSION_ID> [--session <ID>]` forks a session. A live parent
   is snapshotted through its mount's control socket without stopping it (the
   snapshot is a drained `VACUUM INTO` copy, so every write acknowledged
@@ -70,7 +45,6 @@ pack/adopt manifest shapes and all other wire contracts remain unchanged.
   adopt` on a receiver without the artifact store reconstructs the branched
   view exactly. Pack refuses to publish if a parent artifact is missing or
   drifted.
-- `vfs version --json` advertises `features.branch` and `features.history`.
 - `vfs prune artifacts [--dry-run]` collects artifacts no session chain
   references and emits a one-line JSON report (`removed`, `kept`,
   `reclaimedBytes`). Classification is conservative: inactive sessions are
@@ -81,20 +55,46 @@ pack/adopt manifest shapes and all other wire contracts remain unchanged.
 - Each `vfs run` session now exposes a control socket
   (`~/.vfs/run/<id>/ctl.sock`) accepting snapshot and parent-digest requests
   from same-machine tooling while the session is live.
-- Schema v0.7 replaces per-file chunk blobs with a content-addressed
-  `fs_chunk` store keyed by raw 32-byte BLAKE3 digests. `fs_data` now maps
-  `(ino, chunk_index)` to a digest, identical chunks deduplicate, and exact
-  live-mapping refcounts support safe reclamation.
-- A thin operation journal records one row per logical mutation, groups rows
-  from the same commit by transaction ID (the seq of the group's first row —
-  there is no allocator table), and references chunk digests rather than
-  duplicating chunk bytes. Journal retention pins otherwise unreferenced
-  chunks until the retained operations are collected. `vfs pack` truncates
-  the journal to the configured retention on its staging copy, so shipped
-  artifacts carry a bounded journal. Measured on the codex workload
-  (median-of-5): the CAS reshape alone holds the git-clone phase at the
-  pre-v0.7 time, and journaling adds about 26µs per logical operation
-  (+395ms over ~19,600 operations); `VFS_JOURNAL=0` removes that cost.
+- Schema v0.8 replaces the semantic journal with complete table-row
+  post-images grouped by SQLite transaction. Immutable roots cover inode,
+  namespace, content, overlay, and provenance state; inline bytes remain
+  content-addressed and pinned rather than embedded in history JSON.
+- In-place and copy migration from v0.7 discard the old semantic journal,
+  initialize durable history markers, and establish one migration root at
+  epoch 1 through sequence 0.
+- `vfs-core` exposes root capture, history status and target validation, and
+  exact reconstruction of a private staged database to any retained complete
+  transaction boundary. Reconstruction verifies digests, recomputes chunk
+  refcounts, preserves inode allocator high-water marks, trims the future, and
+  runs relational plus visible-tree integrity checks.
+- Journal collection is snapshot-covered: GC rolls the root forward to a
+  complete boundary before removing older groups. Pack establishes a fresh
+  `pack` root after parent-chain materialization, and revert establishes a
+  fresh `revert` root, so each published generation has an explicit floor.
+- The journaling kill switch has a durable epoch contract. An unjournaled
+  mutation marks history invalid; re-enabling journaling bumps the epoch,
+  removes stale history, and captures the current state as a fresh root.
+  Read-only and no-op maintenance opens never mutate these markers.
+- `vfs history <SESSION_ID> [--limit N | --all] [--json]` lists retained
+  complete-transaction targets newest-first with the epoch, validity marker,
+  floor/head range, diagnostic label, wall clock, touched tables, and row
+  count.
+- `vfs branch <SESSION_ID> --to <SEQ>` reconstructs the private parent
+  snapshot before immutable artifact publication. Historical manifests add
+  `targetSeq`, `sourceHeadSeq`, and `rootSnapshotSeq`; plain branch manifests
+  remain unchanged.
+- `vfs revert <SESSION_ID> --to <SEQ>` performs an offline staged rewind with
+  exit-status-3 live-session refusal, generation increment, backup-rename
+  publication, rollback, integrity verification, and run/resume crash
+  recovery. KV and tool-call rows remain outside the rewind.
+- `vfs version --json` advertises `features.branch` and `features.history`.
+
+### Fixed
+
+- Fresh databases now create inode 1 before capturing the sequence-0 `init`
+  root, so the advertised history floor reconstructs a valid visible tree.
+- `rmdir` now removes an empty directory inode with its dentry instead of
+  leaving an unreachable inode at `nlink=1`.
 
 ### Changed
 

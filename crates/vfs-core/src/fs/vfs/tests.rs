@@ -916,6 +916,10 @@
         assert!(cached_attr(&fs, ROOT_INO).is_none());
         assert!(cached_attr(&fs, dir.ino).is_none());
         assert!(FileSystem::lookup(&fs, ROOT_INO, "dir").await?.is_none());
+        assert!(
+            FileSystem::getattr(&fs, dir.ino).await?.is_none(),
+            "rmdir must delete the now-unreachable directory inode"
+        );
 
         FileSystem::getattr(&fs, file_ino).await?.unwrap();
         FileSystem::getattr(&fs, ROOT_INO).await?.unwrap();

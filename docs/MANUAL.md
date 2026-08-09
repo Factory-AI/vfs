@@ -756,6 +756,11 @@ artifact can never be collected before the branch referencing it lands.
 
 ## Inspecting replayable history
 
+The time-travel path is one contract: committed row deltas advance the
+journal, immutable roots bound replay, `history` exposes the retained
+complete-transaction targets, and `branch --to` or `revert --to` consumes one
+of those exact targets. Commands never approximate an unavailable target.
+
 `vfs history <session-id>` reports the retained replay range without opening
 the live database path alongside its writable owner. It uses the same
 lock/control-socket snapshot discipline as branch, so stopped and live sessions

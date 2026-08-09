@@ -1235,7 +1235,7 @@ impl FileSystem for Vfs {
         // BEGIN IMMEDIATE: see `unlink` — never race the batcher's drain
         // transactions with autocommit metadata writes.
         let mut txn = MutationTxn::begin(&conn, self.journal_ctx()).await?;
-        let result: Result<(i64, InodeRow, InodeRow, bool)> = async {
+        let result: Result<(i64, InodeRow)> = async {
             // Look up the child inode
             let ino = self
                 .lookup_child(&conn, parent_ino, name)
@@ -1278,17 +1278,12 @@ impl FileSystem for Vfs {
                 .await?;
             stmt.execute((parent_ino, name)).await?;
 
-            // Decrement link count on removed directory
-            let mut rows = conn
-                .query(
-                    "UPDATE fs_inode SET nlink = nlink - 1 WHERE ino = ?
-                     RETURNING ino, mode, nlink, uid, gid, size, atime, mtime, ctime, rdev,
-                               atime_nsec, mtime_nsec, ctime_nsec, data_inline, storage_kind",
-                    (ino,),
-                )
+            // Removing an empty directory drops both its parent dentry and its
+            // synthetic "." link. No live namespace path can reference the
+            // inode afterward, so retaining it at nlink=1 would create an
+            // unreachable inode that history reconstruction correctly rejects.
+            conn.execute("DELETE FROM fs_inode WHERE ino = ?", (ino,))
                 .await?;
-            let inode = InodeRow::from_row(&rows.next().await?.ok_or(FsError::NotFound)?, 0)?;
-            drop(rows);
 
             // Decrement parent nlink (removed directory's ".." link) and update timestamps
             let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
@@ -1307,28 +1302,14 @@ impl FileSystem for Vfs {
             let parent = InodeRow::from_row(&rows.next().await?.ok_or(FsError::NotFound)?, 0)?;
             drop(rows);
 
-            // Delete inode if no more links
-            let link_count = self.get_link_count(&conn, ino).await?;
-            let deleted = link_count == 0;
-            if deleted {
-                let mut stmt = conn
-                    .prepare_cached("DELETE FROM fs_inode WHERE ino = ?")
-                    .await?;
-                stmt.execute((ino,)).await?;
-            }
-
-            Ok((ino, inode, parent, deleted))
+            Ok((ino, parent))
         }
         .await;
 
         match result {
-            Ok((ino, inode, parent, deleted)) => {
+            Ok((ino, parent)) => {
                 txn.record(JournalDelta::dentry_delete("rmdir", parent_ino, name));
-                if deleted {
-                    txn.record(JournalDelta::inode_delete("rmdir", ino));
-                } else {
-                    txn.record_inode("rmdir", inode).await?;
-                }
+                txn.record(JournalDelta::inode_delete("rmdir", ino));
                 txn.record_inode("rmdir", parent).await?;
                 txn.commit().await?;
                 self.invalidate_dentry(parent_ino, name);

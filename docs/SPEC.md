@@ -262,7 +262,8 @@ CREATE TABLE fs_config (
 - `chunk_size` determines the fixed size of data chunks in `fs_data`
 - New v0.7+ filesystems use 64 KiB chunks by default; legacy databases retain their recorded chunk size until copy-migrated
 - `inline_threshold` determines when dense regular files may avoid `fs_data` rows entirely
-- Configuration is immutable after filesystem initialization
+- Schema and geometry keys are immutable after initialization; the history
+  epoch, validity, and floor keys are runtime-managed durable markers
 - Implementations MAY define additional configuration keys
 
 #### Table: `fs_inode`
@@ -434,9 +435,9 @@ CREATE TABLE fs_chunk (
 - Equal chunk bytes MUST share one row.
 - `refcount` counts live mappings only; journal retention is tracked
   separately by `fs_journal_chunk`.
-- A zero-refcount row MAY remain while a retained journal entry references
-  its digest. Garbage collection MUST remove it only after both the live
-  mapping count and journal retention count reach zero.
+- A zero-refcount row MAY remain while a retained journal entry or root
+  snapshot references its digest. Garbage collection MUST remove it only
+  after the live mapping count is zero and neither retention relation pins it.
 - Digest computation and insertion MUST occur in the same transaction as the
   corresponding `fs_data` mapping change.
 
@@ -600,7 +601,7 @@ To read `length` bytes starting at byte offset `offset`:
    DELETE FROM fs_data WHERE ino = ?
    ```
 6. Garbage-collect zero-refcount `fs_chunk` rows only when they are not pinned
-   by `fs_journal_chunk`.
+   by `fs_journal_chunk` or `fs_snapshot_chunk`.
 
 #### Creating a Hard Link
 
@@ -635,20 +636,26 @@ When creating a new agent database, initialize the filesystem configuration and 
 INSERT INTO fs_config (key, value) VALUES ('schema_version', '0.8');
 INSERT INTO fs_config (key, value) VALUES ('chunk_size', '65536');
 INSERT INTO fs_config (key, value) VALUES ('inline_threshold', '16384');
+INSERT INTO fs_config (key, value) VALUES ('history_epoch', '1');
+INSERT INTO fs_config (key, value) VALUES ('history_valid', '1');
+INSERT INTO fs_config (key, value) VALUES ('history_floor_seq', '0');
 
 -- Initialize root directory
 INSERT INTO fs_inode (ino, mode, nlink, uid, gid, size, atime, mtime, ctime)
-VALUES (1, 16877, 1, 0, 0, 0, unixepoch(), unixepoch(), unixepoch());
+VALUES (1, 16877, 2, 0, 0, 0, unixepoch(), unixepoch(), unixepoch());
 ```
 
-Where `16877` = `0o040755` (directory with rwxr-xr-x permissions)
+Where `16877` = `0o040755` (directory with rwxr-xr-x permissions). Before the
+first writable open completes, initialization captures an immutable `init`
+history root containing inode 1 at epoch 1 through sequence 0.
 
-**Note:** The `chunk_size` and `inline_threshold` values can be customized at filesystem creation time but MUST NOT be changed afterward. The root directory has `nlink=1` as it has no parent directory entry.
+**Note:** The `chunk_size` and `inline_threshold` values can be customized at filesystem creation time but MUST NOT be changed afterward. The root directory starts at `nlink=2` for its synthetic `.` and `..` references.
 
 ### Schema Migration
 
 Migrations are keyed by `PRAGMA user_version` and land any supported old
-schema (v0.0, v0.2, v0.4, v0.5, v0.6) at the current version with one command:
+schema (v0.0, v0.2, v0.4, v0.5, v0.6, v0.7) at the current version with one
+command:
 
 ```bash
 vfs migrate <id-or-path>
@@ -664,6 +671,9 @@ In-place migration requirements:
    deduplicates it into `fs_chunk`, replaces `fs_data.data` with the raw
    32-byte digest mapping, and initializes the thin journal schema in the same
    transaction.
+6. The v0.7 → v0.8 migration discards the non-replayable semantic journal,
+   initializes durable history markers, and captures the migrated live state
+   as one immutable root at epoch 1 through sequence 0.
 
 The copy-based mode rebuilds the database with the current chunk layout:
 
@@ -1304,6 +1314,11 @@ Such extensions SHOULD use separate tables to maintain referential integrity.
 - Normalized inline bytes to content-addressed digests in both journal and
   snapshot rows, with explicit snapshot and journal pins
 - Added history epoch, validity, and floor markers
+- Defined exact reconstruction at complete transaction boundaries, including
+  future trimming, inode allocator preservation, refcount repair, and
+  integrity verification
+- Made journal retention snapshot-covered and made pack/revert establish fresh
+  history floors
 - The v0.7 → v0.8 migration discards the old non-replayable journal and
   establishes one migration root at epoch 1 through sequence 0
 

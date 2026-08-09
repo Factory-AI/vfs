@@ -77,6 +77,42 @@ that is not the branched state. Branches of branches chain the same way, and
 artifact, so a forked session teleports like any other. Unreferenced
 snapshots are collected with `vfs prune artifacts`.
 
+## Replaying and reverting filesystem history
+
+Every committed filesystem mutation is journaled as complete row deltas.
+Immutable root snapshots bound replay, so Vfs can reconstruct any retained
+complete-transaction boundary without interpreting operation-specific logs.
+`vfs history` lists those boundaries, `vfs branch --to` forks one without
+changing the parent, and offline `vfs revert` publishes a checked reconstruction
+back over the session. Retention advances the oldest available boundary; Vfs
+refuses targets outside the advertised floor/head range.
+
+Against a stopped session, the full flow is:
+
+```console
+$ vfs run --session history-demo -- sh -c 'printf "version one\n" > draft.txt'
+$ FIRST_HEAD="$(vfs history history-demo --json |
+    python3 -c 'import json,sys; print(json.load(sys.stdin)["historyHeadSeq"])')"
+
+$ vfs run --session history-demo -- sh -c 'printf "version two\n" > draft.txt'
+$ vfs branch history-demo --to "$FIRST_HEAD" --session history-probe
+{"manifestVersion":1,"sessionId":"history-probe",…,"targetSeq":6,…}
+
+$ vfs run --session history-probe -- cat draft.txt
+version one
+
+$ vfs revert history-demo --to "$FIRST_HEAD"
+Reverted session history-demo to history sequence 6.
+Generation: 1
+Database: /home/you/.vfs/run/history-demo/delta.db
+$ vfs run --session history-demo -- cat draft.txt
+version one
+```
+
+Revert rewinds filesystem and overlay state only. KV values and the tool-call
+audit trail remain intact, and the restored state becomes the new history
+floor rather than preserving a forked future.
+
 ## Why it's a database
 
 Vfs stores everything an agent does — every file it writes, every piece of
@@ -294,9 +330,10 @@ At the core is the [agent filesystem](docs/SPEC.md), a SQLite storage system
 built on [Turso](https://github.com/tursodatabase/turso). The schema separates
 namespace (dentries) from data (inodes + chunked/inline content), which is
 what buys hard links, POSIX metadata, sparse files, and SQL-queryable history.
-Schema v0.6 adds `fs_session_metadata` — the reason pack generation and seed
-provenance travel *inside* the transferred file instead of in sidecars that
-never leave the sender.
+Schema v0.8 content-addresses file chunks, records replayable row deltas, and
+pins immutable root snapshots. Session metadata remains inside the same file,
+which is why pack generation, seed provenance, and retained history travel
+with an artifact instead of depending on sidecars left on the sender.
 
 On Linux the FUSE backend dispatches through a bounded worker pool with a
 read/write lane split, kernel-cache acceleration (entry/attr TTLs, writeback

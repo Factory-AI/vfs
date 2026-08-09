@@ -79,6 +79,19 @@ doc drift fails the gate:
 - `docs/MANUAL.md` command reference — regenerate with
   `VFS_UPDATE_MANUAL=1 cargo +nightly test -p vfs-cli --lib docs::tests::manual_help_parity -- --exact`
 
+The vfs-core history tests include a seeded randomized replay conformance
+suite. Three fixed seeds each drive 320 weighted filesystem mutations across
+create/write/truncate, namespace, link, metadata, and unlink-while-open paths;
+checkpoints are captured every 40 operations and every retained checkpoint is
+reconstructed and compared byte-for-byte across replayable live tables and
+live-reachable chunks. Separate fixed cases force snapshot-covered GC
+roll-forward (including typed refusal below the floor) and many batched writes
+to one inode before each drain:
+
+```bash
+cargo +nightly test -p vfs-core randomized_replay_conformance
+```
+
 ## Shell integration suite
 
 ```bash
@@ -99,6 +112,17 @@ kernels that cannot provide a prerequisite at all;
 `VFS_GATE_FORCE_SKIP=<label|all>` synthesizes a SKIP for testing the
 runner itself. Never run the corruption
 torture test concurrently with another mount, test suite, or benchmark.
+
+`test-history-revert-e2e.sh` owns the release-binary history lifecycle:
+history pagination/manifests, historical branching, range and epoch refusal,
+offline revert publication and recovery, KV/tool-call preservation, resumed
+mutation after revert, and pack/adopt of the restored state. Run it directly
+after a release build with:
+
+```bash
+VFS_GATE_STRICT=1 VFS_BIN="$PWD/target/release/vfs" \
+  crates/vfs-cli/tests/test-history-revert-e2e.sh
+```
 
 ## Python validation gates
 

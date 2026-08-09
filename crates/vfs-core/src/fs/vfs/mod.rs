@@ -409,6 +409,7 @@ impl Vfs {
                 (ROOT_INO, DEFAULT_DIR_MODE as i64, uid, gid, now_secs, now_secs, now_secs, now_nsec, now_nsec, now_nsec),
             )
             .await?;
+            schema::refresh_empty_initial_root(txn.conn()).await?;
             Some(InodeRow {
                 ino: ROOT_INO,
                 mode: DEFAULT_DIR_MODE as i64,
