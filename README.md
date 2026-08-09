@@ -307,7 +307,6 @@ $ vfs diff my-session
 
 * `vfs exec` — one-shot command over a temporary mount, unmounted after.
 * `vfs clone` — bulk-ingest a git repository straight into the database.
-* `vfs sync` — push/pull to a remote Turso (libSQL) server.
 * `vfs serve nfs` / `vfs serve mcp` — export over NFS, or expose filesystem
   and KV tools to agents over MCP.
 * `--key` / `--cipher` — local at-rest encryption.

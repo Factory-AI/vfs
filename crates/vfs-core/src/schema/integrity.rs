@@ -347,6 +347,8 @@ async fn check_history_invariants(conn: &Connection, report: &mut Report) -> Res
 }
 
 async fn check_storage_invariants(conn: &Connection, report: &mut Report) -> Result<()> {
+    let hollow = super::chunks_hollow(conn).await?;
+
     add_zero_count_check(
         conn,
         report,
@@ -440,6 +442,7 @@ async fn check_storage_invariants(conn: &Connection, report: &mut Report) -> Res
         "SELECT COUNT(*) FROM fs_chunk WHERE length(digest) != 32",
     )
     .await?;
+    check_chunk_bytes_match_digests(conn, report, hollow).await?;
     add_zero_count_check(
         conn,
         report,
@@ -600,16 +603,39 @@ async fn check_portability_status(
     } else {
         0
     };
+    let chunks_hollow = super::chunks_hollow(conn).await?;
+    let hollow_chunks = if chunks_hollow && table_exists(conn, "fs_chunk").await? {
+        scalar_i64(conn, "SELECT COUNT(*) FROM fs_chunk").await?
+    } else {
+        0
+    };
 
     report.partial_origin_rows = partial_origin_rows;
     report.origin_backed = partial_origin_rows > 0;
-    report.portable = partial_origin_rows == 0;
+    report.portable = partial_origin_rows == 0 && !chunks_hollow;
+
+    report.push_check(
+        "storage.chunks_hollow",
+        !chunks_hollow || !require_portable,
+        if chunks_hollow {
+            format!("remote metadata artifact: {hollow_chunks} chunk row(s) have no local bytes")
+        } else {
+            "chunk bytes are present".to_string()
+        },
+        Some(hollow_chunks),
+    );
 
     report.push_check(
         "overlay.portability_status",
         true,
         if report.portable {
             "portable: no partial-origin rows".to_string()
+        } else if chunks_hollow && partial_origin_rows == 0 {
+            "not portable: chunk bytes are not present".to_string()
+        } else if chunks_hollow {
+            format!(
+                "not portable: {partial_origin_rows} partial-origin row(s) and chunk bytes are not present"
+            )
         } else {
             format!("origin-backed: {partial_origin_rows} partial-origin row(s)")
         },
@@ -622,6 +648,12 @@ async fn check_portability_status(
             report.portable,
             if report.portable {
                 "portable requirement satisfied".to_string()
+            } else if chunks_hollow && partial_origin_rows == 0 {
+                "portable requirement failed: chunk bytes are not present".to_string()
+            } else if chunks_hollow {
+                format!(
+                    "portable requirement failed: {partial_origin_rows} partial-origin row(s) and chunk bytes are not present"
+                )
             } else {
                 format!("portable requirement failed: {partial_origin_rows} partial-origin row(s)")
             },
@@ -629,6 +661,72 @@ async fn check_portability_status(
         );
     }
 
+    Ok(())
+}
+
+async fn check_chunk_bytes_match_digests(
+    conn: &Connection,
+    report: &mut Report,
+    hollow: bool,
+) -> Result<()> {
+    let mut rows = conn.query("SELECT digest, data FROM fs_chunk", ()).await?;
+    let mut checked = 0_i64;
+    let mut absent = 0_i64;
+    let mut violations = 0_i64;
+    let mut first_violation = None;
+    while let Some(row) = rows.next().await? {
+        let digest = match row.get_value(0)? {
+            Value::Blob(digest) => digest,
+            _ => {
+                violations += 1;
+                first_violation.get_or_insert_with(|| "digest is not a blob".to_string());
+                continue;
+            }
+        };
+        let data = match row.get_value(1)? {
+            Value::Blob(data) => data,
+            _ => {
+                violations += 1;
+                first_violation.get_or_insert_with(|| "data is not a blob".to_string());
+                continue;
+            }
+        };
+
+        if hollow && data.is_empty() {
+            absent += 1;
+            continue;
+        }
+        checked += 1;
+        if digest.len() != 32 || blake3::hash(&data).as_bytes().as_slice() != digest.as_slice() {
+            violations += 1;
+            first_violation.get_or_insert_with(|| {
+                format!(
+                    "digest {} has {} byte(s)",
+                    digest
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>(),
+                    data.len()
+                )
+            });
+        }
+    }
+
+    let violation_detail = first_violation
+        .map(|first| format!("; first: {first}"))
+        .unwrap_or_default();
+    report.push_check(
+        "storage.chunk_bytes_match_digest",
+        violations == 0,
+        if hollow {
+            format!(
+                "verified {checked} present chunk(s); skipped {absent} intentionally absent chunk(s); {violations} violation(s){violation_detail}"
+            )
+        } else {
+            format!("verified {checked} chunk(s); {violations} violation(s){violation_detail}")
+        },
+        Some(violations),
+    );
     Ok(())
 }
 

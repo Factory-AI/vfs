@@ -58,17 +58,9 @@ pub enum Error {
     #[error("tool call not found")]
     ToolCallNotFound,
 
-    /// Sync not enabled for this database
-    #[error("sync is not enabled for this database")]
-    SyncNotEnabled,
-
     /// Connection pool timeout - no connections available
     #[error("connection pool timeout: no connections available")]
     ConnectionPoolTimeout,
-
-    /// Encryption not supported for this configuration
-    #[error("encryption not supported: {0}")]
-    EncryptionNotSupported(String),
 
     /// Invalid encryption key
     #[error("invalid encryption key: {0}")]
@@ -81,6 +73,20 @@ pub enum Error {
     /// Schema version mismatch - database schema version doesn't match expected version
     #[error("schema version mismatch: database is version {found}, expected {expected}")]
     SchemaVersionMismatch { found: String, expected: String },
+
+    /// A hollow database contains metadata but not its content-addressed chunk bytes.
+    #[error(
+        "database is a remote metadata artifact whose chunk bytes are not present; hydrate it before opening writable"
+    )]
+    ChunksHollow,
+
+    /// A chunk source returned bytes that do not match the requested digest.
+    #[error("hydrated chunk {digest} does not match its BLAKE3 digest")]
+    ChunkDigestMismatch { digest: String },
+
+    /// A stored chunk digest cannot identify a BLAKE3 object.
+    #[error("stored chunk digest has length {length}, expected 32 bytes")]
+    InvalidChunkDigest { length: usize },
 
     /// Durable history markers record a journaling gap.
     #[error(

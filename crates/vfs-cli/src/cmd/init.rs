@@ -2,12 +2,9 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result as AnyhowResult};
-use vfs_core::{
-    vfs_dir, EncryptionConfig, OverlayFS, PartialBootstrapStrategy, PartialSyncOpts, SyncOptions,
-    Vfs, VfsOptions,
-};
+use vfs_core::{vfs_dir, EncryptionConfig, OverlayFS, Vfs, VfsOptions};
 
-use crate::opts::{MountBackend, SyncCommandOptions};
+use crate::opts::MountBackend;
 
 pub struct EncryptionOptions {
     /// Hex-encoded encryption key
@@ -20,10 +17,6 @@ pub(crate) async fn open_vfs(options: VfsOptions) -> Result<Vfs, vfs_core::error
     let mut options = options;
     if options.core_config.is_none() {
         options = options.with_core_config(crate::config::core_config_from_env());
-    }
-    // CLI handles env var fallback for auth token
-    if options.sync.auth_token.is_none() {
-        options.sync.auth_token = crate::config::turso_db_auth_token();
     }
     Vfs::open(options).await
 }
@@ -40,51 +33,8 @@ pub(crate) async fn finalize_readonly(vfs: &Vfs) {
     }
 }
 
-fn build_sync_options(sync_cmd_options: &SyncCommandOptions) -> SyncOptions {
-    let mut sync = SyncOptions {
-        remote_url: sync_cmd_options.sync_remote_url.clone(),
-        auth_token: crate::config::turso_db_auth_token(),
-        partial_sync: None,
-    };
-
-    if sync_cmd_options.sync_remote_url.is_some() {
-        let mut partial_sync = PartialSyncOpts {
-            bootstrap_strategy: Some(PartialBootstrapStrategy::Prefix { length: 128 * 1024 }),
-            prefetch: false,
-            segment_size: 128 * 1024,
-        };
-        let mut has_partial_sync = false;
-
-        if let Some(prefetch) = sync_cmd_options.sync_partial_prefetch {
-            partial_sync.prefetch = prefetch;
-            has_partial_sync = true;
-        }
-        if let Some(segment_size) = sync_cmd_options.sync_partial_segment_size {
-            partial_sync.segment_size = segment_size;
-            has_partial_sync = true;
-        }
-        if let Some(length) = sync_cmd_options.sync_partial_bootstrap_length {
-            partial_sync.bootstrap_strategy = Some(PartialBootstrapStrategy::Prefix { length });
-            has_partial_sync = true;
-        }
-        if let Some(ref query) = sync_cmd_options.sync_partial_bootstrap_query {
-            partial_sync.bootstrap_strategy = Some(PartialBootstrapStrategy::Query {
-                query: query.clone(),
-            });
-            has_partial_sync = true;
-        }
-
-        if has_partial_sync {
-            sync.partial_sync = Some(partial_sync);
-        }
-    }
-
-    sync
-}
-
 pub async fn init_database(
     id: Option<String>,
-    sync_options: SyncCommandOptions,
     force: bool,
     base: Option<PathBuf>,
     encryption: Option<EncryptionOptions>,
@@ -139,16 +89,13 @@ pub async fn init_database(
         }
     }
 
-    let mut open_options = VfsOptions::with_id(&id).with_sync(build_sync_options(&sync_options));
+    let mut open_options = VfsOptions::with_id(&id);
     if let Some(base_path) = base.as_ref() {
         open_options = open_options.with_base(base_path);
     }
     open_options = open_options.with_core_config(crate::config::core_config_from_env());
 
     let encrypted = if let Some(enc_opts) = encryption {
-        if sync_options.sync_remote_url.is_some() {
-            anyhow::bail!("Local encryption is not supported with cloud sync");
-        }
         if !enc_opts.key.chars().all(|c| c.is_ascii_hexdigit()) {
             anyhow::bail!("Encryption key must be a valid hex string");
         }
@@ -181,10 +128,6 @@ pub async fn init_database(
             .await
             .context("Failed to initialize overlay schema")?;
 
-        if agent.is_synced() {
-            agent.push().await?;
-        }
-
         eprintln!("Created overlay filesystem: {}", db_path.display());
         eprintln!("Agent ID: {}", id);
         eprintln!("Base: {}", base_path.display());
@@ -192,10 +135,6 @@ pub async fn init_database(
             eprintln!("Encryption: enabled");
         }
     } else {
-        if agent.is_synced() {
-            agent.push().await?;
-        }
-
         eprintln!("Created agent filesystem: {}", db_path.display());
         eprintln!("Agent ID: {}", id);
         if encrypted {

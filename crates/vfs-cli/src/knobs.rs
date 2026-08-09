@@ -12,7 +12,9 @@ use vfs_core::{
 
 use vfs_core::telemetry::DEFAULT_PROFILE_ENABLED;
 
-use crate::config::DEFAULT_CLONE_TIMINGS_ENABLED;
+use crate::config::{
+    DEFAULT_CLONE_TIMINGS_ENABLED, DEFAULT_REMOTE_CONCURRENCY, DEFAULT_REMOTE_STREAM_INTERVAL_MS,
+};
 
 // The runtime FUSE config lives in the sealed vfs-fuse crate while the
 // knob ledger lives at the CLI edge. Keep these defaults byte-for-byte aligned
@@ -113,6 +115,8 @@ pub enum DefaultValue {
     Unset,
     Removed,
     CloneTimingsEnabled,
+    RemoteConcurrency,
+    RemoteStreamIntervalMs,
     ProfileEnabled,
     CoreOverlayReads,
     CoreKeepcacheDelta,
@@ -178,6 +182,8 @@ impl DefaultValue {
             Self::Unset => "unset".to_string(),
             Self::Removed => "removed".to_string(),
             Self::CloneTimingsEnabled => render_bool(DEFAULT_CLONE_TIMINGS_ENABLED).to_string(),
+            Self::RemoteConcurrency => DEFAULT_REMOTE_CONCURRENCY.to_string(),
+            Self::RemoteStreamIntervalMs => DEFAULT_REMOTE_STREAM_INTERVAL_MS.to_string(),
             Self::ProfileEnabled => render_bool(DEFAULT_PROFILE_ENABLED).to_string(),
             Self::CoreOverlayReads => render_bool(CoreConfig::default().overlay_reads).to_string(),
             Self::CoreKeepcacheDelta => {
@@ -346,6 +352,7 @@ const CORE_OWNER: &str = "vfs-core config";
 #[cfg(target_os = "linux")]
 const FUSE_OWNER: &str = "vfs FUSE config";
 const CLI_OWNER: &str = "vfs CLI edge";
+const REMOTE_OWNER: &str = "vfs-cli config";
 #[cfg(all(test, target_os = "linux"))]
 const KNOBS_DOC_REGEN_ENV: &str = "VFS_UPDATE_KNOBS";
 const KNOBS_DOC_REGEN_COMMAND: &str = "VFS_UPDATE_KNOBS=1 cargo +nightly test -p vfs-cli --lib knobs::tests::generated_knobs_doc_matches_declarations -- --exact";
@@ -553,6 +560,30 @@ const LINUX_FUSE_KNOBS: &[Knob] = &[
 const LINUX_FUSE_KNOBS: &[Knob] = &[];
 
 const ACTIVE_COMMON_KNOBS: &[Knob] = &[
+    Knob::product(
+        "VFS_REMOTE_URL",
+        "env",
+        DefaultValue::Unset,
+        REMOTE_OWNER,
+        "S3 or absolute file URL that opts the process into the remote checkpoint tier.",
+        "crates/vfs-cli/tests/test-remote-checkpoint-e2e.sh",
+    ),
+    Knob::product(
+        "VFS_REMOTE_CONCURRENCY",
+        "env",
+        DefaultValue::RemoteConcurrency,
+        REMOTE_OWNER,
+        "Maximum concurrent remote object transfers; values must be at least one.",
+        "crates/vfs-cli/tests/test-remote-checkpoint-e2e.sh",
+    ),
+    Knob::product(
+        "VFS_REMOTE_STREAM_INTERVAL_MS",
+        "env",
+        DefaultValue::RemoteStreamIntervalMs,
+        REMOTE_OWNER,
+        "Background remote streamer interval in milliseconds; zero disables streaming.",
+        "crates/vfs-cli/tests/test-remote-checkpoint-e2e.sh",
+    ),
     Knob::product(
         "VFS_KEY",
         "env or --key",
@@ -997,7 +1028,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn extract_env_tokens(contents: &str) -> BTreeSet<String> {
         let mut tokens = BTreeSet::new();
-        for prefix in ["VFS_", "TURSO_DB_AUTH_TOKEN"] {
+        for prefix in ["VFS_"] {
             let mut offset = 0;
             while let Some(index) = contents[offset..].find(prefix) {
                 let start = offset + index;
@@ -1024,7 +1055,6 @@ mod tests {
                 | "VFS_SCHEMA_VERSION"
                 | "VFS_SANDBOX"
                 | "VFS_SESSION"
-                | "TURSO_DB_AUTH_TOKEN"
                 // Doc-regeneration test flag (docs.rs), not a runtime knob;
                 // its knobs.rs sibling is exempt via the knobs.rs file skip.
                 | "VFS_UPDATE_MANUAL"

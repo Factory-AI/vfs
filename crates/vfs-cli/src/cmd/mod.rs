@@ -12,13 +12,13 @@ pub mod migrate;
 pub mod pack;
 pub mod profiling;
 pub mod ps;
+pub mod remote;
 pub mod revert;
 pub mod safety;
 pub mod seed;
 mod session_lock;
 #[cfg(unix)]
 pub(crate) mod stack;
-pub mod sync;
 pub mod timeline;
 pub mod version;
 

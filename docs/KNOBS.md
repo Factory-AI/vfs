@@ -8,6 +8,9 @@ Every active runtime knob is declared here with an architecture class. Defaults 
 
 | Name | Surface | Class | Default | Owner | Description | Removal criteria | Gate |
 |---|---|---|---|---|---|---|---|
+| `VFS_REMOTE_URL` | env | product-config | `unset` | vfs-cli config | S3 or absolute file URL that opts the process into the remote checkpoint tier. | n/a | crates/vfs-cli/tests/test-remote-checkpoint-e2e.sh |
+| `VFS_REMOTE_CONCURRENCY` | env | product-config | `4` | vfs-cli config | Maximum concurrent remote object transfers; values must be at least one. | n/a | crates/vfs-cli/tests/test-remote-checkpoint-e2e.sh |
+| `VFS_REMOTE_STREAM_INTERVAL_MS` | env | product-config | `5000` | vfs-cli config | Background remote streamer interval in milliseconds; zero disables streaming. | n/a | crates/vfs-cli/tests/test-remote-checkpoint-e2e.sh |
 | `VFS_KEY` | env or --key | product-config | `unset` | vfs CLI edge | Hex-encoded local encryption key for CLI commands that open a database. | n/a | opts clap env binding |
 | `VFS_CIPHER` | env or --cipher | product-config | `unset` | vfs CLI edge | Encryption cipher paired with VFS_KEY or --key. | n/a | opts clap env binding |
 | `VFS_CLONE_TIMINGS` | env | sunset | `false` | vfs CLI edge | Ad hoc clone timing printout for local performance investigations. | Remove after telemetry registry exposes clone timing through the single report sink. | config::clone_timings_enabled |

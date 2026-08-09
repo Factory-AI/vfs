@@ -1,7 +1,5 @@
 use crate::error::Result;
 use crate::pool::ConnectionPool;
-#[cfg(test)]
-use crate::pool::DatabaseType;
 use crate::schema;
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
@@ -22,7 +20,7 @@ impl KvStore {
         } else {
             crate::fs::vfs::file_backed_connection_pool_options()
         };
-        let pool = ConnectionPool::with_options(DatabaseType::Local(db), options);
+        let pool = ConnectionPool::with_options(db, options);
         let kv = Self { pool };
         kv.initialize().await?;
         Ok(kv)

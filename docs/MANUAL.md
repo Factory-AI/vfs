@@ -84,55 +84,6 @@ vfs init [OPTIONS] [ID]
 - `--cipher <CIPHER>` — Cipher algorithm for encryption (required with --key). Options: aegis128l, aegis128x2, aegis128x4, aegis256, aegis256x2, aegis256x4, aes128gcm, aes256gcm [env: VFS_CIPHER]
 - `-c, --command <COMMAND>` — Command to execute after initialization (mounts the filesystem, runs command, unmounts)
 - `--backend <BACKEND>` — Backend to use for mounting when using -c (default: fuse on Linux, nfs on macOS) [possible values: fuse, nfs; default: fuse]
-- `--sync-remote-url <SYNC_REMOTE_URL>`
-- `--sync-partial-prefetch <SYNC_PARTIAL_PREFETCH>` [possible values: true, false]
-- `--sync-partial-segment-size <SYNC_PARTIAL_SEGMENT_SIZE>`
-- `--sync-partial-bootstrap-query <SYNC_PARTIAL_BOOTSTRAP_QUERY>`
-- `--sync-partial-bootstrap-length <SYNC_PARTIAL_BOOTSTRAP_LENGTH>`
-
-### vfs sync
-
-Remote sync operations
-
-```
-vfs sync <ID_OR_PATH> <COMMAND>
-```
-
-**Arguments:**
-
-- `<ID_OR_PATH>` — Agent ID or database path
-
-#### vfs sync pull
-
-Pull remote changes (only of vfs was initialized with remote sync)
-
-```
-vfs sync <ID_OR_PATH> pull
-```
-
-#### vfs sync push
-
-Push remote changes (only of vfs was initialized with remote sync)
-
-```
-vfs sync <ID_OR_PATH> push
-```
-
-#### vfs sync stats
-
-Print synced database stats
-
-```
-vfs sync <ID_OR_PATH> stats
-```
-
-#### vfs sync checkpoint
-
-Checkpoint local synced db
-
-```
-vfs sync <ID_OR_PATH> checkpoint
-```
 
 ### vfs fs
 
@@ -1000,7 +951,7 @@ Every runtime knob (env var or first-class flag) is declared in the generated
 [docs/KNOBS.md](KNOBS.md) ledger with its class, default, owner, and gate.
 `VFS_KEY` / `VFS_CIPHER` provide default encryption credentials for
 the commands whose `--key` / `--cipher` options declare them (see the
-generated sections above); `TURSO_DB_AUTH_TOKEN` authenticates cloud sync.
+generated sections above).
 
 ### FUSE-over-io_uring and rapid remounts
 
@@ -1074,10 +1025,6 @@ export VFS_CIPHER=aes256gcm
 vfs init my-secure-agent
 vfs fs my-secure-agent ls /
 ```
-
-**Limitations:**
-
-- Local encryption cannot be used with cloud sync (`--sync-remote-url`)
 
 ## Files
 

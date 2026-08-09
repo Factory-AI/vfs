@@ -330,7 +330,7 @@ def main(argv: list[str]) -> int:
                     "BLOB reads/writes for fs_data and inline inode payloads",
                     "PRAGMA WAL, synchronous=NORMAL, checkpoint, and busy-timeout behavior",
                     "single-file snapshot/checkpoint semantics",
-                    "optional local encryption/cloud sync compatibility decision",
+                    "optional local encryption compatibility decision",
                 ],
                 "db_backend_trait_practicality": args.fallback_trait_practicality,
                 "estimated_invasiveness": args.fallback_invasiveness,

@@ -3535,7 +3535,7 @@
             .build()
             .await?;
         let pool = crate::pool::ConnectionPool::with_options(
-            crate::pool::DatabaseType::Local(db),
+            db,
             super::super::vfs::file_backed_connection_pool_options(),
         );
         let config = crate::CoreConfig {

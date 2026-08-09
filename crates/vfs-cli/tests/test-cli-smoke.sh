@@ -243,9 +243,6 @@ cp "$DIR/fixtures/migrate/v0_4.db" "$ROOT/dry-run.db"
 run_vfs migrate "$ROOT/dry-run.db" --dry-run >/dev/null 2>&1 || fail "migrate --dry-run failed"
 [ ! -e "$ROOT/dry-run.db-wal" ] || fail "migrate --dry-run left $ROOT/dry-run.db-wal behind"
 [ ! -e "$ROOT/dry-run.db-shm" ] || fail "migrate --dry-run left $ROOT/dry-run.db-shm behind"
-# sync stats errors on a non-synced local DB but must still exit single-file
-run_vfs sync "$RDB" stats >/dev/null 2>&1 || true
-no_sidecars "sync stats"
 run_vfs ps >/dev/null 2>&1 || fail "ps (read census) failed"
 no_sidecars "ps"
 # exec is mount-owning: teardown chdirs to / before the sidecar sweep runs, and

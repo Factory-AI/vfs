@@ -1,7 +1,5 @@
 use crate::error::{Error, Result};
 use crate::pool::ConnectionPool;
-#[cfg(test)]
-use crate::pool::DatabaseType;
 use crate::schema;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -90,7 +88,7 @@ impl ToolCalls {
         } else {
             crate::fs::vfs::file_backed_connection_pool_options()
         };
-        let pool = ConnectionPool::with_options(DatabaseType::Local(db), options);
+        let pool = ConnectionPool::with_options(db, options);
         let tc = Self { pool };
         tc.initialize().await?;
         Ok(tc)

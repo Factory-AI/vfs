@@ -7,7 +7,10 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use turso::transaction::{Transaction, TransactionBehavior};
 use turso::{Builder, Connection, EncryptionOpts, Value};
-use vfs_core::{schema::integrity, VfsOptions};
+use vfs_core::{
+    schema::{self, integrity},
+    VfsOptions,
+};
 
 const S_IFMT: i64 = 0o170000;
 const S_IFREG: i64 = 0o100000;
@@ -125,7 +128,15 @@ pub async fn handle_backup_command(
     let source_path = resolve_local_db_path(&id_or_path)?;
     ensure_backup_target(&source_path, &target)?;
 
+    let db = build_local_database(&source_path, encryption).await?;
+    let conn = db
+        .connect()
+        .context("Failed to connect to source database")?;
+    reject_hollow_backup(&conn).await?;
+
     if materialize {
+        drop(conn);
+        drop(db);
         let materialized =
             copy_and_materialize_database(&source_path, &target, verify, encryption).await?;
         writeln!(stdout, "Source: {}", source_path.display())?;
@@ -139,11 +150,6 @@ pub async fn handle_backup_command(
         }
         return Ok(());
     }
-
-    let db = build_local_database(&source_path, encryption).await?;
-    let conn = db
-        .connect()
-        .context("Failed to connect to source database")?;
 
     reject_partial_origin_backup(&conn).await?;
     checkpoint_for_backup(&conn, &source_path).await?;
@@ -838,6 +844,15 @@ async fn reject_partial_origin_backup(conn: &Connection) -> AnyhowResult<()> {
     Ok(())
 }
 
+async fn reject_hollow_backup(conn: &Connection) -> AnyhowResult<()> {
+    if schema::chunks_hollow(conn).await? {
+        anyhow::bail!(
+            "backup is not supported for a remote metadata artifact whose chunk bytes are not present; hydrate the database first"
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn copy_file_exclusive(source: &Path, target: &Path) -> AnyhowResult<()> {
     let mut src = fs::File::open(source)
         .with_context(|| format!("Failed to open source {}", source.display()))?;
@@ -1454,6 +1469,47 @@ mod tests {
         );
         let output = String::from_utf8(stdout).unwrap();
         assert!(output.contains("Verification: complete"));
+    }
+
+    #[tokio::test]
+    async fn backup_refuses_hollow_metadata_artifacts() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source = temp_dir.path().join("hollow-source.db");
+        {
+            let agent = Vfs::open(VfsOptions::with_path(source.to_string_lossy()))
+                .await
+                .unwrap();
+            write_agent_file(&agent, "/large.bin", &vec![7_u8; 128 * 1024]).await;
+            agent.fs.finalize().await.unwrap();
+        }
+        {
+            let db = build_local_database(&source, None).await.unwrap();
+            let conn = db.connect().unwrap();
+            schema::hollow_chunks(&conn).await.unwrap();
+        }
+
+        for materialize in [false, true] {
+            let target = temp_dir
+                .path()
+                .join(format!("backup-materialize-{materialize}.db"));
+            let error = handle_backup_command(
+                &mut Vec::new(),
+                source.to_string_lossy().to_string(),
+                target.clone(),
+                false,
+                materialize,
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("remote metadata artifact whose chunk bytes are not present"),
+                "unexpected error: {error:#}"
+            );
+            assert!(!target.exists());
+        }
     }
 
     #[tokio::test]

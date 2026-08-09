@@ -105,20 +105,6 @@ pub struct Args {
     pub command: Command,
 }
 
-#[derive(Debug, Parser)]
-pub struct SyncCommandOptions {
-    #[arg(long)]
-    pub(crate) sync_remote_url: Option<String>,
-    #[arg(long)]
-    pub(crate) sync_partial_prefetch: Option<bool>,
-    #[arg(long)]
-    pub(crate) sync_partial_segment_size: Option<usize>,
-    #[arg(long)]
-    pub(crate) sync_partial_bootstrap_query: Option<String>,
-    #[arg(long)]
-    pub(crate) sync_partial_bootstrap_length: Option<usize>,
-}
-
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Manage shell completions (supported shells: bash, zsh, fish, elvish, powershell)
@@ -156,18 +142,6 @@ pub enum Command {
         /// Backend to use for mounting when using -c (default: fuse on Linux, nfs on macOS)
         #[arg(long, default_value_t = MountBackend::default())]
         backend: MountBackend,
-
-        #[command(flatten)]
-        sync: SyncCommandOptions,
-    },
-    /// Remote sync operations
-    Sync {
-        /// Agent ID or database path
-        #[arg(add = ArgValueCompleter::new(id_or_path_completer))]
-        id_or_path: String,
-
-        #[command(subcommand)]
-        command: SyncCommand,
     },
     /// Filesystem operations
     Fs {
@@ -734,18 +708,6 @@ pub enum FsCommand {
         /// Content of the file
         content: String,
     },
-}
-
-#[derive(Subcommand, Debug)]
-pub enum SyncCommand {
-    /// Pull remote changes (only of vfs was initialized with remote sync)
-    Pull,
-    /// Push remote changes (only of vfs was initialized with remote sync)
-    Push,
-    /// Print synced database stats
-    Stats,
-    /// Checkpoint local synced db
-    Checkpoint,
 }
 
 #[derive(Subcommand, Debug)]

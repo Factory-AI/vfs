@@ -66,14 +66,6 @@ impl PoolOptions {
     }
 }
 
-/// Database wrapper that supports both regular and sync databases.
-pub enum DatabaseType {
-    /// A local Turso database.
-    Local(Database),
-    /// A Turso sync database.
-    Sync(turso::sync::Database),
-}
-
 /// A pool of database connections with a maximum limit.
 ///
 /// The pool enforces a maximum number of concurrent connections. When all
@@ -85,7 +77,7 @@ pub struct ConnectionPool {
 }
 
 struct ConnectionPoolInner {
-    db: DatabaseType,
+    db: Database,
     /// Available connections ready to be reused
     pool: Mutex<Vec<Connection>>,
     /// Semaphore to limit concurrent connections
@@ -99,8 +91,8 @@ struct ConnectionPoolInner {
 }
 
 impl ConnectionPool {
-    /// Create a connection pool with explicit database type and options.
-    pub(crate) fn with_options(db: DatabaseType, options: PoolOptions) -> Self {
+    /// Create a connection pool with explicit options.
+    pub(crate) fn with_options(db: Database, options: PoolOptions) -> Self {
         Self {
             inner: Arc::new(ConnectionPoolInner {
                 db,
@@ -165,27 +157,12 @@ impl ConnectionPool {
     }
 
     /// Get the underlying database reference (for creating additional connections).
-    /// Returns None if this is a sync database.
-    pub fn database(&self) -> Option<&Database> {
-        match &self.inner.db {
-            DatabaseType::Local(db) => Some(db),
-            DatabaseType::Sync(_) => None,
-        }
-    }
-
-    /// Get the underlying sync database reference.
-    pub fn sync_database(&self) -> Option<&turso::sync::Database> {
-        match &self.inner.db {
-            DatabaseType::Local(_) => None,
-            DatabaseType::Sync(db) => Some(db),
-        }
+    pub fn database(&self) -> &Database {
+        &self.inner.db
     }
 
     async fn create_connection(&self) -> Result<Connection> {
-        let conn = match &self.inner.db {
-            DatabaseType::Local(db) => db.connect()?,
-            DatabaseType::Sync(db) => db.connect().await?,
-        };
+        let conn = self.inner.db.connect()?;
 
         if let Some(timeout) = self.inner.connection_busy_timeout {
             conn.busy_timeout(timeout)?;
@@ -283,8 +260,7 @@ mod tests {
     #[tokio::test]
     async fn test_connection_pool_basic() {
         let db = Builder::new_local(":memory:").build().await.unwrap();
-        let pool =
-            ConnectionPool::with_options(DatabaseType::Local(db), PoolOptions::single_connection());
+        let pool = ConnectionPool::with_options(db, PoolOptions::single_connection());
 
         // Get a connection
         let conn = pool.get_connection().await.unwrap();
@@ -301,8 +277,7 @@ mod tests {
     #[tokio::test]
     async fn test_default_pool_is_single_connection() {
         let db = Builder::new_local(":memory:").build().await.unwrap();
-        let pool =
-            ConnectionPool::with_options(DatabaseType::Local(db), PoolOptions::single_connection());
+        let pool = ConnectionPool::with_options(db, PoolOptions::single_connection());
 
         let conn1 = pool.get_connection().await.unwrap();
         let pool_clone = pool.clone();
@@ -318,7 +293,7 @@ mod tests {
     async fn test_single_connection_pool_times_out_under_contention() {
         let db = Builder::new_local(":memory:").build().await.unwrap();
         let pool = ConnectionPool::with_options(
-            DatabaseType::Local(db),
+            db,
             PoolOptions {
                 timeout: Duration::from_millis(50),
                 ..PoolOptions::single_connection()
@@ -344,7 +319,7 @@ mod tests {
         // Create pool with very short timeout
         let db = Builder::new_local(":memory:").build().await.unwrap();
         let pool = ConnectionPool::with_options(
-            DatabaseType::Local(db),
+            db,
             PoolOptions {
                 timeout: Duration::from_millis(50),
                 ..PoolOptions::single_connection()
@@ -362,8 +337,7 @@ mod tests {
     #[tokio::test]
     async fn test_connection_pool_concurrent_waiters() {
         let db = Builder::new_local(":memory:").build().await.unwrap();
-        let pool =
-            ConnectionPool::with_options(DatabaseType::Local(db), PoolOptions::single_connection());
+        let pool = ConnectionPool::with_options(db, PoolOptions::single_connection());
         let counter = Arc::new(AtomicUsize::new(0));
 
         // Spawn multiple tasks that all want the connection
@@ -391,8 +365,7 @@ mod tests {
     #[tokio::test]
     async fn test_drop_discard_is_counted_when_pool_lock_is_busy() {
         let db = Builder::new_local(":memory:").build().await.unwrap();
-        let pool =
-            ConnectionPool::with_options(DatabaseType::Local(db), PoolOptions::single_connection());
+        let pool = ConnectionPool::with_options(db, PoolOptions::single_connection());
 
         let conn = pool.get_connection().await.unwrap();
         let before = crate::telemetry::snapshot().counter("connection_drop_discards");
@@ -410,8 +383,7 @@ mod tests {
     #[tokio::test]
     async fn test_unhealthy_connection_is_evicted_and_counted() {
         let db = Builder::new_local(":memory:").build().await.unwrap();
-        let pool =
-            ConnectionPool::with_options(DatabaseType::Local(db), PoolOptions::single_connection());
+        let pool = ConnectionPool::with_options(db, PoolOptions::single_connection());
 
         let mut conn = pool.get_connection().await.unwrap();
         let before = crate::telemetry::snapshot().counter("connection_health_evictions");
@@ -452,7 +424,7 @@ mod tests {
             .await
             .unwrap();
         let pool = ConnectionPool::with_options(
-            DatabaseType::Local(db),
+            db,
             PoolOptions {
                 max_connections: 2,
                 ..PoolOptions::default()
@@ -490,7 +462,7 @@ mod tests {
             .await
             .unwrap();
         let pool = ConnectionPool::with_options(
-            DatabaseType::Local(db),
+            db,
             PoolOptions {
                 max_connections: 2,
                 ..PoolOptions::default().with_setup_sql(["PRAGMA busy_timeout = 1234"])

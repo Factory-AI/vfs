@@ -37,16 +37,13 @@ pub mod telemetry;
 pub mod toolcalls;
 
 use error::{Error, Result};
-use pool::{ConnectionPool, DatabaseType, PoolOptions, PooledConnection};
+use pool::{ConnectionPool, PooledConnection};
 use std::{
     collections::{HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::Arc,
 };
 use turso::{Builder, EncryptionOpts, Value};
-
-// Re-export turso sync types for CLI usage
-pub use turso::sync::{DatabaseSyncStats, PartialBootstrapStrategy, PartialSyncOpts};
 
 // Re-export filesystem types
 pub use config::{
@@ -66,8 +63,11 @@ pub use fs::{
 };
 pub use kv::KvStore;
 pub use mounts::{get_mounts, Mount};
-pub use options::{vfs_dir, EncryptionConfig, SyncOptions, VfsOptions};
-pub use schema::{SchemaVersion, CURRENT, VFS_SCHEMA_VERSION};
+pub use options::{vfs_dir, EncryptionConfig, VfsOptions};
+pub use schema::{
+    chunks_hollow, hollow_chunks, hydrate_chunks, ChunkSource, HollowReport, SchemaVersion,
+    CURRENT, VFS_SCHEMA_VERSION,
+};
 pub use semantics::{AckDurability, Semantics, WriteReceipt};
 pub use session::{SessionMetadata, SessionStatusMetadata};
 pub use toolcalls::{ToolCall, ToolCallStats, ToolCallStatus, ToolCalls};
@@ -78,7 +78,6 @@ pub use toolcalls::{ToolCall, ToolCallStats, ToolCallStatus, ToolCalls};
 /// and tool calls tracking backed by a SQLite database.
 pub struct Vfs {
     pool: ConnectionPool,
-    sync_db: Option<turso::sync::Database>,
     pub kv: KvStore,
     pub fs: fs::Vfs,
     pub tools: ToolCalls,
@@ -108,7 +107,7 @@ impl Vfs {
             .ok_or_else(|| Error::InvalidUtf8Path(path.display().to_string()))?;
         let db = Builder::new_local(path_str).read_only(true).build().await?;
         let pool = ConnectionPool::with_options(
-            DatabaseType::Local(db),
+            db,
             fs::vfs::read_only_file_backed_connection_pool_options(),
         );
         let fs =
@@ -117,7 +116,6 @@ impl Vfs {
 
         Ok(Self {
             pool: pool.clone(),
-            sync_db: None,
             kv: KvStore::from_read_only_pool(pool.clone()),
             fs,
             tools: ToolCalls::from_read_only_pool(pool),
@@ -158,72 +156,23 @@ impl Vfs {
             }
         }
 
-        // Encryption is not supported with sync
-        if options.encryption.is_some() && options.sync.remote_url.is_some() {
-            return Err(Error::EncryptionNotSupported(
-                "Local encryption is not supported with cloud sync".to_string(),
-            ));
-        }
-
         let db_path = options.db_path()?;
-        let meta_path = format!("{db_path}-info");
-
-        // Determine if this is a synced database:
-        // 1. If sync.remote_url is set, create a new synced database
-        // 2. If {path}-info file exists, open as existing synced database
-        // 3. Otherwise, open as local database (with optional encryption via URI)
-        let (sync_db, pool) = if let Some(remote_url) = options.sync.remote_url {
-            // Creating a new synced database
-            let mut builder =
-                turso::sync::Builder::new_remote(&db_path).with_remote_url(remote_url);
-            if let Some(auth_token) = options.sync.auth_token {
-                builder = builder.with_auth_token(auth_token);
-            }
-            if let Some(partial_sync) = options.sync.partial_sync {
-                builder = builder.with_partial_sync_opts_experimental(partial_sync);
-            }
-            let db = builder.build().await?;
-            let pool = ConnectionPool::with_options(
-                DatabaseType::Sync(db.clone()),
-                PoolOptions::single_connection(),
-            );
-            (Some(db), pool)
-        } else if std::fs::exists(&meta_path).unwrap_or(false) {
-            let mut builder = turso::sync::Builder::new_remote(&db_path);
-            if let Some(auth_token) = options.sync.auth_token {
-                builder = builder.with_auth_token(auth_token);
-            }
-            let db = builder.build().await?;
-            let pool = ConnectionPool::with_options(
-                DatabaseType::Sync(db.clone()),
-                PoolOptions::single_connection(),
-            );
-            (Some(db), pool)
+        let db = if let Some(ref enc_config) = options.encryption {
+            Builder::new_local(&db_path)
+                .experimental_encryption(true)
+                .with_encryption(EncryptionOpts {
+                    cipher: enc_config.cipher.clone(),
+                    hexkey: enc_config.hex_key.clone(),
+                })
+                .build()
+                .await?
         } else {
-            let db = if let Some(ref enc_config) = options.encryption {
-                Builder::new_local(&db_path)
-                    .experimental_encryption(true)
-                    .with_encryption(EncryptionOpts {
-                        cipher: enc_config.cipher.clone(),
-                        hexkey: enc_config.hex_key.clone(),
-                    })
-                    .build()
-                    .await?
-            } else {
-                Builder::new_local(&db_path).build().await?
-            };
-            let pool = if db_path == ":memory:" {
-                ConnectionPool::with_options(
-                    DatabaseType::Local(db),
-                    fs::vfs::memory_connection_pool_options(),
-                )
-            } else {
-                ConnectionPool::with_options(
-                    DatabaseType::Local(db),
-                    fs::vfs::file_backed_connection_pool_options(),
-                )
-            };
-            (None, pool)
+            Builder::new_local(&db_path).build().await?
+        };
+        let pool = if db_path == ":memory:" {
+            ConnectionPool::with_options(db, fs::vfs::memory_connection_pool_options())
+        } else {
+            ConnectionPool::with_options(db, fs::vfs::file_backed_connection_pool_options())
         };
 
         // Initialize or normalize schema for existing databases before any
@@ -247,18 +196,17 @@ impl Vfs {
             }
         }
 
-        let db_path_for_fs = if sync_db.is_none() && db_path != ":memory:" {
+        let db_path_for_fs = if db_path != ":memory:" {
             Some(PathBuf::from(&db_path))
         } else {
             None
         };
 
-        Self::build_from_pool_and_path(pool, sync_db, db_path_for_fs, core_config, Vec::new()).await
+        Self::build_from_pool_and_path(pool, db_path_for_fs, core_config, Vec::new()).await
     }
 
     async fn build_from_pool_and_config(
         pool: ConnectionPool,
-        sync_db: Option<turso::sync::Database>,
         core_config: CoreConfig,
     ) -> Result<Self> {
         let kv = KvStore::from_pool(pool.clone()).await?;
@@ -273,7 +221,6 @@ impl Vfs {
 
         Ok(Self {
             pool,
-            sync_db,
             kv,
             fs,
             tools,
@@ -282,7 +229,6 @@ impl Vfs {
 
     async fn build_from_pool_and_path(
         pool: ConnectionPool,
-        sync_db: Option<turso::sync::Database>,
         db_path: Option<PathBuf>,
         core_config: CoreConfig,
         reap_hooks: Vec<Arc<dyn fs::vfs::ReapHook>>,
@@ -299,7 +245,6 @@ impl Vfs {
 
         Ok(Self {
             pool,
-            sync_db,
             kv,
             fs,
             tools,
@@ -313,17 +258,11 @@ impl Vfs {
     pub async fn new(db_path: &str) -> Result<Self> {
         let db = Builder::new_local(db_path).build().await?;
         let pool = if db_path == ":memory:" {
-            ConnectionPool::with_options(
-                DatabaseType::Local(db),
-                fs::vfs::memory_connection_pool_options(),
-            )
+            ConnectionPool::with_options(db, fs::vfs::memory_connection_pool_options())
         } else {
-            ConnectionPool::with_options(
-                DatabaseType::Local(db),
-                fs::vfs::file_backed_connection_pool_options(),
-            )
+            ConnectionPool::with_options(db, fs::vfs::file_backed_connection_pool_options())
         };
-        Self::build_from_pool_and_config(pool, None, CoreConfig::from_env()).await
+        Self::build_from_pool_and_config(pool, CoreConfig::from_env()).await
     }
 
     /// Get a connection from the pool
@@ -392,39 +331,6 @@ impl Vfs {
         // so no later commit pins one the collection removed.
         self.fs.journal_ctx().forget_chunks();
         Ok(root)
-    }
-
-    /// Check if sync is enabled for this database
-    pub fn is_synced(&self) -> bool {
-        self.sync_db.is_some()
-    }
-
-    /// Pull changes from remote database
-    pub async fn pull(&self) -> Result<()> {
-        let db = self.sync_db.as_ref().ok_or(Error::SyncNotEnabled)?;
-        db.pull().await?;
-        Ok(())
-    }
-
-    /// Push local changes to remote database
-    pub async fn push(&self) -> Result<()> {
-        let db = self.sync_db.as_ref().ok_or(Error::SyncNotEnabled)?;
-        db.push().await?;
-        Ok(())
-    }
-
-    /// Checkpoint the local database
-    pub async fn checkpoint(&self) -> Result<()> {
-        let db = self.sync_db.as_ref().ok_or(Error::SyncNotEnabled)?;
-        db.checkpoint().await?;
-        Ok(())
-    }
-
-    /// Get sync statistics
-    pub async fn sync_stats(&self) -> Result<DatabaseSyncStats> {
-        let db = self.sync_db.as_ref().ok_or(Error::SyncNotEnabled)?;
-        let stats = db.stats().await?;
-        Ok(stats)
     }
 
     /// Get all paths in the delta layer (files in fs_dentry)

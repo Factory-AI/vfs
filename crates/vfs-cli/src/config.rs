@@ -5,14 +5,20 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use vfs_core::{CoreConfig, EnvReader};
 
+use crate::cmd::remote::RemoteConfig;
+
 const CLONE_TIMINGS_ENV: &str = "VFS_CLONE_TIMINGS";
+const REMOTE_CONCURRENCY_ENV: &str = "VFS_REMOTE_CONCURRENCY";
+const REMOTE_STREAM_INTERVAL_MS_ENV: &str = "VFS_REMOTE_STREAM_INTERVAL_MS";
+const REMOTE_URL_ENV: &str = "VFS_REMOTE_URL";
 const SHELL_ENV: &str = "SHELL";
-const TURSO_AUTH_TOKEN_ENV: &str = "TURSO_DB_AUTH_TOKEN";
 
 #[cfg(target_os = "linux")]
 const FUSE_WRITEBACK_ENV: &str = "VFS_FUSE_WRITEBACK";
 
 pub(crate) const DEFAULT_CLONE_TIMINGS_ENABLED: bool = false;
+pub(crate) const DEFAULT_REMOTE_CONCURRENCY: usize = 4;
+pub(crate) const DEFAULT_REMOTE_STREAM_INTERVAL_MS: u64 = 5_000;
 
 pub(crate) fn core_config_from_env() -> CoreConfig {
     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
@@ -36,8 +42,47 @@ pub(crate) fn current_shell_path() -> Option<String> {
     EnvReader::new().string(SHELL_ENV)
 }
 
-pub(crate) fn turso_db_auth_token() -> Option<String> {
-    EnvReader::new().string(TURSO_AUTH_TOKEN_ENV)
+pub fn remote_config() -> Option<RemoteConfig> {
+    let reader = EnvReader::new();
+    let url = reader.string(REMOTE_URL_ENV)?;
+    let concurrency =
+        reader
+            .string(REMOTE_CONCURRENCY_ENV)
+            .map_or(DEFAULT_REMOTE_CONCURRENCY, |value| {
+                value
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|value| *value >= 1)
+                    .unwrap_or_else(|| {
+                        tracing::warn!(
+                            "Ignoring invalid {}={:?}; using default {}",
+                            REMOTE_CONCURRENCY_ENV,
+                            value,
+                            DEFAULT_REMOTE_CONCURRENCY
+                        );
+                        DEFAULT_REMOTE_CONCURRENCY
+                    })
+            });
+    let stream_interval_ms = reader.string(REMOTE_STREAM_INTERVAL_MS_ENV).map_or(
+        DEFAULT_REMOTE_STREAM_INTERVAL_MS,
+        |value| {
+            value.parse::<u64>().unwrap_or_else(|_| {
+                tracing::warn!(
+                    "Ignoring invalid {}={:?}; using default {}",
+                    REMOTE_STREAM_INTERVAL_MS_ENV,
+                    value,
+                    DEFAULT_REMOTE_STREAM_INTERVAL_MS
+                );
+                DEFAULT_REMOTE_STREAM_INTERVAL_MS
+            })
+        },
+    );
+
+    Some(RemoteConfig {
+        url,
+        concurrency,
+        stream_interval_ms,
+    })
 }
 
 // ─── private sort-spill dir ──────────────────────────────────────────────────
@@ -198,7 +243,13 @@ mod tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    const CONFIG_ENV_KEYS: &[&str] = &[CLONE_TIMINGS_ENV, SHELL_ENV, TURSO_AUTH_TOKEN_ENV];
+    const CONFIG_ENV_KEYS: &[&str] = &[
+        CLONE_TIMINGS_ENV,
+        REMOTE_CONCURRENCY_ENV,
+        REMOTE_STREAM_INTERVAL_MS_ENV,
+        REMOTE_URL_ENV,
+        SHELL_ENV,
+    ];
 
     struct EnvSnapshot {
         values: Vec<(&'static str, Option<String>)>,
@@ -229,17 +280,6 @@ mod tests {
     }
 
     #[test]
-    fn turso_db_auth_token_reads_env_at_cli_edge() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let _snapshot = EnvSnapshot::capture(CONFIG_ENV_KEYS);
-
-        assert_eq!(turso_db_auth_token(), None);
-
-        std::env::set_var(TURSO_AUTH_TOKEN_ENV, "test-token");
-        assert_eq!(turso_db_auth_token().as_deref(), Some("test-token"));
-    }
-
-    #[test]
     fn clone_timings_enabled_reads_explicit_one_only() {
         let _lock = ENV_LOCK.lock().unwrap();
         let _snapshot = EnvSnapshot::capture(CONFIG_ENV_KEYS);
@@ -262,6 +302,54 @@ mod tests {
 
         std::env::set_var(SHELL_ENV, "/bin/test-shell");
         assert_eq!(current_shell_path().as_deref(), Some("/bin/test-shell"));
+    }
+
+    #[test]
+    fn remote_config_is_absent_until_url_opts_in() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _snapshot = EnvSnapshot::capture(CONFIG_ENV_KEYS);
+
+        assert_eq!(remote_config(), None);
+    }
+
+    #[test]
+    fn remote_config_uses_typed_defaults() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _snapshot = EnvSnapshot::capture(CONFIG_ENV_KEYS);
+        std::env::set_var(REMOTE_URL_ENV, "file:///tmp/vfs-remote");
+
+        assert_eq!(
+            remote_config(),
+            Some(RemoteConfig {
+                url: "file:///tmp/vfs-remote".to_string(),
+                concurrency: DEFAULT_REMOTE_CONCURRENCY,
+                stream_interval_ms: DEFAULT_REMOTE_STREAM_INTERVAL_MS,
+            })
+        );
+
+        std::env::set_var(REMOTE_CONCURRENCY_ENV, "12");
+        std::env::set_var(REMOTE_STREAM_INTERVAL_MS_ENV, "0");
+        assert_eq!(
+            remote_config(),
+            Some(RemoteConfig {
+                url: "file:///tmp/vfs-remote".to_string(),
+                concurrency: 12,
+                stream_interval_ms: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn remote_config_rejects_zero_concurrency() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _snapshot = EnvSnapshot::capture(CONFIG_ENV_KEYS);
+        std::env::set_var(REMOTE_URL_ENV, "s3://checkpoints/vfs");
+        std::env::set_var(REMOTE_CONCURRENCY_ENV, "0");
+
+        assert_eq!(
+            remote_config().unwrap().concurrency,
+            DEFAULT_REMOTE_CONCURRENCY
+        );
     }
 
     #[test]

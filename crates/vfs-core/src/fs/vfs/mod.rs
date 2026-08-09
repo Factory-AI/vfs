@@ -23,7 +23,7 @@ use super::{FileSystem, TimeChange, WriteRange, DEFAULT_FILE_MODE};
 #[cfg(test)]
 use crate::config::BatcherConfig;
 use crate::config::{CoreConfig, Geometry, DEFAULT_CHUNK_SIZE, DEFAULT_INLINE_THRESHOLD};
-use crate::pool::{ConnectionPool, DatabaseType, PoolOptions};
+use crate::pool::{ConnectionPool, PoolOptions};
 use crate::schema;
 
 mod batcher;
@@ -172,12 +172,9 @@ impl Vfs {
     pub async fn new(db_path: &str) -> Result<Self> {
         let db = Builder::new_local(db_path).build().await?;
         let pool = if db_path == ":memory:" {
-            ConnectionPool::with_options(DatabaseType::Local(db), memory_connection_pool_options())
+            ConnectionPool::with_options(db, memory_connection_pool_options())
         } else {
-            ConnectionPool::with_options(
-                DatabaseType::Local(db),
-                file_backed_connection_pool_options(),
-            )
+            ConnectionPool::with_options(db, file_backed_connection_pool_options())
         };
         let db_path = if db_path == ":memory:" {
             None

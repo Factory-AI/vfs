@@ -18,7 +18,7 @@
             .build()
             .await?;
         let pool =
-            ConnectionPool::with_options(DatabaseType::Local(db), file_backed_connection_pool_options());
+            ConnectionPool::with_options(db, file_backed_connection_pool_options());
         let fs = Vfs::from_pool_with_path_and_config(pool, Some(db_path), config).await?;
         Ok((fs, dir))
     }
@@ -4431,16 +4431,18 @@
         conn.execute("DELETE FROM fs_op_journal", ()).await?;
         crate::schema::rebuild_journal_allocator(&conn, 0).await?;
 
-        let x = vec![0x11; 32];
-        let y = vec![0x22; 32];
+        let x_data = b"x";
+        let y_data = b"y";
+        let x = blake3::hash(x_data).as_bytes().to_vec();
+        let y = blake3::hash(y_data).as_bytes().to_vec();
         conn.execute(
             "INSERT INTO fs_chunk (digest, data, refcount) VALUES (?, ?, 0)",
-            (x.clone(), b"x".as_slice()),
+            (x.clone(), x_data.as_slice()),
         )
         .await?;
         conn.execute(
             "INSERT INTO fs_chunk (digest, data, refcount) VALUES (?, ?, 0)",
-            (y.clone(), b"y".as_slice()),
+            (y.clone(), y_data.as_slice()),
         )
         .await?;
 
@@ -4480,7 +4482,9 @@
         }
         // The rolled-forward floor root pins both digests needed to recreate
         // state at that boundary; the retained suffix also pins x.
-        assert_eq!(chunks, vec![x, y]);
+        let mut expected_chunks = vec![x, y];
+        expected_chunks.sort();
+        assert_eq!(chunks, expected_chunks);
 
         let report = crate::schema::integrity::check(
             &conn,

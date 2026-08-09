@@ -1,24 +1,11 @@
 use std::path::{Path, PathBuf};
 
-use turso::sync::PartialSyncOpts;
-
 use crate::config::CoreConfig;
 use crate::error::{Error, Result};
 
 /// Directory containing vfs databases
 pub fn vfs_dir() -> &'static std::path::Path {
     std::path::Path::new(".vfs")
-}
-
-/// Configuration options for sync
-#[derive(Debug, Clone, Default)]
-pub struct SyncOptions {
-    /// Remote URL for syncing
-    pub remote_url: Option<String>,
-    /// Auth token for remote sync
-    pub auth_token: Option<String>,
-    /// Partial sync options
-    pub partial_sync: Option<PartialSyncOpts>,
 }
 
 /// Configuration options for local encryption
@@ -43,8 +30,6 @@ pub struct VfsOptions {
     /// Optional base directory for overlay filesystem (copy-on-write).
     /// When set, the filesystem operates as an overlay on top of this directory.
     pub(crate) base: Option<PathBuf>,
-    /// Sync options for remote database synchronization
-    pub sync: SyncOptions,
     /// Encryption configuration for database at rest
     pub(crate) encryption: Option<EncryptionConfig>,
     /// Typed core runtime configuration. When omitted, [`CoreConfig::from_env`]
@@ -99,7 +84,6 @@ impl VfsOptions {
             id: Some(id.into()),
             path: None,
             base: None,
-            sync: SyncOptions::default(),
             encryption: None,
             core_config: None,
         }
@@ -111,7 +95,6 @@ impl VfsOptions {
             id: None,
             path: None,
             base: None,
-            sync: SyncOptions::default(),
             encryption: None,
             core_config: None,
         }
@@ -123,16 +106,9 @@ impl VfsOptions {
             id: None,
             path: Some(path.into()),
             base: None,
-            sync: SyncOptions::default(),
             encryption: None,
             core_config: None,
         }
-    }
-
-    /// Set sync options
-    pub fn with_sync(mut self, sync: SyncOptions) -> Self {
-        self.sync = sync;
-        self
     }
 
     /// Set typed core runtime configuration.

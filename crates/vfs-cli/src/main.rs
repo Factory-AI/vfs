@@ -5,7 +5,7 @@ use vfs_cli::{
     cmd::{self, completions::handle_completions},
     get_runtime,
     logging::default_env_filter,
-    opts::{Args, Command, FsCommand, PruneCommand, ServeCommand, SyncCommand},
+    opts::{Args, Command, FsCommand, PruneCommand, ServeCommand},
 };
 
 /// Parse and validate encryption key and cipher options.
@@ -119,37 +119,18 @@ fn dispatch(args: Args) -> anyhow::Result<()> {
             cipher,
             command,
             backend,
-            sync,
         } => {
             let rt = get_runtime();
             let encryption_opts = parse_encryption(key, cipher)?
                 .map(|(key, cipher)| cmd::init::EncryptionOptions { key, cipher });
             rt.block_on(cmd::init::init_database(
                 id,
-                sync,
                 force,
                 base,
                 encryption_opts,
                 command,
                 backend,
             ))
-        }
-        Command::Sync {
-            id_or_path,
-            command,
-        } => {
-            let rt = get_runtime();
-            match command {
-                SyncCommand::Pull => rt.block_on(cmd::sync::handle_pull_command(id_or_path)),
-                SyncCommand::Push => rt.block_on(cmd::sync::handle_push_command(id_or_path)),
-                SyncCommand::Checkpoint => {
-                    rt.block_on(cmd::sync::handle_checkpoint_command(id_or_path))
-                }
-                SyncCommand::Stats => rt.block_on(cmd::sync::handle_stats_command(
-                    &mut std::io::stdout(),
-                    id_or_path,
-                )),
-            }
         }
         Command::Run {
             allow,

@@ -109,6 +109,13 @@ pack/adopt manifest fields and reserved exit statuses remain unchanged.
   guarantee parent artifacts are never opened writable. `turso_core` is
   unchanged.
 
+### Removed
+
+- Remove the turso page-level `vfs sync` family (`pull`, `push`, `checkpoint`,
+  and `stats`), the `vfs init` sync flags, and `TURSO_DB_AUTH_TOKEN`. The CAS
+  remote tier is this release's only replication mechanism, and the top-level
+  `checkpoint` verb is available for `vfs checkpoint`.
+
 ## [1.0.2] - 2026-08-08 - Lifecycle benchmark hardening
 
 This release makes the chaos workload the unambiguous primary performance

@@ -7,6 +7,7 @@ pub mod integrity;
 
 use crate::config::{DEFAULT_CHUNK_SIZE, DEFAULT_INLINE_THRESHOLD};
 use crate::error::{Error, Result};
+use async_trait::async_trait;
 use std::time::{SystemTime, UNIX_EPOCH};
 use turso::transaction::{Transaction, TransactionBehavior};
 use turso::{Connection, Value};
@@ -26,6 +27,131 @@ pub const CONFIG_INLINE_THRESHOLD_KEY: &str = "inline_threshold";
 pub const CONFIG_HISTORY_EPOCH_KEY: &str = "history_epoch";
 pub const CONFIG_HISTORY_VALID_KEY: &str = "history_valid";
 pub const CONFIG_HISTORY_FLOOR_SEQ_KEY: &str = "history_floor_seq";
+pub const CONFIG_CHUNKS_HOLLOW_KEY: &str = "chunks_hollow";
+
+/// Aggregate content removed when a database is converted to a metadata artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HollowReport {
+    pub chunks: u64,
+    pub bytes: u64,
+}
+
+/// Supplies content-addressed chunk bytes to bulk hydration.
+#[async_trait]
+pub trait ChunkSource: Send + Sync {
+    async fn fetch(&self, digest: &[u8; 32]) -> Result<Vec<u8>>;
+}
+
+/// Return whether this database is a metadata artifact without chunk bytes.
+pub async fn chunks_hollow(conn: &Connection) -> Result<bool> {
+    if !table_exists(conn, "fs_config").await? {
+        return Ok(false);
+    }
+    Ok(read_config_value(conn, CONFIG_CHUNKS_HOLLOW_KEY)
+        .await?
+        .as_deref()
+        == Some("1"))
+}
+
+/// Remove chunk bytes while retaining their content addresses and references.
+pub async fn hollow_chunks(conn: &Connection) -> Result<HollowReport> {
+    let txn = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).await?;
+    let result = async {
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*), COALESCE(SUM(LENGTH(data)), 0) FROM fs_chunk",
+                (),
+            )
+            .await?;
+        let row = rows
+            .next()
+            .await?
+            .ok_or_else(|| Error::Internal("chunk aggregate returned no rows".to_string()))?;
+        let chunks = row.get::<i64>(0)?;
+        let bytes = row.get::<i64>(1)?;
+        drop(rows);
+
+        conn.execute("UPDATE fs_chunk SET data = ?", (Value::Blob(Vec::new()),))
+            .await?;
+        conn.execute(
+            "INSERT OR REPLACE INTO fs_config (key, value) VALUES (?, '1')",
+            (CONFIG_CHUNKS_HOLLOW_KEY,),
+        )
+        .await?;
+
+        Ok(HollowReport {
+            chunks: u64::try_from(chunks)
+                .map_err(|_| Error::Internal("negative fs_chunk count".to_string()))?,
+            bytes: u64::try_from(bytes)
+                .map_err(|_| Error::Internal("negative fs_chunk byte count".to_string()))?,
+        })
+    }
+    .await;
+
+    match result {
+        Ok(report) => {
+            txn.commit().await?;
+            Ok(report)
+        }
+        Err(err) => {
+            let _ = txn.rollback().await;
+            Err(err)
+        }
+    }
+}
+
+/// Restore every content-addressed chunk and publish the database atomically.
+pub async fn hydrate_chunks(conn: &Connection, source: &dyn ChunkSource) -> Result<u64> {
+    let txn = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).await?;
+    let result = async {
+        let mut rows = conn
+            .query("SELECT digest FROM fs_chunk ORDER BY digest", ())
+            .await?;
+        let mut digests = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let digest = row.get::<Vec<u8>>(0)?;
+            let length = digest.len();
+            digests.push(
+                <[u8; 32]>::try_from(digest).map_err(|_| Error::InvalidChunkDigest { length })?,
+            );
+        }
+        drop(rows);
+
+        for digest in &digests {
+            let bytes = source.fetch(digest).await?;
+            if blake3::hash(&bytes).as_bytes() != digest {
+                return Err(Error::ChunkDigestMismatch {
+                    digest: blake3::Hash::from_bytes(*digest).to_hex().to_string(),
+                });
+            }
+            conn.execute(
+                "UPDATE fs_chunk SET data = ? WHERE digest = ?",
+                (Value::Blob(bytes), Value::Blob(digest.as_slice().to_vec())),
+            )
+            .await?;
+        }
+
+        conn.execute(
+            "DELETE FROM fs_config WHERE key = ?",
+            (CONFIG_CHUNKS_HOLLOW_KEY,),
+        )
+        .await?;
+        u64::try_from(digests.len())
+            .map_err(|_| Error::Internal("chunk count exceeds u64".to_string()))
+    }
+    .await;
+
+    match result {
+        Ok(chunks) => {
+            txn.commit().await?;
+            Ok(chunks)
+        }
+        Err(err) => {
+            let _ = txn.rollback().await;
+            Err(err)
+        }
+    }
+}
 
 /// Detected schema version based on PRAGMA user_version, with fs_config and
 /// column-sniffing compatibility for pre-user_version databases.
@@ -628,6 +754,10 @@ pub async fn require_current(conn: &Connection) -> Result<()> {
 /// a single IMMEDIATE transaction and stamping `PRAGMA user_version` before the
 /// DDL transaction commits.
 pub async fn ensure_current(conn: &Connection) -> Result<()> {
+    if chunks_hollow(conn).await? {
+        return Err(Error::ChunksHollow);
+    }
+
     let raw_user_version = user_version(conn).await?;
     let detected = detect_schema_version(conn).await?;
 
@@ -1528,12 +1658,331 @@ fn is_duplicate_column_error(err: &turso::Error) -> bool {
 mod tests {
     use super::*;
     use crate::{KvStore, ToolCalls, Vfs, VfsOptions, DEFAULT_FILE_MODE};
+    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use tempfile::tempdir;
     use turso::Builder;
 
     const S_IFDIR: i64 = 0o040000;
     const S_IFREG: i64 = 0o100000;
+
+    struct MapChunkSource {
+        chunks: HashMap<[u8; 32], Vec<u8>>,
+    }
+
+    #[async_trait]
+    impl ChunkSource for MapChunkSource {
+        async fn fetch(&self, digest: &[u8; 32]) -> Result<Vec<u8>> {
+            self.chunks.get(digest).cloned().ok_or_else(|| {
+                Error::Internal(format!(
+                    "test source is missing {}",
+                    blake3::Hash::from_bytes(*digest).to_hex()
+                ))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn hollow_hydrate_roundtrip_preserves_chunks_and_openability() -> Result<()> {
+        let dir = tempdir()?;
+        let db_path = dir.path().join("hollow-roundtrip.db");
+        let readonly_path = dir.path().join("hollow-readonly.db");
+        let large;
+        let deleted;
+        {
+            let agent = Vfs::open(VfsOptions::with_path(db_path.to_string_lossy())).await?;
+            let (_, inline_file) = agent
+                .fs
+                .create_file("/inline.txt", DEFAULT_FILE_MODE, 0, 0)
+                .await?;
+            inline_file.pwrite(0, b"inline bytes").await?;
+            inline_file.fsync().await?;
+
+            large = (0..(agent.fs.chunk_size() * 2 + 17))
+                .map(|index| (index % 251) as u8)
+                .collect::<Vec<_>>();
+            let (_, large_file) = agent
+                .fs
+                .create_file("/large.bin", DEFAULT_FILE_MODE, 0, 0)
+                .await?;
+            large_file.pwrite(0, &large).await?;
+            large_file.fsync().await?;
+
+            deleted = vec![0x5a; agent.fs.chunk_size()];
+            let (_, deleted_file) = agent
+                .fs
+                .create_file("/deleted.bin", DEFAULT_FILE_MODE, 0, 0)
+                .await?;
+            deleted_file.pwrite(0, &deleted).await?;
+            deleted_file.fsync().await?;
+            drop(deleted_file);
+            agent.fs.remove("/deleted.bin").await?;
+            agent.fs.finalize().await?;
+        }
+
+        let db = Builder::new_local(db_path.to_str().unwrap())
+            .build()
+            .await?;
+        let conn = db.connect()?;
+        let before = chunk_rows(&conn).await?;
+        let source = MapChunkSource {
+            chunks: before
+                .iter()
+                .map(|(digest, data, _)| (*digest, data.clone()))
+                .collect(),
+        };
+        let deleted_digest = *blake3::hash(&deleted).as_bytes();
+        assert!(
+            before
+                .iter()
+                .any(|(digest, data, refcount)| *digest == deleted_digest
+                    && data == &deleted
+                    && *refcount == 0),
+            "deleted journal-retained content must be part of the hollow artifact"
+        );
+
+        let expected_bytes = before
+            .iter()
+            .map(|(_, data, _)| data.len() as u64)
+            .sum::<u64>();
+        assert_eq!(
+            hollow_chunks(&conn).await?,
+            HollowReport {
+                chunks: before.len() as u64,
+                bytes: expected_bytes,
+            }
+        );
+        assert!(chunks_hollow(&conn).await?);
+        let hollow = chunk_rows(&conn).await?;
+        assert_eq!(hollow.len(), before.len());
+        for ((digest, data, refcount), (before_digest, _, before_refcount)) in
+            hollow.iter().zip(&before)
+        {
+            assert_eq!(digest, before_digest);
+            assert!(data.is_empty());
+            assert_eq!(refcount, before_refcount);
+        }
+        assert!(matches!(
+            require_current(&conn).await.unwrap_err(),
+            Error::ChunksHollow
+        ));
+        assert!(matches!(
+            ensure_current(&conn).await.unwrap_err(),
+            Error::ChunksHollow
+        ));
+
+        let plain = integrity::check(&conn, &integrity::CheckOpts::new(db_path.clone())).await?;
+        assert!(plain.ok, "plain integrity must permit hollow artifacts");
+        assert!(!plain.portable);
+        let portable = integrity::check(
+            &conn,
+            &integrity::CheckOpts::new(db_path.clone()).require_portable(true),
+        )
+        .await?;
+        assert!(!portable.ok);
+        assert!(portable
+            .checks
+            .iter()
+            .any(|check| check.name == "storage.chunks_hollow" && !check.ok));
+
+        let mut checkpoint = conn.query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await?;
+        while checkpoint.next().await?.is_some() {}
+        drop(checkpoint);
+        drop(conn);
+        drop(db);
+        std::fs::copy(&db_path, &readonly_path)?;
+
+        let open_error = match Vfs::open(VfsOptions::with_path(db_path.to_string_lossy())).await {
+            Ok(_) => panic!("writable open must reject a hollow artifact"),
+            Err(error) => error,
+        };
+        assert!(matches!(open_error, Error::ChunksHollow));
+        let readonly = Vfs::open_read_only(&readonly_path).await?;
+        drop(readonly);
+
+        let db = Builder::new_local(db_path.to_str().unwrap())
+            .build()
+            .await?;
+        let conn = db.connect()?;
+        assert_eq!(hydrate_chunks(&conn, &source).await?, before.len() as u64);
+        assert!(!chunks_hollow(&conn).await?);
+        assert_eq!(chunk_rows(&conn).await?, before);
+        drop(conn);
+        drop(db);
+
+        let agent = Vfs::open(VfsOptions::with_path(db_path.to_string_lossy())).await?;
+        assert_eq!(agent.fs.read_file("/large.bin").await?.unwrap(), large);
+        let conn = agent.get_connection().await?;
+        let report = integrity::check(
+            &conn,
+            &integrity::CheckOpts::new(db_path).require_portable(true),
+        )
+        .await?;
+        let failures = report
+            .checks
+            .iter()
+            .filter(|check| !check.ok)
+            .map(|check| format!("{}: {}", check.name, check.detail))
+            .collect::<Vec<_>>();
+        assert!(report.ok, "integrity failures: {failures:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hydrate_digest_mismatch_rolls_back_hollow_database() -> Result<()> {
+        let dir = tempdir()?;
+        let db_path = dir.path().join("hydrate-mismatch.db");
+        {
+            let agent = Vfs::open(VfsOptions::with_path(db_path.to_string_lossy())).await?;
+            let (_, file) = agent
+                .fs
+                .create_file("/chunk.bin", DEFAULT_FILE_MODE, 0, 0)
+                .await?;
+            file.pwrite(0, &vec![0x7b; agent.fs.chunk_size()]).await?;
+            file.fsync().await?;
+            agent.fs.finalize().await?;
+        }
+
+        let db = Builder::new_local(db_path.to_str().unwrap())
+            .build()
+            .await?;
+        let conn = db.connect()?;
+        let before = chunk_rows(&conn).await?;
+        hollow_chunks(&conn).await?;
+        let hollow = chunk_rows(&conn).await?;
+        let mut chunks = before
+            .iter()
+            .map(|(digest, data, _)| (*digest, data.clone()))
+            .collect::<HashMap<_, _>>();
+        let corrupt_digest = *chunks.keys().next().expect("test must create a chunk");
+        chunks.insert(corrupt_digest, b"wrong bytes".to_vec());
+
+        let error = hydrate_chunks(&conn, &MapChunkSource { chunks })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::ChunkDigestMismatch { ref digest }
+                if digest == &blake3::Hash::from_bytes(corrupt_digest).to_hex().to_string()
+        ));
+        assert!(chunks_hollow(&conn).await?);
+        assert_eq!(chunk_rows(&conn).await?, hollow);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hollow_is_idempotent_for_empty_and_populated_databases() -> Result<()> {
+        let dir = tempdir()?;
+        let empty_path = dir.path().join("empty-hollow.db");
+        let db = Builder::new_local(empty_path.to_str().unwrap())
+            .build()
+            .await?;
+        let conn = db.connect()?;
+        ensure_current(&conn).await?;
+        assert_eq!(
+            hollow_chunks(&conn).await?,
+            HollowReport {
+                chunks: 0,
+                bytes: 0
+            }
+        );
+        assert_eq!(
+            hollow_chunks(&conn).await?,
+            HollowReport {
+                chunks: 0,
+                bytes: 0
+            }
+        );
+        assert!(chunks_hollow(&conn).await?);
+        assert_eq!(
+            hydrate_chunks(
+                &conn,
+                &MapChunkSource {
+                    chunks: HashMap::new()
+                }
+            )
+            .await?,
+            0
+        );
+        assert!(!chunks_hollow(&conn).await?);
+        drop(conn);
+        drop(db);
+
+        let populated_path = dir.path().join("populated-hollow.db");
+        {
+            let agent = Vfs::open(VfsOptions::with_path(populated_path.to_string_lossy())).await?;
+            let (_, file) = agent
+                .fs
+                .create_file("/chunk.bin", DEFAULT_FILE_MODE, 0, 0)
+                .await?;
+            file.pwrite(0, &vec![0x19; agent.fs.chunk_size()]).await?;
+            file.fsync().await?;
+            agent.fs.finalize().await?;
+        }
+        let db = Builder::new_local(populated_path.to_str().unwrap())
+            .build()
+            .await?;
+        let conn = db.connect()?;
+        let first = hollow_chunks(&conn).await?;
+        assert!(first.chunks > 0);
+        assert!(first.bytes > 0);
+        assert_eq!(
+            hollow_chunks(&conn).await?,
+            HollowReport {
+                chunks: first.chunks,
+                bytes: 0
+            }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_chunk_without_hollow_marker_is_corruption() -> Result<()> {
+        let dir = tempdir()?;
+        let db_path = dir.path().join("empty-chunk-corruption.db");
+        let db = Builder::new_local(db_path.to_str().unwrap())
+            .build()
+            .await?;
+        let conn = db.connect()?;
+        ensure_current(&conn).await?;
+        conn.execute(
+            "INSERT INTO fs_chunk (digest, data, refcount) VALUES (?, ?, 0)",
+            (
+                Value::Blob(blake3::hash(b"missing bytes").as_bytes().to_vec()),
+                Value::Blob(Vec::new()),
+            ),
+        )
+        .await?;
+
+        let report = integrity::check(&conn, &integrity::CheckOpts::new(db_path.clone())).await?;
+        assert!(!report.ok);
+        assert!(report.checks.iter().any(|check| {
+            check.name == "storage.chunk_bytes_match_digest"
+                && !check.ok
+                && check.detail.contains("1 violation")
+        }));
+        Ok(())
+    }
+
+    async fn chunk_rows(conn: &Connection) -> Result<Vec<([u8; 32], Vec<u8>, i64)>> {
+        let mut rows = conn
+            .query(
+                "SELECT digest, data, refcount FROM fs_chunk ORDER BY digest",
+                (),
+            )
+            .await?;
+        let mut chunks = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let digest = row.get::<Vec<u8>>(0)?;
+            let length = digest.len();
+            chunks.push((
+                <[u8; 32]>::try_from(digest).map_err(|_| Error::InvalidChunkDigest { length })?,
+                row.get(1)?,
+                row.get(2)?,
+            ));
+        }
+        Ok(chunks)
+    }
 
     #[tokio::test]
     async fn schema_user_version_migrations_from_all_fixtures() -> Result<()> {
