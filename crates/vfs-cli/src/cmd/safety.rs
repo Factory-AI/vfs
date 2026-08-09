@@ -429,8 +429,7 @@ async fn materialize_partial_file(
     })?;
     let logical_size = logical_size as usize;
 
-    conn.execute("DELETE FROM fs_data WHERE ino = ?", (partial.delta_ino,))
-        .await?;
+    delete_all_chunk_mappings(conn, partial.delta_ino).await?;
 
     if logical_size as i64 <= inline_threshold {
         let bytes = materialized_file_bytes(
@@ -467,11 +466,7 @@ async fn materialize_partial_file(
             &overrides,
         )?;
         if !chunk.iter().all(|byte| *byte == 0) {
-            conn.execute(
-                "INSERT INTO fs_data (ino, chunk_index, data) VALUES (?, ?, ?)",
-                (partial.delta_ino, chunk_index as i64, Value::Blob(chunk)),
-            )
-            .await?;
+            insert_chunk_mapping(conn, partial.delta_ino, chunk_index as i64, &chunk).await?;
         }
     }
 
@@ -499,11 +494,13 @@ async fn load_override_chunks(
 
     let mut rows = conn
         .query(
-            "SELECT c.chunk_index, d.data
-             FROM fs_chunk_override c
-             LEFT JOIN fs_data d ON d.ino = c.delta_ino AND d.chunk_index = c.chunk_index
-             WHERE c.delta_ino = ?
-             ORDER BY c.chunk_index",
+            "SELECT o.chunk_index, c.data
+             FROM fs_chunk_override o
+             LEFT JOIN fs_data d
+               ON d.ino = o.delta_ino AND d.chunk_index = o.chunk_index
+             LEFT JOIN fs_chunk c ON c.digest = d.digest
+             WHERE o.delta_ino = ?
+             ORDER BY o.chunk_index",
             (delta_ino,),
         )
         .await?;
@@ -522,6 +519,60 @@ async fn load_override_chunks(
         overrides.insert(chunk_index, data);
     }
     Ok(overrides)
+}
+
+async fn insert_chunk_mapping(
+    conn: &Connection,
+    ino: i64,
+    chunk_index: i64,
+    data: &[u8],
+) -> AnyhowResult<()> {
+    let digest = blake3::hash(data).as_bytes().to_vec();
+    conn.execute(
+        "INSERT INTO fs_chunk (digest, data, refcount)
+         VALUES (?, ?, 1)
+         ON CONFLICT(digest) DO UPDATE SET refcount = refcount + 1",
+        (digest.as_slice(), data),
+    )
+    .await?;
+    conn.execute(
+        "INSERT INTO fs_data (ino, chunk_index, digest) VALUES (?, ?, ?)",
+        (ino, chunk_index, digest.as_slice()),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn delete_all_chunk_mappings(conn: &Connection, ino: i64) -> AnyhowResult<()> {
+    let mut rows = conn
+        .query(
+            "SELECT digest, COUNT(*)
+             FROM fs_data
+             WHERE ino = ?
+             GROUP BY digest",
+            (ino,),
+        )
+        .await?;
+    let mut counts = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let digest = match row.get_value(0)? {
+            Value::Blob(digest) => digest,
+            other => anyhow::bail!("invalid fs_data digest value: {other:?}"),
+        };
+        counts.push((digest, value_i64(row.get_value(1)?)?));
+    }
+    drop(rows);
+
+    for (digest, count) in counts {
+        conn.execute(
+            "UPDATE fs_chunk SET refcount = refcount - ? WHERE digest = ?",
+            (count, digest.as_slice()),
+        )
+        .await?;
+    }
+    conn.execute("DELETE FROM fs_data WHERE ino = ?", (ino,))
+        .await?;
+    Ok(())
 }
 
 fn materialized_file_bytes(
@@ -1298,12 +1349,7 @@ mod tests {
                 .unwrap();
             let row = rows.next().await.unwrap().unwrap();
             let ino = value_i64(row.get_value(0).unwrap()).unwrap();
-            conn.execute(
-                "INSERT INTO fs_data (ino, chunk_index, data) VALUES (?, 0, ?)",
-                (ino, Value::Blob(b"bad".to_vec())),
-            )
-            .await
-            .unwrap();
+            insert_chunk_mapping(&conn, ino, 0, b"bad").await.unwrap();
         }
 
         let mut stdout = Vec::new();
@@ -1618,12 +1664,7 @@ mod tests {
         )
         .await
         .unwrap();
-        conn.execute(
-            "INSERT INTO fs_data (ino, chunk_index, data) VALUES (2, 1, ?)",
-            (Value::Blob(b"WXYZ".to_vec()),),
-        )
-        .await
-        .unwrap();
+        insert_chunk_mapping(&conn, 2, 1, b"WXYZ").await.unwrap();
         conn.execute(
             "INSERT INTO fs_chunk_override (delta_ino, chunk_index) VALUES (2, 1)",
             (),

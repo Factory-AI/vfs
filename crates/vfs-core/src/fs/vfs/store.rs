@@ -35,9 +35,9 @@ pub(in crate::fs) trait ChunkWriteHooks: Send + Sync {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct NormalizedWriteRange {
-    pub(super) offset: u64,
-    pub(super) data: Vec<u8>,
+pub(in crate::fs) struct NormalizedWriteRange {
+    pub(in crate::fs) offset: u64,
+    pub(in crate::fs) data: Vec<u8>,
 }
 
 impl NormalizedWriteRange {
@@ -46,7 +46,7 @@ impl NormalizedWriteRange {
     }
 }
 
-pub(super) fn normalize_write_ranges(
+pub(in crate::fs) fn normalize_write_ranges(
     ranges: &[WriteRangeRef<'_>],
 ) -> Result<Vec<NormalizedWriteRange>> {
     let mut merged_ranges: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
@@ -244,7 +244,13 @@ async fn read_chunked(
     let end_chunk = (offset + size).saturating_sub(1) / chunk_size;
 
     let mut stmt = conn
-        .prepare_cached("SELECT chunk_index, data FROM fs_data WHERE ino = ? AND chunk_index >= ? AND chunk_index <= ? ORDER BY chunk_index")
+        .prepare_cached(
+            "SELECT d.chunk_index, c.data
+             FROM fs_data d
+             JOIN fs_chunk c ON c.digest = d.digest
+             WHERE d.ino = ? AND d.chunk_index BETWEEN ? AND ?
+             ORDER BY d.chunk_index",
+        )
         .await?;
     crate::telemetry::record_chunk_read_query();
     let mut rows = stmt
@@ -274,7 +280,7 @@ async fn read_chunked(
 
         let chunk_data = match row.get_value(1) {
             Ok(Value::Blob(data)) => data,
-            Ok(_) | Err(_) => return Err(corrupt_column("fs_data.data", "expected blob")),
+            Ok(_) | Err(_) => return Err(corrupt_column("fs_chunk.data", "expected blob")),
         };
         let skip = if chunk_index == start_chunk {
             start_offset_in_chunk
@@ -308,6 +314,128 @@ async fn read_chunked(
 
     crate::telemetry::record_chunk_read_chunks(chunks_read);
     Ok(result)
+}
+
+fn digest_chunk(data: &[u8]) -> Vec<u8> {
+    blake3::hash(data).as_bytes().to_vec()
+}
+
+async fn mapping_digest(conn: &Connection, ino: i64, chunk_index: i64) -> Result<Option<Vec<u8>>> {
+    let mut stmt = conn
+        .prepare_cached("SELECT digest FROM fs_data WHERE ino = ? AND chunk_index = ?")
+        .await?;
+    let mut rows = stmt.query((ino, chunk_index)).await?;
+    let Some(row) = rows.next().await? else {
+        return Ok(None);
+    };
+    match row.get_value(0) {
+        Ok(Value::Blob(digest)) => Ok(Some(digest)),
+        Ok(_) | Err(_) => Err(corrupt_column("fs_data.digest", "expected blob")),
+    }
+}
+
+async fn upsert_chunk(conn: &Connection, digest: &[u8], data: &[u8]) -> Result<()> {
+    conn.execute(
+        "INSERT INTO fs_chunk (digest, data, refcount)
+         VALUES (?, ?, 1)
+         ON CONFLICT(digest) DO UPDATE SET refcount = refcount + 1",
+        (digest, data),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn decrement_chunk_refcount(conn: &Connection, digest: &[u8], count: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE fs_chunk SET refcount = refcount - ? WHERE digest = ?",
+        (count, digest),
+    )
+    .await?;
+    Ok(())
+}
+
+pub(super) async fn insert_chunk_mapping(
+    conn: &Connection,
+    ino: i64,
+    chunk_index: i64,
+    data: &[u8],
+) -> Result<Vec<u8>> {
+    let digest = digest_chunk(data);
+    let old_digest = mapping_digest(conn, ino, chunk_index).await?;
+    if old_digest.as_deref() == Some(digest.as_slice()) {
+        return Ok(digest);
+    }
+
+    upsert_chunk(conn, &digest, data).await?;
+    conn.execute(
+        "INSERT OR REPLACE INTO fs_data (ino, chunk_index, digest) VALUES (?, ?, ?)",
+        (ino, chunk_index, digest.as_slice()),
+    )
+    .await?;
+    if let Some(old_digest) = old_digest {
+        decrement_chunk_refcount(conn, &old_digest, 1).await?;
+    }
+    Ok(digest)
+}
+
+async fn mapped_digest_counts(
+    conn: &Connection,
+    sql: &str,
+    params: impl turso::params::IntoParams,
+) -> Result<Vec<(Vec<u8>, i64)>> {
+    let mut rows = conn.query(sql, params).await?;
+    let mut counts = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let digest = match row.get_value(0) {
+            Ok(Value::Blob(digest)) => digest,
+            Ok(_) | Err(_) => return Err(corrupt_column("fs_data.digest", "expected blob")),
+        };
+        let count = required_i64(&row, 1, "fs_data.digest count")?;
+        counts.push((digest, count));
+    }
+    Ok(counts)
+}
+
+pub(super) async fn delete_all_chunk_mappings(conn: &Connection, ino: i64) -> Result<()> {
+    let counts = mapped_digest_counts(
+        conn,
+        "SELECT digest, COUNT(*) FROM fs_data WHERE ino = ? GROUP BY digest",
+        (ino,),
+    )
+    .await?;
+    // Refcounts move first so every mapping deletion has a matching decrement
+    // in the caller's transaction.
+    for (digest, count) in counts {
+        decrement_chunk_refcount(conn, &digest, count).await?;
+    }
+    conn.execute("DELETE FROM fs_data WHERE ino = ?", (ino,))
+        .await?;
+    Ok(())
+}
+
+async fn delete_chunk_mappings_after(
+    conn: &Connection,
+    ino: i64,
+    last_chunk_index: i64,
+) -> Result<()> {
+    let counts = mapped_digest_counts(
+        conn,
+        "SELECT digest, COUNT(*)
+         FROM fs_data
+         WHERE ino = ? AND chunk_index > ?
+         GROUP BY digest",
+        (ino, last_chunk_index),
+    )
+    .await?;
+    for (digest, count) in counts {
+        decrement_chunk_refcount(conn, &digest, count).await?;
+    }
+    conn.execute(
+        "DELETE FROM fs_data WHERE ino = ? AND chunk_index > ?",
+        (ino, last_chunk_index),
+    )
+    .await?;
+    Ok(())
 }
 
 /// `preserve_times`: when true (deferred batcher commits racing an explicit
@@ -398,8 +526,7 @@ async fn write_ranges_inner(
             inline_data[start..start + range.data.len()].copy_from_slice(&range.data);
         }
 
-        conn.execute("DELETE FROM fs_data WHERE ino = ?", (ino,))
-            .await?;
+        delete_all_chunk_mappings(conn, ino).await?;
         let mut sets = vec!["size = ?", "data_inline = ?", "storage_kind = ?"];
         let mut values: Vec<Value> = vec![
             Value::Integer(new_size as i64),
@@ -420,8 +547,7 @@ async fn write_ranges_inner(
     if metadata.storage_kind == STORAGE_INLINE {
         let mut inline_data = metadata.inline_data.unwrap_or_default();
         inline_data.resize(metadata.size as usize, 0);
-        conn.execute("DELETE FROM fs_data WHERE ino = ?", (ino,))
-            .await?;
+        delete_all_chunk_mappings(conn, ino).await?;
         if !inline_data.is_empty() {
             chunked_ranges.push(NormalizedWriteRange {
                 offset: 0,
@@ -489,8 +615,7 @@ async fn truncate_inner(
             let mut inline_data = metadata.inline_data.unwrap_or_default();
             inline_data.resize(metadata.size as usize, 0);
             inline_data.resize(new_size as usize, 0);
-            conn.execute("DELETE FROM fs_data WHERE ino = ?", (ino,))
-                .await?;
+            delete_all_chunk_mappings(conn, ino).await?;
             let (now_secs, now_nsec) = current_timestamp()?;
             conn.execute(
                 "UPDATE fs_inode SET size = ?, data_inline = ?, storage_kind = ?, mtime = ?, ctime = ?, mtime_nsec = ?, ctime_nsec = ? WHERE ino = ?",
@@ -521,8 +646,7 @@ async fn truncate_inner(
         if let Some(inline_data) =
             read_dense_prefix_for_inline(conn, ino, geometry, new_size).await?
         {
-            conn.execute("DELETE FROM fs_data WHERE ino = ?", (ino,))
-                .await?;
+            delete_all_chunk_mappings(conn, ino).await?;
             let (now_secs, now_nsec) = current_timestamp()?;
             conn.execute(
                 "UPDATE fs_inode SET size = ?, data_inline = ?, storage_kind = ?, mtime = ?, ctime = ?, mtime_nsec = ?, ctime_nsec = ? WHERE ino = ?",
@@ -554,8 +678,7 @@ async fn transition_inline_to_chunked(
     inline_data: &[u8],
     hooks: Option<&dyn ChunkWriteHooks>,
 ) -> Result<()> {
-    conn.execute("DELETE FROM fs_data WHERE ino = ?", (ino,))
-        .await?;
+    delete_all_chunk_mappings(conn, ino).await?;
 
     if !inline_data.is_empty() {
         write_data_at_offset(conn, ino, geometry, 0, inline_data, hooks).await?;
@@ -585,7 +708,12 @@ async fn read_dense_prefix_for_inline(
     let mut inline_data = Vec::with_capacity(new_size as usize);
 
     let mut stmt = conn
-        .prepare_cached("SELECT data FROM fs_data WHERE ino = ? AND chunk_index = ?")
+        .prepare_cached(
+            "SELECT c.data
+             FROM fs_data d
+             JOIN fs_chunk c ON c.digest = d.digest
+             WHERE d.ino = ? AND d.chunk_index = ?",
+        )
         .await?;
     for chunk_idx in 0..=last_chunk {
         stmt.reset()?;
@@ -619,30 +747,32 @@ async fn truncate_chunked_data(
     let chunk_size = geometry.chunk_size as u64;
 
     if new_size == 0 {
-        conn.execute("DELETE FROM fs_data WHERE ino = ?", (ino,))
-            .await?;
+        delete_all_chunk_mappings(conn, ino).await?;
     } else if new_size < current_size {
         let last_chunk_idx = (new_size - 1) / chunk_size;
 
-        conn.execute(
-            "DELETE FROM fs_data WHERE ino = ? AND chunk_index > ?",
-            (ino, last_chunk_idx as i64),
-        )
-        .await?;
+        delete_chunk_mappings_after(conn, ino, last_chunk_idx as i64).await?;
 
         let end_in_last_chunk = ((new_size - 1) % chunk_size + 1) as usize;
         if end_in_last_chunk < chunk_size as usize {
             let mut stmt = conn
-                .prepare_cached("SELECT data FROM fs_data WHERE ino = ? AND chunk_index = ?")
+                .prepare_cached(
+                    "SELECT c.data
+                     FROM fs_data d
+                     JOIN fs_chunk c ON c.digest = d.digest
+                     WHERE d.ino = ? AND d.chunk_index = ?",
+                )
                 .await?;
             let mut rows = stmt.query((ino, last_chunk_idx as i64)).await?;
 
             if let Some(row) = rows.next().await? {
                 if let Ok(Value::Blob(chunk_data)) = row.get_value(0) {
                     if chunk_data.len() > end_in_last_chunk {
-                        conn.execute(
-                            "UPDATE fs_data SET data = ? WHERE ino = ? AND chunk_index = ?",
-                            (&chunk_data[..end_in_last_chunk], ino, last_chunk_idx as i64),
+                        insert_chunk_mapping(
+                            conn,
+                            ino,
+                            last_chunk_idx as i64,
+                            &chunk_data[..end_in_last_chunk],
                         )
                         .await?;
                         if let Some(hooks) = hooks {
@@ -664,7 +794,12 @@ async fn truncate_chunked_data(
 
         if let Some(last_idx) = last_existing_chunk {
             let mut stmt = conn
-                .prepare_cached("SELECT data FROM fs_data WHERE ino = ? AND chunk_index = ?")
+                .prepare_cached(
+                    "SELECT c.data
+                     FROM fs_data d
+                     JOIN fs_chunk c ON c.digest = d.digest
+                     WHERE d.ino = ? AND d.chunk_index = ?",
+                )
                 .await?;
             let mut rows = stmt.query((ino, last_idx as i64)).await?;
 
@@ -680,11 +815,7 @@ async fn truncate_chunked_data(
                     if needed_len > current_chunk_len {
                         let mut padded = chunk_data.clone();
                         padded.resize(needed_len, 0);
-                        conn.execute(
-                            "UPDATE fs_data SET data = ? WHERE ino = ? AND chunk_index = ?",
-                            (&padded[..], ino, last_idx as i64),
-                        )
-                        .await?;
+                        insert_chunk_mapping(conn, ino, last_idx as i64, &padded).await?;
                         if let Some(hooks) = hooks {
                             hooks.chunk_written(conn, ino, last_idx as i64).await?;
                         }
@@ -701,11 +832,7 @@ async fn truncate_chunked_data(
                 chunk_size as usize
             };
             let zeros = vec![0u8; chunk_len];
-            conn.execute(
-                "INSERT INTO fs_data (ino, chunk_index, data) VALUES (?, ?, ?)",
-                (ino, chunk_idx as i64, &zeros[..]),
-            )
-            .await?;
+            insert_chunk_mapping(conn, ino, chunk_idx as i64, &zeros).await?;
             if let Some(hooks) = hooks {
                 hooks.chunk_written(conn, ino, chunk_idx as i64).await?;
             }
@@ -764,10 +891,12 @@ async fn write_ranges_chunked(
     }
 
     let mut select_stmt = conn
-        .prepare_cached("SELECT data FROM fs_data WHERE ino = ? AND chunk_index = ?")
-        .await?;
-    let mut insert_stmt = conn
-        .prepare_cached("INSERT OR REPLACE INTO fs_data (ino, chunk_index, data) VALUES (?, ?, ?)")
+        .prepare_cached(
+            "SELECT c.data
+             FROM fs_data d
+             JOIN fs_chunk c ON c.digest = d.digest
+             WHERE d.ino = ? AND d.chunk_index = ?",
+        )
         .await?;
 
     let mut chunks: BTreeMap<i64, Vec<u8>> = BTreeMap::new();
@@ -796,7 +925,7 @@ async fn write_ranges_chunked(
                     Some(match row.get_value(0) {
                         Ok(Value::Blob(data)) => data,
                         Ok(_) | Err(_) => {
-                            return Err(corrupt_column("fs_data.data", "expected blob"))
+                            return Err(corrupt_column("fs_chunk.data", "expected blob"))
                         }
                     })
                 } else {
@@ -830,18 +959,8 @@ async fn write_ranges_chunked(
     }
 
     let chunks_written = chunks.len() as u64;
-    // Tier Three Axis H investigation: tried a multi-row VALUES batch
-    // with up to 32 rows per execute() but measured slower wall-time in
-    // 5-iter runs, suggesting libSQL doesn't share the
-    // prepared-statement cost reduction across different VALUES
-    // arities or that the per-execute setup cost dwarfed any saved
-    // round-trips on our workload sizes. Reverted to the cached
-    // single-row prepared statement.
     for (chunk_index, chunk_data) in chunks {
-        insert_stmt
-            .execute((ino, chunk_index, Value::Blob(chunk_data)))
-            .await?;
-        insert_stmt.reset()?;
+        insert_chunk_mapping(conn, ino, chunk_index, &chunk_data).await?;
         if let Some(hooks) = hooks {
             hooks.chunk_written(conn, ino, chunk_index).await?;
         }

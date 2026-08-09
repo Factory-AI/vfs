@@ -197,27 +197,39 @@ impl OverlayFS {
 
     async fn restore_materialized_metadata(&self, metadata: HashMap<i64, Stats>) -> Result<()> {
         let conn = self.delta.get_connection().await?;
+        let mut txn =
+            super::super::vfs::MutationTxn::begin(&conn, self.delta.journal_enabled()).await?;
+        let mut restored = Vec::with_capacity(metadata.len());
         for (ino, stats) in metadata {
-            conn.execute(
-                "UPDATE fs_inode
+            txn.conn()
+                .execute(
+                    "UPDATE fs_inode
                  SET mode = ?, uid = ?, gid = ?, atime = ?, mtime = ?, ctime = ?,
                      atime_nsec = ?, mtime_nsec = ?, ctime_nsec = ?, rdev = ?
                  WHERE ino = ?",
-                (
-                    stats.mode as i64,
-                    stats.uid as i64,
-                    stats.gid as i64,
-                    stats.atime,
-                    stats.mtime,
-                    stats.ctime,
-                    stats.atime_nsec as i64,
-                    stats.mtime_nsec as i64,
-                    stats.ctime_nsec as i64,
-                    stats.rdev as i64,
-                    ino,
-                ),
-            )
-            .await?;
+                    (
+                        stats.mode as i64,
+                        stats.uid as i64,
+                        stats.gid as i64,
+                        stats.atime,
+                        stats.mtime,
+                        stats.ctime,
+                        stats.atime_nsec as i64,
+                        stats.mtime_nsec as i64,
+                        stats.ctime_nsec as i64,
+                        stats.rdev as i64,
+                        ino,
+                    ),
+                )
+                .await?;
+            txn.record(super::super::vfs::JournalOp::new(
+                "materialize_meta",
+                serde_json::json!({ "ino": ino }),
+            ));
+            restored.push(ino);
+        }
+        txn.commit().await?;
+        for ino in restored {
             self.delta.invalidate_attr(ino);
         }
         Ok(())

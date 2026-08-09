@@ -2,7 +2,7 @@
 //!
 //! Fixtures live in `tests/fixtures/migrate/` and are exercised by
 //! `test-migrate-consolidation.sh` and by validation flows against real old
-//! databases (v0.0, v0.2, v0.4, and an encrypted v0.4).
+//! databases (v0.0, v0.2, v0.4, v0.6, and an encrypted v0.4).
 //!
 //! Regenerate after a schema-authority or turso format change with:
 //!
@@ -26,6 +26,7 @@ const FIXTURES: &[(&str, SchemaVersion, bool)] = &[
     ("v0_2.db", SchemaVersion::V0_2, false),
     ("v0_4.db", SchemaVersion::V0_4, false),
     ("v0_4-encrypted.db", SchemaVersion::V0_4, true),
+    ("v0_6.db", SchemaVersion::V0_6, false),
 ];
 
 fn fixtures_dir() -> PathBuf {
@@ -87,7 +88,12 @@ async fn committed_fixtures_detect_as_expected_versions() {
         let mut rows = conn.query("PRAGMA user_version", ()).await.unwrap();
         let row = rows.next().await.unwrap().unwrap();
         let user_version: i64 = row.get(0).unwrap();
-        assert_eq!(user_version, 0, "{name}: old fixtures predate user_version");
+        let expected_user_version = if *version == SchemaVersion::V0_6 {
+            SchemaVersion::V0_6.user_version()
+        } else {
+            0
+        };
+        assert_eq!(user_version, expected_user_version, "{name}");
     }
 
     let committed = fixtures_dir().join("v0_4-encrypted.db");
@@ -180,6 +186,12 @@ async fn populate_fixture(conn: &Connection, version: SchemaVersion) {
             "ctime_nsec INTEGER NOT NULL DEFAULT 0",
         ]);
     }
+    if version >= SchemaVersion::V0_5 {
+        inode_columns.extend([
+            "data_inline BLOB",
+            "storage_kind INTEGER NOT NULL DEFAULT 0",
+        ]);
+    }
     conn.execute(
         &format!("CREATE TABLE fs_inode ({})", inode_columns.join(", ")),
         (),
@@ -221,6 +233,17 @@ async fn populate_fixture(conn: &Connection, version: SchemaVersion) {
     )
     .await
     .unwrap();
+    if version >= SchemaVersion::V0_6 {
+        conn.execute(
+            "CREATE TABLE fs_session_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )",
+            (),
+        )
+        .await
+        .unwrap();
+    }
     conn.execute(
         "CREATE TABLE kv_store (
             key TEXT PRIMARY KEY,
@@ -291,6 +314,10 @@ async fn populate_fixture(conn: &Connection, version: SchemaVersion) {
                 Value::Integer(333),
             ]);
         }
+        if version >= SchemaVersion::V0_5 {
+            columns.extend(["data_inline", "storage_kind"]);
+            values.extend([Value::Null, Value::Integer(0)]);
+        }
         let placeholders = std::iter::repeat_n("?", values.len())
             .collect::<Vec<_>>()
             .join(", ");
@@ -351,4 +378,24 @@ async fn populate_fixture(conn: &Connection, version: SchemaVersion) {
     )
     .await
     .unwrap();
+    if version >= SchemaVersion::V0_6 {
+        conn.execute(
+            "INSERT INTO fs_session_metadata (key, value) VALUES
+             ('generation', '3'),
+             ('seeded_paths', '[\"dir/small.txt\"]'),
+             ('seed_pin', '0123456789abcdef0123456789abcdef01234567')",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            &format!(
+                "PRAGMA user_version = {}",
+                SchemaVersion::V0_6.user_version()
+            ),
+            (),
+        )
+        .await
+        .unwrap();
+    }
 }

@@ -1,8 +1,8 @@
 use super::super::vfs::store::{self, ChunkWriteHooks, WriteRangeRef};
 use super::*;
 use crate::fs::{File, FsError, WriteRange};
+use std::collections::BTreeSet;
 use std::sync::Arc;
-use turso::transaction::{Transaction, TransactionBehavior};
 
 #[derive(Debug, Clone)]
 pub(super) struct PartialOrigin {
@@ -136,15 +136,14 @@ impl OverlayFS {
         }
     }
 
-    pub(super) async fn add_partial_origin_mapping(
-        &self,
+    pub(super) async fn add_partial_origin_mapping_with_conn(
+        conn: &Connection,
         delta_ino: i64,
         base_ino: i64,
         base_path: &str,
         base_stats: &Stats,
+        now: i64,
     ) -> Result<()> {
-        let conn = self.delta.get_connection().await?;
-        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
         conn.execute(
             "INSERT OR REPLACE INTO fs_partial_origin (
                 delta_ino, base_ino, base_path, base_size, created_at
@@ -221,7 +220,8 @@ impl File for OverlayPartialFile {
             return Ok(());
         }
         let conn = self.delta.get_connection().await?;
-        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+        let mut txn =
+            super::super::vfs::MutationTxn::begin(&conn, self.delta.journal_enabled()).await?;
         let range_refs: Vec<_> = ranges
             .iter()
             .map(|range| WriteRangeRef {
@@ -229,6 +229,7 @@ impl File for OverlayPartialFile {
                 data: range.data.as_slice(),
             })
             .collect();
+        let normalized = store::normalize_write_ranges(&range_refs)?;
         let hooks = PartialOriginChunkHooks { file: self };
 
         let result: Result<()> = async {
@@ -246,6 +247,30 @@ impl File for OverlayPartialFile {
 
         match result {
             Ok(()) => {
+                txn.record(
+                    super::super::vfs::JournalOp::write(
+                        txn.conn(),
+                        self.delta_ino,
+                        self.chunk_size,
+                        &normalized,
+                    )
+                    .await?,
+                );
+                let mut override_indexes = BTreeSet::new();
+                for range in &normalized {
+                    let start = range.offset / self.chunk_size as u64;
+                    let end = (range.offset + range.data.len() as u64 - 1) / self.chunk_size as u64;
+                    override_indexes.extend(start..=end);
+                }
+                for chunk_index in override_indexes {
+                    txn.record(super::super::vfs::JournalOp::new(
+                        "chunk_override",
+                        serde_json::json!({
+                            "delta_ino": self.delta_ino,
+                            "chunk_index": chunk_index,
+                        }),
+                    ));
+                }
                 txn.commit().await?;
                 self.delta.invalidate_attr(self.delta_ino);
                 Ok(())
@@ -259,7 +284,8 @@ impl File for OverlayPartialFile {
 
     async fn truncate(&self, size: u64) -> Result<()> {
         let conn = self.delta.get_connection().await?;
-        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+        let mut txn =
+            super::super::vfs::MutationTxn::begin(&conn, self.delta.journal_enabled()).await?;
         let hooks = PartialOriginChunkHooks { file: self };
 
         let result: Result<()> = async {
@@ -282,6 +308,15 @@ impl File for OverlayPartialFile {
 
         match result {
             Ok(()) => {
+                txn.record(
+                    super::super::vfs::JournalOp::truncate(
+                        txn.conn(),
+                        self.delta_ino,
+                        self.chunk_size,
+                        size,
+                    )
+                    .await?,
+                );
                 txn.commit().await?;
                 self.delta.invalidate_attr(self.delta_ino);
                 Ok(())

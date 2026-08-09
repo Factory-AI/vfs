@@ -3,8 +3,9 @@ use crate::pool::ConnectionPool;
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use turso::transaction::{Transaction, TransactionBehavior};
 use turso::Connection;
+
+use super::journal::{JournalOp, MutationTxn};
 
 /// Hook invoked in the same SQLite transaction that reaps an inode.
 ///
@@ -56,13 +57,17 @@ impl Lifecycle {
     /// were unlinked while open and never queued for deferred reap because the
     /// process died. They are invisible (no dentry), so deleting them before
     /// serving is safe.
-    pub(crate) async fn sweep_mount_orphans(&self, conn: &Connection) -> Result<Vec<i64>> {
+    pub(crate) async fn sweep_mount_orphans(
+        &self,
+        conn: &Connection,
+        journal_enabled: bool,
+    ) -> Result<Vec<i64>> {
         let inos = self.nlink_zero_inos(conn).await?;
         if inos.is_empty() {
             return Ok(Vec::new());
         }
 
-        let txn = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).await?;
+        let mut txn = MutationTxn::begin(conn, journal_enabled).await?;
         let result: Result<Vec<i64>> = async {
             let mut reaped = Vec::new();
             for ino in &inos {
@@ -76,6 +81,9 @@ impl Lifecycle {
 
         match result {
             Ok(reaped) => {
+                for ino in &reaped {
+                    txn.record(JournalOp::new("reap", serde_json::json!({ "ino": ino })));
+                }
                 txn.commit().await?;
                 Ok(reaped)
             }
@@ -93,6 +101,7 @@ impl Lifecycle {
     pub(crate) async fn process_deferred_reaps<F>(
         &self,
         pool: &ConnectionPool,
+        journal_enabled: bool,
         before_reap: F,
     ) -> Result<Vec<i64>>
     where
@@ -106,7 +115,7 @@ impl Lifecycle {
             before_reap(*ino);
         }
         let conn = pool.get_connection().await?;
-        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+        let mut txn = MutationTxn::begin(&conn, journal_enabled).await?;
         let result: Result<Vec<i64>> = async {
             let mut reaped = Vec::new();
             for ino in &inos {
@@ -120,6 +129,9 @@ impl Lifecycle {
 
         match result {
             Ok(reaped) => {
+                for ino in &reaped {
+                    txn.record(JournalOp::new("reap", serde_json::json!({ "ino": ino })));
+                }
                 txn.commit().await?;
                 Ok(reaped)
             }
@@ -145,8 +157,7 @@ impl Lifecycle {
         for hook in self.hooks_snapshot() {
             hook.on_reap(conn, ino).await?;
         }
-        conn.execute("DELETE FROM fs_data WHERE ino = ?", (ino,))
-            .await?;
+        super::store::delete_all_chunk_mappings(conn, ino).await?;
         conn.execute("DELETE FROM fs_symlink WHERE ino = ?", (ino,))
             .await?;
         Ok(true)

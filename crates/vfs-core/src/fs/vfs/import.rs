@@ -6,12 +6,14 @@
 
 use std::collections::HashMap;
 
-use turso::transaction::{Transaction, TransactionBehavior};
 use turso::Value;
 
 use crate::error::Error;
 
 use super::*;
+
+/// `(ino, size, chunk digests)` captured at write time; `None` = inline.
+type JournalImport = (i64, u64, Option<Vec<Vec<u8>>>);
 
 /// One node accepted by [`ImportSession::import_chunk`]. `path` is relative to
 /// the import root and '/'-separated; parents must precede their children.
@@ -140,9 +142,6 @@ impl Vfs {
         let mut dentry_stmt = conn
             .prepare_cached("INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, ?, ?)")
             .await?;
-        let mut chunk_stmt = conn
-            .prepare_cached("INSERT INTO fs_data (ino, chunk_index, data) VALUES (?, ?, ?)")
-            .await?;
         let mut symlink_stmt = conn
             .prepare_cached("INSERT INTO fs_symlink (ino, target) VALUES (?, ?)")
             .await?;
@@ -169,10 +168,11 @@ impl Vfs {
             // Cache fills staged until after a successful commit so a rolled
             // back batch never leaves phantom dentries/attrs behind.
             let mut staged: Vec<(i64, String, Stats)> = Vec::with_capacity(batch_end - idx);
+            let mut journal_imports: Vec<JournalImport> = Vec::with_capacity(batch_end - idx);
             // parent ino -> nlink bump from new subdirectories ("..").
             let mut parent_bumps: HashMap<i64, i64> = HashMap::new();
 
-            let txn = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).await?;
+            let mut txn = MutationTxn::begin(conn, self.journal_enabled()).await?;
             for entry in &entries[idx..batch_end] {
                 let (parent_path, name) = match entry.path.rsplit_once('/') {
                     Some((parent, name)) => (parent, name),
@@ -240,30 +240,45 @@ impl Vfs {
                     Err(error) => return Err(error.into()),
                 }
 
-                match kind {
+                let journal_digests = match kind {
                     S_IFDIR => {
                         dir_inos.insert(entry.path.clone(), ino);
                         *parent_bumps.entry(parent_ino).or_insert(0) += 1;
+                        Some(Vec::new())
                     }
                     S_IFLNK => {
                         let target = std::str::from_utf8(&entry.data)
                             .map_err(|_| Error::Fs(FsError::InvalidPath))?;
                         symlink_stmt.execute((ino, target)).await?;
                         parent_bumps.entry(parent_ino).or_insert(0);
+                        Some(Vec::new())
                     }
                     _ => {
-                        if storage_kind == STORAGE_CHUNKED {
+                        let digests = if storage_kind == STORAGE_CHUNKED {
+                            let mut digests =
+                                Vec::with_capacity(entry.data.len().div_ceil(self.chunk_size));
                             for (chunk_index, chunk) in
                                 entry.data.chunks(self.chunk_size).enumerate()
                             {
-                                chunk_stmt
-                                    .execute((ino, chunk_index as i64, Value::Blob(chunk.to_vec())))
-                                    .await?;
+                                digests.push(
+                                    super::store::insert_chunk_mapping(
+                                        conn,
+                                        ino,
+                                        chunk_index as i64,
+                                        chunk,
+                                    )
+                                    .await?,
+                                );
                             }
-                        }
+                            Some(digests)
+                        } else {
+                            None
+                        };
                         parent_bumps.entry(parent_ino).or_insert(0);
+                        digests
                     }
-                }
+                };
+                journal_imports.push((ino, size, journal_digests));
 
                 staged.push((
                     parent_ino,
@@ -298,6 +313,9 @@ impl Vfs {
                     .await?;
             }
 
+            for (ino, size, digests) in journal_imports {
+                txn.record(JournalOp::import(ino, size, digests));
+            }
             txn.commit().await?;
             #[cfg(test)]
             self.import_commit_sizes.lock().unwrap().push(staged.len());

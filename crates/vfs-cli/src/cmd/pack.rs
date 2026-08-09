@@ -173,6 +173,9 @@ async fn pack_session(
     materialize_branch_staging(home, &base_path, &vfs).await?;
     let prune_set = build_prune_set(&extra_prunes, no_default_prunes)?;
     let pruned_paths = prune_delta_paths(&vfs, &prune_set).await?;
+    vfs.collect_journal()
+        .await
+        .context("Failed to collect the staged session journal")?;
     let metadata = vfs.increment_session_generation().await?;
     vfs.fs
         .finalize()

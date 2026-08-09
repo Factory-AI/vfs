@@ -586,78 +586,21 @@ mod tests {
     }
 
     async fn create_currentish_db_with_legacy_whiteout(db_path: &Path) {
+        let vfs = vfs_core::Vfs::open(VfsOptions::with_path(db_path.to_string_lossy()))
+            .await
+            .unwrap();
+        drop(vfs);
+
         let db = Builder::new_local(db_path.to_str().unwrap())
             .build()
             .await
             .unwrap();
         let conn = db.connect().unwrap();
-        conn.execute(
-            "CREATE TABLE fs_inode (
-                ino INTEGER PRIMARY KEY AUTOINCREMENT,
-                mode INTEGER NOT NULL,
-                nlink INTEGER NOT NULL DEFAULT 0,
-                uid INTEGER NOT NULL DEFAULT 0,
-                gid INTEGER NOT NULL DEFAULT 0,
-                size INTEGER NOT NULL DEFAULT 0,
-                atime INTEGER NOT NULL,
-                mtime INTEGER NOT NULL,
-                ctime INTEGER NOT NULL,
-                rdev INTEGER NOT NULL DEFAULT 0,
-                atime_nsec INTEGER NOT NULL DEFAULT 0,
-                mtime_nsec INTEGER NOT NULL DEFAULT 0,
-                ctime_nsec INTEGER NOT NULL DEFAULT 0,
-                data_inline BLOB,
-                storage_kind INTEGER NOT NULL DEFAULT 0
-            )",
-            (),
-        )
-        .await
-        .unwrap();
-        conn.execute(
-            "CREATE TABLE fs_dentry (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                parent_ino INTEGER NOT NULL,
-                ino INTEGER NOT NULL,
-                UNIQUE(parent_ino, name)
-            )",
-            (),
-        )
-        .await
-        .unwrap();
-        conn.execute(
-            "CREATE TABLE fs_data (
-                ino INTEGER NOT NULL,
-                chunk_index INTEGER NOT NULL,
-                data BLOB NOT NULL,
-                PRIMARY KEY (ino, chunk_index)
-            )",
-            (),
-        )
-        .await
-        .unwrap();
-        conn.execute(
-            "CREATE TABLE fs_symlink (
-                ino INTEGER PRIMARY KEY,
-                target TEXT NOT NULL
-            )",
-            (),
-        )
-        .await
-        .unwrap();
+        conn.execute("DROP TABLE fs_whiteout", ()).await.unwrap();
         conn.execute(
             "CREATE TABLE fs_whiteout (
                 path TEXT PRIMARY KEY,
                 created_at INTEGER NOT NULL
-            )",
-            (),
-        )
-        .await
-        .unwrap();
-        conn.execute(
-            "CREATE TABLE fs_session_metadata (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
             )",
             (),
         )
@@ -669,33 +612,7 @@ mod tests {
         )
         .await
         .unwrap();
-        conn.execute(
-            "CREATE TABLE kv_store (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL,
-                created_at INTEGER DEFAULT (unixepoch()),
-                updated_at INTEGER DEFAULT (unixepoch())
-            )",
-            (),
-        )
-        .await
-        .unwrap();
-        conn.execute(
-            "CREATE TABLE tool_calls (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                parameters TEXT,
-                result TEXT,
-                error TEXT,
-                status TEXT NOT NULL DEFAULT 'pending',
-                started_at INTEGER NOT NULL,
-                completed_at INTEGER,
-                duration_ms INTEGER
-            )",
-            (),
-        )
-        .await
-        .unwrap();
+        conn.execute("PRAGMA user_version = 0", ()).await.unwrap();
     }
 
     async fn table_columns(conn: &Connection, table_name: &str) -> Vec<String> {

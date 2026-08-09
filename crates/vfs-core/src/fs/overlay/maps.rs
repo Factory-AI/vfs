@@ -2,6 +2,7 @@ use super::{OverlayFS, ROOT_INO};
 use crate::error::Result;
 use crate::fs::FsError;
 use std::collections::HashMap;
+use turso::Connection;
 
 /// Which layer an inode belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -246,12 +247,31 @@ impl OverlayFS {
     /// Store origin mapping for copy-up
     pub(super) async fn add_origin_mapping(&self, delta_ino: i64, base_ino: i64) -> Result<()> {
         let conn = self.delta.get_connection().await?;
+        let mut txn =
+            super::super::vfs::MutationTxn::begin(&conn, self.delta.journal_enabled()).await?;
+        Self::add_origin_mapping_with_conn(txn.conn(), delta_ino, base_ino).await?;
+        txn.record(super::super::vfs::JournalOp::new(
+            "origin_map",
+            serde_json::json!({
+                "delta_ino": delta_ino,
+                "base_ino": base_ino,
+            }),
+        ));
+        txn.commit().await?;
+        self.origin_map.write().insert(delta_ino, base_ino);
+        Ok(())
+    }
+
+    pub(super) async fn add_origin_mapping_with_conn(
+        conn: &Connection,
+        delta_ino: i64,
+        base_ino: i64,
+    ) -> Result<()> {
         conn.execute(
             "INSERT OR REPLACE INTO fs_origin (delta_ino, base_ino) VALUES (?, ?)",
             (delta_ino, base_ino),
         )
         .await?;
-        self.origin_map.write().insert(delta_ino, base_ino);
         Ok(())
     }
 

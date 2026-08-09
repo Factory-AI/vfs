@@ -3,9 +3,10 @@
 ## [Unreleased] - Session branching
 
 `vfs branch` forks a run session into an independent session that starts at
-the parent's exact current state. The handoff wire contract and database
-schema do not change: `artifactVersion` remains `0.6`, and packed artifacts
-stay self-contained.
+the parent's exact current state. This release also advances the database and
+artifact schema to v0.7. `artifactVersion` changes from `0.6` to `0.7`;
+`adopt` migrates supported older artifacts forward automatically, while the
+pack/adopt manifest shapes and all other wire contracts remain unchanged.
 
 ### Added
 
@@ -42,9 +43,25 @@ stay self-contained.
 - Each `vfs run` session now exposes a control socket
   (`~/.vfs/run/<id>/ctl.sock`) accepting snapshot and parent-digest requests
   from same-machine tooling while the session is live.
+- Schema v0.7 replaces per-file chunk blobs with a content-addressed
+  `fs_chunk` store keyed by raw 32-byte BLAKE3 digests. `fs_data` now maps
+  `(ino, chunk_index)` to a digest, identical chunks deduplicate, and exact
+  live-mapping refcounts support safe reclamation.
+- A thin operation journal records one row per logical mutation, groups rows
+  from the same commit by transaction ID (the seq of the group's first row —
+  there is no allocator table), and references chunk digests rather than
+  duplicating chunk bytes. Journal retention pins otherwise unreferenced
+  chunks until the retained operations are collected. `vfs pack` truncates
+  the journal to the configured retention on its staging copy, so shipped
+  artifacts carry a bounded journal. Measured on the codex workload
+  (median-of-5): the CAS reshape alone holds the git-clone phase at the
+  pre-v0.7 time, and journaling adds about 26µs per logical operation
+  (+395ms over ~19,600 operations); `VFS_JOURNAL=0` removes that cost.
 
 ### Changed
 
+- Add `blake3` as a first-party dependency for content-addressed chunk
+  identity and schema migration.
 - The bundled turso SDK crates (`turso`, `turso_sdk_kit` 0.5.3) are vendored
   under `third_party/` with a patch adding a read-only open mode, used to
   guarantee parent artifacts are never opened writable. `turso_core` is

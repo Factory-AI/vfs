@@ -5,9 +5,9 @@
 //! first-class partial-origin CLI policy flags.
 
 use vfs_core::{
-    CoreConfig, DEFAULT_PARTIAL_ORIGIN_THRESHOLD_BYTES, DEFAULT_WRITE_BATCH_BYTES,
-    DEFAULT_WRITE_BATCH_GLOBAL_BYTES, DEFAULT_WRITE_BATCH_MS, DEFAULT_WRITE_BATCH_TXN_BYTES,
-    DEFAULT_WRITE_BATCH_TXN_INODES,
+    CoreConfig, DEFAULT_JOURNAL_RETENTION_OPS, DEFAULT_PARTIAL_ORIGIN_THRESHOLD_BYTES,
+    DEFAULT_WRITE_BATCH_BYTES, DEFAULT_WRITE_BATCH_GLOBAL_BYTES, DEFAULT_WRITE_BATCH_MS,
+    DEFAULT_WRITE_BATCH_TXN_BYTES, DEFAULT_WRITE_BATCH_TXN_INODES,
 };
 
 use vfs_core::telemetry::DEFAULT_PROFILE_ENABLED;
@@ -117,6 +117,8 @@ pub enum DefaultValue {
     CoreOverlayReads,
     CoreKeepcacheDelta,
     CoreDrainOnSetattr,
+    CoreJournalEnabled,
+    JournalRetentionOps,
     PartialOriginMode,
     WriteBatchMs,
     WriteBatchBytes,
@@ -184,6 +186,10 @@ impl DefaultValue {
             Self::CoreDrainOnSetattr => {
                 render_bool(CoreConfig::default().drain_on_setattr).to_string()
             }
+            Self::CoreJournalEnabled => {
+                render_bool(CoreConfig::default().journal_enabled).to_string()
+            }
+            Self::JournalRetentionOps => DEFAULT_JOURNAL_RETENTION_OPS.to_string(),
             Self::PartialOriginMode => {
                 partial_origin_mode_as_str(CoreConfig::default().partial_origin.mode).to_string()
             }
@@ -597,6 +603,23 @@ const ACTIVE_COMMON_KNOBS: &[Knob] = &[
         "Allows DB-backed delta files to participate in keep-cache eligibility.",
         "VAL-FUSE-014",
     ),
+    Knob::sunset(
+        "VFS_JOURNAL",
+        "env",
+        DefaultValue::CoreJournalEnabled,
+        CORE_OWNER,
+        "Enables the transactional filesystem operation journal without changing content-addressed storage.",
+        "Retire the switch after N=2 consecutive milestones default-on with core journal atomicity, pinning, and GC gates green.",
+        "vfs-core journal atomicity and kill-switch tests",
+    ),
+    Knob::product(
+        "VFS_JOURNAL_RETENTION_OPS",
+        "env",
+        DefaultValue::JournalRetentionOps,
+        CORE_OWNER,
+        "Maximum recent journal sequence window retained by journal GC; transaction groups at the horizon are retained whole.",
+        "vfs-core journal GC tests",
+    ),
     Knob::product(
         "VFS_BATCH_MS",
         "env",
@@ -805,6 +828,8 @@ mod tests {
             ("VFS_BATCH_GLOBAL_BYTES", "67108864"),
             ("VFS_BATCH_TXN_INODES", "1024"),
             ("VFS_BATCH_TXN_BYTES", "33554432"),
+            ("VFS_JOURNAL", "true"),
+            ("VFS_JOURNAL_RETENTION_OPS", "50000"),
             ("VFS_PROFILE", "false"),
         ];
 
@@ -850,6 +875,7 @@ mod tests {
             "VFS_FUSE_URING_SPIN_US",
             "VFS_DRAIN_ON_SETATTR",
             "VFS_OVERLAY_READS",
+            "VFS_JOURNAL",
         ] {
             assert!(
                 sunset_names.contains(&required),

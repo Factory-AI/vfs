@@ -50,16 +50,16 @@ pub use turso::sync::{DatabaseSyncStats, PartialBootstrapStrategy, PartialSyncOp
 
 // Re-export filesystem types
 pub use config::{
-    BatcherConfig, CoreConfig, EnvReader, Geometry, DEFAULT_WRITE_BATCH_BYTES,
-    DEFAULT_WRITE_BATCH_GLOBAL_BYTES, DEFAULT_WRITE_BATCH_MS, DEFAULT_WRITE_BATCH_TXN_BYTES,
-    DEFAULT_WRITE_BATCH_TXN_INODES,
+    BatcherConfig, CoreConfig, EnvReader, Geometry, DEFAULT_JOURNAL_RETENTION_OPS,
+    DEFAULT_WRITE_BATCH_BYTES, DEFAULT_WRITE_BATCH_GLOBAL_BYTES, DEFAULT_WRITE_BATCH_MS,
+    DEFAULT_WRITE_BATCH_TXN_BYTES, DEFAULT_WRITE_BATCH_TXN_INODES,
 };
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use fs::HostFS;
 pub use fs::{
-    BoxedFile, DirEntry, File, FileSystem, FilesystemStats, FsError, ImportEntry, ImportOptions,
-    ImportSession, ImportedEntry, OverlayFS, PartialOriginMode, PartialOriginPolicy, Stats,
-    TimeChange, WriteRange, DEFAULT_DIR_MODE, DEFAULT_FILE_MODE,
+    journal_gc, BoxedFile, DirEntry, File, FileSystem, FilesystemStats, FsError, ImportEntry,
+    ImportOptions, ImportSession, ImportedEntry, OverlayFS, PartialOriginMode, PartialOriginPolicy,
+    Stats, TimeChange, WriteRange, DEFAULT_DIR_MODE, DEFAULT_FILE_MODE,
     DEFAULT_PARTIAL_ORIGIN_THRESHOLD_BYTES, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT,
     S_IFREG, S_IFSOCK,
 };

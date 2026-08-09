@@ -1,5 +1,4 @@
 use super::*;
-use turso::transaction::{Transaction, TransactionBehavior};
 
 impl OverlayFS {
     /// Check if a path is whiteout (deleted from base).
@@ -19,7 +18,8 @@ impl OverlayFS {
     /// Create a whiteout for a path.
     pub(super) async fn create_whiteout(&self, path: &str) -> Result<()> {
         let conn = self.delta.get_connection().await?;
-        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+        let mut txn =
+            super::super::vfs::MutationTxn::begin(&conn, self.delta.journal_enabled()).await?;
         let parent_path = parent_path_for_whiteout(path);
         let (now, _) = current_timestamp()?;
 
@@ -36,6 +36,10 @@ impl OverlayFS {
 
         match result {
             Ok(()) => {
+                txn.record(super::super::vfs::JournalOp::new(
+                    "whiteout",
+                    serde_json::json!({ "path": path }),
+                ));
                 txn.commit().await?;
                 self.whiteouts.write().insert(path.to_string());
                 Ok(())
@@ -54,7 +58,8 @@ impl OverlayFS {
         }
 
         let conn = self.delta.get_connection().await?;
-        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+        let mut txn =
+            super::super::vfs::MutationTxn::begin(&conn, self.delta.journal_enabled()).await?;
         let result: Result<()> = async {
             conn.execute("DELETE FROM fs_whiteout WHERE path = ?", (path,))
                 .await?;
@@ -65,6 +70,10 @@ impl OverlayFS {
 
         match result {
             Ok(()) => {
+                txn.record(super::super::vfs::JournalOp::new(
+                    "whiteout_remove",
+                    serde_json::json!({ "path": path }),
+                ));
                 txn.commit().await?;
                 self.whiteouts.write().remove(path);
                 Ok(())

@@ -11,6 +11,7 @@ pub const DEFAULT_WRITE_BATCH_BYTES: usize = 4 * 1024 * 1024;
 pub const DEFAULT_WRITE_BATCH_GLOBAL_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_WRITE_BATCH_TXN_INODES: usize = 1024;
 pub const DEFAULT_WRITE_BATCH_TXN_BYTES: usize = 32 * 1024 * 1024;
+pub const DEFAULT_JOURNAL_RETENTION_OPS: usize = 50_000;
 
 const WRITE_BATCHER_MS_ENV: &str = "VFS_BATCH_MS";
 const WRITE_BATCHER_BYTES_ENV: &str = "VFS_BATCH_BYTES";
@@ -20,6 +21,8 @@ const WRITE_BATCHER_TXN_BYTES_ENV: &str = "VFS_BATCH_TXN_BYTES";
 const OVERLAY_READS_ENV: &str = "VFS_OVERLAY_READS";
 const DRAIN_ON_SETATTR_ENV: &str = "VFS_DRAIN_ON_SETATTR";
 const KEEPCACHE_DELTA_ENV: &str = "VFS_KEEPCACHE_DELTA";
+const JOURNAL_ENV: &str = "VFS_JOURNAL";
+const JOURNAL_RETENTION_OPS_ENV: &str = "VFS_JOURNAL_RETENTION_OPS";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Geometry {
@@ -85,6 +88,8 @@ pub struct CoreConfig {
     pub overlay_reads: bool,
     pub drain_on_setattr: bool,
     pub keepcache_delta: bool,
+    pub journal_enabled: bool,
+    pub journal_retention_ops: usize,
     pub partial_origin: PartialOriginPolicy,
 }
 
@@ -96,6 +101,8 @@ impl Default for CoreConfig {
             overlay_reads: true,
             drain_on_setattr: true,
             keepcache_delta: true,
+            journal_enabled: true,
+            journal_retention_ops: DEFAULT_JOURNAL_RETENTION_OPS,
             partial_origin: PartialOriginPolicy::default(),
         }
     }
@@ -111,6 +118,9 @@ impl CoreConfig {
             overlay_reads: reader.bool(OVERLAY_READS_ENV, default.overlay_reads),
             drain_on_setattr: reader.bool(DRAIN_ON_SETATTR_ENV, default.drain_on_setattr),
             keepcache_delta: reader.bool(KEEPCACHE_DELTA_ENV, default.keepcache_delta),
+            journal_enabled: reader.bool(JOURNAL_ENV, default.journal_enabled),
+            journal_retention_ops: reader
+                .positive_usize(JOURNAL_RETENTION_OPS_ENV, default.journal_retention_ops),
             partial_origin: default.partial_origin,
         }
     }

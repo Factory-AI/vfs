@@ -16,7 +16,7 @@ pub use host::HostFS;
 pub use overlay::{
     OverlayFS, PartialOriginMode, PartialOriginPolicy, DEFAULT_PARTIAL_ORIGIN_THRESHOLD_BYTES,
 };
-pub use vfs::{ImportEntry, ImportOptions, ImportSession, ImportedEntry, Vfs};
+pub use vfs::{journal_gc, ImportEntry, ImportOptions, ImportSession, ImportedEntry, Vfs};
 
 /// Filesystem-specific errors with errno semantics
 #[derive(Debug, Error)]

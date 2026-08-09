@@ -1,15 +1,16 @@
 # Agent Filesystem Specification
 
-**Version:** 0.6
+**Version:** 0.7
 
 ## Introduction
 
-The Agent Filesystem Specification defines a SQLite schema for representing agent filesystem state. The current v0.6 format adds persistent session handoff metadata to the v0.5 chunk and inline-storage layout, with `user_version`-keyed migration from older databases (in place by default, or copy-based re-chunking with `--copy`). The specification consists of four main components:
+The Agent Filesystem Specification defines a SQLite schema for representing agent filesystem state. The current v0.7 format content-addresses chunk blobs by raw 32-byte BLAKE3 digest and adds a thin logical-operation journal to the v0.6 handoff-capable layout, with `user_version`-keyed migration from older databases (in place by default, or copy-based re-chunking with `--copy`). The specification consists of five main components:
 
 1. **Tool Call Audit Trail**: Captures tool invocations, parameters, and results for debugging, auditing, and performance analysis
 2. **Virtual Filesystem**: Stores agent artifacts (files, documents, outputs) using a Unix-like inode design with support for hard links, proper metadata, and efficient file operations
 3. **Session Handoff Metadata**: Stores the monotonic pack generation and future seed provenance inside the transferable database
-4. **Key-Value Store**: Provides simple get/set operations for agent context, preferences, and structured state that doesn't fit into the filesystem model
+4. **Operation Journal**: Records committed logical mutations without duplicating chunk bytes
+5. **Key-Value Store**: Provides simple get/set operations for agent context, preferences, and structured state that doesn't fit into the filesystem model
 
 All timestamps in this specification use Unix epoch format (seconds since 1970-01-01 00:00:00 UTC) with optional nanosecond precision via separate `_nsec` columns.
 
@@ -249,14 +250,14 @@ CREATE TABLE fs_config (
 
 | Key | Description | Default |
 |-----|-------------|---------|
-| `schema_version` | On-disk schema version | `0.6` |
+| `schema_version` | On-disk schema version | `0.7` |
 | `chunk_size` | Size of data chunks in bytes | `65536` |
-| `inline_threshold` | Maximum dense regular-file size stored inline in `fs_inode.data_inline` | `4096` |
+| `inline_threshold` | Maximum dense regular-file size stored inline in `fs_inode.data_inline` | `16384` |
 
 **Notes:**
 
 - `chunk_size` determines the fixed size of data chunks in `fs_data`
-- New v0.6 filesystems use 64 KiB chunks by default; legacy v0.4 databases used 4 KiB chunks until copy-migrated
+- New v0.7 filesystems use 64 KiB chunks by default; legacy databases retain their recorded chunk size until copy-migrated
 - `inline_threshold` determines when dense regular files may avoid `fs_data` rows entirely
 - Configuration is immutable after filesystem initialization
 - Implementations MAY define additional configuration keys
@@ -374,13 +375,14 @@ CREATE INDEX idx_fs_dentry_parent ON fs_dentry(parent_ino, name)
 
 #### Table: `fs_data`
 
-Stores file content in fixed-size chunks. Chunk size is configured at filesystem level via `fs_config`.
+Maps each live file chunk to content in the shared chunk store. Chunk size is
+configured at filesystem level via `fs_config`.
 
 ```sql
 CREATE TABLE fs_data (
   ino INTEGER NOT NULL,
   chunk_index INTEGER NOT NULL,
-  data BLOB NOT NULL,
+  digest BLOB NOT NULL,
   PRIMARY KEY (ino, chunk_index)
 )
 ```
@@ -389,20 +391,51 @@ CREATE TABLE fs_data (
 
 - `ino` - Inode number
 - `chunk_index` - Zero-based chunk index (chunk 0 contains bytes 0 to chunk_size-1)
-- `data` - Binary content (BLOB), up to `chunk_size` bytes
+- `digest` - Raw 32-byte BLAKE3 digest identifying the chunk's `fs_chunk` row
 
 **Notes:**
 
 - Directories MUST NOT have data chunks
 - Inline regular files MUST NOT have data chunks
 - Chunk size is determined by the `chunk_size` value in `fs_config`
-- New v0.6 filesystems default to 64 KiB chunks
+- New v0.7 filesystems default to 64 KiB chunks
 - All chunks except the last chunk of a dense chunked file SHOULD be exactly `chunk_size` bytes
 - The last chunk MAY be smaller than `chunk_size`
 - Sparse holes MAY be represented by missing chunk rows and MUST read back as zero bytes
 - All-zero chunk rows MAY be omitted when doing so preserves read semantics
+- Every `digest` MUST resolve to exactly one `fs_chunk` row
 - Byte offset for a chunk = `chunk_index * chunk_size`
 - To read at byte offset `N`: `chunk_index = N / chunk_size`, `offset_in_chunk = N % chunk_size`
+
+#### Table: `fs_chunk`
+
+Stores content-addressed chunk bytes shared by every `fs_data` mapping with
+the same digest.
+
+```sql
+CREATE TABLE fs_chunk (
+  digest BLOB PRIMARY KEY,
+  data BLOB NOT NULL,
+  refcount INTEGER NOT NULL DEFAULT 0
+)
+```
+
+**Fields:**
+
+- `digest` - Raw 32-byte BLAKE3 digest of `data`
+- `data` - Binary chunk content, up to `chunk_size` bytes
+- `refcount` - Number of live `fs_data` mappings that reference this digest
+
+**Notes:**
+
+- Equal chunk bytes MUST share one row.
+- `refcount` counts live mappings only; journal retention is tracked
+  separately by `fs_journal_chunk`.
+- A zero-refcount row MAY remain while a retained journal entry references
+  its digest. Garbage collection MUST remove it only after both the live
+  mapping count and journal retention count reach zero.
+- Digest computation and insertion MUST occur in the same transaction as the
+  corresponding `fs_data` mapping change.
 
 #### Table: `fs_symlink`
 
@@ -462,12 +495,20 @@ To resolve a path to an inode:
    SET size = ?, data_inline = ?, storage_kind = 1, mtime = ?
    WHERE ino = ?
    ```
-7. Otherwise, split data into chunks and insert each:
+7. Otherwise, split data into chunks and content-address every stored chunk.
+   Chunks that are entirely zero may be omitted — a missing mapping reads
+   back as zeroes — but a writer that stores them pays almost nothing, since
+   every zero chunk deduplicates to the one all-zero `fs_chunk` row:
    ```sql
-   INSERT INTO fs_data (ino, chunk_index, data)
+   INSERT INTO fs_chunk (digest, data, refcount)
+   VALUES (?, ?, 1)
+   ON CONFLICT(digest) DO UPDATE SET refcount = refcount + 1;
+
+   INSERT INTO fs_data (ino, chunk_index, digest)
    VALUES (?, ?, ?)
    ```
-   Where `chunk_index` starts at 0 and increments for each chunk.
+   Where `digest` is the raw 32-byte BLAKE3 digest of `data`, and
+   `chunk_index` starts at 0 and increments for each logical chunk.
 8. Update inode size and mark chunked storage:
    ```sql
    UPDATE fs_inode SET size = ?, data_inline = NULL, storage_kind = 0, mtime = ? WHERE ino = ?
@@ -483,7 +524,11 @@ To resolve a path to an inode:
 3. If `storage_kind = 1`, return `data_inline` truncated to `size`
 4. Otherwise, fetch all chunks in order:
    ```sql
-   SELECT data FROM fs_data WHERE ino = ? ORDER BY chunk_index ASC
+   SELECT d.chunk_index, c.data
+   FROM fs_data d
+   JOIN fs_chunk c ON c.digest = d.digest
+   WHERE d.ino = ?
+   ORDER BY d.chunk_index ASC
    ```
 5. Concatenate chunks in order, treating missing sparse chunks as zeroes up to `size`
 6. Update access time:
@@ -510,9 +555,11 @@ To read `length` bytes starting at byte offset `offset`:
    - `end_chunk = (offset + length - 1) / chunk_size`
 6. Fetch required chunks:
    ```sql
-   SELECT chunk_index, data FROM fs_data
-   WHERE ino = ? AND chunk_index >= ? AND chunk_index <= ?
-   ORDER BY chunk_index ASC
+   SELECT d.chunk_index, c.data
+   FROM fs_data d
+   JOIN fs_chunk c ON c.digest = d.digest
+   WHERE d.ino = ? AND d.chunk_index >= ? AND d.chunk_index <= ?
+   ORDER BY d.chunk_index ASC
    ```
 7. Extract the requested byte range from the chunks:
    - `offset_in_first_chunk = offset % chunk_size`
@@ -543,11 +590,14 @@ To read `length` bytes starting at byte offset `offset`:
    ```sql
    SELECT nlink FROM fs_inode WHERE ino = ?
    ```
-5. If nlink = 0, delete inode and data:
+5. If nlink = 0, delete the inode and its mappings, decrementing the
+   corresponding `fs_chunk.refcount` values in the same transaction:
    ```sql
    DELETE FROM fs_inode WHERE ino = ?
    DELETE FROM fs_data WHERE ino = ?
    ```
+6. Garbage-collect zero-refcount `fs_chunk` rows only when they are not pinned
+   by `fs_journal_chunk`.
 
 #### Creating a Hard Link
 
@@ -579,9 +629,9 @@ When creating a new agent database, initialize the filesystem configuration and 
 
 ```sql
 -- Initialize filesystem configuration
-INSERT INTO fs_config (key, value) VALUES ('schema_version', '0.6');
+INSERT INTO fs_config (key, value) VALUES ('schema_version', '0.7');
 INSERT INTO fs_config (key, value) VALUES ('chunk_size', '65536');
-INSERT INTO fs_config (key, value) VALUES ('inline_threshold', '4096');
+INSERT INTO fs_config (key, value) VALUES ('inline_threshold', '16384');
 
 -- Initialize root directory
 INSERT INTO fs_inode (ino, mode, nlink, uid, gid, size, atime, mtime, ctime)
@@ -595,7 +645,7 @@ Where `16877` = `0o040755` (directory with rwxr-xr-x permissions)
 ### Schema Migration
 
 Migrations are keyed by `PRAGMA user_version` and land any supported old
-schema (v0.0, v0.2, v0.4) at the current version with one command:
+schema (v0.0, v0.2, v0.4, v0.5, v0.6) at the current version with one command:
 
 ```bash
 vfs migrate <id-or-path>
@@ -603,10 +653,14 @@ vfs migrate <id-or-path>
 
 In-place migration requirements:
 
-1. Every migration step MUST be an additive, idempotent DDL change applied inside a single transaction that stamps `PRAGMA user_version` before committing.
-2. Existing file contents MUST keep their recorded `chunk_size`; the in-place path does not re-chunk data. A defaulted `inline_threshold` MUST NOT exceed the database's recorded `chunk_size`.
+1. Every migration step MUST be idempotent and applied inside one IMMEDIATE transaction that stamps `PRAGMA user_version` before committing.
+2. Existing file contents MUST keep their recorded `chunk_size`; the in-place path does not re-chunk data. A defaulted `inline_threshold` is `min(16384, chunk_size)`.
 3. Open paths (mount, fs, exec, SDK open) MUST NOT run version upgrades implicitly; they reject old schemas and direct the user to `vfs migrate`.
 4. The v0.5 → v0.6 migration creates `fs_session_metadata` and preserves all existing filesystem, overlay, key-value, and tool-call rows.
+5. The v0.6 → v0.7 migration hashes every existing `fs_data.data` blob,
+   deduplicates it into `fs_chunk`, replaces `fs_data.data` with the raw
+   32-byte digest mapping, and initializes the thin journal schema in the same
+   transaction.
 
 The copy-based mode rebuilds the database with the current chunk layout:
 
@@ -621,9 +675,11 @@ Copy-migration requirements:
 3. The migration MUST preserve inode numbers, dentries, symlinks, KV rows, tool-call rows, overlay whiteouts, overlay origin mappings, overlay configuration, and session metadata.
 4. Small dense regular files MAY be converted to inline storage.
 5. Chunked files MUST be re-chunked using the target `chunk_size`.
-6. Sparse holes MUST preserve read-back semantics.
-7. Verification MUST run integrity checks and compare source/target metadata and file contents.
-8. After checkpointing the target, copying only the main `.db` file MUST be sufficient to reopen and verify the target state.
+6. Each non-zero target chunk MUST be hashed into `fs_chunk`; identical
+   content MUST deduplicate and `refcount` MUST equal its live mapping count.
+7. Sparse holes MUST preserve read-back semantics.
+8. Verification MUST run integrity checks and compare source/target metadata and file contents.
+9. After checkpointing the target, copying only the main `.db` file MUST be sufficient to reopen and verify the target state.
 
 ### Consistency Rules
 
@@ -637,6 +693,9 @@ Copy-migration requirements:
 8. Chunked regular files MUST have `storage_kind = 0` and `data_inline IS NULL`
 9. File reads MUST return exactly `size` bytes regardless of sparse missing chunks
 10. Every inode MUST have at least one dentry (except root)
+11. Every `fs_data.digest` and `fs_chunk.digest` MUST be exactly 32 bytes
+12. Every `fs_data.digest` MUST resolve to an `fs_chunk` row
+13. Every `fs_chunk.refcount` MUST equal the number of live `fs_data` mappings for that digest
 
 ### Implementation Notes
 
@@ -856,9 +915,9 @@ CLI policy `--partial-origin <off|on|auto>` (with
 overlay behavior remains whole-file copy-up (`off`). In opt-in mode,
 write-opening a regular base-layer file creates a delta inode with the
 original size and metadata, records the base path/fingerprint in
-`fs_partial_origin`, and stores only changed chunk indexes in `fs_data` plus
-`fs_chunk_override`. Reads merge changed chunks from the delta layer with
-unchanged chunks from the base layer.
+`fs_partial_origin`, and stores only changed chunk mappings in `fs_data` plus
+`fs_chunk_override`; their bytes live in `fs_chunk`. Reads merge changed
+chunks from the delta layer with unchanged chunks from the base layer.
 
 The base fallback is part of the file's integrity contract. Implementations MUST
 fail reads of partial-origin files if the recorded base size or modification
@@ -935,6 +994,66 @@ CREATE TABLE fs_session_metadata (
 generation becomes authoritative when the compacted copy is atomically
 published as the session's `delta.db`. A failed pack MUST leave both metadata
 keys and all filesystem rows at their pre-pack values.
+
+## Operation Journal
+
+The v0.7 journal is a thin, ordered record of logical filesystem mutations.
+It does not duplicate file content: operation payloads describe the mutation
+and refer to content by digest, while chunk retention is represented
+separately.
+
+### Table: `fs_op_journal`
+
+```sql
+CREATE TABLE fs_op_journal (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  txn_id INTEGER NOT NULL,
+  op TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  wallclock_ms INTEGER NOT NULL
+)
+
+CREATE INDEX idx_fs_op_journal_txn_id ON fs_op_journal(txn_id)
+```
+
+**Fields:**
+
+- `seq` - Monotonic journal sequence number and total operation order
+- `txn_id` - Identifier shared by every logical operation committed in one
+  SQLite transaction; it equals the `seq` of the group's first row
+- `op` - Stable logical operation name
+- `payload` - JSON operation payload; chunk content is represented by
+  lowercase hexadecimal digest references, never embedded bytes
+- `wallclock_ms` - Commit-associated Unix epoch timestamp in milliseconds
+
+Each logical mutation produces one row. Operations from one commit MUST share
+one `txn_id`, and journal rows MUST commit atomically with the filesystem rows
+they describe. Consumers replay commits in `seq` order and MUST treat all rows
+with one `txn_id` as a unit.
+
+Transaction IDs need no allocator state: a group's `txn_id` is the `seq`
+AUTOINCREMENT assigns to its first row, which the writer derives as
+`MAX(seq) + 1` inside its exclusive transaction. This holds because seqs are
+never reused and collection always retains the newest whole group; a writer
+MUST NOT delete the highest-`seq` row while the journal is non-empty.
+
+### Table: `fs_journal_chunk`
+
+```sql
+CREATE TABLE fs_journal_chunk (
+  seq INTEGER NOT NULL,
+  digest BLOB NOT NULL
+)
+
+CREATE INDEX idx_fs_journal_chunk_digest ON fs_journal_chunk(digest)
+```
+
+Each row records that the operation at `seq` retains a raw 32-byte BLAKE3
+digest. It is a retention relation, not a second live-mapping refcount:
+`fs_chunk.refcount` continues to equal the number of `fs_data` mappings.
+Collecting a journal range MUST remove its `fs_journal_chunk` rows in the same
+transaction; an `fs_chunk` row is eligible for garbage collection only when
+its live refcount is zero and no retained journal row names its digest.
 
 ## Key-Value Data
 
@@ -1021,6 +1140,19 @@ Such extensions SHOULD use separate tables to maintain referential integrity.
 
 ## Revision History
 
+### Version 0.7
+
+- Replaced inline chunk blobs in `fs_data` with raw 32-byte BLAKE3 digest
+  mappings into the deduplicated `fs_chunk` content-addressed store
+- Added exact live-mapping refcounts and journal-aware retention for
+  zero-refcount chunk rows
+- Added the thin logical-operation journal: one row per operation,
+  transaction grouping, digest-only chunk references, and explicit retention
+  state
+- The v0.6 → v0.7 migration preserves byte-identical file contents while
+  deduplicating equal chunks; copy migration additionally re-chunks into the
+  current 64 KiB layout
+
 ### Version 0.6
 
 - Added `fs_session_metadata(key, value)` for persistent handoff state
@@ -1031,11 +1163,13 @@ Such extensions SHOULD use separate tables to maintain referential integrity.
 ### Version 0.5
 
 - Default chunk size raised to 64 KiB for new filesystems (`chunk_size` in `fs_config`)
-- Added inline storage for dense regular files at or below `inline_threshold` (default 4 KiB): `data_inline` and `storage_kind` columns on `fs_inode`, with layout rules and consistency checks
+- Added inline storage for dense regular files at or below `inline_threshold` (current default 16 KiB): `data_inline` and `storage_kind` columns on `fs_inode`, with layout rules and consistency checks
 - Added `inline_threshold` to the required `fs_config` keys
 - Added partial-origin overlay mode tables (`fs_partial_origin`, `fs_chunk_override`) behind the opt-in `--partial-origin` CLI policy
 - Whiteout schema requires `parent_path`; legacy `fs_whiteout(path, created_at)` rows are synthesized on migration
-- Schema migrations are keyed by `PRAGMA user_version`; `vfs migrate` lands any supported old schema (v0.0, v0.2, v0.4) at the current version in place, and `--copy` rebuilds with the current chunk layout
+- Schema migrations are keyed by `PRAGMA user_version`; `vfs migrate` lands
+  any supported old schema at the current version in place, and `--copy`
+  rebuilds with the current chunk layout
 
 ### Version 0.4
 

@@ -66,19 +66,35 @@ impl OverlayFS {
         if rows.next().await?.is_some() {
             return Ok(());
         }
+        drop(rows);
 
-        conn.execute("DELETE FROM fs_origin WHERE delta_ino = ?", (delta_ino,))
+        let mut txn =
+            super::super::vfs::MutationTxn::begin(&conn, self.delta.journal_enabled()).await?;
+        let mut changed = txn
+            .conn()
+            .execute("DELETE FROM fs_origin WHERE delta_ino = ?", (delta_ino,))
             .await?;
-        conn.execute(
-            "DELETE FROM fs_chunk_override WHERE delta_ino = ?",
-            (delta_ino,),
-        )
-        .await?;
-        conn.execute(
-            "DELETE FROM fs_partial_origin WHERE delta_ino = ?",
-            (delta_ino,),
-        )
-        .await?;
+        changed += txn
+            .conn()
+            .execute(
+                "DELETE FROM fs_chunk_override WHERE delta_ino = ?",
+                (delta_ino,),
+            )
+            .await?;
+        changed += txn
+            .conn()
+            .execute(
+                "DELETE FROM fs_partial_origin WHERE delta_ino = ?",
+                (delta_ino,),
+            )
+            .await?;
+        if changed > 0 {
+            txn.record(super::super::vfs::JournalOp::new(
+                "partial_cleanup",
+                serde_json::json!({ "delta_ino": delta_ino }),
+            ));
+        }
+        txn.commit().await?;
         Ok(())
     }
 
@@ -328,19 +344,22 @@ impl OverlayFS {
             return Ok(stats.ino);
         }
 
-        let (stats, _file) = FileSystem::create_file(
-            &self.delta,
-            parent_ino,
-            name,
-            base_stats.mode,
-            base_stats.uid,
-            base_stats.gid,
-        )
-        .await?;
-        let delta_ino = stats.ino;
-
         let conn = self.delta.get_connection().await?;
-        conn.execute(
+        let mut txn =
+            super::super::vfs::MutationTxn::begin(&conn, self.delta.journal_enabled()).await?;
+        let stats = self
+            .delta
+            .create_file_with_conn(
+                txn.conn(),
+                parent_ino,
+                name,
+                base_stats.mode,
+                (base_stats.uid, base_stats.gid),
+                true,
+            )
+            .await?;
+        let delta_ino = stats.ino;
+        txn.conn().execute(
             "UPDATE fs_inode
              SET mode = ?, uid = ?, gid = ?, size = ?, atime = ?, mtime = ?, ctime = ?,
                  atime_nsec = ?, mtime_nsec = ?, ctime_nsec = ?, data_inline = NULL, storage_kind = ?
@@ -361,12 +380,47 @@ impl OverlayFS {
             ),
         )
         .await?;
-        self.delta.invalidate_attr(delta_ino);
+        Self::add_origin_mapping_with_conn(txn.conn(), delta_ino, info.underlying_ino).await?;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+        Self::add_partial_origin_mapping_with_conn(
+            txn.conn(),
+            delta_ino,
+            info.underlying_ino,
+            &info.path,
+            &base_stats,
+            now,
+        )
+        .await?;
+        txn.record(super::super::vfs::JournalOp::new(
+            "create_file",
+            serde_json::json!({
+                "ino": delta_ino,
+                "parent_ino": parent_ino,
+                "name": name,
+            }),
+        ));
+        txn.record(super::super::vfs::JournalOp::new(
+            "materialize_meta",
+            serde_json::json!({ "ino": delta_ino }),
+        ));
+        txn.record(super::super::vfs::JournalOp::new(
+            "origin_map",
+            serde_json::json!({
+                "delta_ino": delta_ino,
+                "base_ino": info.underlying_ino,
+            }),
+        ));
+        txn.record(super::super::vfs::JournalOp::new(
+            "partial_origin",
+            serde_json::json!({ "delta_ino": delta_ino }),
+        ));
+        txn.commit().await?;
 
-        self.add_origin_mapping(delta_ino, info.underlying_ino)
-            .await?;
-        self.add_partial_origin_mapping(delta_ino, info.underlying_ino, &info.path, &base_stats)
-            .await?;
+        self.delta.publish_created_file(parent_ino, name, &stats);
+        self.delta.invalidate_attr(delta_ino);
+        self.origin_map
+            .write()
+            .insert(delta_ino, info.underlying_ino);
         self.refresh_overlay_mapping(overlay_ino, Layer::Delta, delta_ino, &info.path);
 
         Ok(delta_ino)

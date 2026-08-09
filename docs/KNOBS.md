@@ -14,6 +14,8 @@ Every active runtime knob is declared here with an architecture class. Defaults 
 | `VFS_PROFILE` | env | product-config | `false` | vfs-core config | Enables profiling counters and summaries. | n/a | VAL-CONF-011 and VAL-CONF-014 |
 | `VFS_OVERLAY_READS` | env | sunset | `true` | vfs-core config | Tier-4 pending-write read overlay rollback path. | Remove after PendingView/stat coherence and overlay read gates are green for N=2 consecutive milestones. | VAL-CORE-006 and phase8 smoke |
 | `VFS_KEEPCACHE_DELTA` | env | product-config | `true` | vfs-core config | Allows DB-backed delta files to participate in keep-cache eligibility. | n/a | VAL-FUSE-014 |
+| `VFS_JOURNAL` | env | sunset | `true` | vfs-core config | Enables the transactional filesystem operation journal without changing content-addressed storage. | Retire the switch after N=2 consecutive milestones default-on with core journal atomicity, pinning, and GC gates green. | vfs-core journal atomicity and kill-switch tests |
+| `VFS_JOURNAL_RETENTION_OPS` | env | product-config | `50000` | vfs-core config | Maximum recent journal sequence window retained by journal GC; transaction groups at the horizon are retained whole. | n/a | vfs-core journal GC tests |
 | `VFS_BATCH_MS` | env | product-config | `5` | vfs-core config | Write batcher timer window in milliseconds. | n/a | sdk write-batcher tests |
 | `VFS_BATCH_BYTES` | env | product-config | `4194304` | vfs-core config | Per-inode pending-byte drain trigger. | n/a | sdk write-batcher tests |
 | `VFS_BATCH_GLOBAL_BYTES` | env | product-config | `67108864` | vfs-core config | Global pending-byte cap across inodes. | n/a | sdk write-batcher tests |

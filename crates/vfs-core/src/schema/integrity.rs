@@ -119,7 +119,10 @@ pub async fn check(conn: &Connection, opts: &CheckOpts) -> Result<Report> {
         "fs_inode",
         "fs_dentry",
         "fs_data",
+        "fs_chunk",
         "fs_symlink",
+        "fs_op_journal",
+        "fs_journal_chunk",
         "kv_store",
         "tool_calls",
     ];
@@ -142,8 +145,9 @@ pub async fn check(conn: &Connection, opts: &CheckOpts) -> Result<Report> {
     let has_inode = *tables.get("fs_inode").unwrap_or(&false);
     let has_dentry = *tables.get("fs_dentry").unwrap_or(&false);
     let has_data = *tables.get("fs_data").unwrap_or(&false);
+    let has_chunk = *tables.get("fs_chunk").unwrap_or(&false);
     let has_symlink = *tables.get("fs_symlink").unwrap_or(&false);
-    if has_inode && has_data {
+    if has_inode && has_data && has_chunk {
         check_storage_invariants(conn, &mut report).await?;
     }
     if has_inode && has_dentry {
@@ -275,6 +279,41 @@ async fn check_storage_invariants(conn: &Connection, report: &mut Report) -> Res
         "SELECT COUNT(*) FROM fs_data WHERE chunk_index < 0",
     )
     .await?;
+    add_zero_count_check(
+        conn,
+        report,
+        "storage.chunk_mappings_reference_chunks",
+        "SELECT COUNT(*)
+         FROM fs_data d
+         LEFT JOIN fs_chunk c ON c.digest = d.digest
+         WHERE c.digest IS NULL",
+    )
+    .await?;
+    add_zero_count_check(
+        conn,
+        report,
+        "storage.mapping_digests_are_blake3",
+        "SELECT COUNT(*) FROM fs_data WHERE length(digest) != 32",
+    )
+    .await?;
+    add_zero_count_check(
+        conn,
+        report,
+        "storage.chunk_digests_are_blake3",
+        "SELECT COUNT(*) FROM fs_chunk WHERE length(digest) != 32",
+    )
+    .await?;
+    add_zero_count_check(
+        conn,
+        report,
+        "storage.chunk_refcounts_match_mappings",
+        "SELECT COUNT(*)
+         FROM fs_chunk c
+         WHERE c.refcount != (
+             SELECT COUNT(*) FROM fs_data d WHERE d.digest = c.digest
+         )",
+    )
+    .await?;
 
     if let Some(chunk_size) = config_i64(conn, "chunk_size").await? {
         if chunk_size > 0 {
@@ -282,7 +321,7 @@ async fn check_storage_invariants(conn: &Connection, report: &mut Report) -> Res
                 conn,
                 report,
                 "storage.chunk_length_within_chunk_size",
-                &format!("SELECT COUNT(*) FROM fs_data WHERE length(data) > {chunk_size}"),
+                &format!("SELECT COUNT(*) FROM fs_chunk WHERE length(data) > {chunk_size}"),
             )
             .await?;
         }

@@ -5,7 +5,6 @@
 //! child modules implement caches, file handles, bulk import, path delegates,
 //! and the canonical `FileSystem` trait implementation.
 
-#[cfg(test)]
 use crate::error::Error;
 use crate::error::Result;
 use std::path::{Path, PathBuf};
@@ -32,6 +31,7 @@ mod caches;
 mod file;
 mod fs;
 mod import;
+mod journal;
 mod lifecycle;
 mod path_api;
 pub(in crate::fs) mod store;
@@ -42,6 +42,8 @@ use batcher::{
 use caches::{AttrCache, DentryCache, NegativeDentryCache};
 pub use file::VfsFile;
 pub use import::{ImportEntry, ImportOptions, ImportSession, ImportedEntry};
+pub use journal::journal_gc;
+pub(in crate::fs) use journal::{JournalOp, MutationTxn};
 pub use lifecycle::ReapHook;
 use lifecycle::{Lifecycle, OpenInodeGuard};
 
@@ -254,7 +256,7 @@ impl Vfs {
 
         // Initialize or migrate schema first. The schema module owns DDL and
         // stamps SQLite's user-version inside the DDL transaction.
-        Self::initialize_schema(&conn).await?;
+        Self::initialize_schema(&conn, config.journal_enabled).await?;
 
         // Get chunk_size from config (or use default)
         let chunk_size = Self::read_chunk_size(&conn).await?;
@@ -280,6 +282,7 @@ impl Vfs {
                 inline_threshold,
                 invalidate,
                 &core_config.batcher,
+                core_config.journal_enabled,
             ));
             let (pending_view, write_drain) = VfsWriteBatcher::split(&batcher);
             (Some(pending_view), Some(write_drain), Some(batcher))
@@ -291,7 +294,9 @@ impl Vfs {
         for hook in reap_hooks {
             lifecycle.register_reap_hook(hook);
         }
-        lifecycle.sweep_mount_orphans(&conn).await?;
+        lifecycle
+            .sweep_mount_orphans(&conn, core_config.journal_enabled)
+            .await?;
 
         let overlay_reads = core_config.overlay_reads;
         let fs = Self {
@@ -336,6 +341,15 @@ impl Vfs {
         self.core_config.partial_origin
     }
 
+    pub(crate) fn journal_enabled(&self) -> bool {
+        !self.read_only && self.core_config.journal_enabled
+    }
+
+    /// Configured journal retention horizon, in retained operations.
+    pub fn journal_retention_ops(&self) -> usize {
+        self.core_config.journal_retention_ops
+    }
+
     pub(crate) fn register_reap_hook(&self, hook: Arc<dyn ReapHook>) -> bool {
         self.lifecycle.register_reap_hook(hook)
     }
@@ -356,13 +370,21 @@ impl Vfs {
     }
 
     /// Initialize the database schema
-    async fn initialize_schema(conn: &Connection) -> Result<()> {
+    async fn initialize_schema(conn: &Connection, journal_enabled: bool) -> Result<()> {
         schema::require_current(conn).await?;
+        let mut txn = MutationTxn::begin(conn, journal_enabled).await?;
 
         // Ensure root directory exists with correct ownership
-        let mut rows = conn
-            .query("SELECT ino FROM fs_inode WHERE ino = ?", (ROOT_INO,))
+        let mut rows = txn
+            .conn()
+            .query("SELECT uid, gid FROM fs_inode WHERE ino = ?", (ROOT_INO,))
             .await?;
+        let root_ownership = if let Some(row) = rows.next().await? {
+            Some((row.get::<u32>(0)?, row.get::<u32>(1)?))
+        } else {
+            None
+        };
+        drop(rows);
 
         // SAFETY: getuid/getgid are always safe
         #[cfg(unix)]
@@ -370,25 +392,37 @@ impl Vfs {
         #[cfg(not(unix))]
         let (uid, gid) = (0u32, 0u32);
 
-        if rows.next().await?.is_none() {
+        let changed = if root_ownership.is_none() {
             let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
             let now_secs = dur.as_secs() as i64;
             let now_nsec = dur.subsec_nanos() as i64;
-            conn.execute(
+            txn.conn().execute(
                 "INSERT INTO fs_inode (ino, mode, nlink, uid, gid, size, atime, mtime, ctime, atime_nsec, mtime_nsec, ctime_nsec)
                 VALUES (?, ?, 2, ?, ?, 0, ?, ?, ?, ?, ?, ?)",
                 (ROOT_INO, DEFAULT_DIR_MODE as i64, uid, gid, now_secs, now_secs, now_secs, now_nsec, now_nsec, now_nsec),
             )
             .await?;
-        } else {
+            true
+        } else if root_ownership != Some((uid, gid)) {
             // Update existing root inode ownership to current user
-            conn.execute(
-                "UPDATE fs_inode SET uid = ?, gid = ? WHERE ino = ?",
-                (uid, gid, ROOT_INO),
-            )
-            .await?;
-        }
+            txn.conn()
+                .execute(
+                    "UPDATE fs_inode SET uid = ?, gid = ? WHERE ino = ?",
+                    (uid, gid, ROOT_INO),
+                )
+                .await?;
+            true
+        } else {
+            false
+        };
 
+        if changed {
+            txn.record(JournalOp::new(
+                "root_init",
+                serde_json::json!({ "ino": ROOT_INO }),
+            ));
+        }
+        txn.commit().await?;
         Ok(())
     }
 
@@ -669,7 +703,7 @@ impl Vfs {
     pub(crate) async fn process_deferred_reaps(&self) -> Result<()> {
         let reaped = self
             .lifecycle
-            .process_deferred_reaps(&self.pool, |ino| {
+            .process_deferred_reaps(&self.pool, self.journal_enabled(), |ino| {
                 self.discard_pending_for_reaped_inode(ino);
             })
             .await?;
@@ -711,6 +745,91 @@ impl Vfs {
     fn cache_negative_dentry(&self, parent_ino: i64, name: &str) {
         self.dentry_cache.remove(parent_ino, name);
         self.negative_dentry_cache.insert(parent_ino, name);
+    }
+
+    pub(crate) async fn create_file_with_conn(
+        &self,
+        conn: &Connection,
+        parent_ino: i64,
+        name: &str,
+        mode: u32,
+        ownership: (u32, u32),
+        update_parent_times: bool,
+    ) -> Result<Stats> {
+        let (uid, gid) = ownership;
+        let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
+        let now_secs = dur.as_secs() as i64;
+        let now_nsec = dur.subsec_nanos() as i64;
+        let file_mode = S_IFREG | (mode & 0o7777);
+
+        let mut inode_stmt = conn
+            .prepare_cached(
+                "INSERT INTO fs_inode (mode, nlink, uid, gid, size, atime, mtime, ctime, atime_nsec, mtime_nsec, ctime_nsec, data_inline, storage_kind)
+                 VALUES (?, 1, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING ino",
+            )
+            .await?;
+        let row = inode_stmt
+            .query_row((
+                file_mode as i64,
+                uid,
+                gid,
+                now_secs,
+                now_secs,
+                now_secs,
+                now_nsec,
+                now_nsec,
+                now_nsec,
+                Value::Blob(Vec::new()),
+                STORAGE_INLINE,
+            ))
+            .await?;
+        let ino = row
+            .get_value(0)
+            .ok()
+            .and_then(|value| value.as_integer().copied())
+            .ok_or_else(|| Error::Internal("failed to get inode".to_string()))?;
+
+        match conn
+            .execute(
+                "INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, ?, ?)",
+                (name, parent_ino, ino),
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(turso::Error::Constraint(_)) => return Err(FsError::AlreadyExists.into()),
+            Err(error) => return Err(error.into()),
+        }
+
+        if update_parent_times {
+            conn.execute(
+                "UPDATE fs_inode SET ctime = ?, mtime = ?, ctime_nsec = ?, mtime_nsec = ? WHERE ino = ?",
+                (now_secs, now_secs, now_nsec, now_nsec, parent_ino),
+            )
+            .await?;
+        }
+
+        Ok(Stats {
+            ino,
+            mode: file_mode,
+            nlink: 1,
+            uid,
+            gid,
+            size: 0,
+            atime: now_secs,
+            mtime: now_secs,
+            ctime: now_secs,
+            atime_nsec: now_nsec as u32,
+            mtime_nsec: now_nsec as u32,
+            ctime_nsec: now_nsec as u32,
+            rdev: 0,
+        })
+    }
+
+    pub(crate) fn publish_created_file(&self, parent_ino: i64, name: &str, stats: &Stats) {
+        self.cache_dentry(parent_ino, name, stats.ino);
+        self.invalidate_parent_attr(parent_ino);
+        self.cache_attr(stats.clone());
     }
 
     /// Get link count for an inode
@@ -960,6 +1079,7 @@ impl Vfs {
             pending_view: self.pending_view.clone(),
             write_drain: self.write_drain.clone(),
             overlay_reads: self.overlay_reads,
+            journal_enabled: self.journal_enabled(),
             _open_guard: Some(self.lifecycle.guard(ino)),
         }))
     }

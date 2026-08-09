@@ -844,10 +844,15 @@ def inspect_db(db_path: Path) -> dict[str, Any]:
         try:
             result: dict[str, Any] = {"inspectable": True}
             if table_exists(conn, "fs_data"):
-                row = conn.execute(
-                    "SELECT COUNT(*), COALESCE(SUM(LENGTH(data)), 0) FROM fs_data"
-                ).fetchone()
+                row = conn.execute("SELECT COUNT(*) FROM fs_data").fetchone()
                 result["fs_data_rows"] = int(row[0])
+            if table_exists(conn, "fs_chunk"):
+                # Chunk bytes live in the content-addressed fs_chunk store;
+                # the report key predates v0.7 and is kept for consumers.
+                row = conn.execute(
+                    "SELECT COUNT(*), COALESCE(SUM(LENGTH(data)), 0) FROM fs_chunk"
+                ).fetchone()
+                result["fs_chunk_rows"] = int(row[0])
                 result["fs_data_bytes"] = int(row[1])
             if table_exists(conn, "fs_inode"):
                 row = conn.execute(

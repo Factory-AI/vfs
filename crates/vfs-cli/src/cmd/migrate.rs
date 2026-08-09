@@ -1,9 +1,8 @@
 //! Database schema migration command.
 //!
 //! One `vfs migrate` lands any supported old schema at the current
-//! version: in place by default (every supported migration is an additive,
-//! transactional ALTER), or copy-based via `--copy <target>` for users who
-//! want a rebuilt database with the current chunk layout, keeping the
+//! version: in place by default, or copy-based via `--copy <target>` for users
+//! who want a rebuilt database with the current chunk layout, keeping the
 //! hash/verify engine from the historical `migrate-v0-5` command.
 
 use anyhow::{Context, Result as AnyhowResult};
@@ -421,8 +420,15 @@ async fn migrate_inodes_and_file_data(
             format!("0 AS {}", quote_identifier(name))
         }
     };
+    let select_nullable_column = |name: &str| {
+        if source_columns.iter().any(|column| column == name) {
+            quote_identifier(name)
+        } else {
+            format!("NULL AS {}", quote_identifier(name))
+        }
+    };
     let select_sql = format!(
-        "SELECT ino, mode, {}, uid, gid, size, atime, mtime, ctime, {}, {}, {}, {}
+        "SELECT ino, mode, {}, uid, gid, size, atime, mtime, ctime, {}, {}, {}, {}, {}, {}
          FROM fs_inode
          ORDER BY ino",
         select_column("nlink"),
@@ -430,6 +436,8 @@ async fn migrate_inodes_and_file_data(
         select_column("atime_nsec"),
         select_column("mtime_nsec"),
         select_column("ctime_nsec"),
+        select_nullable_column("data_inline"),
+        select_column("storage_kind"),
     );
     let mut rows = source.query(&select_sql, ()).await?;
 
@@ -447,20 +455,40 @@ async fn migrate_inodes_and_file_data(
         let atime_nsec = row_i64(&row, 10)?;
         let mtime_nsec = row_i64(&row, 11)?;
         let ctime_nsec = row_i64(&row, 12)?;
+        let source_inline = if row_i64(&row, 14)? == 1 {
+            match row.get_value(13)? {
+                Value::Blob(data) => Some(data.clone()),
+                Value::Null => Some(Vec::new()),
+                _ => None,
+            }
+        } else {
+            None
+        };
 
         let is_regular = (mode & S_IFMT) == S_IFREG;
-        let (storage_kind, data_inline) =
-            if is_regular && (size as usize) <= DEFAULT_INLINE_THRESHOLD {
-                let (bytes, dense) =
-                    read_source_file_bytes(source, ino, size as usize, source_chunk_size).await?;
-                if dense {
-                    (1_i64, Value::Blob(bytes))
-                } else {
-                    (0_i64, Value::Null)
+        let (storage_kind, data_inline) = if is_regular
+            && (size as usize) <= DEFAULT_INLINE_THRESHOLD
+        {
+            let (bytes, dense) = match &source_inline {
+                Some(bytes) => {
+                    let mut content = bytes.clone();
+                    let dense = content.len() == size as usize;
+                    content.resize(size as usize, 0);
+                    content.truncate(size as usize);
+                    (content, dense)
                 }
+                None => {
+                    read_source_file_bytes(source, ino, size as usize, source_chunk_size).await?
+                }
+            };
+            if dense {
+                (1_i64, Value::Blob(bytes))
             } else {
                 (0_i64, Value::Null)
-            };
+            }
+        } else {
+            (0_i64, Value::Null)
+        };
 
         target
             .execute(
@@ -489,17 +517,35 @@ async fn migrate_inodes_and_file_data(
             .await?;
 
         if is_regular && storage_kind == 0 {
-            copy_source_file_chunks_to_target(
-                source,
-                target,
-                ino,
-                size as usize,
-                source_chunk_size,
-            )
-            .await?;
+            if let Some(bytes) = source_inline {
+                copy_source_inline_file_chunks_to_target(target, ino, size as usize, &bytes)
+                    .await?;
+            } else {
+                copy_source_file_chunks_to_target(
+                    source,
+                    target,
+                    ino,
+                    size as usize,
+                    source_chunk_size,
+                )
+                .await?;
+            }
         }
     }
 
+    Ok(())
+}
+
+async fn copy_source_inline_file_chunks_to_target(
+    target: &Connection,
+    ino: i64,
+    size: usize,
+    bytes: &[u8],
+) -> AnyhowResult<()> {
+    let copy_len = std::cmp::min(size, bytes.len());
+    for (chunk_index, chunk) in bytes[..copy_len].chunks(DEFAULT_CHUNK_SIZE).enumerate() {
+        flush_target_chunk(target, ino, Some(chunk_index as i64), chunk, true).await?;
+    }
     Ok(())
 }
 
@@ -583,10 +629,19 @@ async fn flush_target_chunk(
     let Some(chunk_index) = chunk_index else {
         return Ok(());
     };
+    let digest = blake3::hash(chunk).as_bytes().to_vec();
     target
         .execute(
-            "INSERT INTO fs_data (ino, chunk_index, data) VALUES (?, ?, ?)",
-            (ino, chunk_index, Value::Blob(chunk.to_vec())),
+            "INSERT INTO fs_chunk (digest, data, refcount)
+             VALUES (?, ?, 1)
+             ON CONFLICT(digest) DO UPDATE SET refcount = refcount + 1",
+            (Value::Blob(digest.clone()), Value::Blob(chunk.to_vec())),
+        )
+        .await?;
+    target
+        .execute(
+            "INSERT INTO fs_data (ino, chunk_index, digest) VALUES (?, ?, ?)",
+            (ino, chunk_index, Value::Blob(digest)),
         )
         .await?;
     Ok(())
@@ -741,12 +796,18 @@ async fn verify_migration_equivalence(
 ) -> AnyhowResult<()> {
     run_integrity_check(source, "source").await?;
     run_integrity_check(target, "target").await?;
-    verify_target_v0_5_invariants(target).await?;
-    verify_target_v0_5_config(target).await?;
+    verify_target_current_invariants(target).await?;
+    verify_target_current_config(target).await?;
     // Compare the inode columns both sides share; columns the source predates
     // (nlink for v0.0, rdev/*_nsec for v0.0/v0.2) are zero-defaulted or
     // backfilled on the target and verified against their rule below.
-    compare_common_table_rows(source, target, "fs_inode").await?;
+    compare_common_table_rows_excluding(
+        source,
+        target,
+        "fs_inode",
+        &["data_inline", "storage_kind"],
+    )
+    .await?;
     verify_target_nlink_rule_if_source_missing(source, target).await?;
     compare_table_rows(
         source,
@@ -834,6 +895,7 @@ async fn compare_regular_file_contents(
 ) -> AnyhowResult<()> {
     let source_chunk_size = read_config_usize(source, "chunk_size", 4096).await?;
     let target_chunk_size = read_config_usize(target, "chunk_size", DEFAULT_CHUNK_SIZE).await?;
+    let source_allows_inline = source_has_column(source, "fs_inode", "storage_kind").await?;
     let mut rows = source
         .query("SELECT ino, mode, size FROM fs_inode ORDER BY ino", ())
         .await?;
@@ -846,10 +908,17 @@ async fn compare_regular_file_contents(
             continue;
         }
 
-        let source_hash =
-            hash_regular_file_contents(source, ino, size, source_chunk_size, false).await?;
+        let source_hash = hash_regular_file_contents(
+            source,
+            ino,
+            size,
+            source_chunk_size,
+            source_allows_inline,
+            false,
+        )
+        .await?;
         let target_hash =
-            hash_regular_file_contents(target, ino, size, target_chunk_size, true).await?;
+            hash_regular_file_contents(target, ino, size, target_chunk_size, true, true).await?;
         if source_hash != target_hash {
             anyhow::bail!("Regular file content mismatch for inode {ino}");
         }
@@ -863,6 +932,7 @@ async fn hash_regular_file_contents(
     size: usize,
     chunk_size: usize,
     allow_inline: bool,
+    cas_chunks: bool,
 ) -> AnyhowResult<u64> {
     let mut hasher = DefaultHasher::new();
 
@@ -890,12 +960,19 @@ async fn hash_regular_file_contents(
         }
     }
 
-    let mut rows = conn
-        .query(
-            "SELECT chunk_index, data FROM fs_data WHERE ino = ? ORDER BY chunk_index",
-            (ino,),
-        )
-        .await?;
+    let sql = if cas_chunks {
+        "SELECT d.chunk_index, c.data
+         FROM fs_data d
+         JOIN fs_chunk c ON c.digest = d.digest
+         WHERE d.ino = ?
+         ORDER BY d.chunk_index"
+    } else {
+        "SELECT chunk_index, data
+         FROM fs_data
+         WHERE ino = ?
+         ORDER BY chunk_index"
+    };
+    let mut rows = conn.query(sql, (ino,)).await?;
     let mut position = 0usize;
     while let Some(row) = rows.next().await? {
         let chunk_index = row_i64(&row, 0)? as usize;
@@ -957,11 +1034,34 @@ async fn read_target_file_bytes(
         return Ok(bytes);
     }
 
-    let (bytes, _) = read_source_file_bytes(conn, ino, size, chunk_size).await?;
+    let mut bytes = vec![0; size];
+    let mut rows = conn
+        .query(
+            "SELECT d.chunk_index, c.data
+             FROM fs_data d
+             JOIN fs_chunk c ON c.digest = d.digest
+             WHERE d.ino = ?
+             ORDER BY d.chunk_index",
+            (ino,),
+        )
+        .await?;
+    while let Some(row) = rows.next().await? {
+        let chunk_index = row_i64(&row, 0)? as usize;
+        let chunk_data = match row.get_value(1)? {
+            Value::Blob(data) => data,
+            _ => continue,
+        };
+        let start = chunk_index.saturating_mul(chunk_size);
+        if start >= size {
+            continue;
+        }
+        let copy_len = std::cmp::min(chunk_data.len(), size - start);
+        bytes[start..start + copy_len].copy_from_slice(&chunk_data[..copy_len]);
+    }
     Ok(bytes)
 }
 
-async fn verify_target_v0_5_config(conn: &Connection) -> AnyhowResult<()> {
+async fn verify_target_current_config(conn: &Connection) -> AnyhowResult<()> {
     let schema_version = read_config_string(conn, schema::CONFIG_SCHEMA_VERSION_KEY).await?;
     if schema_version.as_deref() != Some(schema::CURRENT.as_str()) {
         anyhow::bail!(
@@ -981,7 +1081,7 @@ async fn verify_target_v0_5_config(conn: &Connection) -> AnyhowResult<()> {
     Ok(())
 }
 
-async fn verify_target_v0_5_invariants(conn: &Connection) -> AnyhowResult<()> {
+async fn verify_target_current_invariants(conn: &Connection) -> AnyhowResult<()> {
     let checks = [
         (
             "inline files must not have chunks",
@@ -1006,13 +1106,44 @@ async fn verify_target_v0_5_invariants(conn: &Connection) -> AnyhowResult<()> {
                AND COALESCE(length(data_inline), 0) != size
              LIMIT 1",
         ),
+        (
+            "chunk mappings must use 32-byte digests",
+            "SELECT ino
+             FROM fs_data
+             WHERE length(digest) != 32
+             LIMIT 1",
+        ),
+        (
+            "chunk store rows must use 32-byte digests",
+            "SELECT 0
+             FROM fs_chunk
+             WHERE length(digest) != 32
+             LIMIT 1",
+        ),
+        (
+            "chunk mappings must resolve to stored content",
+            "SELECT d.ino
+             FROM fs_data d
+             LEFT JOIN fs_chunk c ON c.digest = d.digest
+             WHERE c.digest IS NULL
+             LIMIT 1",
+        ),
+        (
+            "chunk refcounts must equal live mapping counts",
+            "SELECT 0
+             FROM fs_chunk c
+             WHERE c.refcount != (
+                 SELECT COUNT(*) FROM fs_data d WHERE d.digest = c.digest
+             )
+             LIMIT 1",
+        ),
     ];
 
     for (description, sql) in checks {
         let mut rows = conn.query(sql, ()).await?;
         if let Some(row) = rows.next().await? {
             let ino = row_i64(&row, 0).unwrap_or_default();
-            anyhow::bail!("Target v0.5 invariant failed: {description} (ino {ino})");
+            anyhow::bail!("Target current-schema invariant failed: {description} (ino {ino})");
         }
     }
     Ok(())
@@ -1082,12 +1213,21 @@ async fn compare_common_table_rows(
     target: &Connection,
     table: &str,
 ) -> AnyhowResult<()> {
+    compare_common_table_rows_excluding(source, target, table, &[]).await
+}
+
+async fn compare_common_table_rows_excluding(
+    source: &Connection,
+    target: &Connection,
+    table: &str,
+    excluded: &[&str],
+) -> AnyhowResult<()> {
     let source_columns = get_table_columns(source, table).await?;
     let target_columns = get_table_columns(target, table).await?;
     let target_set = target_columns.iter().cloned().collect::<HashSet<_>>();
     let columns = source_columns
         .iter()
-        .filter(|column| target_set.contains(*column))
+        .filter(|column| target_set.contains(*column) && !excluded.contains(&column.as_str()))
         .map(String::as_str)
         .collect::<Vec<_>>();
     compare_table_rows(source, target, table, &columns).await
@@ -1506,15 +1646,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_copy_migrate_v0_4_to_v0_5_preserves_source_and_rechunks() {
+    async fn test_copy_migrate_v0_4_to_current_preserves_source_rechunks_and_deduplicates() {
         let temp_dir = tempfile::tempdir().unwrap();
         let source = temp_dir.path().join("source.db");
         let target = temp_dir.path().join("target.db");
         let small_content = b"inline payload".to_vec();
         let large_content = patterned_bytes(DEFAULT_CHUNK_SIZE + 123, 0x42);
         let sparse_tail = b"tail!".to_vec();
+        let duplicate_content = patterned_bytes(DEFAULT_INLINE_THRESHOLD + 1, 0x71);
 
         create_synthetic_v0_4_database(&source, &small_content, &large_content, &sparse_tail).await;
+        insert_duplicate_chunked_source_files(&source, &duplicate_content).await;
         let source_hash_before = hash_file(&source).unwrap();
         let source_bytes_before = fs::read(&source).unwrap();
 
@@ -1538,8 +1680,8 @@ mod tests {
             .await
             .unwrap();
         let conn = db.connect().unwrap();
-        verify_target_v0_5_config(&conn).await.unwrap();
-        verify_target_v0_5_invariants(&conn).await.unwrap();
+        verify_target_current_config(&conn).await.unwrap();
+        verify_target_current_invariants(&conn).await.unwrap();
 
         let mut rows = conn
             .query(
@@ -1598,6 +1740,21 @@ mod tests {
             table_count_for_test(&conn, "tool_calls", "name = 'migrate-test'").await,
             1
         );
+
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(DISTINCT d.digest), MIN(c.refcount), MAX(c.refcount)
+                 FROM fs_data d
+                 JOIN fs_chunk c ON c.digest = d.digest
+                 WHERE d.ino IN (7, 8)",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row_i64(&row, 0).unwrap(), 1);
+        assert_eq!(row_i64(&row, 1).unwrap(), 2);
+        assert_eq!(row_i64(&row, 2).unwrap(), 2);
     }
 
     #[tokio::test]
@@ -2018,6 +2175,99 @@ mod tests {
         .unwrap();
     }
 
+    async fn insert_duplicate_chunked_source_files(path: &Path, content: &[u8]) {
+        let db = Builder::new_local(path.to_str().unwrap())
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        let file_mode = 0o100000 | 0o644;
+        conn.execute(
+            "INSERT INTO fs_inode
+             (ino, mode, nlink, uid, gid, size, atime, mtime, ctime, rdev,
+              atime_nsec, mtime_nsec, ctime_nsec)
+             VALUES
+             (7, ?, 1, 1000, 1000, ?, 16, 16, 16, 0, 7, 7, 7),
+             (8, ?, 1, 1000, 1000, ?, 17, 17, 17, 0, 8, 8, 8)",
+            (
+                file_mode,
+                content.len() as i64,
+                file_mode,
+                content.len() as i64,
+            ),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO fs_dentry (id, name, parent_ino, ino) VALUES
+             (7, 'duplicate-a.bin', 2, 7),
+             (8, 'duplicate-b.bin', 2, 8)",
+            (),
+        )
+        .await
+        .unwrap();
+        for ino in [7_i64, 8] {
+            for (chunk_index, chunk) in content.chunks(4096).enumerate() {
+                conn.execute(
+                    "INSERT INTO fs_data (ino, chunk_index, data) VALUES (?, ?, ?)",
+                    (ino, chunk_index as i64, Value::Blob(chunk.to_vec())),
+                )
+                .await
+                .unwrap();
+            }
+        }
+    }
+
+    async fn upgrade_synthetic_v0_4_to_v0_6_inline(path: &Path, inline_content: &[u8]) {
+        let db = Builder::new_local(path.to_str().unwrap())
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("ALTER TABLE fs_inode ADD COLUMN data_inline BLOB", ())
+            .await
+            .unwrap();
+        conn.execute(
+            "ALTER TABLE fs_inode ADD COLUMN storage_kind INTEGER NOT NULL DEFAULT 0",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "UPDATE fs_inode
+             SET data_inline = ?, storage_kind = 1
+             WHERE ino = 3",
+            (Value::Blob(inline_content.to_vec()),),
+        )
+        .await
+        .unwrap();
+        conn.execute("DELETE FROM fs_data WHERE ino = 3", ())
+            .await
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE fs_session_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO fs_session_metadata (key, value) VALUES ('generation', '2')",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "UPDATE fs_config SET value = '0.6' WHERE key = 'schema_version'",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute("PRAGMA user_version = 6", ()).await.unwrap();
+    }
+
     #[test]
     fn schema_upgrade_guidance_names_a_command_that_finishes_the_job() {
         for (found, id_or_path) in [
@@ -2025,8 +2275,9 @@ mod tests {
             ("0.2", "/tmp/old.db"),
             ("0.4", "other-agent"),
             ("0.5", "pack-agent"),
+            ("0.6", "handoff-agent"),
         ] {
-            let guidance = schema_upgrade_guidance(found, "0.6", id_or_path);
+            let guidance = schema_upgrade_guidance(found, "0.7", id_or_path);
             assert!(
                 guidance.contains(&format!("vfs migrate {id_or_path}")),
                 "{found}: {guidance}"
@@ -2034,7 +2285,7 @@ mod tests {
             assert!(!guidance.contains("migrate-v0-5"), "{found}: {guidance}");
         }
 
-        let future = schema_upgrade_guidance("user_version 7", "0.6", "my-agent");
+        let future = schema_upgrade_guidance("user_version 8", "0.7", "my-agent");
         assert!(
             !future.contains("vfs migrate"),
             "future versions must not promise migrate can fix them: {future}"
@@ -2133,6 +2384,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(migrated_large, large);
+    }
+
+    #[tokio::test]
+    async fn test_copy_migrate_v0_6_source_preserves_inline_and_chunked_contents() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source = temp_dir.path().join("source-v06.db");
+        let target = temp_dir.path().join("target.db");
+        let small = b"already inline".to_vec();
+        let large = patterned_bytes(DEFAULT_CHUNK_SIZE + 33, 0x66);
+        create_synthetic_v0_4_database(&source, &small, &large, b"tail").await;
+        upgrade_synthetic_v0_4_to_v0_6_inline(&source, &small).await;
+
+        let mut stdout = Vec::new();
+        handle_migrate_copy_command(
+            &mut stdout,
+            source.to_string_lossy().into_owned(),
+            target.clone(),
+            true,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        let stdout = String::from_utf8(stdout).unwrap();
+        assert!(stdout.contains("Source schema version: 0.6"), "{stdout}");
+
+        let db = Builder::new_local(target.to_str().unwrap())
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        assert_eq!(
+            read_target_file_bytes(&conn, 3, small.len(), DEFAULT_CHUNK_SIZE)
+                .await
+                .unwrap(),
+            small
+        );
+        assert_eq!(
+            read_target_file_bytes(&conn, 4, large.len(), DEFAULT_CHUNK_SIZE)
+                .await
+                .unwrap(),
+            large
+        );
+        assert_eq!(
+            table_count_for_test(&conn, "fs_session_metadata", "key = 'generation'").await,
+            1
+        );
     }
 
     #[tokio::test]

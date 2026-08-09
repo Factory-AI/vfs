@@ -1562,7 +1562,7 @@
             })
             .expect("schema version should be a text value");
 
-        assert_eq!(value, "0.6");
+        assert_eq!(value, schema::CURRENT.as_str());
 
         Ok(())
     }
@@ -1657,8 +1657,12 @@
             .await?;
         }
 
-        let err = match Vfs::new(db_path.to_str().unwrap()).await {
-            Ok(_) => panic!("opening a database with a conflicting schema column must fail"),
+        let db = Builder::new_local(db_path.to_str().unwrap())
+            .build()
+            .await?;
+        let conn = db.connect()?;
+        let err = match schema::ensure_current(&conn).await {
+            Ok(_) => panic!("migrating a database with a conflicting schema column must fail"),
             Err(err) => err,
         };
         let err_msg = err.to_string();
@@ -1666,6 +1670,8 @@
             err_msg.contains("fs_inode.atime_nsec") && err_msg.contains("incompatible definition"),
             "error should name the incompatible schema column, got: {err_msg}"
         );
+        drop(conn);
+        drop(db);
 
         let db = Builder::new_local(db_path.to_str().unwrap())
             .build()
@@ -1951,7 +1957,7 @@
         let conn = fs.pool.get_connection().await?;
         let result = conn
             .execute(
-                "INSERT INTO fs_data (ino, chunk_index, data) VALUES (?, 0, ?)",
+                "INSERT INTO fs_data (ino, chunk_index, digest) VALUES (?, 0, ?)",
                 (ino, vec![1u8; 10]),
             )
             .await;
@@ -1999,6 +2005,118 @@
 
         assert_eq!(indices, vec![0, 1, 2, 3, 4]);
 
+        Ok(())
+    }
+
+    async fn assert_cas_refcounts_exact(fs: &Vfs) -> Result<()> {
+        let conn = fs.pool.get_connection().await?;
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*)
+                 FROM fs_chunk c
+                 WHERE c.refcount != (
+                     SELECT COUNT(*) FROM fs_data d WHERE d.digest = c.digest
+                 )",
+                (),
+            )
+            .await?;
+        assert_eq!(rows.next().await?.unwrap().get::<i64>(0)?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn identical_chunked_files_share_cas_rows() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        let data = vec![0x5a; fs.chunk_size()];
+
+        for path in ["/first.bin", "/second.bin"] {
+            let (_, file) = fs.create_file(path, DEFAULT_FILE_MODE, 0, 0).await?;
+            file.pwrite(0, &data).await?;
+            file.fsync().await?;
+        }
+
+        let conn = fs.pool.get_connection().await?;
+        let mut rows = conn
+            .query("SELECT COUNT(*), MAX(refcount) FROM fs_chunk", ())
+            .await?;
+        let row = rows.next().await?.unwrap();
+        assert_eq!(row.get::<i64>(0)?, 1);
+        assert_eq!(row.get::<i64>(1)?, 2);
+        drop(rows);
+        assert_cas_refcounts_exact(&fs).await
+    }
+
+    #[tokio::test]
+    async fn overwrite_repoints_mapping_and_decrements_old_chunk() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        let (_, file) = fs
+            .create_file("/overwrite.bin", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        file.pwrite(0, &vec![0x11; fs.chunk_size()]).await?;
+        file.fsync().await?;
+        file.pwrite(0, &vec![0x22; fs.chunk_size()]).await?;
+        file.fsync().await?;
+
+        let conn = fs.pool.get_connection().await?;
+        let mut rows = conn
+            .query("SELECT refcount FROM fs_chunk ORDER BY refcount", ())
+            .await?;
+        assert_eq!(rows.next().await?.unwrap().get::<i64>(0)?, 0);
+        assert_eq!(rows.next().await?.unwrap().get::<i64>(0)?, 1);
+        assert!(rows.next().await?.is_none());
+        drop(rows);
+        assert_cas_refcounts_exact(&fs).await
+    }
+
+    #[tokio::test]
+    async fn unlink_reap_leaves_zero_refcount_chunk_for_gc() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        let (_, file) = fs
+            .create_file("/reap-cas.bin", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        file.pwrite(0, &vec![0x33; fs.chunk_size()]).await?;
+        file.fsync().await?;
+        drop(file);
+
+        fs.remove("/reap-cas.bin").await?;
+
+        let conn = fs.pool.get_connection().await?;
+        let mut rows = conn
+            .query("SELECT COUNT(*), MAX(refcount) FROM fs_chunk", ())
+            .await?;
+        let row = rows.next().await?.unwrap();
+        assert_eq!(row.get::<i64>(0)?, 1);
+        assert_eq!(row.get::<i64>(1)?, 0);
+        drop(rows);
+        assert_cas_refcounts_exact(&fs).await
+    }
+
+    #[tokio::test]
+    async fn truncate_keeps_refcounts_exact_and_dedupes_zero_chunks() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        let chunk_size = fs.chunk_size();
+        let (_, file) = fs
+            .create_file("/truncate-cas.bin", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        let mut initial = vec![0x44; chunk_size];
+        initial.extend(vec![0x55; chunk_size]);
+        file.pwrite(0, &initial).await?;
+        file.fsync().await?;
+
+        file.truncate((chunk_size / 2) as u64).await?;
+        assert_cas_refcounts_exact(&fs).await?;
+        file.truncate((chunk_size * 3) as u64).await?;
+        assert_cas_refcounts_exact(&fs).await?;
+
+        let zero_digest = blake3::hash(&vec![0; chunk_size]).as_bytes().to_vec();
+        let conn = fs.pool.get_connection().await?;
+        let mut rows = conn
+            .query(
+                "SELECT refcount FROM fs_chunk WHERE digest = ?",
+                (zero_digest.as_slice(),),
+            )
+            .await?;
+        assert_eq!(rows.next().await?.unwrap().get::<i64>(0)?, 2);
         Ok(())
     }
 
@@ -2996,6 +3114,7 @@
                 Arc::new(move |ino| attr_cache.remove(ino))
             },
             &config,
+            fs.journal_enabled(),
         ))
     }
 
@@ -4020,5 +4139,413 @@
             size, 11,
             "overlay_reads=false → SQLite has full size after pwrite"
         );
+        Ok(())
+    }
+
+    async fn journal_rows_after(
+        conn: &Connection,
+        seq: i64,
+    ) -> Result<Vec<(i64, i64, String, serde_json::Value)>> {
+        let mut rows = conn
+            .query(
+                "SELECT seq, txn_id, op, payload
+                 FROM fs_op_journal WHERE seq > ? ORDER BY seq",
+                (seq,),
+            )
+            .await?;
+        let mut result = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let payload: String = row.get(3)?;
+            result.push((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                serde_json::from_str(&payload)?,
+            ));
+        }
+        Ok(result)
+    }
+
+    async fn journal_max_seq(conn: &Connection) -> Result<i64> {
+        let mut rows = conn
+            .query("SELECT COALESCE(MAX(seq), 0) FROM fs_op_journal", ())
+            .await?;
+        Ok(rows.next().await?.map(|row| row.get(0)).transpose()?.unwrap_or(0))
+    }
+
+    fn digest_hex(digest: &[u8]) -> String {
+        digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    #[tokio::test]
+    async fn journal_direct_write_truncate_namespace_import_and_reap_are_atomic() -> Result<()> {
+        let mut config = CoreConfig::default();
+        config.batcher.enabled = false;
+        let (fs, _dir) = create_test_fs_with_config(config).await?;
+        let conn = fs.pool.get_connection().await?;
+        let baseline = journal_max_seq(&conn).await?;
+        drop(conn);
+
+        let (created, file) = fs
+            .create_file("/journal.bin", DEFAULT_FILE_MODE, 1, 2)
+            .await?;
+        file.pwrite(0, b"prefix--").await?;
+        let data = vec![0x5a; fs.inline_threshold + 17];
+        file.pwrite_ranges(vec![WriteRange {
+            offset: 8,
+            data: data.clone(),
+        }])
+        .await?;
+        file.truncate((fs.inline_threshold + 3) as u64).await?;
+        drop(file);
+        rename_path_via_trait(&fs, "/journal.bin", "/renamed.bin").await?;
+        fs.remove("/renamed.bin").await?;
+
+        let opts = ImportOptions {
+            uid: 1,
+            gid: 2,
+            timestamp: (123, 456),
+        };
+        fs.import_entries(
+            ROOT_INO,
+            &[
+                ImportEntry {
+                    path: "import-a".to_string(),
+                    mode: DEFAULT_FILE_MODE,
+                    data: b"a".to_vec(),
+                },
+                ImportEntry {
+                    path: "import-b".to_string(),
+                    mode: DEFAULT_FILE_MODE,
+                    data: vec![3; fs.inline_threshold + 1],
+                },
+            ],
+            &opts,
+        )
+        .await?;
+
+        let conn = fs.pool.get_connection().await?;
+        let rows = journal_rows_after(&conn, baseline).await?;
+        let ops = rows.iter().map(|row| row.2.as_str()).collect::<Vec<_>>();
+        for required in [
+            "create_file",
+            "write",
+            "truncate",
+            "rename",
+            "unlink",
+            "reap",
+            "import",
+        ] {
+            assert!(ops.contains(&required), "missing journal op {required}: {ops:?}");
+        }
+
+        let unlink_txn = rows
+            .iter()
+            .find(|row| row.2 == "unlink")
+            .map(|row| row.1)
+            .unwrap();
+        let reap_txn = rows
+            .iter()
+            .find(|row| row.2 == "reap" && row.3["ino"] == created.ino)
+            .map(|row| row.1)
+            .unwrap();
+        assert_eq!(unlink_txn, reap_txn, "unlink and immediate reap must be atomic");
+
+        let import_txns = rows
+            .iter()
+            .filter(|row| row.2 == "import")
+            .map(|row| row.1)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(import_txns.len(), 1, "one bounded import batch shares txn_id");
+
+        let write = rows
+            .iter()
+            .find(|row| row.2 == "write" && row.3.get("inline").is_none())
+            .unwrap();
+        assert_eq!(write.3["ino"], created.ino);
+        assert!(write.3["ranges"].as_array().is_some());
+        let mut pin_rows = conn
+            .query(
+                "SELECT digest FROM fs_journal_chunk WHERE seq = ? ORDER BY digest",
+                (write.0,),
+            )
+            .await?;
+        let mut pins = Vec::new();
+        while let Some(row) = pin_rows.next().await? {
+            pins.push(row.get::<Vec<u8>>(0)?);
+        }
+        assert!(!pins.is_empty(), "chunked write must pin referenced digests");
+        let payload_digests = write.3["ranges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|range| range["digests"].as_array().unwrap())
+            .map(|digest| digest.as_str().unwrap().to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+        let pinned_digests = pins
+            .iter()
+            .map(|digest| digest_hex(digest))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(pinned_digests, payload_digests);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn journal_batcher_group_commit_uses_one_txn_id_per_drain() -> Result<()> {
+        let (fs, _dir) = create_test_fs_with_config(test_config_with_long_batch_window()).await?;
+        let (a, a_file) = fs
+            .create_file("/batch-a", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        let (b, b_file) = fs
+            .create_file("/batch-b", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        let conn = fs.pool.get_connection().await?;
+        let baseline = journal_max_seq(&conn).await?;
+        drop(conn);
+
+        a_file.pwrite(0, b"first").await?;
+        b_file.pwrite(0, b"second").await?;
+        fs.drain_all().await?;
+
+        let conn = fs.pool.get_connection().await?;
+        let first_rows = journal_rows_after(&conn, baseline).await?;
+        let writes = first_rows
+            .iter()
+            .filter(|row| row.2 == "write")
+            .collect::<Vec<_>>();
+        assert_eq!(writes.len(), 2);
+        assert_eq!(writes[0].1, writes[1].1);
+        assert_eq!(
+            writes
+                .iter()
+                .map(|row| row.3["ino"].as_i64().unwrap())
+                .collect::<std::collections::BTreeSet<_>>(),
+            [a.ino, b.ino].into_iter().collect()
+        );
+
+        let second_baseline = journal_max_seq(&conn).await?;
+        drop(conn);
+        a_file.pwrite(5, b"-next").await?;
+        FileSystem::drain_inode_writes(&fs, a.ino).await?;
+        let conn = fs.pool.get_connection().await?;
+        let second_rows = journal_rows_after(&conn, second_baseline).await?;
+        let second_txn = second_rows
+            .iter()
+            .find(|row| row.2 == "write")
+            .map(|row| row.1)
+            .unwrap();
+        assert_ne!(second_txn, writes[0].1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn journal_kill_switch_leaves_all_mutations_unjournaled() -> Result<()> {
+        let mut config = test_config_with_long_batch_window();
+        config.journal_enabled = false;
+        let (fs, _dir) = create_test_fs_with_config(config).await?;
+        let (_, file) = fs
+            .create_file("/off", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        file.pwrite(0, &vec![7; fs.inline_threshold + 1]).await?;
+        fs.drain_all().await?;
+        file.truncate(3).await?;
+        rename_path_via_trait(&fs, "/off", "/off-renamed").await?;
+        fs.remove("/off-renamed").await?;
+        fs.import_entries(
+            ROOT_INO,
+            &[ImportEntry {
+                path: "off-import".to_string(),
+                mode: DEFAULT_FILE_MODE,
+                data: b"x".to_vec(),
+            }],
+            &ImportOptions {
+                uid: 0,
+                gid: 0,
+                timestamp: (1, 0),
+            },
+        )
+        .await?;
+
+        let conn = fs.pool.get_connection().await?;
+        let mut rows = conn
+            .query(
+                "SELECT
+                    (SELECT COUNT(*) FROM fs_op_journal),
+                    (SELECT COUNT(*) FROM fs_journal_chunk)",
+                (),
+            )
+            .await?;
+        let row = rows.next().await?.unwrap();
+        assert_eq!(row.get::<i64>(0)?, 0);
+        assert_eq!(row.get::<i64>(1)?, 0);
+        assert_eq!(fs.read_file("/off-import").await?, Some(b"x".to_vec()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn journal_gc_preserves_pins_and_whole_transaction_groups() -> Result<()> {
+        let (fs, dir) = create_test_fs().await?;
+        let conn = fs.pool.get_connection().await?;
+        conn.execute("DELETE FROM fs_journal_chunk", ()).await?;
+        conn.execute("DELETE FROM fs_op_journal", ()).await?;
+
+        let x = vec![0x11; 32];
+        let y = vec![0x22; 32];
+        conn.execute(
+            "INSERT INTO fs_chunk (digest, data, refcount) VALUES (?, ?, 0)",
+            (x.clone(), b"x".as_slice()),
+        )
+        .await?;
+        conn.execute(
+            "INSERT INTO fs_chunk (digest, data, refcount) VALUES (?, ?, 0)",
+            (y.clone(), b"y".as_slice()),
+        )
+        .await?;
+
+        let mut old = MutationTxn::begin(&conn, true).await?;
+        old.record(JournalOp::with_digests(
+            "write",
+            serde_json::json!({ "ino": 10, "ranges": [] }),
+            vec![y.clone()],
+        ));
+        old.record(JournalOp::new(
+            "setattr",
+            serde_json::json!({ "ino": 10, "fields": { "mode": true } }),
+        ));
+        old.commit().await?;
+
+        let mut boundary = MutationTxn::begin(&conn, true).await?;
+        boundary.record(JournalOp::with_digests(
+            "write",
+            serde_json::json!({ "ino": 11, "ranges": [] }),
+            vec![x.clone()],
+        ));
+        boundary.record(JournalOp::new(
+            "setattr",
+            serde_json::json!({ "ino": 11, "fields": { "mode": true } }),
+        ));
+        boundary.commit().await?;
+
+        let mut newest = MutationTxn::begin(&conn, true).await?;
+        newest.record(JournalOp::new(
+            "mkdir",
+            serde_json::json!({ "ino": 12 }),
+        ));
+        newest.commit().await?;
+
+        journal_gc(&conn, 2).await?;
+
+        let mut rows = conn
+            .query("SELECT seq, txn_id FROM fs_op_journal ORDER BY seq", ())
+            .await?;
+        let mut retained = Vec::new();
+        while let Some(row) = rows.next().await? {
+            retained.push((row.get::<i64>(0)?, row.get::<i64>(1)?));
+        }
+        assert_eq!(retained.len(), 3);
+        assert_eq!(retained[0].1, retained[1].1);
+        assert_ne!(retained[1].1, retained[2].1);
+
+        let mut rows = conn
+            .query("SELECT digest FROM fs_chunk ORDER BY digest", ())
+            .await?;
+        let mut chunks = Vec::new();
+        while let Some(row) = rows.next().await? {
+            chunks.push(row.get::<Vec<u8>>(0)?);
+        }
+        assert_eq!(chunks, vec![x]);
+
+        let report = crate::schema::integrity::check(
+            &conn,
+            &crate::schema::integrity::CheckOpts::new(dir.path().join("test.db")),
+        )
+        .await?;
+        assert!(report.ok, "post-GC integrity report must pass");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn collect_journal_applies_configured_retention() -> Result<()> {
+        let dir = tempdir()?;
+        let db_path = dir.path().join("collect.db");
+        let mut config = test_config_with_long_batch_window();
+        config.journal_retention_ops = 2;
+        let vfs = crate::Vfs::open(
+            crate::VfsOptions::with_path(db_path.to_string_lossy()).with_core_config(config),
+        )
+        .await?;
+
+        // One chunk per file (payload exceeds the inline threshold but fits a
+        // single chunk), each drained so every write is its own commit.
+        let original = vec![9u8; vfs.fs.inline_threshold + 1];
+        let (_, file) = vfs.fs.create_file("/a", DEFAULT_FILE_MODE, 0, 0).await?;
+        file.pwrite(0, &original).await?;
+        vfs.fs.drain_all().await?;
+        drop(file);
+
+        // Overwrite /a early: its original digest drops to refcount 0 and is
+        // pinned only by journal rows the retention horizon will collect.
+        let replacement = vec![7u8; vfs.fs.inline_threshold + 1];
+        let file = vfs.fs.open("/a").await?;
+        file.pwrite(0, &replacement).await?;
+        vfs.fs.drain_all().await?;
+        drop(file);
+
+        for name in ["/b", "/c", "/d", "/e"] {
+            let (_, file) = vfs.fs.create_file(name, DEFAULT_FILE_MODE, 0, 0).await?;
+            file.pwrite(0, &replacement).await?;
+            vfs.fs.drain_all().await?;
+        }
+
+        let conn = vfs.fs.pool.get_connection().await?;
+        let count = |sql: &'static str| {
+            let conn = conn.clone();
+            async move {
+                let mut rows = conn.query(sql, ()).await?;
+                crate::Result::Ok(rows.next().await?.unwrap().get::<i64>(0)?)
+            }
+        };
+        let rows_before = count("SELECT COUNT(*) FROM fs_op_journal").await?;
+
+        vfs.collect_journal().await?;
+
+        let rows_after = count("SELECT COUNT(*) FROM fs_op_journal").await?;
+        assert!(
+            rows_after < rows_before,
+            "retention 2 must truncate {rows_before} journal rows, kept {rows_after}"
+        );
+        assert!(rows_after >= 2, "whole retained groups must survive");
+
+        let original_digest = blake3::hash(&original);
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM fs_chunk WHERE digest = ?",
+                [turso::Value::Blob(original_digest.as_bytes().to_vec())],
+            )
+            .await?;
+        assert_eq!(
+            rows.next().await?.unwrap().get::<i64>(0)?,
+            0,
+            "the unpinned zero-refcount original chunk must be collected"
+        );
+        let replacement_digest = blake3::hash(&replacement);
+        let mut rows = conn
+            .query(
+                "SELECT refcount FROM fs_chunk WHERE digest = ?",
+                [turso::Value::Blob(replacement_digest.as_bytes().to_vec())],
+            )
+            .await?;
+        assert_eq!(
+            rows.next().await?.unwrap().get::<i64>(0)?,
+            5,
+            "live replacement chunk stays with one refcount per mapping"
+        );
+
+        let report = crate::schema::integrity::check(
+            &conn,
+            &crate::schema::integrity::CheckOpts::new(db_path.clone()),
+        )
+        .await?;
+        assert!(report.ok, "post-collect integrity report must pass");
         Ok(())
     }

@@ -12,7 +12,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex as AsyncMutex;
-use turso::transaction::{Transaction, TransactionBehavior};
 use turso::{Connection, Value};
 
 use crate::config::{BatcherConfig, Geometry};
@@ -21,6 +20,7 @@ use crate::fs::{FsError, Stats, WriteRange};
 use crate::pool::ConnectionPool;
 
 use super::current_timestamp;
+use super::journal::{fields, JournalOp, MutationTxn};
 use super::store::{self, normalize_write_ranges, NormalizedWriteRange, WriteRangeRef};
 
 pub(super) type Invalidate = Arc<dyn Fn(i64) + Send + Sync + 'static>;
@@ -427,6 +427,7 @@ pub(super) struct VfsWriteBatcher {
     /// Per-transaction pending-bytes bound for batched drains
     /// (`VFS_BATCH_TXN_BYTES`). See `drain_pending_batched`.
     txn_max_bytes: usize,
+    journal_enabled: bool,
     /// Tier 4 mitigation: parking_lot `RwLock` so `peek_pending` /
     /// `peek_pending_max_end` can acquire read-only access without contending
     /// with writers. The lock is never held across an `.await`, so a sync
@@ -455,6 +456,7 @@ impl VfsWriteBatcher {
         inline_threshold: usize,
         invalidate: Invalidate,
         config: &BatcherConfig,
+        journal_enabled: bool,
     ) -> Self {
         Self {
             pool,
@@ -466,6 +468,7 @@ impl VfsWriteBatcher {
             batch_global_bytes: config.global_bytes,
             txn_max_inodes: config.txn_max_inodes.max(1),
             txn_max_bytes: config.txn_max_bytes.max(1),
+            journal_enabled,
             state: RwLock::new(VfsWriteBatcherState::default()),
             commit_lock: AsyncMutex::new(()),
         }
@@ -694,7 +697,7 @@ impl VfsWriteBatcher {
 
         let started = Instant::now();
         let conn = self.pool.get_connection().await?;
-        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+        let mut txn = MutationTxn::begin(&conn, self.journal_enabled).await?;
 
         // Read times_explicit and the stashed explicit times only AFTER the
         // IMMEDIATE transaction holds the SQLite write lock: explicit
@@ -748,7 +751,7 @@ impl VfsWriteBatcher {
                     inline_threshold: self.inline_threshold,
                 };
                 match store::write_ranges(
-                    &conn,
+                    txn.conn(),
                     *ino,
                     geometry,
                     &normalized_refs,
@@ -793,6 +796,27 @@ impl VfsWriteBatcher {
                         }
                     }
                     applied_times.push((*ino, *times));
+                }
+            }
+
+            if !inode_missing {
+                if !normalized.is_empty() {
+                    txn.record(
+                        JournalOp::write(txn.conn(), *ino, self.chunk_size, normalized).await?,
+                    );
+                }
+                if let Some(times) = pending_times.get(ino) {
+                    let mut changed = Vec::new();
+                    if times.atime.is_some() {
+                        changed.push(("atime", serde_json::Value::Bool(true)));
+                    }
+                    if times.mtime.is_some() {
+                        changed.push(("mtime", serde_json::Value::Bool(true)));
+                    }
+                    if times.ctime.is_some() {
+                        changed.push(("ctime", serde_json::Value::Bool(true)));
+                    }
+                    txn.record(JournalOp::setattr(*ino, fields(changed)));
                 }
             }
         }

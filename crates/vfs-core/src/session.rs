@@ -240,6 +240,19 @@ impl Vfs {
         drop(conn);
         publish_single_file_artifact(output).await
     }
+
+    /// Truncate the op journal to the configured retention horizon and
+    /// collect zero-refcount chunks no surviving journal entry pins.
+    ///
+    /// `pack` runs this on its private staging copy before compaction so a
+    /// shipped artifact carries a bounded journal and no unreachable chunk
+    /// bytes. Pending batched writes are drained first so every acknowledged
+    /// write is journaled before the horizon is computed.
+    pub async fn collect_journal(&self) -> Result<()> {
+        self.fs.drain_all().await?;
+        let conn = self.pool.get_connection().await?;
+        crate::fs::journal_gc(&conn, self.fs.journal_retention_ops()).await
+    }
 }
 
 async fn vacuum_into(conn: &Connection, output: &Path) -> Result<()> {

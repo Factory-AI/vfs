@@ -83,7 +83,7 @@ if run_vfs --help 2>/dev/null | grep -q 'migrate-v0-5'; then
 fi
 
 # --- One migrate per supported old schema -----------------------------------
-for name in v0_0 v0_2 v0_4; do
+for name in v0_0 v0_2 v0_4 v0_6; do
     DB="$ROOT/$name.db"
     cp "$FIXTURES/$name.db" "$DB"
 
@@ -100,16 +100,16 @@ for name in v0_0 v0_2 v0_4; do
         || fail "$name: migrate failed: $(cat "$ROOT/$name-migrate.out")"
     grep -q 'Migration completed successfully.' "$ROOT/$name-migrate.out" \
         || fail "$name: migrate output missing completion line"
-    grep -q 'Target schema version: 0.6 (CURRENT)' "$ROOT/$name-migrate.out" \
+    grep -q 'Target schema version: 0.7 (CURRENT)' "$ROOT/$name-migrate.out" \
         || fail "$name: migrate output missing CURRENT target line"
 
     UV="$(user_version_of "$DB")"
-    [ "$UV" = "6" ] || fail "$name: user_version after migrate is $UV, expected 6"
+    [ "$UV" = "7" ] || fail "$name: user_version after migrate is $UV, expected 7"
 
     # Idempotent second run.
     run_vfs migrate "$DB" >"$ROOT/$name-migrate2.out" 2>&1 \
         || fail "$name: second migrate failed"
-    grep -q 'Database is already at schema 0.6.' "$ROOT/$name-migrate2.out" \
+    grep -q 'Database is already at schema 0.7.' "$ROOT/$name-migrate2.out" \
         || fail "$name: second migrate is not idempotent: $(cat "$ROOT/$name-migrate2.out")"
 
     run_vfs integrity "$DB" >"$ROOT/$name-integrity.out" 2>&1 \

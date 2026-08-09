@@ -11,7 +11,7 @@ use turso::transaction::{Transaction, TransactionBehavior};
 use turso::{Connection, Value};
 
 /// Current schema version.
-pub const CURRENT: SchemaVersion = SchemaVersion::V0_6;
+pub const CURRENT: SchemaVersion = SchemaVersion::V0_7;
 
 /// Oldest schema version with a migration path to [`CURRENT`]; the artifact
 /// version floor for `vfs adopt` and `vfs migrate`.
@@ -37,6 +37,8 @@ pub enum SchemaVersion {
     V0_5,
     /// Added persistent session handoff metadata
     V0_6,
+    /// Added content-addressed chunk storage and operation-journal schema
+    V0_7,
 }
 
 impl std::fmt::Display for SchemaVersion {
@@ -54,6 +56,7 @@ impl SchemaVersion {
             SchemaVersion::V0_4 => "0.4",
             SchemaVersion::V0_5 => "0.5",
             SchemaVersion::V0_6 => "0.6",
+            SchemaVersion::V0_7 => "0.7",
         }
     }
 
@@ -65,6 +68,7 @@ impl SchemaVersion {
             SchemaVersion::V0_4 => 4,
             SchemaVersion::V0_5 => 5,
             SchemaVersion::V0_6 => 6,
+            SchemaVersion::V0_7 => 7,
         }
     }
 
@@ -81,6 +85,7 @@ impl SchemaVersion {
             "0.4" => Some(SchemaVersion::V0_4),
             "0.5" => Some(SchemaVersion::V0_5),
             "0.6" => Some(SchemaVersion::V0_6),
+            "0.7" => Some(SchemaVersion::V0_7),
             _ => None,
         }
     }
@@ -92,6 +97,7 @@ impl SchemaVersion {
             4 => Some(SchemaVersion::V0_4),
             5 => Some(SchemaVersion::V0_5),
             6 => Some(SchemaVersion::V0_6),
+            7 => Some(SchemaVersion::V0_7),
             _ => None,
         }
     }
@@ -125,6 +131,11 @@ const MIGRATIONS: &[Migration] = &[
         from: SchemaVersion::V0_5,
         to: SchemaVersion::V0_6,
         description: "add persistent session handoff metadata",
+    },
+    Migration {
+        from: SchemaVersion::V0_6,
+        to: SchemaVersion::V0_7,
+        description: "content-address file chunks",
     },
 ];
 
@@ -193,8 +204,13 @@ mod ddl {
         "CREATE TABLE IF NOT EXISTS fs_data (
             ino INTEGER NOT NULL,
             chunk_index INTEGER NOT NULL,
-            data BLOB NOT NULL,
+            digest BLOB NOT NULL,
             PRIMARY KEY (ino, chunk_index)
+        )",
+        "CREATE TABLE IF NOT EXISTS fs_chunk (
+            digest BLOB PRIMARY KEY,
+            data BLOB NOT NULL,
+            refcount INTEGER NOT NULL DEFAULT 0
         )",
         "CREATE TABLE IF NOT EXISTS fs_symlink (
             ino INTEGER PRIMARY KEY,
@@ -214,6 +230,19 @@ mod ddl {
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         )",
+        "CREATE TABLE IF NOT EXISTS fs_op_journal (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            txn_id INTEGER NOT NULL,
+            op TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            wallclock_ms INTEGER NOT NULL
+        )",
+        "CREATE INDEX IF NOT EXISTS idx_fs_op_journal_txn_id ON fs_op_journal(txn_id)",
+        "CREATE TABLE IF NOT EXISTS fs_journal_chunk (
+            seq INTEGER NOT NULL,
+            digest BLOB NOT NULL
+        )",
+        "CREATE INDEX IF NOT EXISTS idx_fs_journal_chunk_digest ON fs_journal_chunk(digest)",
         "CREATE TABLE IF NOT EXISTS fs_origin (
             delta_ino INTEGER PRIMARY KEY,
             base_ino INTEGER NOT NULL
@@ -325,6 +354,13 @@ const CURRENT_COLUMN_SPECS: &[ColumnSpec] = &[
         not_null: true,
         default_value: Some("0"),
     },
+    ColumnSpec {
+        table_name: "fs_data",
+        column_name: "digest",
+        type_name: "BLOB",
+        not_null: true,
+        default_value: None,
+    },
 ];
 
 const REQUIRED_CURRENT_TABLES: &[&str] = &[
@@ -332,10 +368,13 @@ const REQUIRED_CURRENT_TABLES: &[&str] = &[
     "fs_inode",
     "fs_dentry",
     "fs_data",
+    "fs_chunk",
     "fs_symlink",
     "fs_whiteout",
     "fs_overlay_config",
     "fs_session_metadata",
+    "fs_op_journal",
+    "fs_journal_chunk",
     "fs_origin",
     "fs_partial_origin",
     "fs_chunk_override",
@@ -361,6 +400,10 @@ pub async fn detect_schema_version(conn: &Connection) -> Result<Option<SchemaVer
 
     if !table_exists(conn, "fs_inode").await? {
         return Ok(None);
+    }
+
+    if table_exists(conn, "fs_chunk").await? {
+        return Ok(Some(SchemaVersion::V0_7));
     }
 
     let columns = get_table_columns(conn, "fs_inode").await?;
@@ -602,6 +645,9 @@ async fn apply_migration(conn: &Connection, migration: &Migration) -> Result<()>
             .await
         }
         (SchemaVersion::V0_5, SchemaVersion::V0_6) => Ok(()),
+        (SchemaVersion::V0_6, SchemaVersion::V0_7) => {
+            migrate_chunks_to_content_addressed_storage(conn).await
+        }
         _ => Err(Error::Internal(format!(
             "unsupported schema migration {} -> {}",
             migration.from, migration.to
@@ -630,6 +676,99 @@ async fn ensure_current_indexes(conn: &Connection) -> Result<()> {
         (),
     )
     .await?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_fs_op_journal_txn_id ON fs_op_journal(txn_id)",
+        (),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn migrate_chunks_to_content_addressed_storage(conn: &Connection) -> Result<()> {
+    let has_data = column_exists(conn, "fs_data", "data").await?;
+    if !has_data {
+        ensure_column_matches(
+            conn,
+            ColumnSpec {
+                table_name: "fs_data",
+                column_name: "digest",
+                type_name: "BLOB",
+                not_null: true,
+                default_value: None,
+            },
+        )
+        .await?;
+        return Ok(());
+    }
+
+    add_column_idempotent(
+        conn,
+        ColumnSpec {
+            table_name: "fs_data",
+            column_name: "digest",
+            type_name: "BLOB",
+            not_null: false,
+            default_value: None,
+        },
+        "ALTER TABLE fs_data ADD COLUMN digest BLOB",
+    )
+    .await?;
+
+    let mut rows = conn
+        .query(
+            "SELECT ino, chunk_index, data
+             FROM fs_data
+             WHERE digest IS NULL
+             ORDER BY ino, chunk_index",
+            (),
+        )
+        .await?;
+    let mut pending = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let ino: i64 = row.get(0)?;
+        let chunk_index: i64 = row.get(1)?;
+        let data: Vec<u8> = row.get(2)?;
+        pending.push((ino, chunk_index, data));
+    }
+    drop(rows);
+
+    for (ino, chunk_index, data) in pending {
+        let digest = blake3::hash(&data).as_bytes().to_vec();
+        conn.execute(
+            "INSERT INTO fs_chunk (digest, data, refcount)
+             VALUES (?, ?, 1)
+             ON CONFLICT(digest) DO UPDATE SET refcount = refcount + 1",
+            (Value::Blob(digest.clone()), Value::Blob(data)),
+        )
+        .await?;
+        conn.execute(
+            "UPDATE fs_data SET digest = ? WHERE ino = ? AND chunk_index = ?",
+            (Value::Blob(digest), ino, chunk_index),
+        )
+        .await?;
+    }
+
+    // Rebuild instead of relying on DROP COLUMN so the backfilled digest
+    // column becomes NOT NULL in the same transaction.
+    conn.execute(
+        "CREATE TABLE fs_data_v7 (
+            ino INTEGER NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            digest BLOB NOT NULL,
+            PRIMARY KEY (ino, chunk_index)
+        )",
+        (),
+    )
+    .await?;
+    conn.execute(
+        "INSERT INTO fs_data_v7 (ino, chunk_index, digest)
+         SELECT ino, chunk_index, digest FROM fs_data",
+        (),
+    )
+    .await?;
+    conn.execute("DROP TABLE fs_data", ()).await?;
+    conn.execute("ALTER TABLE fs_data_v7 RENAME TO fs_data", ())
+        .await?;
     Ok(())
 }
 
@@ -936,6 +1075,12 @@ mod tests {
                 scalar_i64(&conn, "SELECT COUNT(*) FROM tool_calls").await?
             );
             assert_eq!(data_before, read_fixture_file_bytes(&conn).await?);
+            assert_chunk_refcounts_exact(&conn).await?;
+            assert_eq!(
+                scalar_i64(&conn, "SELECT MAX(refcount) FROM fs_chunk").await?,
+                2,
+                "duplicate fixture chunks should share one CAS row"
+            );
 
             drop(conn);
             drop(db);
@@ -992,6 +1137,8 @@ mod tests {
             SchemaVersion::V0_0,
             SchemaVersion::V0_2,
             SchemaVersion::V0_4,
+            SchemaVersion::V0_5,
+            SchemaVersion::V0_6,
         ] {
             let dir = tempdir()?;
             let db_path = dir.path().join(format!("old-{}.db", version.as_str()));
@@ -1035,10 +1182,12 @@ mod tests {
             assert_eq!(user_version(&conn).await?, 0, "{version}: db was stamped");
             assert_eq!(detect_schema_version(&conn).await?, Some(version));
             let columns = get_table_columns(&conn, "fs_inode").await?;
-            assert!(
-                !columns.iter().any(|column| column.name == "data_inline"),
-                "{version}: open added v0.5 columns"
-            );
+            if version < SchemaVersion::V0_5 {
+                assert!(
+                    !columns.iter().any(|column| column.name == "data_inline"),
+                    "{version}: open added v0.5 columns"
+                );
+            }
 
             ensure_current(&conn).await?;
             drop(conn);
@@ -1149,13 +1298,16 @@ mod tests {
             .await?;
         let conn = db.connect()?;
         create_legacy_fixture(&conn, version).await?;
+        ensure_current(&conn).await?;
         add_legacy_whiteout_without_parent_path(&conn).await?;
+        set_user_version(&conn, SchemaVersion::V0_0).await?;
         drop(conn);
         drop(db);
         Ok(db_path)
     }
 
     async fn add_legacy_whiteout_without_parent_path(conn: &Connection) -> Result<()> {
+        conn.execute("DROP TABLE IF EXISTS fs_whiteout", ()).await?;
         conn.execute(
             "CREATE TABLE fs_whiteout (
                 path TEXT PRIMARY KEY,
@@ -1331,14 +1483,24 @@ mod tests {
 
         insert_legacy_inode(conn, version, 1, S_IFDIR | 0o755, 2, 0).await?;
         insert_legacy_inode(conn, version, 2, S_IFREG | DEFAULT_FILE_MODE as i64, 1, 6).await?;
+        insert_legacy_inode(conn, version, 3, S_IFREG | DEFAULT_FILE_MODE as i64, 1, 4).await?;
         conn.execute(
-            "INSERT INTO fs_dentry (name, parent_ino, ino) VALUES ('file.txt', 1, 2)",
+            "INSERT INTO fs_dentry (name, parent_ino, ino) VALUES
+             ('file.txt', 1, 2),
+             ('duplicate.txt', 1, 3)",
             (),
         )
         .await?;
         conn.execute(
-            "INSERT INTO fs_data (ino, chunk_index, data) VALUES (2, 0, ?), (2, 1, ?)",
-            (Value::Blob(b"abcd".to_vec()), Value::Blob(b"ef".to_vec())),
+            "INSERT INTO fs_data (ino, chunk_index, data) VALUES
+             (2, 0, ?),
+             (2, 1, ?),
+             (3, 0, ?)",
+            (
+                Value::Blob(b"abcd".to_vec()),
+                Value::Blob(b"ef".to_vec()),
+                Value::Blob(b"abcd".to_vec()),
+            ),
         )
         .await?;
         conn.execute(
@@ -1408,12 +1570,16 @@ mod tests {
     }
 
     async fn read_fixture_file_bytes(conn: &Connection) -> Result<Vec<u8>> {
-        let mut rows = conn
-            .query(
-                "SELECT data FROM fs_data WHERE ino = 2 ORDER BY chunk_index",
-                (),
-            )
-            .await?;
+        let sql = if column_exists(conn, "fs_data", "data").await? {
+            "SELECT data FROM fs_data WHERE ino = 2 ORDER BY chunk_index"
+        } else {
+            "SELECT c.data
+             FROM fs_data d
+             JOIN fs_chunk c ON c.digest = d.digest
+             WHERE d.ino = 2
+             ORDER BY d.chunk_index"
+        };
+        let mut rows = conn.query(sql, ()).await?;
         let mut bytes = Vec::new();
         while let Some(row) = rows.next().await? {
             match row.get_value(0)? {
@@ -1426,6 +1592,20 @@ mod tests {
             }
         }
         Ok(bytes)
+    }
+
+    async fn assert_chunk_refcounts_exact(conn: &Connection) -> Result<()> {
+        let mismatches = scalar_i64(
+            conn,
+            "SELECT COUNT(*)
+             FROM fs_chunk c
+             WHERE c.refcount != (
+                 SELECT COUNT(*) FROM fs_data d WHERE d.digest = c.digest
+             )",
+        )
+        .await?;
+        assert_eq!(mismatches, 0, "CAS refcounts must match live mappings");
+        Ok(())
     }
 
     async fn scalar_i64(conn: &Connection, sql: &str) -> Result<i64> {

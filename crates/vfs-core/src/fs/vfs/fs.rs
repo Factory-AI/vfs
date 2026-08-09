@@ -9,7 +9,6 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use turso::transaction::{Transaction, TransactionBehavior};
 use turso::Value;
 
 use crate::error::Error;
@@ -391,7 +390,7 @@ impl FileSystem for Vfs {
         // transactions instead of racing them as an autocommit statement
         // (turso reports such write/write races as "database snapshot is
         // stale" instead of waiting on the write lock).
-        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+        let mut txn = MutationTxn::begin(&conn, self.journal_enabled()).await?;
         let result: Result<()> = async {
             // Get current mode to preserve file type bits
             let current_mode = store::mode(&conn, ino).await?.ok_or(FsError::NotFound)?;
@@ -415,6 +414,10 @@ impl FileSystem for Vfs {
 
         match result {
             Ok(()) => {
+                txn.record(JournalOp::setattr(
+                    ino,
+                    journal::fields([("mode", serde_json::Value::Bool(true))]),
+                ));
                 txn.commit().await?;
                 self.invalidate_attr(ino);
                 Ok(())
@@ -435,7 +438,7 @@ impl FileSystem for Vfs {
         let conn = self.pool.get_connection().await?;
         // BEGIN IMMEDIATE: see `chmod` — avoid autocommit write/write races
         // with concurrent batcher drain transactions.
-        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+        let mut txn = MutationTxn::begin(&conn, self.journal_enabled()).await?;
         let result: Result<()> = async {
             // Verify inode exists
             let mut stmt = conn
@@ -477,6 +480,14 @@ impl FileSystem for Vfs {
 
         match result {
             Ok(()) => {
+                let mut changed = Vec::new();
+                if uid.is_some() {
+                    changed.push(("uid", serde_json::Value::Bool(true)));
+                }
+                if gid.is_some() {
+                    changed.push(("gid", serde_json::Value::Bool(true)));
+                }
+                txn.record(JournalOp::setattr(ino, journal::fields(changed)));
                 txn.commit().await?;
                 self.invalidate_attr(ino);
                 Ok(())
@@ -531,7 +542,7 @@ impl FileSystem for Vfs {
         let conn = self.pool.get_connection().await?;
         // BEGIN IMMEDIATE: see `chmod` — avoid autocommit write/write races
         // with concurrent batcher drain transactions.
-        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+        let mut txn = MutationTxn::begin(&conn, self.journal_enabled()).await?;
         let result: Result<()> = async {
             // Verify inode exists
             let mut stmt = conn
@@ -588,6 +599,14 @@ impl FileSystem for Vfs {
 
         match result {
             Ok(()) => {
+                let mut changed = vec![("ctime", serde_json::Value::Bool(true))];
+                if !matches!(atime, TimeChange::Omit) {
+                    changed.push(("atime", serde_json::Value::Bool(true)));
+                }
+                if !matches!(mtime, TimeChange::Omit) {
+                    changed.push(("mtime", serde_json::Value::Bool(true)));
+                }
+                txn.record(JournalOp::setattr(ino, journal::fields(changed)));
                 txn.commit().await?;
                 self.invalidate_attr(ino);
                 Ok(())
@@ -621,6 +640,7 @@ impl FileSystem for Vfs {
             pending_view: self.pending_view.clone(),
             write_drain: self.write_drain.clone(),
             overlay_reads: self.overlay_reads,
+            journal_enabled: self.journal_enabled(),
             _open_guard: Some(self.lifecycle.guard(ino)),
         }))
     }
@@ -641,7 +661,7 @@ impl FileSystem for Vfs {
         // must not run as autocommit statements that race the write batcher's
         // drain transactions (turso reports such write/write races as
         // "database snapshot is stale" instead of waiting on the write lock).
-        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+        let mut txn = MutationTxn::begin(&conn, self.journal_enabled()).await?;
         let result: Result<Stats> = async {
             // Check if already exists
             if self.lookup_child(&conn, parent_ino, name).await?.is_some() {
@@ -720,6 +740,14 @@ impl FileSystem for Vfs {
 
         match result {
             Ok(stats) => {
+                txn.record(JournalOp::new(
+                    "mkdir",
+                    serde_json::json!({
+                        "ino": stats.ino,
+                        "parent_ino": parent_ino,
+                        "name": name,
+                    }),
+                ));
                 txn.commit().await?;
                 // Populate dentry cache only after the transaction is durable.
                 self.cache_dentry(parent_ino, name, stats.ino);
@@ -753,65 +781,33 @@ impl FileSystem for Vfs {
         // rolls back the inode row). Saves one SELECT on the synchronous
         // create path that every git-clone file pays.
 
-        // Prepare statements before starting the transaction
-        let mut inode_stmt = conn
-            .prepare_cached(
-                "INSERT INTO fs_inode (mode, nlink, uid, gid, size, atime, mtime, ctime, atime_nsec, mtime_nsec, ctime_nsec, data_inline, storage_kind)
-                 VALUES (?, 1, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING ino",
-            )
-            .await?;
-        let mut dentry_stmt = conn
-            .prepare_cached("INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, ?, ?)")
-            .await?;
-
-        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
-
-        let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
-        let now_secs = dur.as_secs() as i64;
-        let now_nsec = dur.subsec_nanos() as i64;
-        let file_mode = S_IFREG | (mode & 0o7777);
-
-        let row = inode_stmt
-            .query_row((
-                file_mode as i64,
-                uid,
-                gid,
-                now_secs,
-                now_secs,
-                now_secs,
-                now_nsec,
-                now_nsec,
-                now_nsec,
-                Value::Blob(Vec::new()),
-                STORAGE_INLINE,
-            ))
-            .await?;
-
-        let ino = row
-            .get_value(0)
-            .ok()
-            .and_then(|v| v.as_integer().copied())
-            .ok_or_else(|| Error::Internal("failed to get inode".to_string()))?;
-
-        match dentry_stmt.execute((name, parent_ino, ino)).await {
-            Ok(_) => {}
-            Err(turso::Error::Constraint(_)) => return Err(FsError::AlreadyExists.into()),
-            Err(error) => return Err(error.into()),
-        }
+        let mut txn = MutationTxn::begin(&conn, self.journal_enabled()).await?;
 
         // Parent mtime/ctime: stash into the batcher overlay (committed by the
         // next group drain, served immediately via merge_pending_view) instead
         // of paying an UPDATE on the synchronous create path. Falls back to
         // the in-transaction UPDATE when the overlay cannot serve reads.
         let stash_parent_times = self.overlay_reads && self.write_drain.is_some();
-        if !stash_parent_times {
-            conn.execute(
-                "UPDATE fs_inode SET ctime = ?, mtime = ?, ctime_nsec = ?, mtime_nsec = ? WHERE ino = ?",
-                (now_secs, now_secs, now_nsec, now_nsec, parent_ino),
+        let stats = self
+            .create_file_with_conn(
+                txn.conn(),
+                parent_ino,
+                name,
+                mode,
+                (uid, gid),
+                !stash_parent_times,
             )
             .await?;
-        }
+        let ino = stats.ino;
 
+        txn.record(JournalOp::new(
+            "create_file",
+            serde_json::json!({
+                "ino": ino,
+                "parent_ino": parent_ino,
+                "name": name,
+            }),
+        ));
         txn.commit().await?;
 
         if stash_parent_times {
@@ -820,8 +816,8 @@ impl FileSystem for Vfs {
                     parent_ino,
                     PendingTimeChange {
                         atime: None,
-                        mtime: Some((now_secs, now_nsec)),
-                        ctime: Some((now_secs, now_nsec)),
+                        mtime: Some((stats.mtime, stats.mtime_nsec as i64)),
+                        ctime: Some((stats.ctime, stats.ctime_nsec as i64)),
                     },
                 );
             }
@@ -830,21 +826,6 @@ impl FileSystem for Vfs {
         self.cache_dentry(parent_ino, name, ino);
         self.invalidate_parent_attr(parent_ino);
 
-        let stats = Stats {
-            ino,
-            mode: file_mode,
-            nlink: 1,
-            uid,
-            gid,
-            size: 0,
-            atime: now_secs,
-            mtime: now_secs,
-            ctime: now_secs,
-            atime_nsec: now_nsec as u32,
-            mtime_nsec: now_nsec as u32,
-            ctime_nsec: now_nsec as u32,
-            rdev: 0,
-        };
         self.cache_attr(stats.clone());
 
         let file: BoxedFile = Arc::new(VfsFile {
@@ -856,6 +837,7 @@ impl FileSystem for Vfs {
             pending_view: self.pending_view.clone(),
             write_drain: self.write_drain.clone(),
             overlay_reads: self.overlay_reads,
+            journal_enabled: self.journal_enabled(),
             _open_guard: Some(self.lifecycle.guard(ino)),
         });
 
@@ -877,7 +859,7 @@ impl FileSystem for Vfs {
         let conn = self.pool.get_connection().await?;
         // BEGIN IMMEDIATE: see `mkdir` — never race the batcher's drain
         // transactions with autocommit metadata writes.
-        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+        let mut txn = MutationTxn::begin(&conn, self.journal_enabled()).await?;
         let result: Result<Stats> = async {
             // Check if already exists
             if self.lookup_child(&conn, parent_ino, name).await?.is_some() {
@@ -954,6 +936,14 @@ impl FileSystem for Vfs {
 
         match result {
             Ok(stats) => {
+                txn.record(JournalOp::new(
+                    "mknod",
+                    serde_json::json!({
+                        "ino": stats.ino,
+                        "parent_ino": parent_ino,
+                        "name": name,
+                    }),
+                ));
                 txn.commit().await?;
                 // Populate dentry cache only after the transaction is durable.
                 self.cache_dentry(parent_ino, name, stats.ino);
@@ -982,7 +972,7 @@ impl FileSystem for Vfs {
         let conn = self.pool.get_connection().await?;
         // BEGIN IMMEDIATE: see `mkdir` — never race the batcher's drain
         // transactions with autocommit metadata writes.
-        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+        let mut txn = MutationTxn::begin(&conn, self.journal_enabled()).await?;
         let result: Result<Stats> = async {
             // Check if entry already exists
             if self.lookup_child(&conn, parent_ino, name).await?.is_some() {
@@ -1063,6 +1053,14 @@ impl FileSystem for Vfs {
 
         match result {
             Ok(stats) => {
+                txn.record(JournalOp::new(
+                    "symlink",
+                    serde_json::json!({
+                        "ino": stats.ino,
+                        "parent_ino": parent_ino,
+                        "name": name,
+                    }),
+                ));
                 txn.commit().await?;
                 // Populate dentry cache only after the transaction is durable.
                 self.cache_dentry(parent_ino, name, stats.ino);
@@ -1088,7 +1086,7 @@ impl FileSystem for Vfs {
         // raced the write batcher's drain transactions (git unlinking
         // `.git/config.lock` during a clone). The transaction also makes the
         // dentry/nlink/inode removal atomic.
-        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+        let mut txn = MutationTxn::begin(&conn, self.journal_enabled()).await?;
         let result: Result<(i64, Option<i64>)> = async {
             // Look up the child inode
             let ino = self
@@ -1146,6 +1144,20 @@ impl FileSystem for Vfs {
 
         match result {
             Ok((ino, reaped_ino)) => {
+                txn.record(JournalOp::new(
+                    "unlink",
+                    serde_json::json!({
+                        "ino": ino,
+                        "parent_ino": parent_ino,
+                        "name": name,
+                    }),
+                ));
+                if let Some(reaped_ino) = reaped_ino {
+                    txn.record(JournalOp::new(
+                        "reap",
+                        serde_json::json!({ "ino": reaped_ino }),
+                    ));
+                }
                 txn.commit().await?;
                 if let Some(reaped_ino) = reaped_ino {
                     self.discard_pending_for_reaped_inode(reaped_ino);
@@ -1171,7 +1183,7 @@ impl FileSystem for Vfs {
         let conn = self.pool.get_connection().await?;
         // BEGIN IMMEDIATE: see `unlink` — never race the batcher's drain
         // transactions with autocommit metadata writes.
-        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+        let mut txn = MutationTxn::begin(&conn, self.journal_enabled()).await?;
         let result: Result<i64> = async {
             // Look up the child inode
             let ino = self
@@ -1248,6 +1260,14 @@ impl FileSystem for Vfs {
 
         match result {
             Ok(ino) => {
+                txn.record(JournalOp::new(
+                    "rmdir",
+                    serde_json::json!({
+                        "ino": ino,
+                        "parent_ino": parent_ino,
+                        "name": name,
+                    }),
+                ));
                 txn.commit().await?;
                 self.invalidate_dentry(parent_ino, name);
                 self.invalidate_parent_attr(parent_ino);
@@ -1269,7 +1289,7 @@ impl FileSystem for Vfs {
         let conn = self.pool.get_connection().await?;
         // BEGIN IMMEDIATE: see `unlink` — never race the batcher's drain
         // transactions with autocommit metadata writes.
-        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+        let mut txn = MutationTxn::begin(&conn, self.journal_enabled()).await?;
         let result: Result<Stats> = async {
             // Check if source inode exists and is not a directory
             if let Some(mode) = store::mode(&conn, ino).await? {
@@ -1324,6 +1344,14 @@ impl FileSystem for Vfs {
 
         match result {
             Ok(stats) => {
+                txn.record(JournalOp::new(
+                    "link",
+                    serde_json::json!({
+                        "ino": ino,
+                        "parent_ino": newparent_ino,
+                        "name": newname,
+                    }),
+                ));
                 txn.commit().await?;
                 // Populate dentry cache only after the transaction is durable.
                 self.cache_dentry(newparent_ino, newname, ino);
@@ -1380,7 +1408,7 @@ impl FileSystem for Vfs {
             .await?
             .ok_or(FsError::NotFound)?;
 
-        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+        let mut txn = MutationTxn::begin(&conn, self.journal_enabled()).await?;
 
         let result: Result<(Option<i64>, Option<i64>)> = async {
             let mut replaced_dst_ino = None;
@@ -1533,6 +1561,23 @@ impl FileSystem for Vfs {
 
         match result {
             Ok((replaced_dst_ino, reaped_dst_ino)) => {
+                txn.record(JournalOp::new(
+                    "rename",
+                    serde_json::json!({
+                        "ino": src_ino,
+                        "old_parent_ino": oldparent_ino,
+                        "old_name": oldname,
+                        "new_parent_ino": newparent_ino,
+                        "new_name": newname,
+                        "replaced_ino": replaced_dst_ino,
+                    }),
+                ));
+                if let Some(reaped_dst_ino) = reaped_dst_ino {
+                    txn.record(JournalOp::new(
+                        "reap",
+                        serde_json::json!({ "ino": reaped_dst_ino }),
+                    ));
+                }
                 txn.commit().await?;
                 if let Some(reaped_dst_ino) = reaped_dst_ino {
                     self.discard_pending_for_reaped_inode(reaped_dst_ino);
