@@ -433,11 +433,13 @@ CREATE TABLE fs_chunk (
 **Notes:**
 
 - Equal chunk bytes MUST share one row.
-- `refcount` counts live mappings only; journal retention is tracked
-  separately by `fs_journal_chunk`.
+- `refcount` counts live mappings only; journal retention is derived from
+  the digests named by retained `fs_op_journal` rows, not tracked in a
+  separate relation.
 - A zero-refcount row MAY remain while a retained journal entry or root
   snapshot references its digest. Garbage collection MUST remove it only
-  after the live mapping count is zero and neither retention relation pins it.
+  after the live mapping count is zero, no retained journal row names it,
+  and no `fs_snapshot_chunk` row pins it.
 - Digest computation and insertion MUST occur in the same transaction as the
   corresponding `fs_data` mapping change.
 
@@ -600,8 +602,8 @@ To read `length` bytes starting at byte offset `offset`:
    DELETE FROM fs_inode WHERE ino = ?
    DELETE FROM fs_data WHERE ino = ?
    ```
-6. Garbage-collect zero-refcount `fs_chunk` rows only when they are not pinned
-   by `fs_journal_chunk` or `fs_snapshot_chunk`.
+6. Garbage-collect zero-refcount `fs_chunk` rows only when no retained
+   journal row names their digest and no `fs_snapshot_chunk` row pins it.
 
 #### Creating a Hard Link
 
@@ -1028,9 +1030,13 @@ CREATE TABLE fs_op_journal (
   row TEXT NOT NULL,
   wallclock_ms INTEGER NOT NULL
 )
-
-CREATE INDEX idx_fs_op_journal_txn_id ON fs_op_journal(txn_id)
 ```
+
+The journal carries no secondary index. Groups are contiguous in `seq` and
+`txn_id` equals the group's first `seq`, so every `txn_id` lookup is a `seq`
+range scan; the queries that group by transaction run only on offline paths
+(GC, reconstruction, `vfs history`) where a scan is acceptable, and an index
+would cost every mutating commit an extra B-tree write.
 
 **Fields:**
 
@@ -1066,24 +1072,17 @@ stale hint inside the same exclusive transaction. A cold writer finds the
 head with `ORDER BY seq DESC LIMIT 1`; it does not run an aggregate on the hot
 commit path.
 
-### Table: `fs_journal_chunk`
+### Journal chunk retention
 
-```sql
-CREATE TABLE fs_journal_chunk (
-  seq INTEGER NOT NULL,
-  digest BLOB NOT NULL
-)
-
-CREATE INDEX idx_fs_journal_chunk_digest ON fs_journal_chunk(digest)
-```
-
-Each row records that the operation at `seq` retains a raw 32-byte BLAKE3
-digest. It is a retention relation, not a second live-mapping refcount:
-`fs_chunk.refcount` continues to equal the number of `fs_data` mappings.
-Collecting a journal range MUST remove its `fs_journal_chunk` rows in the same
-transaction; an `fs_chunk` row is eligible for garbage collection only when
+Journal rows are the retention relation for the digests they name: an
+`fs_data` upsert carries its chunk `digest` and an `fs_inode` upsert carries
+`data_inline_digest`. There is no separate pin table — a write-time pin would
+cost every mutating commit extra B-tree writes to record facts the journal
+rows already state. Garbage collection derives the referenced set by scanning
+retained upsert rows; an `fs_chunk` row is eligible for collection only when
 its live refcount is zero and neither a retained journal row nor a root
-snapshot names its digest.
+snapshot names its digest. `fs_chunk.refcount` continues to equal the number
+of live `fs_data` mappings.
 
 ## Root Snapshots
 
@@ -1173,7 +1172,7 @@ only chunks satisfying the three-way rule:
 
 ```text
 refcount == 0
-AND no fs_journal_chunk pin
+AND no retained journal upsert names the digest
 AND no fs_snapshot_chunk pin
 ```
 
@@ -1196,7 +1195,7 @@ environment:
   leave a valid history valid;
 - read-only opens never change history markers;
 - the first writable open after journaling is re-enabled increments
-  `history_epoch`, removes the stale journal, pins, and snapshots, captures an
+  `history_epoch`, removes the stale journal and snapshots, captures an
   `epoch` root at the current state, publishes that root as the new floor, and
   sets `history_valid=1`.
 
@@ -1312,7 +1311,11 @@ Such extensions SHOULD use separate tables to maintain referential integrity.
 - Added immutable root snapshots for inode, namespace, content mapping,
   symlink, overlay, and provenance state
 - Normalized inline bytes to content-addressed digests in both journal and
-  snapshot rows, with explicit snapshot and journal pins
+  snapshot rows; snapshots pin chunks explicitly, journal retention is
+  derived from the digests retained rows name
+- Dropped v0.7's `fs_journal_chunk` pin table and the journal's `txn_id`
+  index: both charged every mutating commit for facts that are derivable
+  offline
 - Added history epoch, validity, and floor markers
 - Defined exact reconstruction at complete transaction boundaries, including
   future trimming, inode allocator preservation, refcount repair, and

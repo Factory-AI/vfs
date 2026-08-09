@@ -245,13 +245,12 @@ mod ddl {
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         )",
+        // The op journal deliberately carries no secondary index and no pin
+        // table: every mutating commit would pay their B-tree writes, and
+        // both are derivable — txn_id equals the group's first seq (groups
+        // are contiguous in the primary key), and the digests history
+        // references are parsed from retained rows by offline collection.
         JOURNAL_V2_DDL,
-        "CREATE INDEX IF NOT EXISTS idx_fs_op_journal_txn_id ON fs_op_journal(txn_id)",
-        "CREATE TABLE IF NOT EXISTS fs_journal_chunk (
-            seq INTEGER NOT NULL,
-            digest BLOB NOT NULL
-        )",
-        "CREATE INDEX IF NOT EXISTS idx_fs_journal_chunk_digest ON fs_journal_chunk(digest)",
         "CREATE TABLE IF NOT EXISTS fs_snapshot (
             snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
             through_seq INTEGER NOT NULL,
@@ -515,7 +514,6 @@ const REQUIRED_CURRENT_TABLES: &[&str] = &[
     "fs_overlay_config",
     "fs_session_metadata",
     "fs_op_journal",
-    "fs_journal_chunk",
     "fs_snapshot",
     "fs_snapshot_inode",
     "fs_snapshot_dentry",
@@ -822,14 +820,15 @@ async fn apply_migration(conn: &Connection, migration: &Migration) -> Result<()>
 }
 
 async fn migrate_history_to_row_deltas(conn: &Connection) -> Result<()> {
-    conn.execute("DELETE FROM fs_journal_chunk", ()).await?;
+    // v0.7's semantic journal and its pin table are not replayable; v0.8
+    // derives history-referenced digests from the row deltas themselves. Only
+    // a genuine v0.7 source carries the pin table — a database migrating up
+    // the chain from an older version never had it.
+    if table_exists(conn, "fs_journal_chunk").await? {
+        conn.execute("DROP TABLE fs_journal_chunk", ()).await?;
+    }
     conn.execute("DROP TABLE fs_op_journal", ()).await?;
     conn.execute(ddl::JOURNAL_V2_DDL, ()).await?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_fs_op_journal_txn_id ON fs_op_journal(txn_id)",
-        (),
-    )
-    .await?;
     initialize_history_markers(conn).await?;
     capture_root_raw(conn, "migrate", 1, 0).await?;
     Ok(())
@@ -856,11 +855,24 @@ async fn ensure_current_indexes(conn: &Connection) -> Result<()> {
         (),
     )
     .await?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_fs_op_journal_txn_id ON fs_op_journal(txn_id)",
-        (),
-    )
-    .await?;
+    // Databases created while v0.8 still carried the journal pin table and
+    // txn_id index (never in a released binary) shed them here.
+    if table_exists(conn, "fs_journal_chunk").await? {
+        conn.execute("DROP TABLE fs_journal_chunk", ()).await?;
+    }
+    let mut rows = conn
+        .query(
+            "SELECT 1 FROM sqlite_master
+             WHERE type = 'index' AND name = 'idx_fs_op_journal_txn_id'",
+            (),
+        )
+        .await?;
+    let stale_index = rows.next().await?.is_some();
+    drop(rows);
+    if stale_index {
+        conn.execute("DROP INDEX idx_fs_op_journal_txn_id", ())
+            .await?;
+    }
     Ok(())
 }
 
@@ -1323,11 +1335,6 @@ pub async fn rebuild_journal_allocator(conn: &Connection, through_seq: i64) -> R
         (),
     )
     .await?;
-    conn.execute(
-        "CREATE INDEX idx_fs_op_journal_txn_id ON fs_op_journal(txn_id)",
-        (),
-    )
-    .await?;
     Ok(())
 }
 
@@ -1349,7 +1356,6 @@ pub async fn reset_history_for_migration(conn: &Connection) -> Result<i64> {
     conn.execute("DELETE FROM fs_snapshot_dentry", ()).await?;
     conn.execute("DELETE FROM fs_snapshot_inode", ()).await?;
     conn.execute("DELETE FROM fs_snapshot", ()).await?;
-    conn.execute("DELETE FROM fs_journal_chunk", ()).await?;
     conn.execute("DELETE FROM fs_op_journal", ()).await?;
     initialize_history_markers(conn).await?;
     capture_root_raw(conn, "migrate", 1, 0).await

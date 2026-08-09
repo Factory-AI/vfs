@@ -10,7 +10,8 @@ use crate::schema::{
     self, CONFIG_HISTORY_EPOCH_KEY, CONFIG_HISTORY_FLOOR_SEQ_KEY, CONFIG_HISTORY_VALID_KEY,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use serde_json::Value as JsonValue;
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::path::Path;
 use turso::transaction::{Transaction, TransactionBehavior};
 use turso::{Connection, Value};
@@ -283,7 +284,6 @@ pub(crate) async fn reconcile_epoch(conn: &Connection, journaling_enabled: bool)
             .checked_add(1)
             .ok_or_else(|| Error::Internal("history epoch overflow".to_string()))?;
         delete_all_snapshots(conn).await?;
-        conn.execute("DELETE FROM fs_journal_chunk", ()).await?;
         conn.execute("DELETE FROM fs_op_journal", ()).await?;
         let snapshot_id = schema::capture_root_raw(conn, "epoch", next_epoch, markers.head).await?;
         let root = snapshot_header(conn, snapshot_id).await?;
@@ -1290,12 +1290,6 @@ async fn verify_reconstructed_digests(conn: &Connection) -> Result<()> {
 }
 
 async fn trim_future(conn: &Connection, target_seq: i64, epoch: i64) -> Result<()> {
-    conn.execute(
-        "DELETE FROM fs_journal_chunk
-         WHERE seq IN (SELECT seq FROM fs_op_journal WHERE seq > ?)",
-        (target_seq,),
-    )
-    .await?;
     conn.execute("DELETE FROM fs_op_journal WHERE seq > ?", (target_seq,))
         .await?;
     delete_snapshots_after(conn, epoch, target_seq).await?;
@@ -1734,12 +1728,6 @@ async fn nearest_snapshot(
 }
 
 async fn delete_journal_through(conn: &Connection, through_seq: i64) -> Result<()> {
-    conn.execute(
-        "DELETE FROM fs_journal_chunk
-         WHERE seq IN (SELECT seq FROM fs_op_journal WHERE seq <= ?)",
-        (through_seq,),
-    )
-    .await?;
     conn.execute("DELETE FROM fs_op_journal WHERE seq <= ?", (through_seq,))
         .await?;
     Ok(())
@@ -1812,16 +1800,77 @@ async fn delete_snapshots_matching(
     Ok(())
 }
 
+/// Delete zero-refcount chunks nothing retains.
+///
+/// Journal references are derived by scanning the retained row deltas rather
+/// than maintained as a write-time pin table: pins cost every mutating commit
+/// two extra B-tree writes, while this scan runs only on offline collection
+/// paths. A chunk survives if a live mapping counts it, a snapshot pins it,
+/// or any retained `fs_data`/`fs_inode` upsert names its digest.
 async fn collect_unpinned_chunks(conn: &Connection) -> Result<()> {
-    conn.execute(
-        "DELETE FROM fs_chunk
-         WHERE refcount = 0
-           AND digest NOT IN (SELECT digest FROM fs_journal_chunk)
-           AND digest NOT IN (SELECT digest FROM fs_snapshot_chunk)",
-        (),
-    )
-    .await?;
+    let mut rows = conn
+        .query(
+            "SELECT digest FROM fs_chunk
+             WHERE refcount = 0
+               AND digest NOT IN (SELECT digest FROM fs_snapshot_chunk)",
+            (),
+        )
+        .await?;
+    let mut candidates: Vec<Vec<u8>> = Vec::new();
+    while let Some(row) = rows.next().await? {
+        candidates.push(row.get(0)?);
+    }
+    drop(rows);
+    if candidates.is_empty() {
+        return Ok(());
+    }
+
+    let referenced = journal_referenced_digests(conn).await?;
+    let doomed: Vec<Vec<u8>> = candidates
+        .into_iter()
+        .filter(|digest| !referenced.contains(digest))
+        .collect();
+    for batch in doomed.chunks(128) {
+        let placeholders = vec!["?"; batch.len()].join(", ");
+        let params: Vec<Value> = batch
+            .iter()
+            .map(|digest| Value::Blob(digest.clone()))
+            .collect();
+        conn.execute(
+            &format!("DELETE FROM fs_chunk WHERE digest IN ({placeholders})"),
+            params,
+        )
+        .await?;
+    }
     Ok(())
+}
+
+/// Every digest a retained journal row references: `fs_data` upserts name
+/// their chunk digest and `fs_inode` upserts carry `data_inline_digest`.
+async fn journal_referenced_digests(conn: &Connection) -> Result<HashSet<Vec<u8>>> {
+    let mut referenced = HashSet::new();
+    let mut rows = conn
+        .query(
+            "SELECT tbl, row FROM fs_op_journal
+             WHERE verb = 'upsert' AND tbl IN ('fs_data', 'fs_inode')",
+            (),
+        )
+        .await?;
+    while let Some(row) = rows.next().await? {
+        let tbl: String = row.get(0)?;
+        let payload: String = row.get(1)?;
+        let value: JsonValue = serde_json::from_str(&payload)
+            .map_err(|error| Error::Internal(format!("malformed journal row: {error}")))?;
+        let field = if tbl == "fs_data" {
+            "digest"
+        } else {
+            "data_inline_digest"
+        };
+        if let Some(hex) = value.get(field).and_then(JsonValue::as_str) {
+            referenced.insert(decode_digest(hex)?);
+        }
+    }
+    Ok(referenced)
 }
 
 async fn query_scalar_i64<P>(conn: &Connection, sql: &str, params: P) -> Result<i64>

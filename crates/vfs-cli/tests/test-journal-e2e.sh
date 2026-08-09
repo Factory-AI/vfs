@@ -303,14 +303,7 @@ import sqlite3
 import sys
 
 conn = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
-counts = {
-    table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-    for table in ("fs_op_journal", "fs_journal_chunk")
-}
-assert counts == {
-    "fs_op_journal": 0,
-    "fs_journal_chunk": 0,
-}, counts
+assert conn.execute("SELECT COUNT(*) FROM fs_op_journal").fetchone()[0] == 0
 assert conn.execute(
     "SELECT value FROM fs_config WHERE key = 'history_valid'"
 ).fetchone() == ("0",)
@@ -368,13 +361,11 @@ roots = conn.execute(
 ).fetchall()
 assert roots == [(floor, "pack", 1)], roots
 assert floor > 1, floor
-orphans = conn.execute(
-    """SELECT COUNT(*)
-       FROM fs_journal_chunk c
-       LEFT JOIN fs_op_journal j ON j.seq = c.seq
-       WHERE j.seq IS NULL"""
-).fetchone()[0]
-assert orphans == 0, orphans
+tables = {
+    row[0]
+    for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+}
+assert "fs_journal_chunk" not in tables, "v0.8 must not carry the journal pin table"
 conn.close()
 PY
 
@@ -427,7 +418,6 @@ tables = {
 required = {
     "fs_chunk",
     "fs_op_journal",
-    "fs_journal_chunk",
     "fs_snapshot",
     "fs_snapshot_inode",
     "fs_snapshot_dentry",
@@ -435,19 +425,13 @@ required = {
     "fs_snapshot_chunk",
 }
 assert required <= tables, sorted(required - tables)
+assert "fs_journal_chunk" not in tables, "v0.8 must not carry the journal pin table"
 columns = [row[1] for row in conn.execute("PRAGMA table_info(fs_data)")]
 assert columns == ["ino", "chunk_index", "digest"], columns
 assert conn.execute(
     "SELECT COUNT(*) FROM fs_data WHERE typeof(digest) != 'blob' OR length(digest) != 32"
 ).fetchone()[0] == 0
-counts = {
-    table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-    for table in ("fs_op_journal", "fs_journal_chunk")
-}
-assert counts == {
-    "fs_op_journal": 0,
-    "fs_journal_chunk": 0,
-}, counts
+assert conn.execute("SELECT COUNT(*) FROM fs_op_journal").fetchone()[0] == 0
 assert conn.execute(
     "SELECT COUNT(*) FROM fs_snapshot WHERE reason = 'migrate' AND history_epoch = 1 AND through_seq = 0"
 ).fetchone()[0] == 1

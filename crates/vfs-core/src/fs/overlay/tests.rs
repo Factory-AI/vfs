@@ -3558,10 +3558,6 @@
             scalar_i64(&overlay, "SELECT COUNT(*) FROM fs_op_journal").await?,
             0
         );
-        assert_eq!(
-            scalar_i64(&overlay, "SELECT COUNT(*) FROM fs_journal_chunk").await?,
-            0
-        );
         Ok(())
     }
 

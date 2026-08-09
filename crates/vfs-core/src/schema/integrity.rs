@@ -122,7 +122,6 @@ pub async fn check(conn: &Connection, opts: &CheckOpts) -> Result<Report> {
         "fs_chunk",
         "fs_symlink",
         "fs_op_journal",
-        "fs_journal_chunk",
         "fs_snapshot",
         "fs_snapshot_inode",
         "fs_snapshot_dentry",

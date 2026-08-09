@@ -58,7 +58,11 @@ pack/adopt manifest fields and reserved exit statuses remain unchanged.
 - Schema v0.8 replaces the semantic journal with complete table-row
   post-images grouped by SQLite transaction. Immutable roots cover inode,
   namespace, content, overlay, and provenance state; inline bytes remain
-  content-addressed and pinned rather than embedded in history JSON.
+  content-addressed rather than embedded in history JSON. The journal
+  carries no pin table and no secondary index — chunk retention is derived
+  from the digests retained rows name, and `txn_id` lookups are `seq` range
+  scans on offline paths — so a mutating commit pays only its own journal
+  row inserts.
 - In-place and copy migration from v0.7 discard the old semantic journal,
   initialize durable history markers, and establish one migration root at
   epoch 1 through sequence 0.

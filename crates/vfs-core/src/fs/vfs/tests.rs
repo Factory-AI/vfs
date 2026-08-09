@@ -4202,10 +4202,6 @@
         Ok(rows.next().await?.map(|row| row.get(0)).transpose()?.unwrap_or(0))
     }
 
-    fn digest_hex(digest: &[u8]) -> String {
-        digest.iter().map(|byte| format!("{byte:02x}")).collect()
-    }
-
     #[tokio::test]
     async fn journal_direct_write_truncate_namespace_import_and_reap_are_atomic() -> Result<()> {
         let mut config = CoreConfig::default();
@@ -4284,17 +4280,18 @@
             .as_str()
             .unwrap()
             .to_string();
-        let mut pin_rows = conn
+        let mut chunk_rows = conn
             .query(
-                "SELECT lower(hex(digest)) FROM fs_journal_chunk WHERE seq = ?",
-                (inline_write.0,),
+                "SELECT COUNT(*) FROM fs_chunk WHERE lower(hex(digest)) = ?",
+                (inline_digest.as_str(),),
             )
             .await?;
         assert_eq!(
-            pin_rows.next().await?.unwrap().get::<String>(0)?,
-            inline_digest
+            chunk_rows.next().await?.unwrap().get::<i64>(0)?,
+            1,
+            "inline journal digest must be backed by an fs_chunk row"
         );
-        drop(pin_rows);
+        drop(chunk_rows);
 
         let unlink_txn = rows
             .iter()
@@ -4325,26 +4322,18 @@
             .find(|row| row.2 == "write" && row.3 == "fs_data" && row.4 == "upsert")
             .unwrap();
         assert_eq!(write.5["ino"], created.ino);
-        let mut pin_rows = conn
+        let payload_digest = write.5["digest"].as_str().unwrap().to_string();
+        let mut chunk_rows = conn
             .query(
-                "SELECT digest FROM fs_journal_chunk WHERE seq = ? ORDER BY digest",
-                (write.0,),
+                "SELECT COUNT(*) FROM fs_chunk WHERE lower(hex(digest)) = ?",
+                (payload_digest.as_str(),),
             )
             .await?;
-        let mut pins = Vec::new();
-        while let Some(row) = pin_rows.next().await? {
-            pins.push(row.get::<Vec<u8>>(0)?);
-        }
-        assert!(!pins.is_empty(), "chunked write must pin referenced digests");
-        let payload_digests =
-            [write.5["digest"].as_str().unwrap().to_string()]
-                .into_iter()
-                .collect::<std::collections::BTreeSet<_>>();
-        let pinned_digests = pins
-            .iter()
-            .map(|digest| digest_hex(digest))
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(pinned_digests, payload_digests);
+        assert_eq!(
+            chunk_rows.next().await?.unwrap().get::<i64>(0)?,
+            1,
+            "chunked-write journal digest must be backed by an fs_chunk row"
+        );
         Ok(())
     }
 
@@ -4426,25 +4415,19 @@
 
         let conn = fs.pool.get_connection().await?;
         let mut rows = conn
-            .query(
-                "SELECT
-                    (SELECT COUNT(*) FROM fs_op_journal),
-                    (SELECT COUNT(*) FROM fs_journal_chunk)",
-                (),
-            )
+            .query("SELECT COUNT(*) FROM fs_op_journal", ())
             .await?;
         let row = rows.next().await?.unwrap();
         assert_eq!(row.get::<i64>(0)?, 0);
-        assert_eq!(row.get::<i64>(1)?, 0);
+        drop(rows);
         assert_eq!(fs.read_file("/off-import").await?, Some(b"x".to_vec()));
         Ok(())
     }
 
     #[tokio::test]
-    async fn journal_gc_preserves_pins_and_whole_transaction_groups() -> Result<()> {
+    async fn journal_gc_preserves_referenced_chunks_and_whole_transaction_groups() -> Result<()> {
         let (fs, dir) = create_test_fs().await?;
         let conn = fs.pool.get_connection().await?;
-        conn.execute("DELETE FROM fs_journal_chunk", ()).await?;
         conn.execute("DELETE FROM fs_op_journal", ()).await?;
         crate::schema::rebuild_journal_allocator(&conn, 0).await?;
 

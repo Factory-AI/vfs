@@ -1,6 +1,6 @@
 use serde::Serialize;
 use serde_json::{json, Value as JsonValue};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -15,7 +15,6 @@ use super::store::{DataDelta, StorageChanges};
 /// Rows per multi-row journal insert; two shapes (full batch and remainder)
 /// keep prepared-statement variety low while bounding SQL length.
 const JOURNAL_INSERT_ROWS: usize = 64;
-const JOURNAL_PIN_INSERT_ROWS: usize = 128;
 
 /// Shared journal context: the kill-switch state plus an optimistic hint for
 /// the next journal seq.
@@ -110,7 +109,6 @@ pub(crate) struct JournalDelta {
     tbl: &'static str,
     verb: &'static str,
     row: JsonValue,
-    digests: Vec<Vec<u8>>,
 }
 
 impl JournalDelta {
@@ -125,13 +123,7 @@ impl JournalDelta {
             tbl,
             verb,
             row: serde_json::to_value(row).expect("journal row serialization cannot fail"),
-            digests: Vec::new(),
         }
-    }
-
-    fn with_digests(mut self, digests: Vec<Vec<u8>>) -> Self {
-        self.digests = digests;
-        self
     }
 
     pub(crate) fn inode_delete(label: &'static str, ino: i64) -> Self {
@@ -175,7 +167,6 @@ impl JournalDelta {
             "upsert",
             json!({ "ino": ino, "chunk_index": chunk_index, "digest": digest_hex }),
         )
-        .with_digests(vec![digest])
     }
 
     pub(crate) fn data_delete(label: &'static str, ino: i64, chunk_index: i64) -> Self {
@@ -458,7 +449,6 @@ impl<'conn> MutationTxn<'conn> {
             tbl: "fs_inode",
             verb: "upsert",
             row: value,
-            digests: inline_digest.into_iter().collect(),
         });
         Ok(())
     }
@@ -518,8 +508,6 @@ impl<'conn> MutationTxn<'conn> {
             // transaction no other writer can interleave, so the AUTOINCREMENT
             // seqs of one insert are contiguous and recoverable from
             // last_insert_rowid.
-            let mut pins: Vec<(i64, Vec<u8>)> = Vec::new();
-            let mut seen_pins = BTreeSet::new();
             let mut first_batch = true;
             let mut last = 0;
             for batch in records.chunks(JOURNAL_INSERT_ROWS) {
@@ -555,26 +543,6 @@ impl<'conn> MutationTxn<'conn> {
                         txn_id = first;
                     }
                 }
-                for (index, record) in batch.iter().enumerate() {
-                    let seq = first + index as i64;
-                    for digest in &record.digests {
-                        if seen_pins.insert(digest.clone()) {
-                            pins.push((seq, digest.clone()));
-                        }
-                    }
-                }
-            }
-            for batch in pins.chunks(JOURNAL_PIN_INSERT_ROWS) {
-                let placeholders = vec!["(?, ?)"; batch.len()].join(", ");
-                let sql =
-                    format!("INSERT INTO fs_journal_chunk (seq, digest) VALUES {placeholders}");
-                let mut params = Vec::with_capacity(batch.len() * 2);
-                for (seq, digest) in batch {
-                    params.push(Value::Integer(*seq));
-                    params.push(Value::Blob(digest.clone()));
-                }
-                let mut stmt = txn.prepare_cached(&sql).await?;
-                stmt.execute(params).await?;
             }
             // Stored before the SQLite commit: a failed commit leaves the
             // hint one group too high, which the next commit detects and
