@@ -82,6 +82,7 @@ on any of these. Know them before you write, not after CI tells you:
 | Line-count cap | No production `.rs` file over 2,500 non-test code lines. This fork exists partly because a 9,338-line file was allowed to grow. |
 | Logging | `tracing` only. `println!`/`eprintln!` are user-facing CLI output, allowed only under `crates/vfs-cli/src/cmd/`, `main.rs`, and build scripts. |
 | Env reads | `env::var`/`var_os` only inside a crate's config module (`vfs-core/src/config/`, `vfs-fuse/src/adapter/config.rs`, `vfs-cli/src/config.rs`). Parse at the edge into typed config; the core never reads the environment. |
+| Schema DDL | `CREATE TABLE` / `ALTER TABLE` / `PRAGMA user_version` / `schema_version` literals in production Rust live only under `crates/vfs-core/src/schema/`. Test code is exempt; vendored `third_party/` is excluded. |
 | EnvFilter | `logging.rs` must name every first-party crate target. |
 | Lock discipline | `clippy::await_holding_lock = "deny"` workspace-wide; every crate opts in. Multi-lock modules (batcher, adapter cache, overlay, handle table) must carry a documented lock-order header. |
 | Docs layout | `MANUAL.md`, `TESTING.md`, `SPEC.md`, `KNOBS.md` live under `docs/`, never at the root. `CHANGELOG.md` is non-empty at the root. |

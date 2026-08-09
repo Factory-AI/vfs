@@ -296,6 +296,9 @@ if problems:
 print("user docs live under docs/ (MANUAL, TESTING, SPEC, KNOBS)")
 PY
 
+# --- schema DDL centralization (VAL-CORE-014) ---------------------------------------
+check_python "ddl-census" "$SCRIPT_DIR/ddl-census.py"
+
 # --- changelog ----------------------------------------------------------------------
 check_python "changelog" - <<'PY'
 import sys

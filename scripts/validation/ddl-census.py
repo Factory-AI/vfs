@@ -19,18 +19,15 @@ DDL_RE = re.compile(
     re.IGNORECASE,
 )
 
-SCHEMA_AUTHORITY_FILES = {
-    Path("sdk/rust/src/schema.rs"),
-}
-SCHEMA_AUTHORITY_DIRS = (
-    Path("sdk/rust/src/schema"),
-    Path("crates/vfs-core/src/schema"),
-)
+SCHEMA_AUTHORITY_FILES: set[Path] = set()
+SCHEMA_AUTHORITY_DIRS = (Path("crates/vfs-core/src/schema"),)
 
 EXCLUDED_DIR_NAMES = {".git", "target"}
 EXCLUDED_PREFIXES = (
     Path(".agents/benchmarks/fixtures"),
     Path(".agents/kernel"),
+    # Vendored upstream crates are not first-party production Rust.
+    Path("third_party"),
 )
 
 

@@ -25,7 +25,7 @@ first failing command and runs, in order:
 7. `scripts/validation/consistency-canon.sh` — the structural canon census
    (crate DAG, sealed transport surfaces, file-size cap, tracing-only
    logging, env-reads-at-the-config-edge, `await_holding_lock`, lock-order
-   headers, docs layout, changelog)
+   headers, docs layout, schema-DDL centralization, changelog)
 
 Steps 1-4 are the `cargo` phase, 5 the `shell` phase, 6 the `python` phase
 and 7 the `canon` phase. `gate.sh --phases shell,canon` runs a subset; with
