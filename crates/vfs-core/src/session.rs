@@ -276,7 +276,11 @@ impl Vfs {
     pub async fn collect_journal(&self) -> Result<()> {
         self.fs.drain_all().await?;
         let conn = self.pool.get_connection().await?;
-        crate::fs::journal_gc(&conn, self.fs.journal_retention_ops()).await
+        crate::fs::journal_gc(&conn, self.fs.journal_retention_ops()).await?;
+        // GC may have deleted zero-ref chunks the known-digest cache vouches
+        // for; a stale entry would let a later commit pin a missing digest.
+        self.fs.journal_ctx().forget_chunks();
+        Ok(())
     }
 }
 

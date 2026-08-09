@@ -340,7 +340,9 @@ impl Vfs {
     pub async fn capture_root(&self, reason: &str) -> Result<SnapshotHeader> {
         self.fs.drain_all().await?;
         let conn = self.pool.get_connection().await?;
-        fs::history::capture_root(&conn, reason).await
+        let root = fs::history::capture_root(&conn, reason).await?;
+        self.fs.journal_ctx().forget_chunks();
+        Ok(root)
     }
 
     /// Return the retained replay range and complete transaction targets.
@@ -385,7 +387,11 @@ impl Vfs {
     pub async fn establish_history_floor(&self, reason: &str) -> Result<SnapshotHeader> {
         self.fs.drain_all().await?;
         let conn = self.pool.get_connection().await?;
-        fs::history::establish_fresh_floor(&conn, reason).await
+        let root = fs::history::establish_fresh_floor(&conn, reason).await?;
+        // Floor establishment collects unpinned chunks; drop cached digests
+        // so no later commit pins one the collection removed.
+        self.fs.journal_ctx().forget_chunks();
+        Ok(root)
     }
 
     /// Check if sync is enabled for this database

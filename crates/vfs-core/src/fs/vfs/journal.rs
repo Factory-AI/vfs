@@ -1,8 +1,8 @@
 use serde::Serialize;
 use serde_json::{json, Value as JsonValue};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use turso::transaction::{Transaction, TransactionBehavior};
 use turso::{Connection, Value};
@@ -38,7 +38,24 @@ pub(crate) struct JournalCtx {
     /// valid history valid. Set only after a successful commit so a failed
     /// one retries the marker.
     invalidated: Arc<AtomicBool>,
+    /// Digests this opener has already committed to `fs_chunk`.
+    ///
+    /// Inline post-images content-address their bytes on every inode row, and
+    /// a workload like a git clone rewrites the same inline content two or
+    /// three times per file (create, write, setattr). Without this set each
+    /// occurrence ships the full blob in an `ON CONFLICT DO NOTHING` upsert;
+    /// with it only the first insert pays. Digests enter the set only after
+    /// their transaction commits, so a rollback cannot leave the set claiming
+    /// a chunk the database never got. Journal chunk GC runs only offline
+    /// (pack's collect path), never beside a live opener, so a cached digest
+    /// cannot be collected out from under a later pin.
+    known_chunks: Arc<Mutex<HashSet<[u8; 32]>>>,
 }
+
+/// Bound on the known-digest set; a clone of the codex fixture produces ~5k
+/// distinct inline digests, so this is generous while capping memory at
+/// ~8 MiB. Overflow clears: correctness never depends on membership.
+const KNOWN_CHUNKS_CAP: usize = 1 << 18;
 
 impl JournalCtx {
     pub(crate) fn new(enabled: bool) -> Self {
@@ -46,7 +63,44 @@ impl JournalCtx {
             enabled,
             next_seq: Arc::new(AtomicI64::new(0)),
             invalidated: Arc::new(AtomicBool::new(false)),
+            known_chunks: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    fn chunk_known(&self, digest: &[u8]) -> bool {
+        let Ok(digest) = <[u8; 32]>::try_from(digest) else {
+            return false;
+        };
+        self.known_chunks
+            .lock()
+            .expect("known-chunk set is never poisoned")
+            .contains(&digest)
+    }
+
+    /// Drop every cached digest. Must be called after any operation that can
+    /// delete `fs_chunk` rows on a live opener (journal GC, floor
+    /// establishment, root capture), since a collected chunk the cache still
+    /// vouches for would let a later commit pin a digest the database no
+    /// longer holds.
+    pub(crate) fn forget_chunks(&self) {
+        self.known_chunks
+            .lock()
+            .expect("known-chunk set is never poisoned")
+            .clear();
+    }
+
+    fn remember_chunks(&self, digests: &[[u8; 32]]) {
+        if digests.is_empty() {
+            return;
+        }
+        let mut known = self
+            .known_chunks
+            .lock()
+            .expect("known-chunk set is never poisoned");
+        if known.len() + digests.len() > KNOWN_CHUNKS_CAP {
+            known.clear();
+        }
+        known.extend(digests.iter().copied());
     }
 }
 
@@ -336,6 +390,9 @@ pub(crate) struct MutationTxn<'conn> {
     txn: Transaction<'conn>,
     journal: JournalCtx,
     records: Vec<JournalDelta>,
+    /// Digests whose `fs_chunk` upsert this transaction issued; promoted to
+    /// the shared known-digest set only after the commit succeeds.
+    inserted_chunks: Vec<[u8; 32]>,
 }
 
 impl<'conn> MutationTxn<'conn> {
@@ -344,6 +401,7 @@ impl<'conn> MutationTxn<'conn> {
             txn: Transaction::new_unchecked(conn, TransactionBehavior::Immediate).await?,
             journal,
             records: Vec::new(),
+            inserted_chunks: Vec::new(),
         })
     }
 
@@ -368,16 +426,19 @@ impl<'conn> MutationTxn<'conn> {
             return Ok(());
         }
         let inline_digest = if let Some(data) = &row.data_inline {
-            let digest = blake3::hash(data).as_bytes().to_vec();
-            self.txn
-                .execute(
-                    "INSERT INTO fs_chunk (digest, data, refcount)
-                     VALUES (?, ?, 0)
-                     ON CONFLICT(digest) DO NOTHING",
-                    (Value::Blob(digest.clone()), Value::Blob(data.clone())),
-                )
-                .await?;
-            Some(digest)
+            let digest = *blake3::hash(data).as_bytes();
+            if !self.journal.chunk_known(&digest) {
+                self.txn
+                    .execute(
+                        "INSERT INTO fs_chunk (digest, data, refcount)
+                         VALUES (?, ?, 0)
+                         ON CONFLICT(digest) DO NOTHING",
+                        (Value::Blob(digest.to_vec()), Value::Blob(data.clone())),
+                    )
+                    .await?;
+                self.inserted_chunks.push(digest);
+            }
+            Some(digest.to_vec())
         } else {
             None
         };
@@ -428,6 +489,7 @@ impl<'conn> MutationTxn<'conn> {
             txn,
             journal,
             records,
+            inserted_chunks,
         } = self;
         let marks_history_invalid =
             !journal.enabled && !journal.invalidated.load(Ordering::Acquire);
@@ -524,6 +586,7 @@ impl<'conn> MutationTxn<'conn> {
         if marks_history_invalid {
             journal.invalidated.store(true, Ordering::Release);
         }
+        journal.remember_chunks(&inserted_chunks);
         Ok(())
     }
 

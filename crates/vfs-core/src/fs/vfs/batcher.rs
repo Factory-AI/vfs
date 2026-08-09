@@ -211,6 +211,7 @@ async fn apply_pending_times_with_conn(
     conn: &Connection,
     ino: i64,
     times: &PendingTimeChange,
+    journaling: bool,
 ) -> Result<Option<InodeRow>> {
     let mut updates = Vec::new();
     let mut values: Vec<Value> = Vec::new();
@@ -236,6 +237,13 @@ async fn apply_pending_times_with_conn(
         return Ok(None);
     }
     values.push(Value::Integer(ino));
+    // The post-image exists only to feed the journal; with the kill switch on
+    // the RETURNING clause (and shipping data_inline back per row) is waste.
+    if !journaling {
+        let sql = format!("UPDATE fs_inode SET {} WHERE ino = ?", updates.join(", "));
+        conn.execute(&sql, values).await?;
+        return Ok(None);
+    }
     let sql = format!(
         "UPDATE fs_inode SET {} WHERE ino = ?
          RETURNING ino, mode, nlink, uid, gid, size, atime, mtime, ctime, rdev,
@@ -809,7 +817,9 @@ impl VfsWriteBatcher {
             if !inode_missing {
                 if let Some(times) = pending_times.get(ino) {
                     if normalized.is_empty() {
-                        match apply_pending_times_with_conn(&conn, *ino, times).await {
+                        match apply_pending_times_with_conn(&conn, *ino, times, txn.journaling())
+                            .await
+                        {
                             Ok(Some(inode)) => {
                                 if let Err(error) = txn.record_inode("setattr", inode).await {
                                     let _ = txn.rollback().await;
