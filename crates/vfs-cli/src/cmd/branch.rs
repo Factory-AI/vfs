@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
-use vfs_core::{Vfs, VfsOptions};
+use vfs_core::{ReconstructionInfo, Vfs, VfsOptions};
 
 use super::artifacts;
 use super::run::ctl;
@@ -41,6 +41,12 @@ pub struct BranchManifest {
     seed_pin: Option<String>,
     parent_live: bool,
     vfs_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_seq: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_head_seq: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    root_snapshot_seq: Option<i64>,
 }
 
 /// Fork `parent_session_id` into a new session and emit the branch manifest.
@@ -48,10 +54,18 @@ pub async fn handle_branch_command(
     stdout: &mut impl Write,
     parent_session_id: String,
     branch_session_id: Option<String>,
+    target_seq: Option<i64>,
     _json: bool,
 ) -> Result<()> {
     let home = dirs::home_dir().context("Failed to get home directory")?;
-    branch_session(stdout, &home, parent_session_id, branch_session_id).await
+    branch_session(
+        stdout,
+        &home,
+        parent_session_id,
+        branch_session_id,
+        target_seq,
+    )
+    .await
 }
 
 pub(crate) async fn branch_session(
@@ -59,6 +73,7 @@ pub(crate) async fn branch_session(
     home: &Path,
     parent_session_id: String,
     branch_session_id: Option<String>,
+    target_seq: Option<i64>,
 ) -> Result<()> {
     if !VfsOptions::validate_agent_id(&parent_session_id) {
         bail!("invalid session ID: {parent_session_id}");
@@ -102,6 +117,7 @@ pub(crate) async fn branch_session(
         .join(format!(".branch-{}.tmp", Uuid::new_v4()));
     let staging_cleanup = RemoveOnDrop::armed(staging.clone());
     let parent_live = snapshot_parent(&parent, &staging).await?;
+    let reconstruction = reconstruct_branch_target(&staging, target_seq).await?;
 
     // Handoff metadata is read from the snapshot (the parent may be live and
     // exclusively owned); any sidecar churn this causes lands before hashing.
@@ -134,6 +150,9 @@ pub(crate) async fn branch_session(
         seed_pin,
         parent_live,
         vfs_version: super::version::VERSION.to_string(),
+        target_seq: reconstruction.as_ref().map(|info| info.target_seq),
+        source_head_seq: reconstruction.as_ref().map(|info| info.source_head_seq),
+        root_snapshot_seq: reconstruction.as_ref().map(|info| info.root_snapshot_seq),
     };
     serde_json::to_writer(&mut *stdout, &manifest)?;
     writeln!(stdout)?;
@@ -146,11 +165,12 @@ pub(crate) async fn branch_session(
 /// exclusive acquisition proves no owner, and the control socket is only a
 /// capability channel to whoever holds the shared lock. The single retry
 /// covers the owner exiting between classification and connect.
-async fn snapshot_parent(parent: &SessionPaths, staging: &Path) -> Result<bool> {
+pub(crate) async fn snapshot_parent(parent: &SessionPaths, staging: &Path) -> Result<bool> {
     for attempt in 0..2 {
         match SessionLock::try_exclusive(&parent.run_dir) {
             Ok(_lock) => {
                 super::pack::recover_interrupted_publication(&parent.db_path)?;
+                super::revert::recover_interrupted_publication(&parent.db_path)?;
                 if !parent.db_path.is_file() {
                     bail!("session database not found: {}", parent.db_path.display());
                 }
@@ -221,25 +241,55 @@ async fn snapshot_parent(parent: &SessionPaths, staging: &Path) -> Result<bool> 
     unreachable!("snapshot_parent loops at most twice and every arm returns")
 }
 
+async fn reconstruct_branch_target(
+    staging: &Path,
+    target_seq: Option<i64>,
+) -> Result<Option<ReconstructionInfo>> {
+    let Some(target_seq) = target_seq else {
+        return Ok(None);
+    };
+    let info = Vfs::reconstruct_to(staging, target_seq)
+        .await
+        .context("Failed to reconstruct the branch parent at the requested history target")?;
+    super::safety::remove_sqlite_sidecars_after_checkpoint(staging)?;
+    Ok(Some(info))
+}
+
 /// Read the handoff metadata a branch inherits from its parent snapshot.
 async fn read_snapshot_metadata(staging: &Path) -> Result<(Option<String>, Vec<String>)> {
-    let staging_str = staging
-        .to_str()
-        .context("Staging path contains non-UTF8 characters")?;
-    let vfs = Vfs::open(VfsOptions::with_path(staging_str))
-        .await
-        .context("Failed to open the staged parent snapshot")?;
+    let sidecars = super::safety::ReadOnlyOpenSidecars::capture(staging);
     let result = async {
-        let seed_pin = vfs.seed_pin().await?;
-        let metadata = vfs.session_metadata().await?;
-        Ok::<_, vfs_core::error::Error>((seed_pin, metadata.seeded_paths))
+        let db = super::safety::build_local_database(staging, None)
+            .await
+            .context("Failed to open the staged parent snapshot")?;
+        let conn = db
+            .connect()
+            .context("Failed to connect to the staged parent snapshot")?;
+        let seed_pin = read_session_metadata_value(&conn, "seed_pin").await?;
+        let seeded_paths = read_session_metadata_value(&conn, "seeded_paths")
+            .await?
+            .map(|value| serde_json::from_str(&value))
+            .transpose()
+            .context("Invalid seeded path metadata in the staged parent snapshot")?
+            .unwrap_or_default();
+        Ok::<_, anyhow::Error>((seed_pin, seeded_paths))
     }
     .await;
-    vfs.fs
-        .finalize()
-        .await
-        .context("Failed to finalize the staged parent snapshot")?;
-    Ok(result?)
+    sidecars.remove_created_frameless();
+    result
+}
+
+async fn read_session_metadata_value(
+    conn: &turso::Connection,
+    key: &str,
+) -> Result<Option<String>> {
+    let mut rows = conn
+        .query(
+            "SELECT value FROM fs_session_metadata WHERE key = ?",
+            (key,),
+        )
+        .await?;
+    Ok(rows.next().await?.map(|row| row.get(0)).transpose()?)
 }
 
 /// Create the branch session directory and its delta database.
@@ -274,6 +324,11 @@ async fn install_branch_session(
         // The branch shares the parent's git base provenance; whiteouts and
         // content live in the parent artifact, so none are recorded here.
         vfs.record_seed_state(seeded_paths, &[], pin).await?;
+    }
+    if vfs.history_status().await?.valid {
+        vfs.capture_root("branch")
+            .await
+            .context("Failed to capture branch history provenance")?;
     }
     vfs.fs
         .finalize()
@@ -370,6 +425,7 @@ mod tests {
             home.path(),
             "parent-1".to_string(),
             Some("branch-1".to_string()),
+            None,
         )
         .await
         .unwrap();
@@ -461,6 +517,7 @@ mod tests {
             home.path(),
             "parent-2".to_string(),
             Some("branch-a".to_string()),
+            None,
         )
         .await
         .unwrap();
@@ -470,6 +527,7 @@ mod tests {
             home.path(),
             "parent-2".to_string(),
             Some("branch-b".to_string()),
+            None,
         )
         .await
         .unwrap();
@@ -519,6 +577,7 @@ mod tests {
             home.path(),
             "parent-3".to_string(),
             Some("branch-live".to_string()),
+            None,
         )
         .await
         .unwrap();
@@ -539,7 +598,7 @@ mod tests {
         let _owner_lock = SessionLock::try_shared(&parent.run_dir).unwrap();
 
         let mut out = Vec::new();
-        let error = branch_session(&mut out, home.path(), "parent-4".to_string(), None)
+        let error = branch_session(&mut out, home.path(), "parent-4".to_string(), None, None)
             .await
             .unwrap_err();
         assert!(

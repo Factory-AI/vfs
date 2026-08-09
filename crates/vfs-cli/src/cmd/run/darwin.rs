@@ -600,6 +600,7 @@ fn setup_run_directory(
     } = paths;
     if owns_runtime {
         crate::cmd::pack::recover_interrupted_publication(&db_path)?;
+        crate::cmd::revert::recover_interrupted_publication(&db_path)?;
     }
     let base_path = if !existed && !acquire_lock {
         cwd.to_path_buf()

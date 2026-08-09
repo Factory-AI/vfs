@@ -259,21 +259,21 @@ struct ReplayState {
     meta: BTreeMap<String, String>,
 }
 
-/// Reconcile the durable epoch markers for one writable open.
+/// Reconcile the durable epoch markers for one writable journaled open.
 ///
-/// A disabled journal invalidates the current epoch once. Re-enabling after a
-/// gap drops the stale replay plane, bumps the epoch, captures the current
-/// root, and publishes that root as the new floor.
+/// Invalidation is not this function's job: the first unjournaled mutation
+/// writes `history_valid=0` in its own commit (see `MutationTxn::commit`), so
+/// maintenance opens that mutate nothing leave a valid history valid.
+/// Re-enabling journaling after a recorded gap drops the stale replay plane,
+/// bumps the epoch, captures the current root, and publishes that root as the
+/// new floor.
 pub(crate) async fn reconcile_epoch(conn: &Connection, journaling_enabled: bool) -> Result<()> {
+    if !journaling_enabled {
+        return Ok(());
+    }
     let txn = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).await?;
     let result = async {
         let markers = read_markers(conn).await?;
-        if !journaling_enabled {
-            if markers.valid {
-                set_config_i64(conn, CONFIG_HISTORY_VALID_KEY, 0).await?;
-            }
-            return Ok(());
-        }
         if markers.valid {
             return Ok(());
         }
@@ -2229,6 +2229,16 @@ mod tests {
             journal_enabled: false,
             ..crate::CoreConfig::default()
         };
+        // A disabled open that mutates nothing is a maintenance open and must
+        // not poison history; only the first unjournaled mutation does.
+        let vfs = Vfs::open(
+            VfsOptions::with_path(path.to_string_lossy()).with_core_config(disabled.clone()),
+        )
+        .await?;
+        assert!(vfs.history_status().await?.valid);
+        vfs.fs.finalize().await?;
+        drop(vfs);
+
         let vfs =
             Vfs::open(VfsOptions::with_path(path.to_string_lossy()).with_core_config(disabled))
                 .await?;

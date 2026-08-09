@@ -150,6 +150,7 @@ async fn pack_session(
         })?;
     let db_path = paths.db_path.clone();
     recover_interrupted_publication(&db_path)?;
+    super::revert::recover_interrupted_publication(&db_path)?;
     if !db_path.is_file() {
         anyhow::bail!("session database not found: {}", db_path.display());
     }
@@ -767,6 +768,7 @@ mod tests {
             home,
             parent.to_string(),
             Some(branch.to_string()),
+            None,
         )
         .await
     }

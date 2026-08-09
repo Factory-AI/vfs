@@ -399,6 +399,7 @@ fn dispatch(args: Args) -> anyhow::Result<()> {
         Command::Branch {
             parent_session_id,
             session,
+            to,
             json,
         } => {
             let rt = get_runtime();
@@ -406,6 +407,35 @@ fn dispatch(args: Args) -> anyhow::Result<()> {
                 &mut std::io::stdout(),
                 parent_session_id,
                 session,
+                to,
+                json,
+            ))
+        }
+        Command::History {
+            session_id,
+            limit,
+            all,
+            json,
+        } => {
+            let rt = get_runtime();
+            rt.block_on(cmd::history::handle_history_command(
+                &mut std::io::stdout(),
+                session_id,
+                limit,
+                all,
+                json,
+            ))
+        }
+        Command::Revert {
+            session_id,
+            to,
+            json,
+        } => {
+            let rt = get_runtime();
+            rt.block_on(cmd::revert::handle_revert_command(
+                &mut std::io::stdout(),
+                session_id,
+                to,
                 json,
             ))
         }

@@ -33,6 +33,20 @@ pack/adopt manifest shapes and all other wire contracts remain unchanged.
   with journaling disabled marks history invalid; re-enabling journaling bumps
   the epoch, removes stale history, and captures the current state as a fresh
   root. Read-only opens never write these markers.
+- `vfs history <SESSION_ID> [--limit N | --all] [--json]` lists retained
+  complete-transaction targets newest-first with the durable epoch,
+  valid/invalid marker, available floor/head range, diagnostic label, wall
+  clock, touched tables, and row-delta count.
+- `vfs branch <SESSION_ID> --to <SEQ>` reconstructs the branch's private
+  parent snapshot to a retained transaction boundary before immutable artifact
+  publication. Historical branch manifests add `targetSeq`, `sourceHeadSeq`,
+  and `rootSnapshotSeq`; plain branch behavior and manifest shape are
+  unchanged.
+- `vfs revert <SESSION_ID> --to <SEQ>` performs an offline, staged,
+  integrity-checked filesystem rewind with exit-status-3 live-session refusal,
+  generation increment, a fresh `revert` history floor, backup-rename
+  publication, rollback, and run/resume crash recovery. KV and tool-call rows
+  remain outside the rewind.
 
 - `vfs branch <SESSION_ID> [--session <ID>]` forks a session. A live parent
   is snapshotted through its mount's control socket without stopping it (the
@@ -56,7 +70,7 @@ pack/adopt manifest shapes and all other wire contracts remain unchanged.
   adopt` on a receiver without the artifact store reconstructs the branched
   view exactly. Pack refuses to publish if a parent artifact is missing or
   drifted.
-- `vfs version --json` advertises `features.branch`.
+- `vfs version --json` advertises `features.branch` and `features.history`.
 - `vfs prune artifacts [--dry-run]` collects artifacts no session chain
   references and emits a one-line JSON report (`removed`, `kept`,
   `reclaimedBytes`). Classification is conservative: inactive sessions are

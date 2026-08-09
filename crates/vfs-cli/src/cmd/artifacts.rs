@@ -227,6 +227,7 @@ async fn session_parent_digest(paths: &super::run::SessionPaths) -> Result<Optio
     match SessionLock::try_exclusive(&paths.run_dir) {
         Ok(_lock) => {
             super::pack::recover_interrupted_publication(&paths.db_path)?;
+            super::revert::recover_interrupted_publication(&paths.db_path)?;
             if !paths.db_path.is_file() {
                 return Ok(None);
             }
@@ -365,6 +366,7 @@ mod tests {
             home,
             parent.to_string(),
             Some(child.to_string()),
+            None,
         )
         .await
         .unwrap();

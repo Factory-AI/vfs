@@ -445,10 +445,16 @@ impl Vfs {
             None
         };
 
-        if let Some(root) = changed {
-            txn.record_inode("root_init", root).await?;
+        // A no-change open only read; committing it would count as a
+        // mutating commit (and, with journaling disabled, durably mark the
+        // history epoch invalid for a maintenance open that touched nothing).
+        match changed {
+            Some(root) => {
+                txn.record_inode("root_init", root).await?;
+                txn.commit().await?;
+            }
+            None => txn.rollback().await?,
         }
-        txn.commit().await?;
         Ok(())
     }
 

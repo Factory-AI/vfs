@@ -435,7 +435,7 @@ vfs seed [OPTIONS] <SESSION_ID>
 
 ### vfs branch
 
-Fork a run session into a new session at its current state.
+Fork a run session at its current or a retained historical state.
 
 Snapshots the parent session (live sessions are snapshotted through the mount without stopping them), publishes the snapshot as an immutable content-addressed artifact under ~/.vfs/artifacts, and installs a new session whose overlay reads fall through to that artifact. Branches taken at the same state share one artifact, so forking N times is cheap. The branch refuses to mount if the artifact no longer matches its recorded digest.
 
@@ -450,7 +450,43 @@ vfs branch [OPTIONS] <SESSION_ID>
 **Options:**
 
 - `--session <ID>` — Identifier for the new branch session (default: generated)
+- `--to <SEQ>` — Reconstruct the parent at this complete history sequence
 - `--json` — Emit machine-readable JSON (branch output is always JSON)
+
+### vfs history
+
+List retained replayable history for a run session
+
+```
+vfs history [OPTIONS] <SESSION_ID>
+```
+
+**Arguments:**
+
+- `<SESSION_ID>` — Run session identifier
+
+**Options:**
+
+- `--limit <N>` — Maximum newest transaction groups to list (default: 100)
+- `--all` — List every retained transaction group
+- `--json` — Emit a one-line machine-readable JSON manifest
+
+### vfs revert
+
+Rewind an inactive run session to a retained history sequence
+
+```
+vfs revert [OPTIONS] <SESSION_ID>
+```
+
+**Arguments:**
+
+- `<SESSION_ID>` — Run session identifier
+
+**Options:**
+
+- `--to <SEQ>` — Complete history sequence to restore
+- `--json` — Emit a one-line machine-readable JSON manifest
 
 ### vfs adopt
 
@@ -667,13 +703,19 @@ same exit-code-3 teardown gate used by `vfs pack`.
 
 ## Branching run sessions
 
-`vfs branch <session-id> [--session <new-id>]` forks a session into a new,
-independent session that starts at the parent's exact current state. The
-parent keeps running: a live parent is snapshotted through its mount's
+`vfs branch <session-id> [--session <new-id>] [--to <seq>]` forks a session
+into a new, independent session. Without `--to`, it starts at the parent's
+exact current state. With `--to`, the command reconstructs the private parent
+snapshot to that retained complete-transaction boundary before publishing the
+artifact. Targets outside the advertised range, inside a transaction, or from
+an invalid history epoch are refused with the available floor/head range.
+
+The parent keeps running: a live parent is snapshotted through its mount's
 control socket (`~/.vfs/run/<id>/ctl.sock`) as a drained `VACUUM INTO` copy,
 so every write acknowledged before the branch call is included and the agent
-inside the session never stalls beyond the drain. An inactive parent is
-snapshotted directly under the exclusive session lock.
+inside the session never stalls beyond the drain. Historical reconstruction
+then changes only that private copy. An inactive parent is snapshotted directly
+under the exclusive session lock.
 
 The snapshot is published write-protected into a content-addressed store at
 `~/.vfs/artifacts/<sha256>.db`, and the new session's delta records that
@@ -700,6 +742,8 @@ stack).
 Branch prints a one-line JSON manifest: `sessionId`, `parentSessionId`,
 `parentArtifactSha256`, `artifactPath`, `basePath`, `seedPin` (inherited
 from the parent when recorded), `parentLive`, and `vfsVersion`.
+Historical branches add `targetSeq`, `sourceHeadSeq`, and `rootSnapshotSeq`;
+plain current-state branches omit those fields.
 
 Artifacts are collected with `vfs prune artifacts` (`--dry-run` to preview),
 which removes every artifact no installed session's chain references and
@@ -709,6 +753,51 @@ control socket, and a session that cannot be classified either way aborts
 the prune untouched. Prune and an in-flight `vfs branch` publication exclude
 each other through an advisory lock on the store, so a freshly installed
 artifact can never be collected before the branch referencing it lands.
+
+## Inspecting replayable history
+
+`vfs history <session-id>` reports the retained replay range without opening
+the live database path alongside its writable owner. It uses the same
+lock/control-socket snapshot discipline as branch, so stopped and live sessions
+are both supported. The header names the durable history epoch, whether that
+epoch is valid, and the inclusive floor/head range.
+
+Each listed line is one complete committed transaction group. Its `seq` is the
+only target accepted by `branch --to` or `revert --to`; the line also reports
+the first row's diagnostic label and wall clock, the authoritative tables
+touched, and the row-delta count. Output is newest-first and defaults to 100
+groups. Use `--limit <n>` to choose another page size or `--all` to list every
+retained group.
+
+`--json` emits one line:
+
+```json
+{"manifestVersion":1,"sessionId":"<session-id>","historyEpoch":1,"historyValid":true,"historyFloorSeq":0,"historyHeadSeq":42,"targets":[{"seq":42,"txnId":40,"label":"rename","wallclockMs":1786320000000,"tables":["fs_dentry","fs_inode"],"rows":6}]}
+```
+
+## Reverting run sessions
+
+`vfs revert <session-id> --to <seq>` destructively rewinds only filesystem and
+overlay state. Application KV rows, tool-call audit rows, the mountpoint,
+process records, runtime status, control socket, and recorded base path remain
+outside the swap. Revert increments the session generation and establishes the
+restored state as a fresh `revert` history floor; new filesystem mutations
+continue journaling after that boundary.
+
+Revert is offline-only. It takes the session's exclusive lock and returns the
+existing exit status `3` if an owner or joiner is genuinely live. It stages and
+verifies reconstruction on a private database family, rechecks inactivity,
+renames `delta.db` to the dedicated `delta.db.revert-backup`, publishes the
+single-file candidate, fsyncs the file and session directory, and reopens the
+published database for integrity and generation verification. Any publication
+failure restores the backup. A later `vfs run` or `vfs revert` resolves an
+interrupted backup/candidate before opening the session.
+
+With `--json`, success emits:
+
+```json
+{"manifestVersion":1,"sessionId":"<session-id>","targetSeq":42,"sourceHeadSeq":87,"rootSnapshotSeq":0,"historyEpoch":1,"generation":2,"dbPath":"/home/user/.vfs/run/<session-id>/delta.db"}
+```
 
 ## Packing run sessions
 

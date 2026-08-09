@@ -483,7 +483,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Fork a run session into a new session at its current state.
+    /// Fork a run session at its current or a retained historical state.
     ///
     /// Snapshots the parent session (live sessions are snapshotted through
     /// the mount without stopping them), publishes the snapshot as an
@@ -502,7 +502,43 @@ pub enum Command {
         #[arg(long = "session", value_name = "ID")]
         session: Option<String>,
 
+        /// Reconstruct the parent at this complete history sequence
+        #[arg(long, value_name = "SEQ")]
+        to: Option<i64>,
+
         /// Emit machine-readable JSON (branch output is always JSON)
+        #[arg(long)]
+        json: bool,
+    },
+    /// List retained replayable history for a run session
+    History {
+        /// Run session identifier
+        #[arg(value_name = "SESSION_ID")]
+        session_id: String,
+
+        /// Maximum newest transaction groups to list (default: 100)
+        #[arg(long, value_name = "N", conflicts_with = "all")]
+        limit: Option<usize>,
+
+        /// List every retained transaction group
+        #[arg(long)]
+        all: bool,
+
+        /// Emit a one-line machine-readable JSON manifest
+        #[arg(long)]
+        json: bool,
+    },
+    /// Rewind an inactive run session to a retained history sequence
+    Revert {
+        /// Run session identifier
+        #[arg(value_name = "SESSION_ID")]
+        session_id: String,
+
+        /// Complete history sequence to restore
+        #[arg(long, value_name = "SEQ", required = true)]
+        to: i64,
+
+        /// Emit a one-line machine-readable JSON manifest
         #[arg(long)]
         json: bool,
     },

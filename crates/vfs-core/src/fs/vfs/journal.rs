@@ -1,7 +1,7 @@
 use serde::Serialize;
 use serde_json::{json, Value as JsonValue};
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use turso::transaction::{Transaction, TransactionBehavior};
@@ -29,6 +29,15 @@ const JOURNAL_PIN_INSERT_ROWS: usize = 128;
 pub(crate) struct JournalCtx {
     enabled: bool,
     next_seq: Arc<AtomicI64>,
+    /// Whether this opener has already durably marked history invalid.
+    ///
+    /// With the kill switch on, the first mutating commit writes
+    /// `history_valid=0` in the same transaction as the mutation it fails to
+    /// journal, so the gap is detectable even after a crash. Maintenance
+    /// opens that mutate nothing (snapshot reads, staged reverts) leave a
+    /// valid history valid. Set only after a successful commit so a failed
+    /// one retries the marker.
+    invalidated: Arc<AtomicBool>,
 }
 
 impl JournalCtx {
@@ -36,6 +45,7 @@ impl JournalCtx {
         Self {
             enabled,
             next_seq: Arc::new(AtomicI64::new(0)),
+            invalidated: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -419,6 +429,19 @@ impl<'conn> MutationTxn<'conn> {
             journal,
             records,
         } = self;
+        let marks_history_invalid =
+            !journal.enabled && !journal.invalidated.load(Ordering::Acquire);
+        if marks_history_invalid {
+            // Every MutationTxn mutates replayable scope, so this commit is
+            // exactly the unjournaled gap the durable epoch contract must
+            // record. Committed atomically with the mutation itself.
+            txn.execute(
+                "INSERT INTO fs_config (key, value) VALUES ('history_valid', '0')
+                 ON CONFLICT(key) DO UPDATE SET value = '0'",
+                (),
+            )
+            .await?;
+        }
         if journal.enabled && !records.is_empty() {
             let hint = journal.next_seq.load(Ordering::Acquire);
             let mut txn_id = if hint > 0 {
@@ -498,6 +521,9 @@ impl<'conn> MutationTxn<'conn> {
             journal.next_seq.store(last + 1, Ordering::Release);
         }
         txn.commit().await?;
+        if marks_history_invalid {
+            journal.invalidated.store(true, Ordering::Release);
+        }
         Ok(())
     }
 

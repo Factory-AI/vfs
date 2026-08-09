@@ -26,6 +26,7 @@ struct VersionFeatures {
     seed: bool,
     adopt: bool,
     branch: bool,
+    history: bool,
 }
 
 /// Print the build version and supported handoff capabilities.
@@ -42,6 +43,7 @@ pub fn handle_version_command(stdout: &mut impl Write, json: bool) -> Result<()>
             seed: true,
             adopt: true,
             branch: cfg!(unix),
+            history: cfg!(unix),
         },
     };
 
@@ -76,5 +78,6 @@ mod tests {
         assert_eq!(value["features"]["seed"], true);
         assert_eq!(value["features"]["adopt"], true);
         assert_eq!(value["features"]["branch"], cfg!(unix));
+        assert_eq!(value["features"]["history"], cfg!(unix));
     }
 }

@@ -165,14 +165,14 @@ struct PreparedSession {
     start_state: StartState,
 }
 
-fn session_paths(home: &Path, session_id: &str) -> Result<SessionPaths> {
+pub(crate) fn session_paths(home: &Path, session_id: &str) -> Result<SessionPaths> {
     if !VfsOptions::validate_agent_id(session_id) {
         return Err(InvalidRunSession::new(format!("invalid session ID: {session_id}")).into());
     }
     Ok(SessionPaths::new(home, session_id))
 }
 
-fn read_session_base_path(paths: &SessionPaths) -> Result<PathBuf> {
+pub(crate) fn read_session_base_path(paths: &SessionPaths) -> Result<PathBuf> {
     let raw = std::fs::read_to_string(&paths.base_path_file).map_err(|error| {
         InvalidRunSession::new(format!(
             "invalid session {}: failed to read {}: {error}",
@@ -253,6 +253,7 @@ fn prepare_session(
     };
 
     crate::cmd::pack::recover_interrupted_publication(&paths.db_path)?;
+    crate::cmd::revert::recover_interrupted_publication(&paths.db_path)?;
     if !existed {
         std::fs::write(
             &paths.base_path_file,
@@ -400,6 +401,7 @@ pub async fn handle_status_command(
         match crate::cmd::session_lock::SessionLock::try_exclusive(&paths.run_dir) {
             Ok(lock) => {
                 crate::cmd::pack::recover_interrupted_publication(&paths.db_path)?;
+                crate::cmd::revert::recover_interrupted_publication(&paths.db_path)?;
                 if !paths.db_path.is_file() {
                     return Err(
                         InvalidRunSession::new(format!("session not found: {session_id}")).into(),

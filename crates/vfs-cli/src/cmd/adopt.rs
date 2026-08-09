@@ -79,6 +79,7 @@ async fn adopt_session(
             }
         })?;
     super::pack::recover_interrupted_publication(&db_path)?;
+    super::revert::recover_interrupted_publication(&db_path)?;
     if db_path.is_file() {
         bail!("session already exists: {}", session_dir.display());
     }

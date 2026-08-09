@@ -101,6 +101,7 @@ pub(crate) async fn seed_session(
     let (base_path, publish_base_path) = resolve_base_path(&paths, requested_base_path)?;
     let db_path = paths.db_path.clone();
     recover_interrupted_publication(&db_path)?;
+    super::revert::recover_interrupted_publication(&db_path)?;
     if !db_path.is_file() && !create_database {
         bail!("session database not found: {}", db_path.display());
     }
@@ -157,6 +158,11 @@ pub(crate) async fn seed_session(
     vfs.record_seed_state(&seeded_paths, &whiteout_db_paths, &plan.pin)
         .await
         .context("Failed to record seed metadata")?;
+    if vfs.history_status().await?.valid {
+        vfs.capture_root("seed")
+            .await
+            .context("Failed to capture seeded history provenance")?;
+    }
     vfs.fs
         .finalize()
         .await

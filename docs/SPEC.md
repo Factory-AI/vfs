@@ -1178,9 +1178,12 @@ walk from inode 1.
 The journaling kill switch is recorded durably, not inferred from the current
 environment:
 
-- the first writable open with journaling disabled changes
-  `history_valid` from `1` to `0`;
-- later disabled opens do not rewrite the marker;
+- the first mutation committed with journaling disabled changes
+  `history_valid` from `1` to `0`, in the same transaction as the mutation it
+  fails to journal; later unjournaled mutations do not rewrite the marker;
+- opens that mutate nothing never change the marker, so maintenance
+  operations (snapshot reads, staged reconstruction) under a disabled journal
+  leave a valid history valid;
 - read-only opens never change history markers;
 - the first writable open after journaling is re-enabled increments
   `history_epoch`, removes the stale journal, pins, and snapshots, captures an
