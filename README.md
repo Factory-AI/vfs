@@ -322,9 +322,11 @@ One Cargo workspace, five crates:
 
 **Linux is first-tier** (FUSE and NFS backends, `vfs run` sandbox, full
 validation gate). **macOS is second-tier**: NFS mount plus a sandboxed `vfs
-run` (Seatbelt with default-deny read scoping), validated by a manual release
-gate on real hardware — see [docs/TESTING.md](docs/TESTING.md). No other
-platforms are supported.
+run` (Seatbelt with default-deny read scoping). CI exercises the macOS
+runtime for real — the NFS mount path, the Seatbelt read-scoping check, and
+the remote-tier suites all run on macos-latest — leaving a short list of
+Seatbelt spot-checks to real hardware; see
+[docs/TESTING.md](docs/TESTING.md). No other platforms are supported.
 
 ## Getting started
 
@@ -445,7 +447,7 @@ looks fine and is quietly wrong.
 - **[User Manual](docs/MANUAL.md)** — complete CLI reference (generation-checked against the binary)
 - **[Agent Filesystem Specification](docs/SPEC.md)** — SQLite schema and runtime invariants
 - **[Runtime Knobs](docs/KNOBS.md)** — generated ledger of every tunable
-- **[Testing](docs/TESTING.md)** — validation gates, benchmark policy, manual macOS release gate
+- **[Testing](docs/TESTING.md)** — validation gates, benchmark policy, the macOS runtime gate
 - **[AGENTS.md](AGENTS.md)** — working contract for changing this repo
 - **[CHANGELOG](CHANGELOG.md)** — fork-era summary
 - **[Turso](https://github.com/tursodatabase/turso)** — the in-process SQL database Vfs builds on

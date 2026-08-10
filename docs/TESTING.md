@@ -1,8 +1,8 @@
 # Testing Vfs
 
 Linux is the first-tier platform: every gate below runs on Linux. macOS is
-second-tier (NFS mount only) and is covered by the manual release gate at the
-end of this document.
+second-tier (NFS mount only); its CI job and the remaining manual
+spot-checks are at the end of this document.
 
 ## The honest gate: `scripts/gate.sh`
 
@@ -49,21 +49,20 @@ once in `gate-binary` and fans it out as an artifact to four `gate-shell`
 shards and one `gate-python` job (`--phases python,canon` plus pjdfstest
 `phase5-ci`). Sharing one prebuilt binary keeps the release build off every
 shard's critical path, and the cargo phase is not repeated there because the
-workspace job already covers fmt, clippy, and the workspace tests.
+workspace job already covers fmt, clippy, and the workspace tests. A
+separate `macos-runtime` job builds its own release binary and runs the
+macOS runtime gates described at the end of this document.
 The gate jobs first set `kernel.apparmor_restrict_unprivileged_userns=0` so
 the `vfs run` suites exercise the sandbox instead of skipping on the
 Ubuntu 24.04 runner image. FUSE-over-io_uring coverage stays local-only: the
-CI kernel exposes `/sys/module/fuse/parameters/enable_uring` but ships it
-disabled (`N`), so the kernel refuses ring registration, the panic-census
-uring leg can never run there, and the gate job allowlists that one skip with
-`VFS_GATE_ALLOWED_SKIPS=fuse-sigint-panic-census`. The
-`corruption-torture-uring` leg needs no allowlist entry: with `enable_uring=N`
-the mount falls back to the legacy channel (the fallback is logged at INFO)
-and the leg passes, exercising uring only on kernels that enable it. A
-"starting fuse-over-io_uring queues" line in CI logs therefore does not mean
-uring served requests; it precedes kernel acceptance of the ring
-registration. The uring legs are honest only on a local machine whose kernel
-sets `enable_uring=Y`.
+CI kernel ships `/sys/module/fuse/parameters/enable_uring` disabled, so the
+panic-census uring leg can never run there and the gate job allowlists that
+one skip (`VFS_GATE_ALLOWED_SKIPS=fuse-sigint-panic-census`). The
+`corruption-torture-uring` leg needs no entry: with uring disabled the mount
+falls back to the legacy channel and the leg passes. A "starting
+fuse-over-io_uring queues" log line precedes kernel acceptance of the ring
+registration and does not mean uring served requests; the uring legs are
+honest only on a kernel with `enable_uring=Y`.
 
 ## Workspace tests and generated-docs parity
 
@@ -140,6 +139,12 @@ hollow containment across pack/branch/revert/checkpoint/backup,
 pack-after-materialize closing the loop onto a third machine, adopt refusals
 (missing configuration, corrupted metadata, future artifact version), and
 the streamer's empty-body guard. Run it the same way, substituting its path.
+
+Both remote suites are platform-gated rather than Linux-only: on macOS they
+run over the NFS mount path (CI runs them on macos-latest), with the
+live-checkpoint and streamer legs guarded to Linux because the session
+control socket and the background streamer exist only in the Linux mount
+owner.
 
 ## Python validation gates
 
@@ -438,13 +443,20 @@ their contents depend on an external base tree; use `backup --materialize`
 or `vfs materialize` first, and audit the dependency with
 `vfs integrity --require-portable --check-base`.
 
-## macOS: second-tier platform and the manual release gate
+## macOS: second-tier platform and its gates
 
 macOS support is explicitly second-tier: mounting uses the NFS backend only
 (no FUSE, no `vfs ps`), and NFS protocol semantics are validated by cargo
-protocol/unit tests on Linux. There is no macOS coverage in the automated
-gate, so the macOS NFS git validation script is a **manual release gate**: it
-must be run on real macOS hardware before a release is cut.
+protocol/unit tests on Linux. Runtime behavior runs in CI in the
+`macos-runtime` job on macos-latest: it builds the release binary, puts GNU
+coreutils' gnubin on PATH (the suites use `sha256sum` and `truncate`), runs
+`scripts/validation/macos-nfs-git-validation.sh`, then runs
+`test-remote-checkpoint-e2e.sh` and `test-remote-adopt-e2e.sh` over the NFS
+mount path. `/sbin/mount_nfs` mounts the session's loopback NFS server
+unprivileged, so no step needs sudo, and a suite `SKIP:` line fails the
+step — a runner that cannot run these legs goes red instead of green.
+
+The validation script runs locally the same way:
 
 ```bash
 cargo +nightly build --release --workspace --bins
@@ -453,28 +465,28 @@ scripts/validation/macos-nfs-git-validation.sh \
 ```
 
 The harness is temp-directory scoped, initializes a fresh Vfs database,
-mounts it with `vfs mount --backend nfs`, then runs `git init`,
-`git add`, `git commit`, and `git fsck --strict`, and verifies at least one
-loose object was written. It then verifies the `vfs run` Seatbelt
-read-scoping posture: a secret file in an unallowed directory under `$HOME`
-must be unreadable from inside the sandbox (permission error, no content
-leak), and re-running with `--allow <dir>` must make it readable. The
-generated profile itself is pinned by macOS-gated unit tests
-(`cmd::run::tests::darwin_read_scoping`) that run in the CI macos-latest
-workspace job; this script is the runtime check. A passing run ends with
+mounts it with `vfs mount --backend nfs`, runs `git init`, `git add`,
+`git commit`, and `git fsck --strict`, and verifies at least one loose
+object was written. It then verifies the `vfs run` Seatbelt read-scoping
+posture: a secret file in an unallowed directory under `$HOME` must be
+unreadable from inside the sandbox (permission error, no content leak), and
+re-running with `--allow <dir>` must make it readable. The generated profile
+itself is pinned by macOS-gated unit tests
+(`cmd::run::tests::darwin_read_scoping`) in the macos-latest workspace job;
+this script is the runtime check. A passing run ends with
 `macOS NFS git + run read-scoping validation passed`. Unsupported platforms
 or missing prerequisites exit `77`; on Linux that skip is expected, not a
-failure. A release SHOULD NOT ship without a passing run of this script on
-real hardware.
+failure. Launching git and `/bin/bash` under the sandbox in these CI legs
+also exercises the `/System/Volumes/Preboot` metadata literal that lets
+path resolution reach the dyld cryptex root, which used to be a manual
+spot-check.
 
-Beyond the script, the manual hardware run must also confirm three behaviors
-the Linux toolchain cannot exercise: dynamic profile paths now travel as
-Seatbelt `(param "NAME")` references with `-D NAME=value` definitions on the
-`/usr/bin/sandbox-exec` command line (spot-check that a session under a
-directory with spaces or quotes in its name still mounts and runs);
-`/System/Volumes/Preboot` has a metadata literal so path resolution down to
-the dyld cryptex root (`/System/Volumes/Preboot/Cryptexes`) can stat every
-component (spot-check that dynamically linked binaries start under the
-sandbox); and `vfs run <missing-command>` must exit `127` (`126` for a
-present but non-executable file), matching `vfs exec` and the Linux run
+What still needs a manual run on real hardware before a release that
+advertises macOS: the rest of the shell suite (CI runs only the two remote
+suites there), and two Seatbelt spot-checks the suites do not reach —
+dynamic profile paths travel as Seatbelt `(param "NAME")` references with
+`-D NAME=value` definitions on the `/usr/bin/sandbox-exec` command line, so
+confirm a session under a directory with spaces or quotes in its name still
+mounts and runs; and `vfs run <missing-command>` must exit `127` (`126` for
+a present but non-executable file), matching `vfs exec` and the Linux run
 path.

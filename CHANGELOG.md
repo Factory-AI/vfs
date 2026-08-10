@@ -145,6 +145,12 @@ pack/adopt manifest fields and reserved exit statuses remain unchanged.
   `revert`, `checkpoint`, and plain `backup` refuse while hollow, and the
   streamer never publishes an empty chunk body. `vfs version --json`
   advertises `features.adoptRemote`.
+- CI now runs the macOS runtime for real: a `macos-runtime` job on
+  macos-latest executes the NFS + Seatbelt validation script (previously a
+  manual hardware gate) and both remote-tier suites over the unprivileged
+  `mount_nfs` path, failing on any suite SKIP. The suites gate per platform;
+  only the live-checkpoint and streamer legs stay Linux-only, because the
+  control socket and streamer exist only in the Linux mount owner.
 
 ### Fixed
 
