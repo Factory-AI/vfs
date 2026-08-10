@@ -132,6 +132,15 @@ background streamer, failure injection against an unwritable remote, and a
 full hydration round trip proving the remote holds everything needed to
 reconstruct. Run it the same way, substituting its path.
 
+`test-remote-adopt-e2e.sh` owns the lazy consumption side: adopt from the
+manifest alone, lazy read and read-modify-write correctness against the
+origin bytes, explicit failure (never zeros) when the remote is unreachable,
+hollow containment across pack/branch/revert/checkpoint/backup,
+`materialize --in-place` hydration with sidecar removal and idempotence,
+pack-after-materialize closing the loop onto a third machine, adopt refusals
+(missing configuration, corrupted metadata, future artifact version), and
+the streamer's empty-body guard. Run it the same way, substituting its path.
+
 ## Python validation gates
 
 All harnesses take `--vfs-bin` (or `VFS_BIN`); build a release binary

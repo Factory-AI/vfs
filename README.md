@@ -140,14 +140,52 @@ with `VFS_REMOTE_URL` set, a background streamer uploads chunk objects ahead
 of time so the explicit checkpoint has less left to ship; it never touches
 the manifest, so consistency points stay the ones you asked for.
 
-The metadata artifact is a wire shape, not a live database: every writable
-open refuses it, `vfs integrity` names its state, `--require-portable` fails
-it, and `vfs backup` rejects it. Branch sessions fold their parent chain
-before upload, so the remote stays branch-agnostic like `pack`. Encrypted
-sessions refuse to checkpoint — shipping plaintext chunks from an
-at-rest-encrypted database would quietly undo the encryption. A lazy
-`vfs adopt --remote` that installs directly from this tier is the next
-planned phase.
+The metadata artifact is a wire shape, not a live database: a writable open
+refuses it unless a chunk source backs it (which is exactly what
+`adopt --remote` arranges below), `vfs integrity` names its state,
+`--require-portable` fails it, and `vfs backup` rejects it. Branch sessions
+fold their parent chain before upload, so the remote stays branch-agnostic
+like `pack`. Encrypted sessions refuse to checkpoint — shipping plaintext
+chunks from an at-rest-encrypted database would quietly undo the encryption.
+
+## Adopting from the remote tier
+
+`vfs adopt --remote` installs a session directly from the checkpoint tier —
+no artifact file changes hands. It fetches the manifest, verifies the
+metadata artifact against the recorded SHA-256, migrates it forward, checks
+the receiver's checkout against the seed pin, and publishes with the same
+single rename every adopt uses. What lands is *lazy*: metadata is all local,
+chunk bytes stay remote, and the first read of each chunk fetches it by
+digest, BLAKE3-verifies it, and caches it in the database.
+
+```console
+# --- receiver: a checkout at the session's seed pin -----------------------
+$ export VFS_REMOTE_URL="file:///tmp/vfs-remote"
+$ vfs adopt remote-demo --remote --base ~/src/checkout
+{"manifestVersion":1,"sessionId":"remote-demo",…,"remote":true}
+
+$ vfs run --session remote-demo -- sha256sum data.bin   # faults the file's chunks
+ba09e4…  data.bin
+```
+
+Adopt records the remote's URL in the session store, so resumed runs fault
+against the same tier without any environment — `VFS_REMOTE_URL` stays a
+checkpoint-side knob. A read that cannot reach the remote fails loudly with
+an I/O error; you never get silent zeros. The session is fully usable while
+lazy — partial writes and truncations fetch the chunks they modify — but it
+cannot leave the machine in that state: `pack`, `branch`, `revert`,
+`checkpoint`, and `backup` all refuse until the remote dependency is gone:
+
+```console
+$ vfs materialize remote-demo --in-place
+Hydrated chunks: 4
+$ vfs pack remote-demo --output /tmp/artifact.db   # now succeeds
+```
+
+Materializing in place fetches every remaining chunk in one all-or-nothing
+transaction, drops the recorded remote, and re-verifies integrity; run it
+twice and the second pass is a no-op. `backup --materialize` and
+`materialize --output` do the same for copies.
 
 ## Why it's a database
 

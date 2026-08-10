@@ -9,7 +9,9 @@ offline `vfs revert` publishes a checked reconstruction back over a session.
 The same content-addressed store now extends off the machine: `vfs checkpoint`
 publishes sessions to S3-compatible object storage as chunk objects plus a
 hollowed metadata artifact, replacing the turso page-level sync family as the
-one replication mechanism.
+one replication mechanism, and `vfs adopt --remote` installs directly from
+that tier as a lazy session whose reads fault chunks by digest until
+`vfs materialize --in-place` cuts the dependency.
 The database and artifact schema advances through v0.7 content addressing to
 v0.8 replay history. `artifactVersion` changes from `0.7` to `0.8`; `adopt`
 migrates supported older artifacts forward automatically, while existing
@@ -112,12 +114,37 @@ pack/adopt manifest fields and reserved exit statuses remain unchanged.
   checkpoints when the remote is configured
   (`VFS_REMOTE_STREAM_INTERVAL_MS`, 0 disables). It never writes the
   manifest, keeps no persistent state, and dies with the mount.
-- Hollow metadata artifacts are contained like partial-origin state: every
-  writable open refuses them, `integrity` reports `storage.chunks_hollow`,
-  `--require-portable` fails them, and `backup` rejects them. Hydration
-  refills every chunk with per-digest BLAKE3 verification in one
-  transaction. The new chunk byte-vs-digest integrity check applies to
-  every non-hollow database.
+- Hollow metadata artifacts are contained like partial-origin state: a
+  writable open refuses them unless a chunk source backs it, `integrity`
+  reports `storage.chunks_hollow`, `--require-portable` fails them, and
+  plain `backup` rejects them. Hydration refills every chunk with
+  per-digest BLAKE3 verification in one transaction. The chunk
+  byte-vs-digest integrity check verifies every non-empty row, hollow or
+  not.
+- `vfs adopt <SESSION_ID> --remote --base <PATH>` installs a session from
+  the checkpoint tier: manifest GET, session and supported-version checks,
+  metadata GET with exact length and SHA-256 verification, forward
+  migration, manifest-vs-database cross-checks, then the unchanged adopt
+  rename commit. The remote locator is durably recorded in the session
+  store between the base path and the commit, and the adopt JSON gains an
+  additive `"remote":true`.
+- Adopted-remote sessions are lazy: the storage engine resolves every chunk
+  consumer (reads, partial-write read-modify-write, truncate boundaries,
+  chunked-to-inline conversion) through one resolver that fetches missing
+  bytes by digest from the recorded remote, BLAKE3-verifies before use, and
+  backfills as a journal-invisible cache fill. An unreachable remote is an
+  explicit I/O error, never silent zeros. Resumed runs fault from the
+  recorded locator alone; `VFS_REMOTE_URL` stays a checkpoint-side knob.
+- `vfs materialize` now requires exactly one destination: the existing
+  `--output`, or the new `--in-place`, which hydrates an installed session
+  offline under the exclusive lock (or a raw path via `VFS_REMOTE_URL`) in
+  one all-or-nothing transaction, removes the recorded remote locator, and
+  is idempotent. `--output` and `backup --materialize` hydrate hollow
+  inputs before the partial-origin conversion and keep the portable gate;
+  lazy state cannot leave the machine otherwise — `pack`, `branch`,
+  `revert`, `checkpoint`, and plain `backup` refuse while hollow, and the
+  streamer never publishes an empty chunk body. `vfs version --json`
+  advertises `features.adoptRemote`.
 
 ### Fixed
 

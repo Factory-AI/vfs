@@ -1330,18 +1330,25 @@ and refcounts are preserved. It is content-addressed by the SHA-256 of the
 published single-file form, mirroring the whole-artifact contracts used by
 the local artifact store.
 
-The hollow state is a wire shape, not a live database:
+The hollow state is a wire shape with exactly one live exception:
 
-- Every mutation-capable open MUST refuse a hollow database (enforced at the
-  schema gate before any normalization write). Read-only opens remain valid.
-- `integrity` MUST report the state (`storage.chunks_hollow`); portable-mode
-  verification MUST fail it. Chunk byte-vs-digest verification is skipped
-  only while the marker is set; an empty chunk body without the marker is
-  corruption.
-- `backup` MUST refuse a hollow source.
-- Hydration (`hydrate_chunks`) refills every chunk from a `ChunkSource`,
-  verifies each against its digest, and clears the marker in the same
-  transaction; a hollow database becomes a normal database only through it.
+- A mutation-capable open MUST refuse a hollow database unless the opener
+  injects a `ChunkSource` (the lazy-session contract below). The refusal is
+  one open-gate decision; migration and other maintenance normalization MUST
+  preserve the marker rather than refuse, and migrations MUST NOT depend on
+  chunk bytes. Read-only opens remain valid.
+- `integrity` MUST report the state (`storage.chunks_hollow`, counting the
+  rows still empty); portable-mode verification MUST fail it. While the
+  marker is set, non-empty chunk rows MUST still verify against their
+  digests; an empty chunk body without the marker is corruption.
+- `backup` MUST refuse a hollow source unless it materializes
+  (`--materialize` hydrates through the same conversion path as
+  `materialize --output`).
+- Hydration (`hydrate_chunks`) refills every still-empty chunk from a
+  `ChunkSource`, verifies each against its digest, and clears the marker in
+  the same transaction; a hollow database becomes a normal database only
+  through it. The single legitimately zero-length row, the BLAKE3 digest of
+  the empty input, is complete by definition.
 
 ### Checkpoint protocol
 
@@ -1379,7 +1386,46 @@ checkpoint to amortize upload latency. The streamer writes only
 `chunks/<digest>` objects, never the manifest or metadata: explicit
 checkpoints are the only consistency points. Its state MUST be
 reconstructible from the database plus one remote listing — losing it costs
-at most redundant idempotent uploads.
+at most redundant idempotent uploads. The streamer MUST NOT publish an empty
+chunk body: an empty object under a real digest key corrupts the shared
+namespace for every session using the prefix, and the checkpoint command
+MUST refuse a hollow session for the same reason.
+
+### Lazy remote adopt
+
+`vfs adopt --remote` installs a session from the remote tier alone:
+
+1. GET the session manifest; verify the requested session ID and that
+   `artifactVersion` lies within the supported range (a future version MUST
+   refuse with upgrade guidance; an older supported one forward-migrates).
+2. GET the metadata object named by the manifest; verify its exact byte
+   length and SHA-256 before any use.
+3. Stage, integrity-check, and forward-migrate through the ordinary adopt
+   spine (the marker survives migration). Cross-check the manifest's
+   `generation`, `seedPin`, history markers, `headSeq`, and `chunkCount`
+   against the staged database before publication; `chunkBytes` is not
+   locally recomputable from a hollow database and is informational.
+4. Durably record the remote locator in the session store after the base
+   path and before the rename commit: no installed database may exist
+   without the source its reads need. The rename remains the commit point.
+
+The installed session is *lazy*. Every consumer of chunk bytes resolves
+through one canonical path: a non-empty row passes through; an empty row in
+a hollow database fetches by digest from the recorded remote, MUST verify
+BLAKE3 before use, and backfills the row as a cache fill that MUST NOT
+produce journal rows (content-addressed bytes carry no logical state). A
+fetch failure or an empty row with no source MUST surface as an explicit
+read error — never silent zeros. Partial writes and truncations MUST resolve
+the chunks they modify before mutating, so untouched remote bytes are
+preserved. The ambient remote configuration is never consulted at read time;
+the recorded locator is the session's one fault source.
+
+Lazy state cannot leave the machine: `pack`, `branch`, `revert`,
+`checkpoint`, and plain `backup` MUST refuse while the marker is set.
+`materialize --in-place` completes hydration offline under the exclusive
+session lock, removes the recorded locator (the dependency is gone), and is
+idempotent. These refusals are the documented relaxation points if a later
+phase teaches transfer commands to carry lazy state.
 
 ## Revision History
 
