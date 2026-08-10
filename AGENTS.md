@@ -241,10 +241,11 @@ Not regressions — deliberate, documented state. Don't "fix" them by accident.
   `FILE_SYNC`-honest and `NFSPROC3_COMMIT` returns `PROC_UNAVAIL`. Implementing
   it with imperfect verifier semantics reintroduces the data-loss class
   invariant 3 exists to prevent.
-* **`TMPDIR` is overridden process-internally** to contain `turso_core`
-  0.5.3's un-unlinked `tursodb-ephemeral-*` sort-spill files
-  (`vdbe/execute.rs:10096`). The override does not leak into `run`/`exec`
-  children. Remove the workaround only after the upstream unlink fix lands.
+* **turso's min/max optimization only fires on the bare aggregate.**
+  `SELECT MAX(seq)` plans a reverse seek; wrapping it (`COALESCE(MAX(seq),
+  0)`) falls back to a full table scan. The journal-head queries handle the
+  empty-table NULL in Rust for exactly this reason — do not "simplify" it
+  back into SQL.
 * **Benchmarks are a local gate, not CI.** Serialized, median-of-5, fresh
   release build, against a pinned baseline; single runs are noise. Red is a
   per-phase median regression >5% relative *and* >10ms absolute.

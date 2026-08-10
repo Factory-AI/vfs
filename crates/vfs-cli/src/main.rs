@@ -53,10 +53,6 @@ fn exit_with_code(code: i32) -> ! {
 }
 
 fn main() {
-    // Before any threads exist: the TMPDIR override mutates the process
-    // environment (see config::init_private_spill_dir).
-    vfs_cli::config::init_private_spill_dir();
-
     // Diagnostics go to stderr. stdout is a data channel this binary does not
     // own: `run`/`exec` pass the wrapped command's output through it, and
     // `mcp-server` speaks JSON-RPC over it. The fmt layer defaults to stdout,

@@ -12,21 +12,27 @@
 [package]
 edition = "2021"
 name = "turso_sdk_kit"
-version = "0.5.3"
+version = "0.7.2"
 authors = ["the Turso authors"]
-build = false
+build = "build.rs"
 autolib = false
 autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "Turso SDK kit"
+description = "Low-level C ABI for building Turso language bindings. For Rust applications, use the `turso` crate instead."
 readme = "README.md"
 license = "MIT"
 repository = "https://github.com/tursodatabase/turso"
 
 [features]
+default = [
+    "encryption",
+    "pure-rust-crypto",
+]
 encryption = ["turso_core/encryption"]
+fts = ["turso_core/fts"]
+pure-rust-crypto = ["turso_core/pure-rust-crypto"]
 
 [lib]
 name = "turso_sdk_kit"
@@ -57,15 +63,18 @@ version = "0.3.20"
 features = ["env-filter"]
 
 [dependencies.turso_core]
-version = "0.5.3"
+version = "0.7.2"
 features = [
     "conn_raw_api",
     "io_uring",
     "experimental_win_iocp",
 ]
 
+[dependencies.turso_ext]
+version = "0.7.2"
+
 [dependencies.turso_sdk_kit_macros]
-version = "0.5.3"
+version = "0.7.2"
 
 [dev-dependencies.tempfile]
 version = "3.20.0"

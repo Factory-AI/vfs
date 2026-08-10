@@ -59,23 +59,29 @@ const STORAGE_INLINE: i64 = 1;
 const DENTRY_CACHE_MAX_SIZE: usize = 10000;
 const NEGATIVE_DENTRY_CACHE_MAX_SIZE: usize = 10000;
 const FILE_BACKED_MAX_CONNECTIONS: usize = 8;
-const TEMP_STORE_MEMORY_SQL: &str = "PRAGMA temp_store = MEMORY";
 const BUSY_TIMEOUT_SQL: &str = "PRAGMA busy_timeout = 5000";
 const WAL_MODE_SQL: &str = "PRAGMA journal_mode = WAL";
 const BASELINE_SYNCHRONOUS_SQL: &str = "PRAGMA synchronous = NORMAL";
 const DURABLE_SYNCHRONOUS_SQL: &str = "PRAGMA synchronous = FULL";
 const WAL_CHECKPOINT_SQL: &str = "PRAGMA wal_checkpoint(TRUNCATE)";
-const FILE_BACKED_SETUP_SQL: &[&str] = &[
-    TEMP_STORE_MEMORY_SQL,
-    BUSY_TIMEOUT_SQL,
-    WAL_MODE_SQL,
-    BASELINE_SYNCHRONOUS_SQL,
-];
-const READ_ONLY_FILE_BACKED_SETUP_SQL: &[&str] = &[TEMP_STORE_MEMORY_SQL];
-const MEMORY_SETUP_SQL: &[&str] = &[TEMP_STORE_MEMORY_SQL];
+// `PRAGMA temp_store` is deliberately absent from every setup list. Running
+// it (any value) initializes the connection's TEMP database, and with a TEMP
+// pager present every `Statement` drop walks turso 0.7's attached-rollback
+// path, which bumps the prepare-context generation and invalidates all
+// cached prepared statements on the connection — a re-prepare per statement
+// on the hot path. Vfs's statements never materialize temp B-trees, so the
+// TEMP database is best left uninitialized.
+const FILE_BACKED_SETUP_SQL: &[&str] = &[BUSY_TIMEOUT_SQL, WAL_MODE_SQL, BASELINE_SYNCHRONOUS_SQL];
+const READ_ONLY_FILE_BACKED_SETUP_SQL: &[&str] = &[];
+const MEMORY_SETUP_SQL: &[&str] = &[];
 const ATTR_CACHE_MAX_SIZE: usize = 10000;
 
 /// Production connection-pool options for local file-backed Vfs databases.
+///
+/// The engine's WAL auto actions stay enabled: interleaved A/B against the
+/// pre-upgrade baseline showed disabling them regresses the checkout phase
+/// 20-30ms per run (reads pay for the longer un-checkpointed WAL) while
+/// buying nothing on the write path.
 pub(crate) fn file_backed_connection_pool_options() -> PoolOptions {
     PoolOptions {
         max_connections: FILE_BACKED_MAX_CONNECTIONS,

@@ -93,9 +93,9 @@ impl Vfs {
     /// lifecycle barriers are no-ops, so reads and shutdown neither checkpoint
     /// nor remove `-wal`/`-shm` sidecars.
     ///
-    /// Turso 0.5.3 caches databases by canonical path without considering open
-    /// flags. Therefore the same path must never be opened writable in this
-    /// process. Artifact paths passed here must be immutable and
+    /// Turso (verified through 0.7.2) caches databases by file identity
+    /// without considering open flags. Therefore the same path must never be
+    /// opened writable in this process. Artifact paths passed here must be immutable and
     /// digest-addressed, and this API must be their only in-process open path.
     pub async fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();

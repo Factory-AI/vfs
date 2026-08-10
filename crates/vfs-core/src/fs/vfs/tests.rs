@@ -1824,7 +1824,10 @@
                 TURSO_OBSERVED_SYNCHRONOUS_NORMAL
             );
             assert_eq!(read_pragma_i64(conn, "PRAGMA busy_timeout").await, 5000);
-            assert_eq!(read_pragma_i64(conn, "PRAGMA temp_store").await, 2);
+            // DEFAULT (0), not MEMORY: setting temp_store initializes the
+            // TEMP database, whose pager makes every statement drop bump the
+            // prepare-context generation (see the setup-SQL comment in mod.rs).
+            assert_eq!(read_pragma_i64(conn, "PRAGMA temp_store").await, 0);
             assert_eq!(
                 read_pragma_text(conn, "PRAGMA journal_mode")
                     .await
@@ -1841,7 +1844,10 @@
         let options = file_backed_connection_pool_options();
 
         assert_eq!(options.max_connections, FILE_BACKED_MAX_CONNECTIONS);
-        assert_eq!(options.setup_sql[0], TEMP_STORE_MEMORY_SQL);
+        assert!(!options
+            .setup_sql
+            .iter()
+            .any(|sql| sql.contains("temp_store")));
         assert!(options.setup_sql.iter().any(|sql| sql == BUSY_TIMEOUT_SQL));
         assert!(options.setup_sql.iter().any(|sql| sql == WAL_MODE_SQL));
         assert!(options
@@ -1855,16 +1861,21 @@
     }
 
     #[tokio::test]
-    async fn test_memory_vfs_connections_use_temp_store_memory() -> Result<()> {
+    async fn test_connections_leave_temp_store_at_default() -> Result<()> {
+        // Any `PRAGMA temp_store` assignment initializes the connection's
+        // TEMP database, and a live TEMP pager makes every statement drop
+        // bump the prepare-context generation — invalidating all cached
+        // prepared statements on the connection (a re-prepare per statement
+        // on the hot path). No pool may set it.
         let vfs = crate::Vfs::open(crate::VfsOptions::ephemeral()).await?;
 
         let conn = vfs.get_connection().await?;
-        assert_eq!(read_pragma_i64(&conn, "PRAGMA temp_store").await, 2);
+        assert_eq!(read_pragma_i64(&conn, "PRAGMA temp_store").await, 0);
         drop(conn);
 
         let core_vfs = Vfs::new(":memory:").await?;
         let core_conn = core_vfs.pool.get_connection().await?;
-        assert_eq!(read_pragma_i64(&core_conn, "PRAGMA temp_store").await, 2);
+        assert_eq!(read_pragma_i64(&core_conn, "PRAGMA temp_store").await, 0);
 
         Ok(())
     }

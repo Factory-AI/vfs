@@ -83,9 +83,6 @@ pub async fn handle_exec_command(
 
     let mut child = tokio::process::Command::new(&command);
     child.args(&args).current_dir(&mountpoint);
-    // The CLI's private spill dir is process-internal; children keep the
-    // user's TMPDIR.
-    crate::config::restore_original_tmpdir(&mut child);
     let status = run_supervised(mount_handle, child).await;
 
     let _ = std::fs::remove_dir_all(&mountpoint);

@@ -1,5 +1,51 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- The bundled turso storage engine advances from 0.5.3 to 0.7.2 (`turso`,
+  `turso_sdk_kit`, `turso_core`), picking up two releases of upstream
+  corruption fixes (WAL frame-cache slot reuse, page-spill frame reuse,
+  nonblocking `read_page` race, WAL-header init ordering). The vendored
+  read-only open patch is re-applied onto 0.7.2; upstream's Rust SDK still
+  has no read-only open mode, and immutable parent artifacts must never be
+  opened writable. Default features are trimmed to `mimalloc` (the 0.5-era
+  allocator, unchanged); the new `fts`/tantivy default stays out of the
+  build. No experimental engine feature (MVCC, multiprocess WAL) is enabled:
+  session liveness stays derived from Vfs's own advisory locks.
+- `turso_core` joins `turso` and `turso_sdk_kit` as a vendored tree, carrying
+  one patch: `Statement` drop no longer invalidates the connection's
+  prepared-statement cache. Upstream 0.6+ bumps the prepare-context
+  generation on every statement drop once the TEMP database exists — and
+  `BEGIN IMMEDIATE` initializes TEMP on every writer connection — so each
+  of a clone workload's ~89,000 statements re-prepared from scratch, the
+  bulk of a 40%+ git-clone CPU regression against 0.5.3. With the patch the
+  workload re-prepares zero statements and the clone runs ~15-20% less CPU
+  than the 0.5.3 baseline (interleaved A/B, CPU time, verified clones).
+  Details in `third_party/turso_core/PATCHES.md`.
+- The vendored SDK caches one-shot `execute`/`query` statements per
+  connection (bounded at 512 entries; PRAGMAs exempt), removing 0.7's
+  higher fresh-prepare cost from hot write and journal statements.
+- `PRAGMA temp_store = MEMORY` is gone from connection setup. Any
+  `temp_store` assignment initializes the TEMP database eagerly, Vfs's
+  statements never materialize temp B-trees, and the engine since 0.6 wraps
+  spill files in self-cleaning temp handles.
+
+### Removed
+
+- The private `TMPDIR` sort-spill override, its `SIGKILL` reaper, and the
+  child-environment restoration in `run`/`exec`/`init -c` spawn paths.
+  turso 0.6.0 fixed the `tursodb-ephemeral-*` unlink leak the machinery
+  contained; children now simply inherit the ambient `TMPDIR`.
+
+### Changed (internal)
+
+- Journal-head queries are spelled `SELECT MAX(seq)` again: turso 0.6.0's
+  min/max optimization plans the bare aggregate as a reverse seek. The
+  empty-journal NULL is handled in Rust because wrapping the aggregate
+  (`COALESCE`) defeats the optimization.
+
 ## [1.1.0] - 2026-08-10 - Replayable history, session branching, and the remote tier
 
 This release builds one time-travel path from content-addressed storage through

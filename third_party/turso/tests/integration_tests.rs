@@ -1504,22 +1504,62 @@ async fn test_lost_updates() {
     );
 }
 
+#[tokio::test]
+async fn test_busy_timeout_pragma_does_not_wait_on_unrelated_writer() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("busy-timeout-pragma.db");
+    let db = Builder::new_local(db_path.to_str().unwrap())
+        .build()
+        .await
+        .unwrap();
+    let writer = db.connect().unwrap();
+    let reader = db.connect().unwrap();
+
+    writer
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER)", ())
+        .await
+        .unwrap();
+    writer
+        .execute("INSERT INTO t VALUES(1, 10)", ())
+        .await
+        .unwrap();
+
+    writer.execute("BEGIN", ()).await.unwrap();
+    writer
+        .execute("UPDATE t SET val = 20 WHERE id = 1", ())
+        .await
+        .unwrap();
+
+    let visible_before_commit = query_i64(&reader, "SELECT val FROM t WHERE id = 1").await;
+    assert_eq!(visible_before_commit, 10);
+
+    tokio::time::timeout(
+        Duration::from_millis(250),
+        reader.execute("PRAGMA busy_timeout = 30000", ()),
+    )
+    .await
+    .expect("busy_timeout pragma should not block on another connection's write txn")
+    .unwrap();
+
+    let visible_after_pragma = query_i64(&reader, "SELECT val FROM t WHERE id = 1").await;
+    assert_eq!(visible_after_pragma, 10);
+
+    writer.execute("COMMIT", ()).await.unwrap();
+
+    let visible_after_commit = query_i64(&reader, "SELECT val FROM t WHERE id = 1").await;
+    assert_eq!(visible_after_commit, 20);
+}
+
 /// Helper: create MVCC-enabled file-backed database with given schema
 async fn setup_mvcc_db(schema: &str) -> (turso::Database, tempfile::TempDir) {
-    setup_mvcc_db_with_options(schema, false).await
+    setup_mvcc_db_with_options(schema).await
 }
 
 /// Helper: create MVCC-enabled file-backed database with options
-async fn setup_mvcc_db_with_options(
-    schema: &str,
-    triggers: bool,
-) -> (turso::Database, tempfile::TempDir) {
+async fn setup_mvcc_db_with_options(schema: &str) -> (turso::Database, tempfile::TempDir) {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let mut builder = Builder::new_local(db_path.to_str().unwrap());
-    if triggers {
-        builder = builder.experimental_triggers(true);
-    }
+    let builder = Builder::new_local(db_path.to_str().unwrap());
     let db = builder.build().await.unwrap();
     let conn = db.connect().unwrap();
     // PRAGMA journal_mode returns a row, so use query() to consume it
@@ -1755,37 +1795,123 @@ async fn test_ghost_commits() {
     }
 }
 
-/// AUTOINCREMENT is not supported in MVCC mode. Verify that CREATE TABLE
-/// with AUTOINCREMENT fails with a clear error message.
+/// AUTOINCREMENT is supported in MVCC mode via the sequence-backed
+/// implementation: each AUTOINCREMENT table implicitly creates a
+/// `__turso_internal_seq___turso_internal_autoincrement_<table>` backing
+/// table, and rowid allocation goes through the shared Sequence atomic so
+/// concurrent inserts don't conflict on `sqlite_sequence`. Verify CREATE
+/// TABLE with AUTOINCREMENT succeeds and assigns monotonic rowids.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_autoincrement_blocked_in_mvcc() {
+async fn test_autoincrement_works_in_mvcc() {
     let (db, _dir) = setup_mvcc_db("").await;
     let conn = db.connect().unwrap();
 
-    // CREATE TABLE with AUTOINCREMENT should fail
-    let result = conn
-        .execute(
-            "CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)",
-            (),
-        )
-        .await;
-    assert!(
-        result.is_err(),
-        "CREATE TABLE with AUTOINCREMENT should fail in MVCC mode"
-    );
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("AUTOINCREMENT is not supported in MVCC mode"),
-        "unexpected error: {err}"
-    );
+    conn.execute(
+        "CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)",
+        (),
+    )
+    .await
+    .unwrap();
+    conn.execute("INSERT INTO t(b) VALUES ('one')", ())
+        .await
+        .unwrap();
+    conn.execute("INSERT INTO t(b) VALUES ('two')", ())
+        .await
+        .unwrap();
 
-    // Regular tables without AUTOINCREMENT should still work
-    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT)", ())
+    let max = query_i64(&conn, "SELECT MAX(a) FROM t").await;
+    assert_eq!(max, 2, "AUTOINCREMENT must assign monotonic rowids");
+}
+
+#[tokio::test]
+async fn test_invalid_transaction_state_on_rows_drop() {
+    const SQL_CREATE: &str = "
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO t(v) VALUES (1), (2), (3);";
+    const SQL_QUERY: &str = "SELECT v FROM t;";
+    let mut conn = turso::Builder::new_local(":memory:")
+        .build()
+        .await
+        .unwrap()
+        .connect()
+        .unwrap();
+    conn.execute_batch(SQL_CREATE).await.unwrap();
+    let tx = conn.transaction().await.unwrap();
+    let mut stmt = tx.prepare(SQL_QUERY).await.unwrap();
+    let mut rows = stmt.query(()).await.unwrap();
+    let _first = rows.next().await.unwrap();
+    drop(rows);
+    drop(stmt);
+    tx.commit().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_invalid_transaction_state_on_rows_drop_mvcc() {
+    const SQL_CREATE: &str = "
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO t(v) VALUES (1), (2), (3);";
+    const SQL_QUERY: &str = "SELECT v FROM t;";
+    let (db, _dir) = setup_mvcc_db(SQL_CREATE).await;
+    let mut conn = db.connect().unwrap();
+    let tx = conn.transaction().await.unwrap();
+    let mut stmt = tx.prepare(SQL_QUERY).await.unwrap();
+    let mut rows = stmt.query(()).await.unwrap();
+    let _first = rows.next().await.unwrap();
+    drop(rows);
+    drop(stmt);
+    tx.commit().await.unwrap();
+}
+
+#[cfg(all(unix, target_pointer_width = "64"))]
+#[tokio::test]
+async fn test_multiprocess_wal_second_process_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("multiprocess-second-open.db");
+    let db_path_str = db_path.to_str().unwrap();
+
+    let db = Builder::new_local(db_path_str)
+        .experimental_multiprocess_wal(true)
+        .build()
         .await
         .unwrap();
-    conn.execute("INSERT INTO t VALUES (1, 'hello')", ())
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE test (x INTEGER)", ())
         .await
         .unwrap();
-    let count = query_i64(&conn, "SELECT COUNT(*) FROM t").await;
-    assert_eq!(count, 1);
+    conn.execute("INSERT INTO test (x) VALUES (1)", ())
+        .await
+        .unwrap();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let child_output = std::process::Command::new(&current_exe)
+        .arg("multiprocess_wal_second_open_child_process")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .output()
+        .unwrap();
+    let child_stdout = String::from_utf8_lossy(&child_output.stdout);
+    assert!(
+        child_output.status.success() && child_stdout.contains("1 passed"),
+        "second multiprocess open must succeed in a child process: stdout={child_stdout}; stderr={}",
+        String::from_utf8_lossy(&child_output.stderr)
+    );
+}
+
+#[cfg(all(unix, target_pointer_width = "64"))]
+#[tokio::test]
+async fn multiprocess_wal_second_open_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+
+    let db = Builder::new_local(db_path.to_str().unwrap())
+        .experimental_multiprocess_wal(true)
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+    let mut rows = conn.query("SELECT count(*) FROM test", ()).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get_value(0).unwrap(), Value::Integer(1));
 }

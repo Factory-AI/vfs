@@ -62,9 +62,10 @@ RUST_TOOLCHAIN="${RUST_TOOLCHAIN:-${PINNED_TOOLCHAIN:-nightly}}"
 SHELL_TIMEOUT="${VFS_GATE_SHELL_TIMEOUT:-900}"
 PHASE8_TIMEOUT="${VFS_GATE_PHASE8_TIMEOUT:-20}"
 
-# Pin TMPDIR to a per-run scratch dir cleaned on exit: turso_core 0.5.3 leaks
-# /tmp/tursodb-ephemeral-* sort-spill files (vdbe/execute.rs:10096 never
-# unlinks them), so dependency litter must not accumulate on the host.
+# Pin TMPDIR to a per-run scratch dir cleaned on exit: gate legs and their
+# dependencies write temp state, and any litter one leg leaves (or a
+# dependency regression starts leaving) must die with the run instead of
+# accumulating on the host.
 GATE_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/vfs-gate.XXXXXX")"
 trap 'rm -rf "$GATE_TMPDIR"' EXIT
 export TMPDIR="$GATE_TMPDIR" TMP="$GATE_TMPDIR" TEMP="$GATE_TMPDIR"

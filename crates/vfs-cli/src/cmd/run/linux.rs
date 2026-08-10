@@ -1339,10 +1339,6 @@ fn exec_command(command: PathBuf, args: Vec<String>, session_id: &str) -> ! {
 
 /// Setup environment variables for the sandbox.
 fn setup_env_vars(session_id: &str) {
-    // The parent CLI overrode TMPDIR with its private spill dir; the
-    // sandboxed command must see the user's TMPDIR instead (inside the
-    // namespace /tmp is a fresh scoping tmpfs anyway).
-    crate::config::restore_original_tmpdir_env();
     std::env::set_var("VFS", "1");
     std::env::set_var("VFS_SANDBOX", "linux-namespace");
     std::env::set_var("VFS_SESSION", session_id);

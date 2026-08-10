@@ -572,25 +572,29 @@ impl<'conn> MutationTxn<'conn> {
 /// commit path free of allocator-table writes, which dirtied an extra B-tree
 /// page on every mutating commit and dominated clone-workload overhead.
 async fn next_txn_id(conn: &Connection) -> Result<i64> {
-    // Expressed as a reverse PK walk because turso 0.5.3 evaluates
-    // `MAX(seq)` with a full table scan, which made commit cost grow with
-    // journal length.
+    // Bare `MAX(seq)` only: turso's min/max optimization plans it as a
+    // reverse seek, but wrapping it (e.g. `COALESCE(MAX(seq), 0)`) falls
+    // back to a full table scan, so the NULL of an empty journal is handled
+    // here instead of in SQL.
     let mut stmt = conn
-        .prepare_cached("SELECT seq FROM fs_op_journal ORDER BY seq DESC LIMIT 1")
+        .prepare_cached("SELECT MAX(seq) FROM fs_op_journal")
         .await?;
     let mut rows = stmt.query(()).await?;
-    Ok(match rows.next().await? {
-        Some(row) => row
-            .get_value(0)
-            .ok()
-            .and_then(|value| value.as_integer().copied())
-            .ok_or_else(|| {
-                Error::Internal("journal txn_id derivation returned no value".to_string())
-            })?
-            .checked_add(1)
-            .ok_or_else(|| Error::Internal("journal seq overflow".to_string()))?,
-        None => 1,
-    })
+    let head = match rows.next().await? {
+        Some(row) => match row.get_value(0)? {
+            Value::Null => None,
+            Value::Integer(seq) => Some(seq),
+            other => {
+                return Err(Error::Internal(format!(
+                    "journal head aggregate returned non-integer {other:?}"
+                )))
+            }
+        },
+        None => None,
+    };
+    head.unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| Error::Internal("journal seq overflow".to_string()))
 }
 
 fn wallclock_ms() -> Result<i64> {

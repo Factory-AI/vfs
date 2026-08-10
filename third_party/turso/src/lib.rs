@@ -61,6 +61,9 @@ use std::task::Poll;
 // Re-exports rows
 pub use crate::rows::{Row, Rows};
 
+// Re-export turso_core
+pub use turso_core as core;
+
 /// Assert that a type implements both Send and Sync at compile time.
 /// Usage: assert_send_sync!(MyType);
 /// Usage: assert_send_sync!(Type1, Type2, Type3);
@@ -138,13 +141,18 @@ pub struct Builder {
     path: String,
     read_only: bool,
     enable_encryption: bool,
-    enable_triggers: bool,
     enable_attach: bool,
     enable_custom_types: bool,
     enable_index_method: bool,
     enable_materialized_views: bool,
+    enable_vacuum: bool,
+    enable_generated_columns: bool,
+    enable_multiprocess_wal: bool,
+    enable_without_rowid: bool,
+    enable_mvcc_passive_checkpoint: bool,
     vfs: Option<String>,
     encryption_opts: Option<turso_sdk_kit::rsapi::EncryptionOpts>,
+    io: Option<Arc<dyn turso_core::IO>>,
 }
 
 impl Builder {
@@ -154,13 +162,18 @@ impl Builder {
             path: path.to_string(),
             read_only: false,
             enable_encryption: false,
-            enable_triggers: false,
             enable_attach: false,
             enable_custom_types: false,
             enable_index_method: false,
             enable_materialized_views: false,
+            enable_vacuum: false,
+            enable_generated_columns: false,
+            enable_multiprocess_wal: false,
+            enable_without_rowid: false,
+            enable_mvcc_passive_checkpoint: false,
             vfs: None,
             encryption_opts: None,
+            io: None,
         }
     }
 
@@ -180,8 +193,8 @@ impl Builder {
         self
     }
 
-    pub fn experimental_triggers(mut self, triggers_enabled: bool) -> Self {
-        self.enable_triggers = triggers_enabled;
+    /// Kept for backwards compatibility. Triggers are now always enabled.
+    pub fn experimental_triggers(self, _triggers_enabled: bool) -> Self {
         self
     }
 
@@ -200,6 +213,11 @@ impl Builder {
         self
     }
 
+    pub fn experimental_generated_columns(mut self, gencols_enabled: bool) -> Self {
+        self.enable_generated_columns = gencols_enabled;
+        self
+    }
+
     pub fn experimental_index_method(mut self, index_method_enabled: bool) -> Self {
         self.enable_index_method = index_method_enabled;
         self
@@ -210,17 +228,41 @@ impl Builder {
         self
     }
 
+    pub fn experimental_vacuum(mut self, enabled: bool) -> Self {
+        self.enable_vacuum = enabled;
+        self
+    }
+
+    pub fn experimental_multiprocess_wal(mut self, enabled: bool) -> Self {
+        self.enable_multiprocess_wal = enabled;
+        self
+    }
+
+    pub fn experimental_without_rowid(mut self, enabled: bool) -> Self {
+        self.enable_without_rowid = enabled;
+        self
+    }
+
+    pub fn experimental_mvcc_passive_checkpoint(mut self, enabled: bool) -> Self {
+        self.enable_mvcc_passive_checkpoint = enabled;
+        self
+    }
+
     pub fn with_io(mut self, vfs: String) -> Self {
         self.vfs = Some(vfs);
         self
     }
+
+    /// Can pass custom IO implementation
+    pub fn with_io_impl(mut self, io: Arc<dyn turso_core::IO>) -> Self {
+        self.io = Some(io);
+        self
+    }
+
     fn build_features_string(&self) -> Option<String> {
         let mut features = Vec::new();
         if self.enable_encryption {
             features.push("encryption");
-        }
-        if self.enable_triggers {
-            features.push("triggers");
         }
         if self.enable_attach {
             features.push("attach");
@@ -233,6 +275,21 @@ impl Builder {
         }
         if self.enable_materialized_views {
             features.push("views");
+        }
+        if self.enable_vacuum {
+            features.push("vacuum");
+        }
+        if self.enable_generated_columns {
+            features.push("generated_columns");
+        }
+        if self.enable_multiprocess_wal {
+            features.push("multiprocess_wal");
+        }
+        if self.enable_without_rowid {
+            features.push("without_rowid");
+        }
+        if self.enable_mvcc_passive_checkpoint {
+            features.push("mvcc_passive_checkpoint");
         }
         if features.is_empty() {
             return None;
@@ -252,7 +309,7 @@ impl Builder {
                 read_only: self.read_only,
                 encryption: self.encryption_opts,
                 vfs: self.vfs,
-                io: None,
+                io: self.io,
                 db_file: None,
             });
         while let Some(io_c) = db.open()?.io() {
@@ -333,7 +390,7 @@ impl Statement {
                     let mut values = Vec::with_capacity(columns);
                     for i in 0..columns {
                         let value = stmt.row_value(i)?;
-                        values.push(value.to_owned());
+                        values.push(value);
                     }
                     Poll::Ready(Ok(Some(Row { values })))
                 } else {
@@ -420,8 +477,7 @@ impl Statement {
         }
         Ok(stmt
             .column_name(idx)
-            .expect("column index must be within valid range")
-            .into_owned())
+            .expect("column index must be within valid range"))
     }
 
     /// Returns the names of all columns in the result set.
@@ -432,7 +488,6 @@ impl Statement {
             .map(|i| {
                 stmt.column_name(i)
                     .expect("column index must be within valid range")
-                    .into_owned()
             })
             .collect()
     }
@@ -445,7 +500,7 @@ impl Statement {
             let col_name = stmt
                 .column_name(i)
                 .expect("column index must be within valid range");
-            if col_name.eq_ignore_ascii_case(name) {
+            if col_name.as_str().eq_ignore_ascii_case(name) {
                 return Ok(i);
             }
         }
@@ -465,12 +520,9 @@ impl Statement {
         for i in 0..n {
             let name = stmt
                 .column_name(i)
-                .expect("column index must be within valid range")
-                .into_owned();
-            cols.push(Column {
-                name,
-                decl_type: None, // TODO
-            });
+                .expect("column index must be within valid range");
+            let decl_type = stmt.column_decltype(i);
+            cols.push(Column { name, decl_type });
         }
 
         cols
@@ -481,6 +533,11 @@ impl Statement {
         let mut stmt = self.inner.lock().unwrap();
         stmt.reset()?;
         Ok(())
+    }
+
+    /// Returns the number of rows modified (insert/delete operations) by the most recent executed statement.
+    pub fn n_change(&self) -> u64 {
+        self.inner.lock().unwrap().n_change() as u64
     }
 
     /// Execute a query that returns the first [`Row`].
@@ -739,4 +796,83 @@ mod tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_parallel_writes_and_wal_size() -> Result<()> {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let db_path_str = db_path.to_str().unwrap();
+
+        let db = Builder::new_local(db_path_str).build().await?;
+        let conn = db.connect()?;
+        conn.execute(
+            "CREATE TABLE test_data (id INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT NOT NULL);",
+            (),
+        )
+        .await?;
+
+        // Generate a ~200KB payload
+        let payload = "X".repeat(200 * 1024);
+
+        // Parallel writes: spawn 8 connections, each inserting 5 rows
+        let mut handles = Vec::new();
+        for conn_id in 0..8u32 {
+            let db = db.clone();
+            let payload = payload.clone();
+            handles.push(tokio::spawn(async move {
+                let conn = db.connect().unwrap();
+                for row_id in 0..5u32 {
+                    let tag = format!("conn{conn_id}_row{row_id}");
+                    let data = format!("{tag}_{payload}");
+                    loop {
+                        match conn
+                            .execute(
+                                "INSERT INTO test_data (payload) VALUES (?);",
+                                params::Params::Positional(vec![Value::Text(data.clone())]),
+                            )
+                            .await
+                        {
+                            Ok(_) => break,
+                            Err(Error::Busy(_)) => {
+                                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                                continue;
+                            }
+                            Err(e) => panic!("Insert failed: {e:?}"),
+                        }
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        // Sequential writes: 3 more large inserts
+        for i in 0..3 {
+            let data = format!("sequential_{i}_{payload}");
+            conn.execute(
+                "INSERT INTO test_data (payload) VALUES (?);",
+                params::Params::Positional(vec![Value::Text(data)]),
+            )
+            .await?;
+        }
+
+        // Verify row count: 8*5 + 3 = 43
+        let mut rows = conn.query("SELECT count(*) FROM test_data;", ()).await?;
+        let row = rows.next().await?.unwrap();
+        assert_eq!(row.get_value(0)?, Value::Integer(43));
+
+        // Report WAL size
+        let wal_path = format!("{db_path_str}-wal");
+        let wal_size = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+        eprintln!(
+            "WAL size after all writes: {} bytes ({:.2} KB)",
+            wal_size,
+            wal_size as f64 / 1024.0
+        );
+        assert!(wal_size > 0, "WAL file should exist and be non-empty");
+
+        Ok(())
+    }
 }
+

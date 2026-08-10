@@ -97,9 +97,6 @@ fn mount_nfs(args: MountArgs) -> Result<()> {
         let ready_mountpoint = mountpoint.clone();
         vfs_mount::daemon::daemonize(
             move || {
-                // The forked daemon shares the parent's spill dir, which the
-                // parent removes when it exits; move off it before DB work.
-                crate::config::adopt_private_spill_dir();
                 let rt = crate::get_runtime();
                 rt.block_on(mount_nfs_backend(args, mountpoint))
             },
@@ -203,12 +200,7 @@ fn mount_fuse(args: MountArgs) -> Result<()> {
         mount()
     } else {
         vfs_mount::daemon::daemonize(
-            move || {
-                // The forked daemon shares the parent's spill dir, which the
-                // parent removes when it exits; move off it before DB work.
-                crate::config::adopt_private_spill_dir();
-                mount()
-            },
+            mount,
             move || vfs_mount::is_mountpoint(&mountpoint),
             std::time::Duration::from_secs(10),
         )

@@ -47,29 +47,22 @@ run_vfs() {
     "$BIN" "$@"
 }
 
-sidecar_count() {
-    find "$PINNED_TMP" -maxdepth 1 -type f -name 'tursodb-ephemeral-*' -print | wc -l | tr -d ' '
-}
-
-spill_dir_count() {
-    find "$PINNED_TMP" -maxdepth 1 -type d -name 'vfs-spill-*' -print | wc -l | tr -d ' '
+# The pinned TMPDIR is dedicated to this test, so it must drain to empty
+# whenever no vfs process is running: turso >= 0.6 removes its sort-spill
+# temp dirs on drop (tempfile-style `.tmp*` names, not the old
+# `tursodb-ephemeral-*` files), and asserting emptiness catches any litter
+# pattern the engine or the CLI grows next.
+residual_count() {
+    find "$PINNED_TMP" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' '
 }
 
 assert_no_sidecars() {
     phase="$1"
-    count="$(sidecar_count)"
-    spills="$(spill_dir_count)"
-    printf '\n%s sidecar_count=%s spill_dir_count=%s\n' "$phase" "$count" "$spills"
+    count="$(residual_count)"
+    printf '\n%s residual_count=%s\n' "$phase" "$count"
     if [ "$count" -ne 0 ]; then
-        echo "FAILED: residual tursodb ephemeral sidecars after $phase"
-        find "$PINNED_TMP" -maxdepth 1 -type f -name 'tursodb-ephemeral-*' -printf '%f %s\n' | sort
-        exit 1
-    fi
-    # The CLI's private TMPDIR spill dir must be cleaned up when the process
-    # exits (no process of ours is running between phases).
-    if [ "$spills" -ne 0 ]; then
-        echo "FAILED: residual vfs-spill dirs after $phase"
-        find "$PINNED_TMP" -maxdepth 1 -type d -name 'vfs-spill-*' -print | sort
+        echo "FAILED: residual temp entries after $phase"
+        find "$PINNED_TMP" -mindepth 1 -maxdepth 1 -print | sort
         exit 1
     fi
 }
@@ -108,8 +101,7 @@ assert_no_sidecars "fs-cat"
 run_vfs run --session sidecar-run -- sh -c 'printf run-data > run.txt && cat run.txt' >/dev/null
 assert_no_sidecars "run"
 
-# The private spill-dir TMPDIR override is process-internal: children of
-# run/exec must see the user's TMPDIR, not the vfs-spill-* dir.
+# The CLI must not touch TMPDIR: children of run/exec see the ambient value.
 # stdout carries only the wrapped child's output, so it is compared verbatim:
 # a log line appearing here means diagnostics have leaked back onto the data
 # channel, which is the bug this asserts against.
@@ -125,14 +117,6 @@ if [ "$CHILD_TMPDIR" != "$PINNED_TMP" ]; then
     exit 1
 fi
 assert_no_sidecars "exec-child-tmpdir"
-# Stale spill dirs from SIGKILLed processes are reaped on the next CLI start.
-mkdir -p "$PINNED_TMP/vfs-spill-99999999-0"
-run_vfs fs sidecar cat /hello.txt >/dev/null
-if [ -d "$PINNED_TMP/vfs-spill-99999999-0" ]; then
-    echo "FAILED: stale dead-owner spill dir was not garbage-collected"
-    exit 1
-fi
-assert_no_sidecars "stale-spill-gc"
 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null run_vfs run --session sidecar-git -- sh -c '
     set -eu
     git init repo >/dev/null

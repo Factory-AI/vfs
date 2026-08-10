@@ -70,7 +70,9 @@ tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-turso = "0.5"
+# default-features would also pull `fts` (a tantivy full-text-search engine
+# nothing in Vfs queries); keep the 0.5-era feature set: mimalloc only.
+turso = { version = "0.7", default-features = false, features = ["mimalloc"] }
 url = "2.5.8"
 uuid = { version = "1", features = ["v4"] }
 zerocopy = { version = "0.8", features = ["derive"] }
@@ -83,6 +85,7 @@ aegis = { version = "0.9.6", features = ["pure-rust"] }
 [patch.crates-io]
 turso = { path = "third_party/turso" }
 turso_sdk_kit = { path = "third_party/turso_sdk_kit" }
+turso_core = { path = "third_party/turso_core" }
 
 # The profile that `dist` will build with.
 [profile.dist]

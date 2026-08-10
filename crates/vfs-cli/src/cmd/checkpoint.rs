@@ -259,18 +259,18 @@ async fn refuse_hollow_session(db_path: &Path) -> Result<()> {
 
 async fn newest_journal_seq(vfs: &Vfs) -> Result<i64> {
     let conn = vfs.get_connection().await?;
-    let mut rows = conn
-        .query(
-            "SELECT seq FROM fs_op_journal ORDER BY seq DESC LIMIT 1",
-            (),
-        )
-        .await?;
-    Ok(rows
-        .next()
-        .await?
-        .map(|row| row.get(0))
-        .transpose()?
-        .unwrap_or(0))
+    let mut rows = conn.query("SELECT MAX(seq) FROM fs_op_journal", ()).await?;
+    // An empty journal yields one NULL row; keep the wrapper out of the SQL
+    // (COALESCE defeats turso's min/max reverse-seek plan).
+    let head = match rows.next().await? {
+        Some(row) => match row.get_value(0)? {
+            turso::Value::Null => None,
+            turso::Value::Integer(seq) => Some(seq),
+            other => bail!("journal head aggregate returned non-integer {other:?}"),
+        },
+        None => None,
+    };
+    Ok(head.unwrap_or(0))
 }
 
 async fn snapshot_history_valid(staging: &Path) -> Result<bool> {

@@ -1,9 +1,12 @@
 use std::{
-    borrow::Cow,
     collections::HashMap,
+    ffi::CString,
     fmt::Display,
     ops::Deref,
-    sync::{Arc, Mutex, Once, RwLock},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex, Once, RwLock, Weak,
+    },
     task::Waker,
     time::Duration,
 };
@@ -30,7 +33,43 @@ use crate::{
 assert_send!(TursoDatabase, TursoConnection, TursoStatement);
 assert_sync!(TursoDatabase);
 
+#[derive(Default)]
+pub struct SyncBusyGate {
+    active: AtomicBool,
+}
+
+impl SyncBusyGate {
+    pub fn set_active(&self, active: bool) {
+        self.active.store(active, Ordering::Release);
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+}
+
+pub struct SyncBusyGuard {
+    gate: Arc<SyncBusyGate>,
+}
+
+impl SyncBusyGuard {
+    pub fn new(gate: Arc<SyncBusyGate>) -> Self {
+        gate.set_active(true);
+        Self { gate }
+    }
+}
+
+impl Drop for SyncBusyGuard {
+    fn drop(&mut self) {
+        self.gate.set_active(false);
+    }
+}
+
 pub use turso_core::types::FromValue;
+pub use turso_ext::{
+    AggCtx, ContextDestructor, FinalizeFunction, InitAggFunction, ResultCode, ScalarFunction,
+    StepFunction, Value as ExtensionValue, ValueDestructor,
+};
 pub type EncryptionOpts = turso_core::EncryptionOpts;
 pub type Value = turso_core::Value;
 pub type ValueRef<'a> = turso_core::types::ValueRef<'a>;
@@ -143,6 +182,39 @@ pub struct TursoDatabaseConfig {
     /// optional custom DatabaseStorage provided by the caller
     /// if provided, caller must guarantee that IO used by the TursoDatabase will be consistent with underlying DatabaseStorage IO
     pub db_file: Option<Arc<dyn DatabaseStorage>>,
+}
+
+impl TursoDatabaseConfig {
+    /// Build the typed [`turso_core::DatabaseOpts`] from the comma-separated
+    /// [`Self::experimental_features`] string. The feature-name tokens are the
+    /// SDK/CLI-facing names; unknown names are ignored and `"strict"` is a
+    /// no-op (strict tables are always enabled). This keeps the
+    /// string -> typed-options translation in the SDK layer where the string
+    /// representation lives, instead of in `turso_core`.
+    pub fn database_opts(&self) -> DatabaseOpts {
+        let mut opts = DatabaseOpts::new();
+        let Some(experimental_features) = &self.experimental_features else {
+            return opts;
+        };
+        for feature in experimental_features.split(',').map(|s| s.trim()) {
+            opts = match feature {
+                "views" => opts.with_views(true),
+                "index_method" => opts.with_index_method(true),
+                "custom_types" => opts.with_custom_types(true),
+                "autovacuum" => opts.with_autovacuum(true),
+                "vacuum" => opts.with_vacuum(true),
+                "encryption" => opts.with_encryption(true),
+                "attach" => opts.with_attach(true),
+                "generated_columns" => opts.with_generated_columns(true),
+                "multiprocess_wal" => opts.with_multiprocess_wal(true),
+                "without_rowid" => opts.with_without_rowid(true),
+                "mvcc_passive_checkpoint" => opts.with_experimental_mvcc_passive_checkpoint(true),
+                // "strict" is always enabled, kept for backwards compatibility
+                _ => opts,
+            };
+        }
+        opts
+    }
 }
 
 pub fn turso_slice_from_bytes(bytes: &[u8]) -> capi::c::turso_slice_ref_t {
@@ -311,6 +383,7 @@ pub struct TursoDatabaseOpenState {
     io: Option<Arc<dyn IO>>,
     db_file: Option<Arc<dyn DatabaseStorage>>,
     opts: Option<DatabaseOpts>,
+    open_flags: OpenFlags,
     open_db_state: OpenDbAsyncState,
 }
 
@@ -327,6 +400,7 @@ impl TursoDatabaseOpenState {
             io: None,
             db_file: None,
             opts: None,
+            open_flags: OpenFlags::default(),
             open_db_state: OpenDbAsyncState::new(),
         }
     }
@@ -362,6 +436,14 @@ impl TursoStatusCode {
             TursoStatusCode::Row => capi::c::turso_status_code_t::TURSO_ROW,
             TursoStatusCode::Io => capi::c::turso_status_code_t::TURSO_IO,
         }
+    }
+}
+
+fn result_code_to_result(result: ResultCode, operation: &str) -> Result<(), TursoError> {
+    if result.is_ok() {
+        Ok(())
+    } else {
+        Err(TursoError::Error(format!("{operation} failed: {result}")))
     }
 }
 
@@ -435,6 +517,9 @@ impl From<LimboError> for TursoError {
             LimboError::DatabaseFull(e) => TursoError::DatabaseFull(e),
             LimboError::ReadOnly => TursoError::Readonly("database is readonly".to_string()),
             LimboError::Busy => TursoError::Busy("database is locked".to_string()),
+            // Same-connection rejections carry SQLITE_BUSY semantics, but the
+            // caller must finish/reset its own statement rather than wait.
+            err @ LimboError::StatementsInProgress(_) => TursoError::Busy(err.to_string()),
             LimboError::BusySnapshot => TursoError::BusySnapshot(
                 "database snapshot is stale, rollback and retry the transaction".to_string(),
             ),
@@ -443,6 +528,32 @@ impl From<LimboError> for TursoError {
             }
             _ => TursoError::Error(value.to_string()),
         }
+    }
+}
+
+fn sync_busy_error() -> TursoError {
+    TursoError::Busy("database is locked".to_string())
+}
+
+fn sync_operation_active(sync_busy: Option<&Arc<SyncBusyGate>>) -> bool {
+    sync_busy.is_some_and(|gate| gate.is_active())
+}
+
+fn map_sync_transient_error(
+    sync_busy: Option<&Arc<SyncBusyGate>>,
+    error: TursoError,
+) -> TursoError {
+    if sync_busy.is_none() {
+        return error;
+    }
+    match error {
+        TursoError::Error(message)
+            if message == "Database schema changed"
+                || message.starts_with("I/O error: short read on page") =>
+        {
+            sync_busy_error()
+        }
+        other => other,
     }
 }
 
@@ -609,9 +720,7 @@ impl TursoDatabase {
                     ));
                 }
                 Some(vfs) => {
-                    return Err(TursoError::Error(format!(
-                        "unsupported VFS backend: '{vfs}'"
-                    )))
+                    Database::io_for_vfs(vfs).map_err(|e| TursoError::Error(format!("{e}")))?
                 }
                 None => match self.config.path.as_str() {
                     ":memory:" => Arc::new(turso_core::MemoryIO::new()),
@@ -643,34 +752,11 @@ impl TursoDatabase {
                     // Store the IO so that it can be retrieved with `io()` call even if the database is still opening
                     *self.io.lock().unwrap() = Some(io.clone());
 
-                    let open_flags = if self.config.read_only {
-                        OpenFlags::ReadOnly
-                    } else {
-                        OpenFlags::default()
-                    };
-                    let db_file = if let Some(db_file) = &self.config.db_file {
-                        db_file.clone()
-                    } else {
-                        let file = io.open_file(&self.config.path, open_flags, true)?;
-                        Arc::new(DatabaseFile::new(file))
-                    };
-
-                    let mut opts = DatabaseOpts::new();
-                    if let Some(experimental_features) = &self.config.experimental_features {
-                        for features in experimental_features.split(",").map(|s| s.trim()) {
-                            opts = match features {
-                                "views" => opts.with_views(true),
-                                "index_method" => opts.with_index_method(true),
-                                "strict" => opts, // strict is always enabled, kept for backwards compatibility
-                                "custom_types" => opts.with_custom_types(true),
-                                "autovacuum" => opts.with_autovacuum(true),
-                                "triggers" => opts.with_triggers(true),
-                                "encryption" => opts.with_encryption(true),
-                                "attach" => opts.with_attach(true),
-                                _ => opts,
-                            };
-                        }
-                    }
+                    // Opts must be computed BEFORE the file open so we can apply
+                    // OpenFlags::NoLock when multiprocess WAL is enabled — taking
+                    // the OS-level fcntl lock here would block every other
+                    // multiprocess process from opening the same file.
+                    let opts = self.config.database_opts();
 
                     if self.config.encryption.is_some() && !opts.enable_encryption {
                         return Err(TursoError::Error(
@@ -678,9 +764,25 @@ impl TursoDatabase {
                         ));
                     }
 
+                    let mut open_flags = if self.config.read_only {
+                        OpenFlags::ReadOnly
+                    } else {
+                        OpenFlags::default()
+                    };
+                    if opts.enable_multiprocess_wal {
+                        open_flags |= OpenFlags::NoLock;
+                    }
+                    let db_file = if let Some(db_file) = &self.config.db_file {
+                        db_file.clone()
+                    } else {
+                        let file = io.open_file(&self.config.path, open_flags, true)?;
+                        Arc::new(DatabaseFile::new(file))
+                    };
+
                     state.io = Some(io);
                     state.db_file = Some(db_file);
                     state.opts = Some(opts);
+                    state.open_flags = open_flags;
                     state.phase = TursoDatabaseOpenPhase::Opening;
                 }
 
@@ -696,19 +798,17 @@ impl TursoDatabase {
                         .expect("db_file must be initialized in Init phase")
                         .clone();
                     let opts = state.opts.expect("opts must be initialized in Init phase");
+                    let open_flags = state.open_flags;
 
                     match Database::open_with_flags_async(
                         &mut state.open_db_state,
                         io.clone(),
                         &self.config.path,
                         db_file,
-                        if self.config.read_only {
-                            OpenFlags::ReadOnly
-                        } else {
-                            OpenFlags::default()
-                        },
+                        open_flags,
                         opts,
                         self.config.encryption.clone(),
+                        None,
                     )? {
                         IOResult::Done(db) => {
                             let mut inner_db = self.db.lock().unwrap();
@@ -794,26 +894,72 @@ struct CachedStatement {
     query_mode: QueryMode,
 }
 
+/// Upper bound on distinct SQL texts cached per connection; see the eviction
+/// comment in `prepare_cached`.
+const STATEMENT_CACHE_CAP: usize = 512;
+
 #[derive(Clone)]
 pub struct TursoConnection {
     async_io: bool,
     concurrent_guard: Arc<ConcurrentGuard>,
     connection: Arc<Connection>,
+    sync_busy: Option<Arc<SyncBusyGate>>,
     cached_statements: Arc<Mutex<HashMap<String, Arc<CachedStatement>>>>,
+    /// Weak refs to every statement handle created by this connection, keyed
+    /// by a monotonic ID. Statements remove themselves on drop, so this map
+    /// only ever contains live entries. `close()` upgrades each remaining
+    /// handle and sets it to `None` to release `Arc<Connection>` → `Arc<Database>`.
+    stmts: StmtRegistry,
+    next_stmt_id: Arc<AtomicUsize>,
 }
 
 impl TursoConnection {
     pub fn new(config: &TursoDatabaseConfig, connection: Arc<Connection>) -> Arc<Self> {
+        Self::new_with_sync_busy(config, connection, None)
+    }
+
+    pub fn new_with_sync_busy(
+        config: &TursoDatabaseConfig,
+        connection: Arc<Connection>,
+        sync_busy: Option<Arc<SyncBusyGate>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             async_io: config.async_io,
             connection,
+            sync_busy,
             concurrent_guard: Arc::new(ConcurrentGuard::new()),
             cached_statements: Arc::new(Mutex::new(HashMap::new())),
+            stmts: Arc::new(Mutex::new(HashMap::new())),
+            next_stmt_id: Arc::new(AtomicUsize::new(0)),
         })
+    }
+
+    fn sync_operation_active(&self) -> bool {
+        sync_operation_active(self.sync_busy.as_ref())
+    }
+
+    fn map_sync_transient_error(&self, error: TursoError) -> TursoError {
+        map_sync_transient_error(self.sync_busy.as_ref(), error)
     }
     /// Set busy timeout for the connection
     pub fn set_busy_timeout(&self, duration: Duration) {
         self.connection.set_busy_timeout(duration);
+    }
+    /// Request interruption of the statement currently running on this connection.
+    /// Mirrors `sqlite3_interrupt`: the in-flight `step`/`execute` aborts with an
+    /// `Interrupt` error. Safe to call from another thread. If no statement is
+    /// active the request is ignored.
+    pub fn interrupt(&self) {
+        self.connection.interrupt();
+    }
+    /// Set the maximum wall-clock duration a single statement is allowed to run
+    /// before it is interrupted. `Duration::ZERO` disables the timeout.
+    pub fn set_query_timeout(&self, duration: Duration) {
+        self.connection.set_query_timeout(duration);
+    }
+    /// Get the current per-statement query timeout (`Duration::ZERO` when disabled).
+    pub fn get_query_timeout(&self) -> Duration {
+        self.connection.get_query_timeout()
     }
     pub fn get_auto_commit(&self) -> bool {
         self.connection.get_auto_commit()
@@ -822,18 +968,140 @@ impl TursoConnection {
         self.connection.last_insert_rowid()
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_external_scalar_function(
+        &self,
+        name: String,
+        argc: i32,
+        deterministic: bool,
+        context: usize,
+        callback: ScalarFunction,
+        context_destructor: Option<ContextDestructor>,
+        value_destructor: Option<ValueDestructor>,
+    ) -> Result<(), TursoError> {
+        let name = CString::new(name).map_err(|err| {
+            TursoError::Misuse(format!(
+                "external scalar function name contains interior NUL: {err}"
+            ))
+        })?;
+        let api = unsafe { self.connection._build_turso_ext() };
+        let result = unsafe {
+            (api.register_scalar_function)(
+                api.ctx,
+                name.as_ptr(),
+                argc,
+                deterministic,
+                context,
+                callback,
+                context_destructor,
+                value_destructor,
+            )
+        };
+        unsafe { self.connection._free_extension_ctx(api) };
+        result_code_to_result(result, "register external scalar function")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_external_aggregate_function(
+        &self,
+        name: String,
+        argc: i32,
+        context: usize,
+        init: InitAggFunction,
+        step: StepFunction,
+        finalize: FinalizeFunction,
+        context_destructor: Option<ContextDestructor>,
+        aggregate_destructor: Option<ContextDestructor>,
+        value_destructor: Option<ValueDestructor>,
+    ) -> Result<(), TursoError> {
+        let name = CString::new(name).map_err(|err| {
+            TursoError::Misuse(format!(
+                "external aggregate function name contains interior NUL: {err}"
+            ))
+        })?;
+        let api = unsafe { self.connection._build_turso_ext() };
+        let result = unsafe {
+            (api.register_aggregate_function)(
+                api.ctx,
+                name.as_ptr(),
+                argc,
+                context,
+                init,
+                step,
+                finalize,
+                context_destructor,
+                aggregate_destructor,
+                value_destructor,
+            )
+        };
+        unsafe { self.connection._free_extension_ctx(api) };
+        result_code_to_result(result, "register external aggregate function")
+    }
+
+    pub fn unregister_external_function(&self, name: &str) -> Result<(), TursoError> {
+        let name = CString::new(name).map_err(|err| {
+            TursoError::Misuse(format!(
+                "external function name contains interior NUL: {err}"
+            ))
+        })?;
+        let api = unsafe { self.connection._build_turso_ext() };
+        let result = unsafe { (api.unregister_function)(api.ctx, name.as_ptr()) };
+        unsafe { self.connection._free_extension_ctx(api) };
+        result_code_to_result(result, "unregister external function")
+    }
+
+    pub fn register_external_collation(
+        &self,
+        name: String,
+        context: usize,
+        callback: turso_core::ContextCollationFunction,
+        context_destructor: Option<ContextDestructor>,
+    ) {
+        self.connection
+            .register_external_collation(name, context, callback, context_destructor);
+    }
+
+    pub fn unregister_external_collation(&self, name: &str) {
+        self.connection.unregister_external_collation(name);
+    }
+
+    pub fn set_load_extension_enabled(&self, enabled: bool) {
+        self.connection.set_load_extension_enabled(enabled);
+    }
+
+    pub fn load_extension(&self, path: &str) -> Result<(), TursoError> {
+        turso_core::resolve_ext_path(path)
+            .and_then(|path| self.connection.load_extension(path))
+            .map_err(TursoError::from)
+    }
+
     /// prepares single SQL statement
     pub fn prepare_single(&self, sql: impl AsRef<str>) -> Result<Box<TursoStatement>, TursoError> {
-        let statement = self.connection.prepare(sql)?;
+        if self.sync_operation_active() {
+            return Err(sync_busy_error());
+        }
+        let statement = self
+            .connection
+            .prepare(sql)
+            .map_err(TursoError::from)
+            .map_err(|error| self.map_sync_transient_error(error))?;
+        let handle: StatementHandle = Arc::new(Mutex::new(Some(statement)));
+        let stmt_id = self.track_stmt(&handle);
         Ok(Box::new(TursoStatement {
             concurrent_guard: self.concurrent_guard.clone(),
             async_io: self.async_io,
-            statement,
+            sync_busy: self.sync_busy.clone(),
+            handle,
+            stmt_id,
+            stmts: self.stmts.clone(),
         }))
     }
 
     /// Prepare a statement from the provided SQL string and cache it for future use.
     pub fn prepare_cached(&self, sql: impl AsRef<str>) -> Result<Box<TursoStatement>, TursoError> {
+        if self.sync_operation_active() {
+            return Err(sync_busy_error());
+        }
         let sql_str = sql.as_ref();
 
         // Check if we have a cached version
@@ -845,31 +1113,53 @@ impl TursoConnection {
                 );
                 let statement =
                     Statement::new(program, self.connection.get_pager(), cached.query_mode, 0);
+                let handle: StatementHandle = Arc::new(Mutex::new(Some(statement)));
+                let stmt_id = self.track_stmt(&handle);
                 return Ok(Box::new(TursoStatement {
                     concurrent_guard: self.concurrent_guard.clone(),
                     async_io: self.async_io,
-                    statement,
+                    sync_busy: self.sync_busy.clone(),
+                    handle,
+                    stmt_id,
+                    stmts: self.stmts.clone(),
                 }));
             }
         }
 
         // Not cached, prepare it fresh
-        let statement = self.connection.prepare(sql_str)?;
+        let statement = self
+            .connection
+            .prepare(sql_str)
+            .map_err(TursoError::from)
+            .map_err(|error| self.map_sync_transient_error(error))?;
 
         // Cache it for future use
         let cached = Arc::new(CachedStatement {
             program: statement.get_program().prepared().clone(),
             query_mode: statement.get_query_mode(),
         });
-        self.cached_statements
-            .lock()
-            .unwrap()
-            .insert(sql_str.to_string(), cached);
+        {
+            // The cache is keyed by exact SQL text and never evicted otherwise,
+            // so a workload generating unbounded statement shapes (variable IN
+            // lists, multi-row VALUES) would grow it without limit. Dropping
+            // the whole map at the cap is deliberate: hot statements re-enter
+            // on their next use, and an LRU would cost more than a re-prepare.
+            let mut cache = self.cached_statements.lock().unwrap();
+            if cache.len() >= STATEMENT_CACHE_CAP {
+                cache.clear();
+            }
+            cache.insert(sql_str.to_string(), cached);
+        }
 
+        let handle: StatementHandle = Arc::new(Mutex::new(Some(statement)));
+        let stmt_id = self.track_stmt(&handle);
         Ok(Box::new(TursoStatement {
             concurrent_guard: self.concurrent_guard.clone(),
             async_io: self.async_io,
-            statement,
+            sync_busy: self.sync_busy.clone(),
+            handle,
+            stmt_id,
+            stmts: self.stmts.clone(),
         }))
     }
 
@@ -879,15 +1169,30 @@ impl TursoConnection {
         &self,
         sql: impl AsRef<str>,
     ) -> Result<Option<(Box<TursoStatement>, usize)>, TursoError> {
-        match self.connection.consume_stmt(sql)? {
-            Some((statement, position)) => Ok(Some((
-                Box::new(TursoStatement {
-                    async_io: self.async_io,
-                    concurrent_guard: Arc::new(ConcurrentGuard::new()),
-                    statement,
-                }),
-                position,
-            ))),
+        if self.sync_operation_active() {
+            return Err(sync_busy_error());
+        }
+        match self
+            .connection
+            .consume_stmt(sql)
+            .map_err(TursoError::from)
+            .map_err(|error| self.map_sync_transient_error(error))?
+        {
+            Some((statement, position)) => {
+                let handle: StatementHandle = Arc::new(Mutex::new(Some(statement)));
+                let stmt_id = self.track_stmt(&handle);
+                Ok(Some((
+                    Box::new(TursoStatement {
+                        async_io: self.async_io,
+                        concurrent_guard: Arc::new(ConcurrentGuard::new()),
+                        sync_busy: self.sync_busy.clone(),
+                        handle,
+                        stmt_id,
+                        stmts: self.stmts.clone(),
+                    }),
+                    position,
+                )))
+            }
             None => Ok(None),
         }
     }
@@ -895,6 +1200,18 @@ impl TursoConnection {
     /// close the connection preventing any further operations executed over it
     /// SAFETY: caller must guarantee that no ongoing operations are running over connection before calling close(...) method
     pub fn close(&self) -> Result<(), TursoError> {
+        // Finalize all outstanding statements to release their Arc chain:
+        // Statement → Program → Arc<Connection> → Arc<Database>.
+        // Without this, un-finalized statements keep the Database alive in
+        // DATABASE_MANAGER, causing stale databases after file renames.
+        let mut stmts = self.stmts.lock().unwrap();
+        for (_id, weak) in stmts.drain() {
+            if let Some(handle) = weak.upgrade() {
+                // Setting to None drops the turso_core::Statement,
+                // releasing Arc<Connection> → Arc<Database>.
+                *handle.lock().unwrap() = None;
+            }
+        }
         self.connection.close()?;
         Ok(())
     }
@@ -938,12 +1255,71 @@ impl TursoConnection {
     pub unsafe fn arc_from_capi(value: *const capi::c::turso_connection_t) -> Arc<Self> {
         Arc::from_raw(value as *const Self)
     }
+
+    /// Register a statement handle and return its ID. The statement removes
+    /// itself from the registry on drop via its `stmt_id` + `stmts` ref.
+    fn track_stmt(&self, handle: &StatementHandle) -> usize {
+        let id = self.next_stmt_id.fetch_add(1, Ordering::Relaxed);
+        self.stmts
+            .lock()
+            .unwrap()
+            .insert(id, Arc::downgrade(handle));
+        id
+    }
+}
+
+/// Shared ownership of a `turso_core::Statement` that can be explicitly finalized.
+/// When the inner `Option` is set to `None`, the statement is considered finalized
+/// and all operations on it will return errors / defaults.
+pub(crate) type StatementHandle = Arc<Mutex<Option<Statement>>>;
+type StmtRegistry = Arc<Mutex<HashMap<usize, Weak<Mutex<Option<Statement>>>>>>;
+
+const FINALIZED_ERR: &str = "statement has been finalized";
+
+/// Advance one step of a statement's execution.
+/// Factored out of `TursoStatement` so it can be called while holding
+/// the `StatementHandle` lock without re-entrancy issues.
+fn step_inner(
+    stmt: &mut Statement,
+    async_io: bool,
+    waker: Option<&Waker>,
+) -> Result<TursoStatusCode, TursoError> {
+    loop {
+        let result = if let Some(waker) = waker {
+            stmt.step_with_waker(waker)
+        } else {
+            stmt.step()
+        };
+        return match result? {
+            StepResult::Done => Ok(TursoStatusCode::Done),
+            StepResult::Row => Ok(TursoStatusCode::Row),
+            StepResult::Busy => Err(TursoError::Busy("database is locked".to_string())),
+            StepResult::Interrupt => Err(TursoError::Interrupt("interrupted".to_string())),
+            StepResult::IO | StepResult::Yield => {
+                if async_io {
+                    Ok(TursoStatusCode::Io)
+                } else {
+                    stmt._io().step()?;
+                    continue;
+                }
+            }
+        };
+    }
 }
 
 pub struct TursoStatement {
     async_io: bool,
     concurrent_guard: Arc<ConcurrentGuard>,
-    statement: Statement,
+    sync_busy: Option<Arc<SyncBusyGate>>,
+    pub(crate) handle: StatementHandle,
+    stmt_id: usize,
+    stmts: StmtRegistry,
+}
+
+impl Drop for TursoStatement {
+    fn drop(&mut self) {
+        self.stmts.lock().unwrap().remove(&self.stmt_id);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -955,11 +1331,28 @@ pub struct TursoExecutionResult {
 impl TursoStatement {
     /// return amount of row modifications (insert/delete operations) made by the most recent executed statement
     pub fn n_change(&self) -> i64 {
-        self.statement.n_change()
+        let handle = self.handle.lock().unwrap();
+        match handle.as_ref() {
+            Some(stmt) => stmt.n_change(),
+            None => 0,
+        }
     }
     /// returns parameters count for the statement
     pub fn parameters_count(&self) -> usize {
-        self.statement.parameters_count()
+        let handle = self.handle.lock().unwrap();
+        match handle.as_ref() {
+            Some(stmt) => stmt.parameters_count(),
+            None => 0,
+        }
+    }
+    /// Returns the name of the parameter at the given 1-based index,
+    /// including its SQL prefix (e.g. `:name`, `@name`, `$name`).
+    /// Returns None for positional-only (`?`) parameters or out-of-range indices.
+    pub fn parameter_name(&self, index: usize) -> Option<String> {
+        let handle = self.handle.lock().unwrap();
+        let stmt = handle.as_ref()?;
+        let index = index.try_into().ok()?;
+        stmt.parameters().name(index)
     }
     /// binds positional parameter at the corresponding index (1-based)
     pub fn bind_positional(
@@ -967,86 +1360,88 @@ impl TursoStatement {
         index: usize,
         value: turso_core::Value,
     ) -> Result<(), TursoError> {
+        let mut handle = self.handle.lock().unwrap();
+        let stmt = handle
+            .as_mut()
+            .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
         let Ok(index) = index.try_into() else {
             return Err(TursoError::Misuse(
                 "bind index must be non-zero".to_string(),
             ));
         };
-        // bind_at is safe to call with any index as it will put pair (index, value) into the map
-        self.statement.bind_at(index, value);
+        if !stmt.parameters().has_slot(index) {
+            return Err(TursoError::Misuse(format!(
+                "bind index {index} is out of bounds"
+            )));
+        }
+        stmt.bind_at(index, value)?;
         Ok(())
     }
-    /// named parameter position (name MUST omit named-parameter control character, e.g. '@', '$' or ':')
+    /// named parameter position.
+    ///
+    /// The name must include the SQL placeholder prefix, e.g. `:name`, `@name`, `$name`, or `?1`.
     pub fn named_position(&mut self, name: impl AsRef<str>) -> Result<usize, TursoError> {
-        let parameters = self.statement.parameters();
-        for i in 1..parameters.next_index().get() {
-            // i is positive - so conversion to NonZero<> type will always succeed
-            let index = i.try_into().unwrap();
-            let Some(parameter) = parameters.name(index) else {
-                continue;
-            };
-            if !(parameter.starts_with(":")
-                || parameter.starts_with("@")
-                || parameter.starts_with("$")
-                || parameter.starts_with("?"))
-            {
-                return Err(TursoError::Error(format!(
-                    "internal error: unexpected internal parameter name: {parameter}"
-                )));
-            }
-            if name.as_ref() == parameter {
-                return Ok(index.into());
+        let handle = self.handle.lock().unwrap();
+        let stmt = handle
+            .as_ref()
+            .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
+        let name = name.as_ref();
+        if let Some(index) = stmt.parameter_index(name) {
+            return Ok(index.into());
+        }
+
+        if name.starts_with('?') {
+            let maybe_index = name
+                .strip_prefix('?')
+                .and_then(|value| value.parse::<usize>().ok())
+                .and_then(|value| value.try_into().ok());
+            if let Some(index) = maybe_index {
+                if stmt.parameters().is_indexed(index) {
+                    return Ok(index.into());
+                }
             }
         }
 
         Err(TursoError::Error(format!(
-            "named parameter {} not found",
-            name.as_ref()
+            "named parameter {name} not found"
         )))
     }
     /// make one execution step of the statement
     /// method returns [TursoStatusCode::Done] if execution is finished
     /// method returns [TursoStatusCode::Row] if execution generated a row
     /// method returns [TursoStatusCode::Io] if async_io was set and execution needs IO in order to make progress
+    #[inline]
     pub fn step(&mut self, waker: Option<&Waker>) -> Result<TursoStatusCode, TursoError> {
+        if sync_operation_active(self.sync_busy.as_ref()) {
+            return Err(sync_busy_error());
+        }
         let guard = self.concurrent_guard.clone();
         let _guard = guard.try_use()?;
-        self.step_no_guard(waker)
+        let mut handle = self.handle.lock().unwrap();
+        let stmt = handle
+            .as_mut()
+            .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
+        step_inner(stmt, self.async_io, waker)
+            .map_err(|error| map_sync_transient_error(self.sync_busy.as_ref(), error))
     }
 
-    fn step_no_guard(&mut self, waker: Option<&Waker>) -> Result<TursoStatusCode, TursoError> {
-        let async_io = self.async_io;
-        loop {
-            let result = if let Some(waker) = waker {
-                self.statement.step_with_waker(waker)
-            } else {
-                self.statement.step()
-            };
-            return match result? {
-                StepResult::Done => Ok(TursoStatusCode::Done),
-                StepResult::Row => Ok(TursoStatusCode::Row),
-                StepResult::Busy => Err(TursoError::Busy("database is locked".to_string())),
-                StepResult::Interrupt => Err(TursoError::Interrupt("interrupted".to_string())),
-                StepResult::IO => {
-                    if async_io {
-                        Ok(TursoStatusCode::Io)
-                    } else {
-                        self.run_io()?;
-                        continue;
-                    }
-                }
-            };
-        }
-    }
     /// execute statement to completion
     /// method returns [TursoStatusCode::Done] if execution completed
     /// method returns [TursoStatusCode::Io] if async_io was set and execution needs IO in order to make progress
     pub fn execute(&mut self, waker: Option<&Waker>) -> Result<TursoExecutionResult, TursoError> {
+        if sync_operation_active(self.sync_busy.as_ref()) {
+            return Err(sync_busy_error());
+        }
         let guard = self.concurrent_guard.clone();
         let _guard = guard.try_use()?;
+        let mut handle = self.handle.lock().unwrap();
+        let stmt = handle
+            .as_mut()
+            .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
 
         loop {
-            let status = self.step_no_guard(waker)?;
+            let status = step_inner(stmt, self.async_io, waker)
+                .map_err(|error| map_sync_transient_error(self.sync_busy.as_ref(), error))?;
             if status == TursoStatusCode::Row {
                 continue;
             } else if status == TursoStatusCode::Io {
@@ -1057,7 +1452,7 @@ impl TursoStatement {
             } else if status == TursoStatusCode::Done {
                 return Ok(TursoExecutionResult {
                     status: TursoStatusCode::Done,
-                    rows_changed: self.statement.n_change() as u64,
+                    rows_changed: stmt.n_change() as u64,
                 });
             }
             return Err(TursoError::Error(format!(
@@ -1067,13 +1462,24 @@ impl TursoStatement {
     }
     /// run iteration of the IO backend
     pub fn run_io(&self) -> Result<(), TursoError> {
-        self.statement._io().step()?;
+        let handle = self.handle.lock().unwrap();
+        let stmt = handle
+            .as_ref()
+            .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
+        stmt._io().step()?;
         Ok(())
     }
-    /// get row value reference currently pointed by the statement
-    /// note, that this row will no longer be valid after execution of methods like [Self::step]/[Self::execute]/[Self::finalize]/[Self::reset]
-    pub fn row_value(&self, index: usize) -> Result<turso_core::ValueRef, TursoError> {
-        let Some(row) = self.statement.row() else {
+    /// get row value as an owned Value
+    #[inline]
+    pub fn row_value(&self, index: usize) -> Result<turso_core::Value, TursoError> {
+        if sync_operation_active(self.sync_busy.as_ref()) {
+            return Err(sync_busy_error());
+        }
+        let handle = self.handle.lock().unwrap();
+        let stmt = handle
+            .as_ref()
+            .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
+        let Some(row) = stmt.row() else {
             return Err(TursoError::Misuse("statement holds no row".to_string()));
         };
         if index >= row.len() {
@@ -1081,45 +1487,80 @@ impl TursoStatement {
                 "attempt to access row value out of bounds".to_string(),
             ));
         }
-        let value = row.get_value(index);
-        Ok(value.as_value_ref())
+        Ok(row.get_value(index).as_value_ref().to_owned())
     }
     /// returns column count
     pub fn column_count(&self) -> usize {
-        self.statement.num_columns()
+        let handle = self.handle.lock().unwrap();
+        match handle.as_ref() {
+            Some(stmt) => stmt.num_columns(),
+            None => 0,
+        }
     }
     /// returns column name
-    pub fn column_name(&self, index: usize) -> Result<Cow<'_, str>, TursoError> {
-        if index >= self.column_count() {
+    pub fn column_name(&self, index: usize) -> Result<String, TursoError> {
+        let handle = self.handle.lock().unwrap();
+        let stmt = handle
+            .as_ref()
+            .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
+        if index >= stmt.num_columns() {
             return Err(TursoError::Misuse("column index out of bounds".to_string()));
         }
-        Ok(self.statement.get_column_name(index))
+        Ok(stmt.get_column_name(index).into_owned())
     }
     /// returns column declared type (e.g. "INTEGER", "TEXT", "DATETIME", etc.)
     pub fn column_decltype(&self, index: usize) -> Option<String> {
-        if index >= self.column_count() {
+        let handle = self.handle.lock().unwrap();
+        let stmt = handle.as_ref()?;
+        if index >= stmt.num_columns() {
             return None;
         }
-        self.statement.get_column_decltype(index)
+        stmt.get_column_decltype(index)
+    }
+
+    /// Returns rich type information for the column at `index`.
+    ///
+    /// Wraps [`turso_core::Statement::get_column_type_info`]. Returns `None`
+    /// when the statement has been finalized, when the index is out of
+    /// bounds, when the connection does not have the experimental custom-
+    /// types feature enabled (the underlying call errors and we surface that
+    /// as "no info"; the C ABI has no error channel), when the statement is
+    /// in EXPLAIN mode, or when the expression behind the column has no
+    /// determined affinity.
+    pub fn column_type_info(&self, index: usize) -> Option<turso_core::ColumnTypeInfo> {
+        let handle = self.handle.lock().unwrap();
+        let stmt = handle.as_ref()?;
+        if index >= stmt.num_columns() {
+            return None;
+        }
+        stmt.get_column_type_info(index).ok().flatten()
     }
     /// finalize statement execution
     /// this method must be called in the end of statement execution (either successfull or not)
     pub fn finalize(&mut self, waker: Option<&Waker>) -> Result<TursoStatusCode, TursoError> {
         let guard = self.concurrent_guard.clone();
         let _guard = guard.try_use()?;
-
-        while self.statement.execution_state().is_running() {
-            let status = self.step_no_guard(waker)?;
-            if status == TursoStatusCode::Io {
-                return Ok(status);
+        let mut handle = self.handle.lock().unwrap();
+        if let Some(stmt) = handle.as_mut() {
+            while stmt.execution_state().is_running() {
+                let status = step_inner(stmt, self.async_io, waker)?;
+                if status == TursoStatusCode::Io {
+                    return Ok(status);
+                }
             }
         }
+        // Drop the inner statement to release the Arc chain
+        *handle = None;
         Ok(TursoStatusCode::Done)
     }
     /// reset internal statement state and bindings
     pub fn reset(&mut self) -> Result<(), TursoError> {
-        self.statement.reset()?;
-        self.statement.clear_bindings();
+        let mut handle = self.handle.lock().unwrap();
+        let stmt = handle
+            .as_mut()
+            .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
+        stmt.reset()?;
+        stmt.clear_bindings();
         Ok(())
     }
 
@@ -1156,7 +1597,56 @@ impl TursoStatement {
 
 #[cfg(test)]
 mod tests {
-    use crate::rsapi::{TursoDatabase, TursoDatabaseConfig, TursoError, TursoStatusCode};
+    use crate::rsapi::{
+        TursoDatabase, TursoDatabaseConfig, TursoError, TursoStatusCode, FINALIZED_ERR,
+    };
+    use turso_core::Value;
+
+    fn config_with_features(features: Option<&str>) -> TursoDatabaseConfig {
+        TursoDatabaseConfig {
+            path: ":memory:".to_string(),
+            experimental_features: features.map(str::to_string),
+            async_io: false,
+            read_only: false,
+            encryption: None,
+            vfs: None,
+            io: None,
+            db_file: None,
+        }
+    }
+
+    #[test]
+    pub fn database_opts_maps_experimental_features() {
+        // No features -> all defaults.
+        assert_eq!(
+            config_with_features(None).database_opts(),
+            turso_core::DatabaseOpts::new()
+        );
+
+        // Each token toggles its corresponding flag.
+        let opts = config_with_features(Some(
+            "views,index_method,custom_types,autovacuum,vacuum,encryption,attach,generated_columns,multiprocess_wal,without_rowid",
+        ))
+        .database_opts();
+        assert!(opts.enable_views);
+        assert!(opts.enable_index_method);
+        assert!(opts.enable_custom_types);
+        assert!(opts.enable_autovacuum);
+        assert!(opts.enable_vacuum);
+        assert!(opts.enable_encryption);
+        assert!(opts.enable_attach);
+        assert!(opts.enable_generated_columns);
+        assert!(opts.enable_multiprocess_wal);
+        assert!(opts.enable_without_rowid);
+
+        // Whitespace is trimmed; `strict` and unknown names are ignored.
+        let opts = config_with_features(Some(" views , strict , unknown_one ")).database_opts();
+        assert!(opts.enable_views);
+        assert_eq!(
+            config_with_features(Some("strict,unknown")).database_opts(),
+            turso_core::DatabaseOpts::new()
+        );
+    }
 
     #[test]
     pub fn test_db_concurrent_use() {
@@ -1245,10 +1735,399 @@ mod tests {
         assert_eq!(stmt.execute(None).unwrap().status, TursoStatusCode::Done);
     }
 
+    #[test]
+    pub fn test_named_position_requires_prefixed_name() {
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: ":memory:".to_string(),
+            experimental_features: None,
+            async_io: false,
+            read_only: false,
+            encryption: None,
+            vfs: None,
+            io: None,
+            db_file: None,
+        });
+        let result = db.open().unwrap();
+        assert!(!result.is_io());
+
+        let conn = db.connect().unwrap();
+        let mut stmt = conn
+            .prepare_single("SELECT :new_name, @other_name, $third_name")
+            .unwrap();
+
+        assert_eq!(stmt.named_position(":new_name").unwrap(), 1);
+        assert!(stmt.named_position("new_name").is_err());
+        assert!(stmt.named_position("?1").is_err());
+
+        assert_eq!(stmt.named_position("@other_name").unwrap(), 2);
+        assert!(stmt.named_position("other_name").is_err());
+
+        assert_eq!(stmt.named_position("$third_name").unwrap(), 3);
+        assert!(stmt.named_position("third_name").is_err());
+    }
+
+    #[test]
+    pub fn test_bind_positional_rejects_out_of_bounds_index() {
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: ":memory:".to_string(),
+            experimental_features: None,
+            async_io: false,
+            read_only: false,
+            encryption: None,
+            vfs: None,
+            io: None,
+            db_file: None,
+        });
+        let result = db.open().unwrap();
+        assert!(!result.is_io());
+
+        let conn = db.connect().unwrap();
+        let mut stmt = conn.prepare_single("SELECT ?1").unwrap();
+
+        stmt.bind_positional(1, Value::from_i64(42)).unwrap();
+
+        let err = stmt.bind_positional(2, Value::from_i64(7)).unwrap_err();
+        assert!(matches!(err, TursoError::Misuse(_)));
+    }
+
+    #[test]
+    pub fn test_execute_update_with_prefixed_named_parameters() {
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: ":memory:".to_string(),
+            experimental_features: None,
+            async_io: false,
+            read_only: false,
+            encryption: None,
+            vfs: None,
+            io: None,
+            db_file: None,
+        });
+        let result = db.open().unwrap();
+        assert!(!result.is_io());
+
+        let conn = db.connect().unwrap();
+
+        let mut create_stmt = conn
+            .prepare_single("CREATE TABLE simple (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+            .unwrap();
+        assert_eq!(
+            create_stmt.execute(None).unwrap().status,
+            TursoStatusCode::Done
+        );
+
+        let mut insert_stmt = conn
+            .prepare_single("INSERT INTO simple (name) VALUES ('original_name')")
+            .unwrap();
+        assert_eq!(
+            insert_stmt.execute(None).unwrap().status,
+            TursoStatusCode::Done
+        );
+
+        let mut update_stmt = conn
+            .prepare_single("UPDATE simple SET name = :new_name WHERE name = :old_name")
+            .unwrap();
+
+        let new_name_position = update_stmt.named_position(":new_name").unwrap();
+        update_stmt
+            .bind_positional(new_name_position, Value::build_text("updated_name"))
+            .unwrap();
+        let old_name_position = update_stmt.named_position(":old_name").unwrap();
+        update_stmt
+            .bind_positional(old_name_position, Value::build_text("original_name"))
+            .unwrap();
+
+        let update_result = update_stmt.execute(None).unwrap();
+        assert_eq!(update_result.status, TursoStatusCode::Done);
+        assert_eq!(update_result.rows_changed, 1);
+    }
+
+    #[test]
+    pub fn test_execute_update_with_mixed_placeholders() {
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: ":memory:".to_string(),
+            experimental_features: None,
+            async_io: false,
+            read_only: false,
+            encryption: None,
+            vfs: None,
+            io: None,
+            db_file: None,
+        });
+        let result = db.open().unwrap();
+        assert!(!result.is_io());
+
+        let conn = db.connect().unwrap();
+
+        let mut create_stmt = conn
+            .prepare_single("CREATE TABLE mixed (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT, age INTEGER)")
+            .unwrap();
+        assert_eq!(
+            create_stmt.execute(None).unwrap().status,
+            TursoStatusCode::Done
+        );
+
+        let mut insert_stmt = conn
+            .prepare_single(
+                "INSERT INTO mixed (name, email, age) VALUES ('alice', 'alice@old.com', 25)",
+            )
+            .unwrap();
+        assert_eq!(
+            insert_stmt.execute(None).unwrap().status,
+            TursoStatusCode::Done
+        );
+
+        let mut update_stmt = conn
+            .prepare_single("UPDATE mixed SET email = ?, age = :new_age WHERE name = ?")
+            .unwrap();
+
+        assert_eq!(update_stmt.named_position("?1").unwrap(), 1);
+        assert_eq!(update_stmt.named_position(":new_age").unwrap(), 2);
+        assert!(update_stmt.named_position("new_age").is_err());
+        assert_eq!(update_stmt.named_position("?3").unwrap(), 3);
+
+        update_stmt
+            .bind_positional(1, Value::build_text("alice@new.com"))
+            .unwrap();
+        let age_position = update_stmt.named_position(":new_age").unwrap();
+        update_stmt
+            .bind_positional(age_position, Value::from_i64(30))
+            .unwrap();
+        update_stmt
+            .bind_positional(3, Value::build_text("alice"))
+            .unwrap();
+
+        let update_result = update_stmt.execute(None).unwrap();
+        assert_eq!(update_result.status, TursoStatusCode::Done);
+        assert_eq!(update_result.rows_changed, 1);
+    }
+
+    #[test]
+    pub fn test_select_named_and_positional_mapping_stays_sql_order() {
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: ":memory:".to_string(),
+            experimental_features: None,
+            async_io: false,
+            read_only: false,
+            encryption: None,
+            vfs: None,
+            io: None,
+            db_file: None,
+        });
+        let result = db.open().unwrap();
+        assert!(!result.is_io());
+
+        let conn = db.connect().unwrap();
+        let mut create_stmt = conn
+            .prepare_single("CREATE TABLE simple (name TEXT NOT NULL)")
+            .unwrap();
+        assert_eq!(
+            create_stmt.execute(None).unwrap().status,
+            TursoStatusCode::Done
+        );
+
+        let mut stmt = conn
+            .prepare_single("SELECT :named FROM simple WHERE name = ?")
+            .unwrap();
+
+        assert_eq!(stmt.named_position(":named").unwrap(), 1);
+        assert!(stmt.named_position("named").is_err());
+        assert_eq!(stmt.named_position("?2").unwrap(), 2);
+    }
+
+    #[test]
+    pub fn test_named_and_indexed_alias_share_slot() {
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: ":memory:".to_string(),
+            experimental_features: None,
+            async_io: false,
+            read_only: false,
+            encryption: None,
+            vfs: None,
+            io: None,
+            db_file: None,
+        });
+        let result = db.open().unwrap();
+        assert!(!result.is_io());
+
+        let conn = db.connect().unwrap();
+        let mut stmt = conn
+            .prepare_single("SELECT :v AS named_slot, ?1 AS pos_slot")
+            .unwrap();
+
+        assert_eq!(stmt.named_position(":v").unwrap(), 1);
+        assert!(stmt.named_position("v").is_err());
+        assert!(stmt.named_position("?1").is_err());
+
+        stmt.bind_positional(1, Value::from_i64(7)).unwrap();
+        assert_eq!(stmt.step(None).unwrap(), TursoStatusCode::Row);
+        assert_eq!(stmt.row_value(0).unwrap().as_int(), Some(7));
+        assert_eq!(stmt.row_value(1).unwrap().as_int(), Some(7));
+    }
+
+    #[test]
+    pub fn test_sparse_positional_index_uses_declared_slot() {
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: ":memory:".to_string(),
+            experimental_features: None,
+            async_io: false,
+            read_only: false,
+            encryption: None,
+            vfs: None,
+            io: None,
+            db_file: None,
+        });
+        let result = db.open().unwrap();
+        assert!(!result.is_io());
+
+        let conn = db.connect().unwrap();
+        let mut stmt = conn.prepare_single("SELECT ?3").unwrap();
+
+        assert_eq!(stmt.parameters_count(), 3);
+        stmt.bind_positional(1, Value::from_i64(1)).unwrap();
+
+        stmt.bind_positional(3, Value::from_i64(9)).unwrap();
+        assert_eq!(stmt.step(None).unwrap(), TursoStatusCode::Row);
+        assert_eq!(stmt.row_value(0).unwrap().as_int(), Some(9));
+    }
+
+    #[test]
+    pub fn test_sparse_positional_index_count_matches_sqlite() {
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: ":memory:".to_string(),
+            experimental_features: None,
+            async_io: false,
+            read_only: false,
+            encryption: None,
+            vfs: None,
+            io: None,
+            db_file: None,
+        });
+        let result = db.open().unwrap();
+        assert!(!result.is_io());
+
+        let conn = db.connect().unwrap();
+        let mut stmt = conn.prepare_single("SELECT ?3").unwrap();
+
+        assert_eq!(stmt.parameters_count(), 3);
+        assert!(stmt.named_position("?1").is_err());
+        assert_eq!(stmt.named_position("?3").unwrap(), 3);
+
+        stmt.bind_positional(3, Value::from_i64(11)).unwrap();
+        assert_eq!(stmt.step(None).unwrap(), TursoStatusCode::Row);
+        assert_eq!(stmt.row_value(0).unwrap().as_int(), Some(11));
+    }
+
+    #[test]
+    pub fn test_insert_with_mixed_placeholders() {
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: ":memory:".to_string(),
+            experimental_features: None,
+            async_io: false,
+            read_only: false,
+            encryption: None,
+            vfs: None,
+            io: None,
+            db_file: None,
+        });
+        let result = db.open().unwrap();
+        assert!(!result.is_io());
+
+        let conn = db.connect().unwrap();
+        let mut create_stmt = conn
+            .prepare_single("CREATE TABLE users (name TEXT NOT NULL, age INTEGER NOT NULL)")
+            .unwrap();
+        assert_eq!(
+            create_stmt.execute(None).unwrap().status,
+            TursoStatusCode::Done
+        );
+
+        let mut insert_stmt = conn
+            .prepare_single("INSERT INTO users (name, age) VALUES (?, :age)")
+            .unwrap();
+
+        assert_eq!(insert_stmt.named_position("?1").unwrap(), 1);
+        assert_eq!(insert_stmt.named_position(":age").unwrap(), 2);
+        assert!(insert_stmt.named_position("age").is_err());
+
+        insert_stmt
+            .bind_positional(1, Value::build_text("alice"))
+            .unwrap();
+        let age_position = insert_stmt.named_position(":age").unwrap();
+        insert_stmt
+            .bind_positional(age_position, Value::from_i64(30))
+            .unwrap();
+
+        let insert_result = insert_stmt.execute(None).unwrap();
+        assert_eq!(insert_result.status, TursoStatusCode::Done);
+        assert_eq!(insert_result.rows_changed, 1);
+
+        let mut verify_stmt = conn
+            .prepare_single("SELECT age FROM users WHERE name = 'alice'")
+            .unwrap();
+        assert_eq!(verify_stmt.step(None).unwrap(), TursoStatusCode::Row);
+        assert_eq!(verify_stmt.row_value(0).unwrap().as_int(), Some(30));
+    }
+
+    #[test]
+    pub fn test_delete_with_mixed_placeholders() {
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: ":memory:".to_string(),
+            experimental_features: None,
+            async_io: false,
+            read_only: false,
+            encryption: None,
+            vfs: None,
+            io: None,
+            db_file: None,
+        });
+        let result = db.open().unwrap();
+        assert!(!result.is_io());
+
+        let conn = db.connect().unwrap();
+        let mut create_stmt = conn
+            .prepare_single("CREATE TABLE users (name TEXT NOT NULL, age INTEGER NOT NULL)")
+            .unwrap();
+        assert_eq!(
+            create_stmt.execute(None).unwrap().status,
+            TursoStatusCode::Done
+        );
+
+        let mut seed_stmt = conn
+            .prepare_single("INSERT INTO users (name, age) VALUES ('alice', 30), ('bob', 40)")
+            .unwrap();
+        assert_eq!(
+            seed_stmt.execute(None).unwrap().status,
+            TursoStatusCode::Done
+        );
+
+        let mut delete_stmt = conn
+            .prepare_single("DELETE FROM users WHERE name = ? AND age = :age")
+            .unwrap();
+
+        assert_eq!(delete_stmt.named_position("?1").unwrap(), 1);
+        assert_eq!(delete_stmt.named_position(":age").unwrap(), 2);
+        assert!(delete_stmt.named_position("age").is_err());
+
+        delete_stmt
+            .bind_positional(1, Value::build_text("alice"))
+            .unwrap();
+        let age_position = delete_stmt.named_position(":age").unwrap();
+        delete_stmt
+            .bind_positional(age_position, Value::from_i64(30))
+            .unwrap();
+
+        let delete_result = delete_stmt.execute(None).unwrap();
+        assert_eq!(delete_result.status, TursoStatusCode::Done);
+        assert_eq!(delete_result.rows_changed, 1);
+
+        let mut verify_stmt = conn.prepare_single("SELECT count(*) FROM users").unwrap();
+        assert_eq!(verify_stmt.step(None).unwrap(), TursoStatusCode::Row);
+        assert_eq!(verify_stmt.row_value(0).unwrap().as_int(), Some(1));
+    }
+
     #[cfg(feature = "encryption")]
     mod encryption_tests {
         use super::*;
-        use crate::rsapi::ValueRef;
         use tempfile::NamedTempFile;
 
         const TEST_CIPHER: &str = "aes256gcm";
@@ -1264,9 +2143,11 @@ mod tests {
             }
         }
 
-        fn assert_integer(value: ValueRef, expected: i64) {
+        fn assert_integer(value: turso_core::Value, expected: i64) {
             match value {
-                ValueRef::Numeric(turso_core::Numeric::Integer(i)) => assert_eq!(i, expected),
+                turso_core::Value::Numeric(turso_core::Numeric::Integer(i)) => {
+                    assert_eq!(i, expected)
+                }
                 _ => panic!("Expected integer {expected}, got {value:?}"),
             }
         }
@@ -1379,5 +2260,159 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Reproducer: stale DATABASE_MANAGER entry when old TursoDatabase/TursoConnection
+    /// haven't been GC'd (dropped) before reopening at the same path.
+    ///
+    /// Steps (mirrors the React Native bug report):
+    ///   1. Open database A via SDK, create table "cache", close connection
+    ///   2. Copy A.db → B.db, delete A.db
+    ///   3. Open a *new* database at path A.db — while old db_a/conn_a still alive
+    ///   4. CREATE TABLE cache should succeed (A.db is fresh) but fails with
+    ///      "table cache already exists" because the registry returned the stale Database
+    #[test]
+    pub fn test_stale_registry_with_live_sdk_handles() {
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let path_a = tmp_dir.path().join("A.db");
+        let path_b = tmp_dir.path().join("B.db");
+
+        // 1. Open database A via SDK and create a table.
+        let db_a = TursoDatabase::new(TursoDatabaseConfig {
+            path: path_a.to_str().unwrap().to_string(),
+            experimental_features: None,
+            async_io: false,
+            read_only: false,
+            encryption: None,
+            vfs: None,
+            io: None,
+            db_file: None,
+        });
+        let _ = db_a.open().unwrap();
+        let conn_a = db_a.connect().unwrap();
+
+        let mut stmt = conn_a
+            .prepare_single("CREATE TABLE cache(x INTEGER)")
+            .unwrap();
+        assert_eq!(stmt.execute(None).unwrap().status, TursoStatusCode::Done);
+        drop(stmt);
+
+        // Close the connection but do NOT drop conn_a or db_a — simulates
+        // the JS GC not having collected them yet.
+        conn_a.close().unwrap();
+
+        // 2. Copy A.db → B.db, then delete A.db (and WAL/SHM files).
+        std::fs::copy(&path_a, &path_b).unwrap();
+        std::fs::remove_file(&path_a).unwrap();
+        for ext in &["-wal", "-shm"] {
+            let src = tmp_dir.path().join(format!("A.db{ext}"));
+            let dst = tmp_dir.path().join(format!("B.db{ext}"));
+            if src.exists() {
+                std::fs::copy(&src, &dst).unwrap();
+                std::fs::remove_file(&src).unwrap();
+            }
+        }
+
+        // 3. Open a new database at the same path A.db.
+        //    The old db_a and conn_a are still alive — this is the key difference
+        //    from test_sdk_close_finalizes_leaked_statements which drops everything.
+        let db_a2 = TursoDatabase::new(TursoDatabaseConfig {
+            path: path_a.to_str().unwrap().to_string(),
+            experimental_features: None,
+            async_io: false,
+            read_only: false,
+            encryption: None,
+            vfs: None,
+            io: None,
+            db_file: None,
+        });
+        let _ = db_a2.open().unwrap();
+        let conn_a2 = db_a2.connect().unwrap();
+
+        // 4. A.db should be a fresh empty database — CREATE TABLE cache must succeed.
+        let mut stmt2 = conn_a2
+            .prepare_single("CREATE TABLE cache(x INTEGER)")
+            .expect("prepare should succeed on fresh database");
+        let result = stmt2.execute(None);
+        assert_eq!(
+            result.unwrap().status,
+            TursoStatusCode::Done,
+            "CREATE TABLE cache on a fresh A.db should succeed — \
+             stale DATABASE_MANAGER entry returned the old Database"
+        );
+
+        // Cleanup: drop old handles (simulates eventual GC).
+        drop(conn_a);
+        drop(db_a);
+    }
+
+    /// Regression test: connection.close() must finalize all outstanding statements
+    /// to break the Statement → Arc<Connection> → Arc<Database> chain that keeps the
+    /// database alive in DATABASE_MANAGER after a file rename.
+    #[test]
+    pub fn test_close_finalizes_outstanding_statements() {
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: ":memory:".to_string(),
+            experimental_features: None,
+            async_io: false,
+            read_only: false,
+            encryption: None,
+            vfs: None,
+            io: None,
+            db_file: None,
+        });
+        let result = db.open().unwrap();
+        assert!(!result.is_io());
+
+        let conn = db.connect().unwrap();
+
+        // Create a statement but do NOT finalize or drop it
+        let mut stmt = conn.prepare_single("SELECT 1").unwrap();
+        assert_eq!(stmt.step(None).unwrap(), TursoStatusCode::Row);
+
+        // close() should finalize the outstanding statement
+        conn.close().unwrap();
+
+        // The statement should now be finalized — using it returns an error
+        let result = stmt.step(None);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            TursoError::Misuse(msg) => assert_eq!(msg, FINALIZED_ERR),
+            other => panic!("expected Misuse error, got: {other:?}"),
+        }
+    }
+
+    /// Test that finalize() sets the statement handle to None, making subsequent
+    /// operations return "statement has been finalized".
+    #[test]
+    pub fn test_finalize_disposes_statement() {
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: ":memory:".to_string(),
+            experimental_features: None,
+            async_io: false,
+            read_only: false,
+            encryption: None,
+            vfs: None,
+            io: None,
+            db_file: None,
+        });
+        let result = db.open().unwrap();
+        assert!(!result.is_io());
+
+        let conn = db.connect().unwrap();
+        let mut stmt = conn.prepare_single("SELECT 1").unwrap();
+
+        // Finalize the statement
+        assert_eq!(stmt.finalize(None).unwrap(), TursoStatusCode::Done);
+
+        // All operations should now return "statement has been finalized"
+        assert!(stmt.step(None).is_err());
+        assert!(stmt.execute(None).is_err());
+        assert!(stmt.reset().is_err());
+        assert!(stmt.run_io().is_err());
+        assert!(stmt.bind_positional(1, Value::Null).is_err());
+        assert_eq!(stmt.n_change(), 0);
+        assert_eq!(stmt.column_count(), 0);
+        assert_eq!(stmt.parameters_count(), 0);
     }
 }

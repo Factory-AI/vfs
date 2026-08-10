@@ -319,18 +319,17 @@ async fn verify_remote_manifest_against_db(
         .get_connection()
         .await
         .context("Failed to inspect staged remote metadata")?;
-    let mut rows = conn
-        .query(
-            "SELECT seq FROM fs_op_journal ORDER BY seq DESC LIMIT 1",
-            (),
-        )
-        .await?;
-    let head_seq = rows
-        .next()
-        .await?
-        .map(|row| row.get::<i64>(0))
-        .transpose()?
-        .unwrap_or(0);
+    let mut rows = conn.query("SELECT MAX(seq) FROM fs_op_journal", ()).await?;
+    // An empty journal yields one NULL row; keep the wrapper out of the SQL
+    // (COALESCE defeats turso's min/max reverse-seek plan).
+    let head_seq = match rows.next().await? {
+        Some(row) => match row.get_value(0)? {
+            turso::Value::Null => 0,
+            turso::Value::Integer(seq) => seq,
+            other => bail!("journal head aggregate returned non-integer {other:?}"),
+        },
+        None => 0,
+    };
     drop(rows);
     if manifest.head_seq != head_seq {
         bail!(

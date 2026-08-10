@@ -985,16 +985,6 @@ other tooling can be recovered with
 `echo 1 > /sys/fs/fuse/connections/<id>/abort` (verify the connection id
 first).
 
-### Temp files (`TMPDIR`)
-
-The `turso_core` dependency (0.5.3) leaks `tursodb-ephemeral-*` sort-spill
-files into the temp dir and never unlinks them (`vdbe/execute.rs:10096`). The
-CLI therefore points its own `TMPDIR` at a private per-process directory that
-is removed on exit, so hosts do not accumulate spill litter. This override is
-process-internal: commands spawned by `vfs run`, `vfs exec`, and
-`vfs init -c` see the original `TMPDIR`. Stale spill directories from
-`SIGKILL`ed processes are garbage-collected on the next CLI start.
-
 Variables set inside an `vfs run` sandbox:
 
 | Variable | Description |

@@ -1612,13 +1612,21 @@ async fn read_markers(conn: &Connection) -> Result<Markers> {
         )));
     }
     let floor = config_i64(conn, CONFIG_HISTORY_FLOOR_SEQ_KEY).await?;
-    let mut rows = conn
-        .query(
-            "SELECT seq FROM fs_op_journal ORDER BY seq DESC LIMIT 1",
-            (),
-        )
-        .await?;
-    let journal_head = rows.next().await?.map(|row| row.get(0)).transpose()?;
+    let mut rows = conn.query("SELECT MAX(seq) FROM fs_op_journal", ()).await?;
+    // An empty journal yields one NULL row; keep the wrapper out of the SQL
+    // (COALESCE defeats turso's min/max reverse-seek plan).
+    let journal_head = match rows.next().await? {
+        Some(row) => match row.get_value(0)? {
+            Value::Null => None,
+            Value::Integer(seq) => Some(seq),
+            other => {
+                return Err(Error::Internal(format!(
+                    "journal head aggregate returned non-integer {other:?}"
+                )))
+            }
+        },
+        None => None,
+    };
     drop(rows);
     let mut rows = conn
         .query(

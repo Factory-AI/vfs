@@ -68,7 +68,7 @@ impl Clone for Connection {
 }
 
 impl Connection {
-    pub fn create(
+    pub(crate) fn create(
         conn: Arc<turso_sdk_kit::rsapi::TursoConnection>,
         extra_io: Option<Arc<dyn Fn(Waker) -> Result<()> + Send + Sync>>,
     ) -> Self {
@@ -107,15 +107,34 @@ impl Connection {
     /// Query the database with SQL.
     pub async fn query(&self, sql: impl AsRef<str>, params: impl IntoParams) -> Result<Rows> {
         self.maybe_handle_dangling_tx().await?;
-        let mut stmt = self.prepare(sql).await?;
+        let mut stmt = self.prepare_maybe_cached(sql).await?;
         stmt.query(params).await
     }
 
     /// Execute SQL statement on the database.
     pub async fn execute(&self, sql: impl AsRef<str>, params: impl IntoParams) -> Result<u64> {
         self.maybe_handle_dangling_tx().await?;
-        let mut stmt = self.prepare(sql).await?;
+        let mut stmt = self.prepare_maybe_cached(sql).await?;
         stmt.execute(params).await
+    }
+
+    /// Route one-shot statements through the per-connection statement cache.
+    ///
+    /// PRAGMA statements are exempt: pragma assignments apply their side
+    /// effect at translate time, and the ones that do not bump the prepare
+    /// context generation (e.g. `fullfsync`) would silently skip that effect
+    /// on a cache hit. Pragmas are never hot, so they always prepare fresh.
+    async fn prepare_maybe_cached(&self, sql: impl AsRef<str>) -> Result<Statement> {
+        let is_pragma = sql
+            .as_ref()
+            .trim_start()
+            .get(..6)
+            .is_some_and(|kw| kw.eq_ignore_ascii_case("PRAGMA"));
+        if is_pragma {
+            self.prepare(sql).await
+        } else {
+            self.prepare_cached(sql).await
+        }
     }
 
     /// get the inner connection
@@ -242,6 +261,7 @@ impl Connection {
         conn.set_busy_timeout(duration);
         Ok(())
     }
+
 }
 
 impl Debug for Connection {

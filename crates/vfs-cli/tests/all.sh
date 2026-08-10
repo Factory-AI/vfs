@@ -26,9 +26,10 @@ cd "$CLI_DIR"
 # have real sessions there — NEVER sweep ~/.vfs/run wholesale). Suites
 # that override HOME to a temp root are covered by their temp-root removal.
 
-# Pin TMPDIR to a per-run scratch dir cleaned on exit: turso_core 0.5.3 leaks
-# /tmp/tursodb-ephemeral-* sort-spill files (vdbe/execute.rs:10096 never
-# unlinks them), so dependency litter must not accumulate on the host.
+# Pin TMPDIR to a per-run scratch dir cleaned on exit: suites and their
+# dependencies write temp state, and any litter a suite leaves (or a
+# dependency regression starts leaving) must die with the run instead of
+# accumulating on the host.
 SUITE_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/vfs-all.XXXXXX")"
 trap 'rm -rf "$SUITE_TMPDIR"' EXIT INT TERM
 TMPDIR="$SUITE_TMPDIR"
