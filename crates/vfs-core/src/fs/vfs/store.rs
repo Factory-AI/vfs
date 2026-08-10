@@ -274,6 +274,77 @@ pub(super) async fn read_from_storage(
     read_chunked(conn, ino, geometry, resolver, offset, size).await
 }
 
+/// Splices ordered chunk rows into one read buffer, zero-filling sparse gaps.
+struct ChunkAssembler {
+    result: Vec<u8>,
+    size: usize,
+    chunk_size: usize,
+    start_chunk: u64,
+    start_offset_in_chunk: usize,
+    next_expected_chunk: u64,
+    chunks_read: u64,
+}
+
+impl ChunkAssembler {
+    fn new(offset: u64, size: u64, chunk_size: u64) -> Self {
+        Self {
+            result: Vec::with_capacity(size as usize),
+            size: size as usize,
+            chunk_size: chunk_size as usize,
+            start_chunk: offset / chunk_size,
+            start_offset_in_chunk: (offset % chunk_size) as usize,
+            next_expected_chunk: offset / chunk_size,
+            chunks_read: 0,
+        }
+    }
+
+    fn skip_for(&self, chunk_index: u64) -> usize {
+        if chunk_index == self.start_chunk {
+            self.start_offset_in_chunk
+        } else {
+            0
+        }
+    }
+
+    fn append(&mut self, chunk_index: u64, chunk_data: &[u8]) {
+        self.chunks_read += 1;
+
+        while self.next_expected_chunk < chunk_index && self.result.len() < self.size {
+            let skip = self.skip_for(self.next_expected_chunk);
+            let zeros_needed = std::cmp::min(self.chunk_size - skip, self.size - self.result.len());
+            self.result.extend(std::iter::repeat_n(0u8, zeros_needed));
+            self.next_expected_chunk += 1;
+        }
+
+        let skip = self.skip_for(chunk_index);
+        if skip >= chunk_data.len() {
+            let zeros_needed = std::cmp::min(self.chunk_size - skip, self.size - self.result.len());
+            self.result.extend(std::iter::repeat_n(0u8, zeros_needed));
+        } else {
+            let remaining = self.size - self.result.len();
+            let take = std::cmp::min(chunk_data.len() - skip, remaining);
+            self.result
+                .extend_from_slice(&chunk_data[skip..skip + take]);
+
+            let chunk_end = skip + take;
+            if chunk_end < self.chunk_size && self.result.len() < self.size {
+                let zeros_needed =
+                    std::cmp::min(self.chunk_size - chunk_end, self.size - self.result.len());
+                self.result.extend(std::iter::repeat_n(0u8, zeros_needed));
+            }
+        }
+        self.next_expected_chunk = chunk_index + 1;
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        if self.result.len() < self.size {
+            self.result.resize(self.size, 0);
+        }
+        crate::telemetry::record_chunk_read_chunks(self.chunks_read);
+        self.result
+    }
+}
+
 async fn read_chunked(
     conn: &Connection,
     ino: i64,
@@ -285,94 +356,77 @@ async fn read_chunked(
     let chunk_size = geometry.chunk_size as u64;
     let start_chunk = offset / chunk_size;
     let end_chunk = (offset + size).saturating_sub(1) / chunk_size;
-
-    let mut stmt = conn
-        .prepare_cached(
-            "SELECT d.chunk_index, c.digest, c.data
-             FROM fs_data d
-             JOIN fs_chunk c ON c.digest = d.digest
-             WHERE d.ino = ? AND d.chunk_index BETWEEN ? AND ?
-             ORDER BY d.chunk_index",
-        )
-        .await?;
+    let mut assembler = ChunkAssembler::new(offset, size, chunk_size);
     crate::telemetry::record_chunk_read_query();
-    let mut rows = stmt
-        .query((ino, start_chunk as i64, end_chunk as i64))
-        .await?;
 
-    let mut chunk_rows = Vec::new();
-    while let Some(row) = rows.next().await? {
-        let chunk_index = required_u64(&row, 0, "fs_data.chunk_index")?;
-        let digest = match row.get_value(1) {
-            Ok(Value::Blob(digest)) => digest,
-            Ok(_) | Err(_) => return Err(corrupt_column("fs_chunk.digest", "expected blob")),
-        };
-        let data = match row.get_value(2) {
-            Ok(Value::Blob(data)) => data,
-            Ok(_) | Err(_) => return Err(corrupt_column("fs_chunk.data", "expected blob")),
-        };
-        chunk_rows.push((chunk_index, digest, data));
-    }
-    drop(rows);
-    drop(stmt);
+    // The hollow session is the exceptional branch of the same read: it must
+    // materialize the digests and finish the row stream before any remote
+    // fetch, while the ordinary path streams rows straight into the buffer
+    // without ever decoding a digest.
+    if resolver.hollow {
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT d.chunk_index, c.digest, c.data
+                 FROM fs_data d
+                 JOIN fs_chunk c ON c.digest = d.digest
+                 WHERE d.ino = ? AND d.chunk_index BETWEEN ? AND ?
+                 ORDER BY d.chunk_index",
+            )
+            .await?;
+        let mut rows = stmt
+            .query((ino, start_chunk as i64, end_chunk as i64))
+            .await?;
 
-    // Remote I/O starts only after the row stream is gone. The caller's pooled
-    // connection remains checked out so verified bytes can backfill through
-    // the same connection; pool occupancy during faults is the accepted
-    // tradeoff, while holding a live Turso statement across a fetch is not.
-    let mut result = Vec::with_capacity(size as usize);
-    let start_offset_in_chunk = (offset % chunk_size) as usize;
-    let mut next_expected_chunk = start_chunk;
-    let mut chunks_read = 0u64;
-
-    for (chunk_index, digest, data) in chunk_rows {
-        chunks_read += 1;
-
-        while next_expected_chunk < chunk_index && result.len() < size as usize {
-            let skip = if next_expected_chunk == start_chunk {
-                start_offset_in_chunk
-            } else {
-                0
+        let mut chunk_rows = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let chunk_index = required_u64(&row, 0, "fs_data.chunk_index")?;
+            let digest = match row.get_value(1) {
+                Ok(Value::Blob(digest)) => digest,
+                Ok(_) | Err(_) => return Err(corrupt_column("fs_chunk.digest", "expected blob")),
             };
-            let zeros_needed =
-                std::cmp::min(chunk_size as usize - skip, size as usize - result.len());
-            result.extend(std::iter::repeat_n(0u8, zeros_needed));
-            next_expected_chunk += 1;
+            let data = match row.get_value(2) {
+                Ok(Value::Blob(data)) => data,
+                Ok(_) | Err(_) => return Err(corrupt_column("fs_chunk.data", "expected blob")),
+            };
+            chunk_rows.push((chunk_index, digest, data));
         }
+        drop(rows);
+        drop(stmt);
 
-        let chunk_data = resolve_chunk_bytes(conn, resolver, digest, data).await?;
-        let skip = if chunk_index == start_chunk {
-            start_offset_in_chunk
-        } else {
-            0
-        };
-        if skip >= chunk_data.len() {
-            let zeros_needed =
-                std::cmp::min(chunk_size as usize - skip, size as usize - result.len());
-            result.extend(std::iter::repeat_n(0u8, zeros_needed));
-        } else {
-            let remaining = size as usize - result.len();
-            let take = std::cmp::min(chunk_data.len() - skip, remaining);
-            result.extend_from_slice(&chunk_data[skip..skip + take]);
-
-            let chunk_end = skip + take;
-            if chunk_end < chunk_size as usize && result.len() < size as usize {
-                let zeros_needed = std::cmp::min(
-                    chunk_size as usize - chunk_end,
-                    size as usize - result.len(),
-                );
-                result.extend(std::iter::repeat_n(0u8, zeros_needed));
-            }
+        // Remote I/O starts only after the row stream is gone. The caller's
+        // pooled connection remains checked out so verified bytes can
+        // backfill through the same connection; pool occupancy during faults
+        // is the accepted tradeoff, while holding a live Turso statement
+        // across a fetch is not.
+        for (chunk_index, digest, data) in chunk_rows {
+            let chunk_data = resolve_chunk_bytes(conn, resolver, digest, data).await?;
+            assembler.append(chunk_index, &chunk_data);
         }
-        next_expected_chunk = chunk_index + 1;
+    } else {
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT d.chunk_index, c.data
+                 FROM fs_data d
+                 JOIN fs_chunk c ON c.digest = d.digest
+                 WHERE d.ino = ? AND d.chunk_index BETWEEN ? AND ?
+                 ORDER BY d.chunk_index",
+            )
+            .await?;
+        let mut rows = stmt
+            .query((ino, start_chunk as i64, end_chunk as i64))
+            .await?;
+
+        while let Some(row) = rows.next().await? {
+            let chunk_index = required_u64(&row, 0, "fs_data.chunk_index")?;
+            let data = match row.get_value(1) {
+                Ok(Value::Blob(data)) => data,
+                Ok(_) | Err(_) => return Err(corrupt_column("fs_chunk.data", "expected blob")),
+            };
+            assembler.append(chunk_index, &data);
+        }
     }
 
-    if result.len() < size as usize {
-        result.resize(size as usize, 0);
-    }
-
-    crate::telemetry::record_chunk_read_chunks(chunks_read);
-    Ok(result)
+    Ok(assembler.finish())
 }
 
 async fn resolve_chunk_bytes(
