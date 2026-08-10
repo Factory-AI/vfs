@@ -673,6 +673,63 @@ mod darwin_spawn_exit_codes {
     }
 }
 
+#[cfg(target_os = "macos")]
+mod darwin_exec_preflight {
+    use super::super::darwin::preflight_exec_exit_code;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    fn code(command: &Path, cwd: &Path) -> Option<i32> {
+        preflight_exec_exit_code(command, cwd).map(|(code, _)| code)
+    }
+
+    #[test]
+    fn missing_absolute_command_is_127() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            code(&dir.path().join("does-not-exist"), dir.path()),
+            Some(127)
+        );
+    }
+
+    #[test]
+    fn present_non_executable_is_126() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("not-executable");
+        std::fs::write(&target, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(code(&target, dir.path()), Some(126));
+    }
+
+    #[test]
+    fn executable_paths_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(code(Path::new("/bin/sh"), dir.path()), None);
+    }
+
+    #[test]
+    fn bare_names_search_path() {
+        let dir = tempfile::tempdir().unwrap();
+        // `sh` resolves through PATH on every runner; a name that cannot
+        // exist anywhere on PATH is not found.
+        assert_eq!(code(Path::new("sh"), dir.path()), None);
+        assert_eq!(
+            code(Path::new("vfs-preflight-test-missing-cmd"), dir.path()),
+            Some(127)
+        );
+    }
+
+    #[test]
+    fn relative_paths_resolve_against_the_child_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("tool.sh");
+        std::fs::write(&target, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(code(Path::new("./tool.sh"), dir.path()), None);
+        assert_eq!(code(Path::new("./absent.sh"), dir.path()), Some(127));
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod skip_mount {
     use super::super::linux::skip_mount;
