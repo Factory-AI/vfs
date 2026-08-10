@@ -293,6 +293,73 @@ pub(super) fn spawn_error_exit_code(error: &anyhow::Error) -> Option<i32> {
         .and_then(exit_code_for_spawn_error)
 }
 
+/// Resolve the target command the way sandbox-exec's execvp will, before
+/// spawning. The spawn itself always succeeds because sandbox-exec is a
+/// pinned system binary; when the *target* is missing or non-executable,
+/// sandbox-exec exits EX_OSERR (71), which would violate the reserved
+/// 127/126 startup-status contract. Returns the reserved exit code and a
+/// message when the command cannot execute.
+pub(super) fn preflight_exec_exit_code(
+    command: &Path,
+    child_cwd: &Path,
+) -> Option<(i32, &'static str)> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fn executable(path: &Path) -> bool {
+        path.metadata()
+            .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+
+    const NOT_FOUND: (i32, &'static str) = (127, "command not found");
+    const NOT_EXECUTABLE: (i32, &'static str) = (126, "not executable");
+
+    // A command containing a slash is used as a path, resolved against the
+    // child's working directory; only a bare name searches PATH.
+    if command.components().count() > 1 {
+        let target = if command.is_absolute() {
+            command.to_path_buf()
+        } else {
+            child_cwd.join(command)
+        };
+        if executable(&target) {
+            return None;
+        }
+        return Some(if target.exists() {
+            NOT_EXECUTABLE
+        } else {
+            NOT_FOUND
+        });
+    }
+
+    let mut found_non_executable = false;
+    for dir in std::env::split_paths(&crate::config::host_path_var()) {
+        // An empty PATH entry means the working directory, per execvp.
+        let candidate = if dir.as_os_str().is_empty() {
+            child_cwd.join(command)
+        } else {
+            dir.join(command)
+        };
+        if executable(&candidate) {
+            return None;
+        }
+        if candidate.exists() {
+            found_non_executable = true;
+        }
+    }
+    Some(if found_non_executable {
+        NOT_EXECUTABLE
+    } else {
+        NOT_FOUND
+    })
+}
+
+/// An exited wait status carrying `code`, for exits decided without a child.
+fn synthesized_exit_status(code: i32) -> std::process::ExitStatus {
+    use std::os::unix::process::ExitStatusExt;
+    std::process::ExitStatus::from_raw(code << 8)
+}
+
 /// Run the command in a Darwin sandbox.
 pub async fn run(options: RunOptions) -> Result<()> {
     let RunOptions {
@@ -456,8 +523,19 @@ pub async fn run(options: RunOptions) -> Result<()> {
     print_welcome_banner(&session, encrypted);
 
     let command_display = command.display().to_string();
-    let child_command = command_in_mount(&session, command, args);
-    let status = run_supervised(mount_handle, child_command).await;
+    let status = match preflight_exec_exit_code(&command, &session.mountpoint) {
+        Some((code, reason)) => {
+            eprintln!("Error: Failed to execute: {command_display}: {reason}");
+            mount_handle
+                .unmount()
+                .await
+                .map(|()| synthesized_exit_status(code))
+        }
+        None => {
+            let child_command = command_in_mount(&session, command, args);
+            run_supervised(mount_handle, child_command).await
+        }
+    };
     if let Err(e) = std::fs::remove_dir(&session.mountpoint) {
         eprintln!(
             "Warning: Failed to clean up mountpoint {}: {}",
@@ -709,6 +787,10 @@ async fn run_command_in_mount(
     args: Vec<String>,
 ) -> Result<ChildOutcome> {
     let command_display = command.display().to_string();
+    if let Some((code, reason)) = preflight_exec_exit_code(&command, &session.mountpoint) {
+        eprintln!("Error: Failed to execute: {command_display}: {reason}");
+        return Ok(ChildOutcome::Exited(synthesized_exit_status(code)));
+    }
     let child_command = command_in_mount(session, command, args);
     match supervise_command(child_command).await {
         Ok(outcome) => Ok(outcome),

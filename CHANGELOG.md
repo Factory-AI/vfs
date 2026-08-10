@@ -1,5 +1,19 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- macOS `vfs run` now honors the reserved startup exit statuses for a bad
+  command: `127` when it is missing and `126` when it is present but not
+  executable. The sandbox wrapper always spawns (`/usr/bin/sandbox-exec` is
+  a pinned system binary), so a missing *target* previously surfaced as
+  sandbox-exec's own `EX_OSERR` exit 71. The run path now resolves the
+  target execvp-style before spawning and exits with the reserved status,
+  matching `vfs exec` and the Linux run path. Caught by the new CI
+  exit-parity leg in `macos-nfs-git-validation.sh`, which also gained a
+  quoted-profile-path leg; both were previously manual release spot-checks.
+
 ## [1.1.0] - 2026-08-09 - Replayable history, session branching, and the remote tier
 
 This release builds one time-travel path from content-addressed storage through

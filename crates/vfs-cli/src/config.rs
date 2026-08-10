@@ -42,6 +42,13 @@ pub(crate) fn current_shell_path() -> Option<String> {
     EnvReader::new().string(SHELL_ENV)
 }
 
+/// PATH as a spawned child inherits it, for execvp-style spawn preflight.
+/// The fallback mirrors execvp's behavior when PATH is unset.
+#[cfg(target_os = "macos")]
+pub(crate) fn host_path_var() -> std::ffi::OsString {
+    std::env::var_os("PATH").unwrap_or_else(|| std::ffi::OsString::from("/usr/bin:/bin"))
+}
+
 pub fn remote_config() -> Option<RemoteConfig> {
     let reader = EnvReader::new();
     let url = reader.string(REMOTE_URL_ENV)?;
