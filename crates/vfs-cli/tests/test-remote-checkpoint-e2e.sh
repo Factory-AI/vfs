@@ -46,7 +46,9 @@ wait_pid_exit() {
 unmount_path() {
     path="$1"
     [ -n "$path" ] || return
-    if command -v fusermount3 >/dev/null 2>&1; then
+    if [ "$(uname -s)" = "Darwin" ]; then
+        /sbin/umount "$path" 2>/dev/null || /sbin/umount -f "$path" 2>/dev/null || true
+    elif command -v fusermount3 >/dev/null 2>&1; then
         fusermount3 -uz "$path" 2>/dev/null || true
     elif command -v fusermount >/dev/null 2>&1; then
         fusermount -u "$path" 2>/dev/null || true
@@ -65,9 +67,20 @@ stop_live() {
     LIVE_SESSION=""
 }
 
-case "$(uname -s)" in
-    Linux) ;;
-    *) skip "requires Linux namespaces and FUSE" ;;
+OS_NAME="$(uname -s)"
+case "$OS_NAME" in
+    Linux)
+        [ -e /dev/fuse ] || skip "requires /dev/fuse for FUSE mounts"
+        if [ -r /proc/sys/kernel/unprivileged_userns_clone ] &&
+            [ "$(cat /proc/sys/kernel/unprivileged_userns_clone)" = "0" ]; then
+            skip "unprivileged user namespaces are disabled"
+        fi
+        ;;
+    Darwin)
+        [ -x /sbin/mount_nfs ] || skip "requires /sbin/mount_nfs for NFS mounts"
+        [ -x /usr/bin/sandbox-exec ] || skip "requires sandbox-exec"
+        ;;
+    *) skip "requires Linux (FUSE) or macOS (NFS)" ;;
 esac
 
 [ -n "$VFS_BIN" ] || command -v cargo >/dev/null 2>&1 ||
@@ -76,12 +89,6 @@ command -v python3 >/dev/null 2>&1 || skip "python3 is unavailable"
 command -v git >/dev/null 2>&1 || skip "git is unavailable"
 command -v sha256sum >/dev/null 2>&1 || skip "sha256sum is unavailable"
 [ -x /bin/bash ] || skip "/bin/bash is unavailable"
-[ -e /dev/fuse ] || skip "requires /dev/fuse for FUSE mounts"
-
-if [ -r /proc/sys/kernel/unprivileged_userns_clone ] &&
-    [ "$(cat /proc/sys/kernel/unprivileged_userns_clone)" = "0" ]; then
-    skip "unprivileged user namespaces are disabled"
-fi
 
 if [ -z "$VFS_BIN" ]; then
     cargo +nightly build --quiet --manifest-path "$CLI_DIR/Cargo.toml" >/dev/null 2>&1 ||
@@ -433,6 +440,12 @@ grep -qi "remote metadata artifact.*chunk bytes are not present" \
     fail "writable-open refusal did not identify hollow remote metadata"
 
 # --- Live checkpoint through the control socket ----------------------------
+# The session control socket and the background streamer live in the mount
+# owner, which serves them only on Linux; on macOS these two legs have no
+# product surface to exercise, so they are the one platform-conditional
+# region in this suite.
+if [ "$OS_NAME" = "Linux" ]; then
+
 LIVE_REMOTE="$TEST_ROOT/remote-live"
 mkdir -p "$LIVE_REMOTE"
 start_live "$LIVE_ID" "$LIVE_REMOTE" 60000 "$TEST_ROOT/live-owner.log"
@@ -536,6 +549,10 @@ assert token["reusedChunks"] > 0, token
 assert token["uploadedChunks"] + token["reusedChunks"] == token["chunkCount"], token
 PY
 stop_live
+
+else
+    echo "note: live-checkpoint and streamer legs run only on Linux (control socket and streamer are Linux-only)"
+fi
 
 # --- Journal disabled ------------------------------------------------------
 NO_JOURNAL_REMOTE="$TEST_ROOT/remote-no-journal"

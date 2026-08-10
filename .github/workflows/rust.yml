@@ -192,6 +192,69 @@ jobs:
           --pjdfstest-dir /tmp/pjdfstest \
           --profile phase5-ci
 
+  # Real macOS runtime coverage: the NFS mount path, the Seatbelt read-scoping
+  # posture, and the remote-tier suites all execute here, not just compile.
+  # macos-latest runners allow unprivileged /sbin/mount_nfs against the
+  # session's loopback NFS server, so no sudo is involved. A suite SKIP is
+  # red: a runner that cannot run these legs must fail loudly, not pass green.
+  macos-runtime:
+    name: macOS runtime gate
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('Cargo.lock') }}
+
+    - name: Cache cargo index
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/git
+        key: ${{ runner.os }}-cargo-index-${{ hashFiles('Cargo.lock') }}
+
+    - name: Cache cargo build
+      uses: actions/cache@v4
+      with:
+        path: target
+        key: ${{ runner.os }}-cargo-build-target-macos-runtime-${{ hashFiles('Cargo.lock') }}
+
+    - name: Put GNU coreutils on PATH
+      # The shell suites use sha256sum and truncate; stock macOS ships neither.
+      run: |
+        brew list coreutils >/dev/null 2>&1 || brew install coreutils
+        echo "$(brew --prefix coreutils)/libexec/gnubin" >> "$GITHUB_PATH"
+
+    - name: Build release binary
+      run: cargo +"$RUST_TOOLCHAIN" build --release -p vfs-cli
+
+    - name: NFS and Seatbelt runtime validation
+      run: scripts/validation/macos-nfs-git-validation.sh --vfs-bin "$PWD/target/release/vfs"
+
+    - name: Remote checkpoint e2e
+      env:
+        VFS_BIN: ${{ github.workspace }}/target/release/vfs
+      run: |
+        set -o pipefail
+        crates/vfs-cli/tests/test-remote-checkpoint-e2e.sh 2>&1 | tee /tmp/remote-checkpoint.log
+        ! grep -q '^SKIP:' /tmp/remote-checkpoint.log
+
+    - name: Remote adopt e2e
+      env:
+        VFS_BIN: ${{ github.workspace }}/target/release/vfs
+      run: |
+        set -o pipefail
+        crates/vfs-cli/tests/test-remote-adopt-e2e.sh 2>&1 | tee /tmp/remote-adopt.log
+        ! grep -q '^SKIP:' /tmp/remote-adopt.log
+
   build-linux-arm64:
     name: Build (Linux arm64)
     runs-on: ubuntu-24.04-arm
