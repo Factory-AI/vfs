@@ -3769,7 +3769,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vfs-cli"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3803,7 +3803,7 @@ dependencies = [
 
 [[package]]
 name = "vfs-core"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "aegis",
  "async-trait",
@@ -3828,7 +3828,7 @@ dependencies = [
 
 [[package]]
 name = "vfs-fuse"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3849,7 +3849,7 @@ dependencies = [
 
 [[package]]
 name = "vfs-mount"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3865,7 +3865,7 @@ dependencies = [
 
 [[package]]
 name = "vfs-nfs"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
