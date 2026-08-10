@@ -146,7 +146,7 @@ Shell tests each run out of their own `mktemp -d` with trap cleanup and honor
 mount, suite, or benchmark.
 
 Full detail — Python harnesses, pjdfstest profiles, benchmark policy, the
-manual macOS gate — is in [docs/TESTING.md](docs/TESTING.md).
+macOS gates — is in [docs/TESTING.md](docs/TESTING.md).
 
 ## Contracts you cannot change quietly
 
@@ -226,14 +226,17 @@ Not regressions — deliberate, documented state. Don't "fix" them by accident.
   The sandbox hides `$HOME` and the temp dirs, so a host path that happens to
   work on the CI image can vanish on a developer's machine. Use
   `sandbox_python()` for interpreters and the `GIT` env var from
-  `pin_distro_git()` for git, both in `scripts/validation/lib/common.py`.
-  Harness helpers live in that module: do not copy one into a harness, because
-  the copies drift and the drift is invisible until the gate runs somewhere
-  unusual.
-* **macOS runtime validation is a manual release gate.** CI builds and clippys
-  on macos-latest, but `scripts/validation/macos-nfs-git-validation.sh` plus
-  the Seatbelt spot-checks in docs/TESTING.md must run on real hardware before
-  shipping a release that advertises macOS.
+  `pin_distro_git()` for git, both in `scripts/validation/lib/common.py`. Do
+  not copy helpers out of that module; copies drift, and the drift is
+  invisible until the gate runs somewhere unusual.
+* **macOS runtime coverage is CI-real but narrower than Linux.** The
+  macos-latest jobs run clippy, the workspace tests, the NFS + Seatbelt
+  runtime validation script, and both remote-tier suites over the NFS mount
+  path. The session control socket and the chunk streamer exist only in the
+  Linux mount owner, so the live-checkpoint and streamer legs never run on a
+  Mac, and the rest of the shell suite plus the Seatbelt spot-checks in
+  docs/TESTING.md still need a manual hardware run before a release that
+  advertises macOS.
 * **NFS `UNSTABLE`+`COMMIT` is deliberately unimplemented.** Every WRITE is
   `FILE_SYNC`-honest and `NFSPROC3_COMMIT` returns `PROC_UNAVAIL`. Implementing
   it with imperfect verifier semantics reintroduces the data-loss class
@@ -247,12 +250,11 @@ Not regressions — deliberate, documented state. Don't "fix" them by accident.
   per-phase median regression >5% relative *and* >10ms absolute.
 * **Read absolute medians, not ratios.** The native and Vfs legs do not share
   controlled page-cache state, so a `vfs / native` ratio moves when the
-  denominator moves. In the committed baselines, `status` and `diff` ratios
-  worsened roughly tenfold across two runs while the Vfs times *improved* —
-  the native leg had simply gotten faster. Quote absolute times with
-  dispersion; treat a bare ratio as unreviewed. The single-run
-  `.agents/benchmarks/baseline-*.json` files are profiled single shots, not
-  the scoreboard.
+  denominator moves: in the committed baselines the `status` and `diff`
+  ratios worsened tenfold across two runs while the Vfs times *improved*.
+  Quote absolute times with dispersion; treat a bare ratio as unreviewed. The
+  single-run `.agents/benchmarks/baseline-*.json` files are profiled single
+  shots, not the scoreboard.
 * **The workload benchmark refuses to guess.** `.agents/benchmarks/fixtures/`
   is gitignored, so the canonical codex fixture is missing on CI and on fresh
   clones. `git-workload-benchmark.py` errors rather than silently measuring
