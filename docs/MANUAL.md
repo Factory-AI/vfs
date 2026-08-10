@@ -592,7 +592,7 @@ vfs backup [OPTIONS] <ID_OR_PATH> <TARGET>
 
 ### vfs materialize
 
-Create a portable database by materializing partial-origin files
+Hydrate remote chunks and optionally create a portable database
 
 ```
 vfs materialize [OPTIONS] <ID_OR_PATH>
@@ -605,6 +605,7 @@ vfs materialize [OPTIONS] <ID_OR_PATH>
 **Options:**
 
 - `--output <OUTPUT>` — Target database path to create
+- `--in-place` — Hydrate the source database offline without creating a copy
 - `--verify` — Reopen and verify the materialized database
 - `--key <KEY>` — Hex-encoded encryption key for encrypted databases
 - `--cipher <CIPHER>` — Encryption cipher (required with --key)

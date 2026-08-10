@@ -12,6 +12,9 @@ use vfs_core::{
     VfsOptions,
 };
 
+use super::pack::SessionStillRunning;
+use super::remote::{RemoteChunkSource, RemoteConfig};
+
 const S_IFMT: i64 = 0o170000;
 const S_IFREG: i64 = 0o100000;
 #[cfg(test)]
@@ -125,25 +128,61 @@ pub async fn handle_backup_command(
     materialize: bool,
     encryption: Option<&(String, String)>,
 ) -> AnyhowResult<()> {
-    let source_path = resolve_local_db_path(&id_or_path)?;
+    let home = dirs::home_dir().context("Failed to get home directory")?;
+    backup_with_context(
+        stdout,
+        &home,
+        id_or_path,
+        target,
+        verify,
+        materialize,
+        encryption,
+        crate::config::remote_config(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn backup_with_context(
+    stdout: &mut impl Write,
+    home: &Path,
+    id_or_path: String,
+    target: PathBuf,
+    verify: bool,
+    materialize: bool,
+    encryption: Option<&(String, String)>,
+    remote_config: Option<RemoteConfig>,
+) -> AnyhowResult<()> {
+    let source = resolve_materialize_input(home, &id_or_path)?;
+    let source_path = source.db_path();
     ensure_backup_target(&source_path, &target)?;
 
     let db = build_local_database(&source_path, encryption).await?;
     let conn = db
         .connect()
         .context("Failed to connect to source database")?;
-    reject_hollow_backup(&conn).await?;
 
     if materialize {
         drop(conn);
         drop(db);
-        let materialized =
-            copy_and_materialize_database(&source_path, &target, verify, encryption).await?;
+        let materialized = copy_and_materialize_database(
+            &source,
+            &target,
+            verify,
+            encryption,
+            remote_config.as_ref(),
+        )
+        .await?;
         writeln!(stdout, "Source: {}", source_path.display())?;
         writeln!(stdout, "Backup: {}", target.display())?;
         writeln!(stdout, "Checkpoint: complete")?;
         writeln!(stdout, "Copy: complete")?;
-        writeln!(stdout, "Materialized partial-origin files: {materialized}")?;
+        writeln!(
+            stdout,
+            "Materialized partial-origin files: {}",
+            materialized.partial_origins
+        )?;
+        writeln!(stdout, "Hydrated chunks: {}", materialized.hydrated_chunks)?;
         writeln!(stdout, "Integrity: complete")?;
         if verify {
             writeln!(stdout, "Verification: complete")?;
@@ -151,6 +190,7 @@ pub async fn handle_backup_command(
         return Ok(());
     }
 
+    reject_hollow_backup(&conn).await?;
     reject_partial_origin_backup(&conn).await?;
     checkpoint_for_backup(&conn, &source_path).await?;
     copy_file_exclusive(&source_path, &target)?;
@@ -195,23 +235,251 @@ pub async fn handle_backup_command(
 pub async fn handle_materialize_command(
     stdout: &mut impl Write,
     id_or_path: String,
-    target: PathBuf,
+    target: Option<PathBuf>,
+    in_place: bool,
     verify: bool,
     encryption: Option<&(String, String)>,
 ) -> AnyhowResult<()> {
-    let source_path = resolve_local_db_path(&id_or_path)?;
-    ensure_backup_target(&source_path, &target)?;
+    let home = dirs::home_dir().context("Failed to get home directory")?;
+    materialize_with_context(
+        stdout,
+        &home,
+        id_or_path,
+        target,
+        in_place,
+        verify,
+        encryption,
+        crate::config::remote_config(),
+    )
+    .await
+}
 
+#[derive(Debug, Clone)]
+enum MaterializeInput {
+    Session(super::run::SessionPaths),
+    Path(PathBuf),
+}
+
+impl MaterializeInput {
+    fn db_path(&self) -> PathBuf {
+        match self {
+            Self::Session(paths) => paths.db_path.clone(),
+            Self::Path(path) => path.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MaterializeResult {
+    partial_origins: usize,
+    hydrated_chunks: u64,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn materialize_with_context(
+    stdout: &mut impl Write,
+    home: &Path,
+    id_or_path: String,
+    target: Option<PathBuf>,
+    in_place: bool,
+    verify: bool,
+    encryption: Option<&(String, String)>,
+    remote_config: Option<RemoteConfig>,
+) -> AnyhowResult<()> {
+    let source = resolve_materialize_input(home, &id_or_path)?;
+    let source_path = source.db_path();
+
+    if in_place {
+        if target.is_some() {
+            anyhow::bail!("--in-place conflicts with --output");
+        }
+        let hydrated =
+            hydrate_database_in_place(&source, verify, encryption, remote_config.as_ref()).await?;
+        writeln!(stdout, "Source: {}", source_path.display())?;
+        writeln!(stdout, "Hydrated chunks: {hydrated}")?;
+        writeln!(stdout, "Checkpoint: complete")?;
+        writeln!(stdout, "Integrity: complete")?;
+        if verify {
+            writeln!(stdout, "Verification: complete")?;
+        }
+        return Ok(());
+    }
+
+    let target =
+        target.context("vfs materialize requires exactly one of --output or --in-place")?;
+    ensure_backup_target(&source_path, &target)?;
     let materialized =
-        copy_and_materialize_database(&source_path, &target, verify, encryption).await?;
+        copy_and_materialize_database(&source, &target, verify, encryption, remote_config.as_ref())
+            .await?;
     writeln!(stdout, "Source: {}", source_path.display())?;
     writeln!(stdout, "Output: {}", target.display())?;
     writeln!(stdout, "Checkpoint: complete")?;
     writeln!(stdout, "Copy: complete")?;
-    writeln!(stdout, "Materialized partial-origin files: {materialized}")?;
+    writeln!(
+        stdout,
+        "Materialized partial-origin files: {}",
+        materialized.partial_origins
+    )?;
+    writeln!(stdout, "Hydrated chunks: {}", materialized.hydrated_chunks)?;
     writeln!(stdout, "Integrity: complete")?;
     if verify {
         writeln!(stdout, "Verification: complete")?;
+    }
+    Ok(())
+}
+
+fn resolve_materialize_input(home: &Path, id_or_path: &str) -> AnyhowResult<MaterializeInput> {
+    if VfsOptions::validate_agent_id(id_or_path) {
+        let paths = super::run::SessionPaths::new(home, id_or_path);
+        if paths.run_dir.is_dir() {
+            return Ok(MaterializeInput::Session(paths));
+        }
+    }
+    Ok(MaterializeInput::Path(resolve_local_db_path(id_or_path)?))
+}
+
+async fn hydrate_database_in_place(
+    source: &MaterializeInput,
+    verify: bool,
+    encryption: Option<&(String, String)>,
+    remote_config: Option<&RemoteConfig>,
+) -> AnyhowResult<u64> {
+    let _session_lock = match source {
+        MaterializeInput::Session(paths) => {
+            let lock = super::session_lock::SessionLock::try_exclusive(&paths.run_dir).map_err(
+                |error| {
+                    if error.kind() == std::io::ErrorKind::WouldBlock {
+                        anyhow::Error::new(SessionStillRunning)
+                    } else {
+                        anyhow::Error::new(error)
+                            .context("Failed to lock session for materialization")
+                    }
+                },
+            )?;
+            super::pack::recover_interrupted_publication(&paths.db_path)?;
+            super::revert::recover_interrupted_publication(&paths.db_path)?;
+            if !paths.db_path.is_file() {
+                anyhow::bail!("session database not found: {}", paths.db_path.display());
+            }
+            super::pack::ensure_session_inactive(paths)?;
+            Some(lock)
+        }
+        MaterializeInput::Path(_) => None,
+    };
+
+    let db_path = source.db_path();
+    let db = build_local_database(&db_path, encryption).await?;
+    let conn = db
+        .connect()
+        .context("Failed to connect to database for in-place materialization")?;
+    let hydrated = hydrate_hollow_chunks(&conn, source, remote_config).await?;
+    ensure_chunks_hydrated(&conn, &db_path).await?;
+    checkpoint_materialized_target(&conn, &db_path).await?;
+    check_hydrated_integrity(&conn, &db_path, "in-place materialization").await?;
+    drop(conn);
+    drop(db);
+
+    if verify {
+        let verify_db = build_local_database(&db_path, encryption)
+            .await
+            .context("Failed to reopen in-place materialized database")?;
+        let verify_conn = verify_db
+            .connect()
+            .context("Failed to reconnect to in-place materialized database")?;
+        ensure_chunks_hydrated(&verify_conn, &db_path).await?;
+        check_hydrated_integrity(&verify_conn, &db_path, "in-place verification").await?;
+        drop(verify_conn);
+        drop(verify_db);
+    }
+    remove_sqlite_sidecars_after_checkpoint(&db_path)?;
+
+    if let MaterializeInput::Session(paths) = source {
+        let remote_path = super::remote::remote_url_path(&paths.run_dir);
+        if remote_path.exists() {
+            // A fully hydrated session has no fault-source dependency; retaining
+            // a stale locator would let later operators mistake it for authority.
+            fs::remove_file(&remote_path).with_context(|| {
+                format!(
+                    "Failed to remove hydrated session remote locator {}",
+                    remote_path.display()
+                )
+            })?;
+            super::pack::sync_parent_directory(&remote_path)?;
+        }
+    }
+
+    Ok(hydrated)
+}
+
+async fn hydrate_hollow_chunks(
+    conn: &Connection,
+    source: &MaterializeInput,
+    remote_config: Option<&RemoteConfig>,
+) -> AnyhowResult<u64> {
+    if !schema::chunks_hollow(conn).await? {
+        return Ok(0);
+    }
+
+    let (remote_url, concurrency) = match source {
+        MaterializeInput::Session(paths) => {
+            let remote_path = super::remote::remote_url_path(&paths.run_dir);
+            let remote_url = super::remote::read_remote_url(&paths.run_dir)?.with_context(|| {
+                format!(
+                    "hollow session {} has no remote sidecar at {}; re-adopt with --remote or restore the sidecar before materializing (VFS_REMOTE_URL is used only for raw database paths)",
+                    paths.session_id,
+                    remote_path.display()
+                )
+            })?;
+            let concurrency = remote_config
+                .map_or_else(crate::config::remote_concurrency, |config| {
+                    config.concurrency
+                });
+            (remote_url, concurrency)
+        }
+        MaterializeInput::Path(path) => {
+            let config = remote_config.with_context(|| {
+                format!(
+                    "cannot hydrate hollow database {}: set VFS_REMOTE_URL for a raw database path, or use an installed session with its remote sidecar",
+                    path.display()
+                )
+            })?;
+            (config.url.clone(), config.concurrency)
+        }
+    };
+    let source = RemoteChunkSource::new(&remote_url)
+        .with_context(|| format!("Failed to configure chunk source {remote_url:?}"))?;
+    schema::hydrate_chunks(conn, &source, concurrency)
+        .await
+        .context("Failed to hydrate remote chunks")
+}
+
+async fn ensure_chunks_hydrated(conn: &Connection, db_path: &Path) -> AnyhowResult<()> {
+    if schema::chunks_hollow(conn).await? {
+        anyhow::bail!(
+            "materialized database still has unresolved remote chunks: {}",
+            db_path.display()
+        );
+    }
+    Ok(())
+}
+
+async fn check_hydrated_integrity(
+    conn: &Connection,
+    db_path: &Path,
+    operation: &str,
+) -> AnyhowResult<()> {
+    // Hydration removes only the remote-byte dependency. Session deltas may
+    // legitimately remain origin-backed, so portability is not required here.
+    let report = integrity::check(
+        conn,
+        &integrity::CheckOpts::new(db_path.to_path_buf()).require_portable(false),
+    )
+    .await?;
+    if !report.ok {
+        anyhow::bail!(
+            "{operation} integrity checks failed for {}",
+            db_path.display()
+        );
     }
     Ok(())
 }
@@ -238,18 +506,20 @@ pub(crate) async fn build_local_database(
 }
 
 async fn copy_and_materialize_database(
-    source_path: &Path,
+    source: &MaterializeInput,
     target: &Path,
     verify: bool,
     encryption: Option<&(String, String)>,
-) -> AnyhowResult<usize> {
-    let source_db = build_local_database(source_path, encryption).await?;
+    remote_config: Option<&RemoteConfig>,
+) -> AnyhowResult<MaterializeResult> {
+    let source_path = source.db_path();
+    let source_db = build_local_database(&source_path, encryption).await?;
     let source_conn = source_db
         .connect()
         .context("Failed to connect to source database")?;
 
-    checkpoint_for_backup(&source_conn, source_path).await?;
-    copy_file_exclusive(source_path, target)?;
+    checkpoint_for_backup(&source_conn, &source_path).await?;
+    copy_file_exclusive(&source_path, target)?;
     fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -264,6 +534,9 @@ async fn copy_and_materialize_database(
     let target_conn = target_db
         .connect()
         .context("Failed to connect to target database")?;
+
+    let hydrated_chunks = hydrate_hollow_chunks(&target_conn, source, remote_config).await?;
+    ensure_chunks_hydrated(&target_conn, target).await?;
 
     let txn = Transaction::new_unchecked(&target_conn, TransactionBehavior::Immediate)
         .await
@@ -322,7 +595,10 @@ async fn copy_and_materialize_database(
     }
     remove_sqlite_sidecars_after_checkpoint(target)?;
 
-    Ok(materialized)
+    Ok(MaterializeResult {
+        partial_origins: materialized,
+        hydrated_chunks,
+    })
 }
 
 async fn materialize_partial_origins_in_target(conn: &Connection) -> AnyhowResult<usize> {
@@ -847,7 +1123,7 @@ async fn reject_partial_origin_backup(conn: &Connection) -> AnyhowResult<()> {
 async fn reject_hollow_backup(conn: &Connection) -> AnyhowResult<()> {
     if schema::chunks_hollow(conn).await? {
         anyhow::bail!(
-            "backup is not supported for a remote metadata artifact whose chunk bytes are not present; hydrate the database first"
+            "backup is not supported for a remote metadata artifact whose chunk bytes are not present; use vfs materialize --in-place or backup --materialize"
         );
     }
     Ok(())
@@ -1094,6 +1370,8 @@ fn value_i64(value: Value) -> AnyhowResult<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmd::remote::{chunk_key, RemoteStore};
+    use bytes::Bytes;
     use serde_json::Value as JsonValue;
     use vfs_core::{Vfs, VfsOptions};
 
@@ -1105,6 +1383,88 @@ mod tests {
             .unwrap();
         file.pwrite(0, data).await.unwrap();
         agent.fs.drain_all().await.unwrap();
+    }
+
+    struct HollowFixture {
+        expected: Vec<u8>,
+        remote_config: RemoteConfig,
+        chunk_count: u64,
+    }
+
+    async fn create_hollow_fixture(db_path: &Path, remote_dir: &Path) -> HollowFixture {
+        let expected = (0..200_000)
+            .map(|index| ((index * 31 + index / 65_537) % 251) as u8)
+            .collect::<Vec<_>>();
+        {
+            let agent = Vfs::open(VfsOptions::with_path(db_path.to_string_lossy()))
+                .await
+                .unwrap();
+            write_agent_file(&agent, "/large.bin", &expected).await;
+            agent.fs.finalize().await.unwrap();
+        }
+
+        let remote_url = format!("file://{}", remote_dir.display());
+        let remote = RemoteStore::new(&remote_url).unwrap();
+        let db = build_local_database(db_path, None).await.unwrap();
+        let conn = db.connect().unwrap();
+        let mut rows = conn
+            .query("SELECT digest, data FROM fs_chunk ORDER BY digest", ())
+            .await
+            .unwrap();
+        let mut chunks = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            let digest = match row.get_value(0).unwrap() {
+                Value::Blob(digest) => <[u8; 32]>::try_from(digest).unwrap(),
+                other => panic!("unexpected digest value: {other:?}"),
+            };
+            let data = match row.get_value(1).unwrap() {
+                Value::Blob(data) => data,
+                other => panic!("unexpected chunk value: {other:?}"),
+            };
+            chunks.push((digest, data));
+        }
+        drop(rows);
+        for (digest, data) in &chunks {
+            remote
+                .put(&chunk_key(digest), Bytes::from(data.clone()))
+                .await
+                .unwrap();
+        }
+        let report = schema::hollow_chunks(&conn).await.unwrap();
+        assert_eq!(report.chunks, chunks.len() as u64);
+        checkpoint_materialized_target(&conn, db_path)
+            .await
+            .unwrap();
+        drop(conn);
+        drop(db);
+        remove_sqlite_sidecars_after_checkpoint(db_path).unwrap();
+
+        HollowFixture {
+            expected,
+            remote_config: RemoteConfig {
+                url: remote_url,
+                concurrency: 2,
+                stream_interval_ms: 5_000,
+            },
+            chunk_count: chunks.len() as u64,
+        }
+    }
+
+    async fn assert_hydrated_file(db_path: &Path, expected: &[u8]) {
+        let db = build_local_database(db_path, None).await.unwrap();
+        let conn = db.connect().unwrap();
+        assert!(!schema::chunks_hollow(&conn).await.unwrap());
+        drop(conn);
+        drop(db);
+        remove_sqlite_sidecars_after_checkpoint(db_path).unwrap();
+
+        let agent = Vfs::open(VfsOptions::with_path(db_path.to_string_lossy()))
+            .await
+            .unwrap();
+        assert_eq!(
+            agent.fs.read_file("/large.bin").await.unwrap().unwrap(),
+            expected
+        );
     }
 
     fn db_family_stats(db_path: &Path) -> Vec<(String, u64, Option<std::time::SystemTime>)> {
@@ -1472,44 +1832,271 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backup_refuses_hollow_metadata_artifacts() {
+    async fn materialize_in_place_hydrates_session_and_removes_remote_sidecar() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let home = temp_dir.path().join("home");
+        let remote = temp_dir.path().join("remote");
+        let paths = super::super::run::SessionPaths::new(&home, "hydration-session");
+        fs::create_dir_all(&paths.run_dir).unwrap();
+        let fixture = create_hollow_fixture(&paths.db_path, &remote).await;
+        super::super::remote::write_remote_url(&paths.run_dir, &fixture.remote_config.url).unwrap();
+
+        let mut stdout = Vec::new();
+        materialize_with_context(
+            &mut stdout,
+            &home,
+            "hydration-session".to_string(),
+            None,
+            true,
+            true,
+            None,
+            Some(fixture.remote_config.clone()),
+        )
+        .await
+        .unwrap();
+
+        assert_hydrated_file(&paths.db_path, &fixture.expected).await;
+        assert!(!super::super::remote::remote_url_path(&paths.run_dir).exists());
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(output.contains(&format!("Hydrated chunks: {}", fixture.chunk_count)));
+        assert!(output.contains("Verification: complete"));
+
+        let mut second_stdout = Vec::new();
+        materialize_with_context(
+            &mut second_stdout,
+            &home,
+            "hydration-session".to_string(),
+            None,
+            true,
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(String::from_utf8(second_stdout)
+            .unwrap()
+            .contains("Hydrated chunks: 0"));
+    }
+
+    #[tokio::test]
+    async fn materialize_in_place_raw_path_uses_remote_config_and_requires_url() {
         let temp_dir = tempfile::tempdir().unwrap();
         let source = temp_dir.path().join("hollow-source.db");
-        {
-            let agent = Vfs::open(VfsOptions::with_path(source.to_string_lossy()))
-                .await
-                .unwrap();
-            write_agent_file(&agent, "/large.bin", &vec![7_u8; 128 * 1024]).await;
-            agent.fs.finalize().await.unwrap();
-        }
-        {
-            let db = build_local_database(&source, None).await.unwrap();
-            let conn = db.connect().unwrap();
-            schema::hollow_chunks(&conn).await.unwrap();
-        }
+        let remote = temp_dir.path().join("remote");
+        let fixture = create_hollow_fixture(&source, &remote).await;
 
-        for materialize in [false, true] {
-            let target = temp_dir
-                .path()
-                .join(format!("backup-materialize-{materialize}.db"));
-            let error = handle_backup_command(
-                &mut Vec::new(),
-                source.to_string_lossy().to_string(),
-                target.clone(),
-                false,
-                materialize,
-                None,
-            )
+        let error = materialize_with_context(
+            &mut Vec::new(),
+            temp_dir.path(),
+            source.to_string_lossy().to_string(),
+            None,
+            true,
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("VFS_REMOTE_URL"),
+            "unexpected error: {error:#}"
+        );
+
+        let output_error = materialize_with_context(
+            &mut Vec::new(),
+            temp_dir.path(),
+            source.to_string_lossy().to_string(),
+            Some(temp_dir.path().join("missing-source-output.db")),
+            false,
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        let output_message = output_error.to_string();
+        assert!(
+            output_message.contains("VFS_REMOTE_URL"),
+            "{output_error:#}"
+        );
+        assert!(
+            output_message.contains("remote sidecar"),
+            "{output_error:#}"
+        );
+
+        materialize_with_context(
+            &mut Vec::new(),
+            temp_dir.path(),
+            source.to_string_lossy().to_string(),
+            None,
+            true,
+            false,
+            None,
+            Some(fixture.remote_config.clone()),
+        )
+        .await
+        .unwrap();
+        assert_hydrated_file(&source, &fixture.expected).await;
+    }
+
+    #[tokio::test]
+    async fn materialize_in_place_session_requires_remote_sidecar() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let home = temp_dir.path().join("home");
+        let remote = temp_dir.path().join("remote");
+        let paths = super::super::run::SessionPaths::new(&home, "missing-sidecar");
+        fs::create_dir_all(&paths.run_dir).unwrap();
+        create_hollow_fixture(&paths.db_path, &remote).await;
+
+        let error = materialize_with_context(
+            &mut Vec::new(),
+            &home,
+            "missing-sidecar".to_string(),
+            None,
+            true,
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("no remote sidecar"), "{error:#}");
+        assert!(message.contains("re-adopt with --remote"), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn materialize_output_hydrates_hollow_input_and_is_portable() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source = temp_dir.path().join("hollow-source.db");
+        let target = temp_dir.path().join("materialized.db");
+        let remote = temp_dir.path().join("remote");
+        let fixture = create_hollow_fixture(&source, &remote).await;
+
+        materialize_with_context(
+            &mut Vec::new(),
+            temp_dir.path(),
+            source.to_string_lossy().to_string(),
+            Some(target.clone()),
+            false,
+            true,
+            None,
+            Some(fixture.remote_config.clone()),
+        )
+        .await
+        .unwrap();
+
+        assert_hydrated_file(&target, &fixture.expected).await;
+        let report = check_integrity_readonly(&target, true, false, None)
             .await
-            .unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("remote metadata artifact whose chunk bytes are not present"),
-                "unexpected error: {error:#}"
-            );
-            assert!(!target.exists());
-        }
+            .unwrap();
+        assert!(report.ok);
+        let source_db = build_local_database(&source, None).await.unwrap();
+        let source_conn = source_db.connect().unwrap();
+        assert!(schema::chunks_hollow(&source_conn).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn backup_materialize_hydrates_hollow_input_while_plain_backup_refuses() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source = temp_dir.path().join("hollow-source.db");
+        let plain_target = temp_dir.path().join("plain-backup.db");
+        let materialized_target = temp_dir.path().join("materialized-backup.db");
+        let remote = temp_dir.path().join("remote");
+        let fixture = create_hollow_fixture(&source, &remote).await;
+
+        let error = backup_with_context(
+            &mut Vec::new(),
+            temp_dir.path(),
+            source.to_string_lossy().to_string(),
+            plain_target.clone(),
+            false,
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("backup --materialize"),
+            "unexpected error: {error:#}"
+        );
+        assert!(!plain_target.exists());
+
+        backup_with_context(
+            &mut Vec::new(),
+            temp_dir.path(),
+            source.to_string_lossy().to_string(),
+            materialized_target.clone(),
+            true,
+            true,
+            None,
+            Some(fixture.remote_config.clone()),
+        )
+        .await
+        .unwrap();
+        assert_hydrated_file(&materialized_target, &fixture.expected).await;
+        let report = check_integrity_readonly(&materialized_target, true, false, None)
+            .await
+            .unwrap();
+        assert!(report.ok);
+    }
+
+    #[tokio::test]
+    async fn materialize_in_place_refuses_live_session_with_reserved_error() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let home = temp_dir.path().join("home");
+        let remote = temp_dir.path().join("remote");
+        let paths = super::super::run::SessionPaths::new(&home, "live-session");
+        fs::create_dir_all(&paths.run_dir).unwrap();
+        let fixture = create_hollow_fixture(&paths.db_path, &remote).await;
+        super::super::remote::write_remote_url(&paths.run_dir, &fixture.remote_config.url).unwrap();
+        let _run_lock =
+            super::super::session_lock::SessionLock::try_shared(&paths.run_dir).unwrap();
+
+        let error = materialize_with_context(
+            &mut Vec::new(),
+            &home,
+            "live-session".to_string(),
+            None,
+            true,
+            false,
+            None,
+            Some(fixture.remote_config),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.downcast_ref::<SessionStillRunning>().is_some());
+    }
+
+    #[tokio::test]
+    async fn backup_refuses_hollow_session_without_materialize() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let home = temp_dir.path().join("home");
+        let remote = temp_dir.path().join("remote");
+        let paths = super::super::run::SessionPaths::new(&home, "backup-session");
+        fs::create_dir_all(&paths.run_dir).unwrap();
+        create_hollow_fixture(&paths.db_path, &remote).await;
+
+        let error = backup_with_context(
+            &mut Vec::new(),
+            &home,
+            "backup-session".to_string(),
+            temp_dir.path().join("backup.db"),
+            false,
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("use vfs materialize --in-place or backup --materialize"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[tokio::test]
@@ -1614,7 +2201,8 @@ mod tests {
         handle_materialize_command(
             &mut stdout,
             source.to_string_lossy().to_string(),
-            target.clone(),
+            Some(target.clone()),
+            false,
             true,
             None,
         )

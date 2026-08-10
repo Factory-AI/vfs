@@ -504,6 +504,7 @@ fn dispatch(args: Args) -> anyhow::Result<()> {
         Command::Materialize {
             id_or_path,
             output,
+            in_place,
             verify,
             key,
             cipher,
@@ -514,6 +515,7 @@ fn dispatch(args: Args) -> anyhow::Result<()> {
                 &mut std::io::stdout(),
                 id_or_path,
                 output,
+                in_place,
                 verify,
                 encryption.as_ref(),
             ))

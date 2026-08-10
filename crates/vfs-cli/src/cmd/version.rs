@@ -26,6 +26,7 @@ struct VersionFeatures {
     checkpoint: bool,
     seed: bool,
     adopt: bool,
+    adopt_remote: bool,
     branch: bool,
     history: bool,
 }
@@ -44,6 +45,7 @@ pub fn handle_version_command(stdout: &mut impl Write, json: bool) -> Result<()>
             checkpoint: true,
             seed: true,
             adopt: true,
+            adopt_remote: true,
             branch: cfg!(unix),
             history: cfg!(unix),
         },
@@ -80,6 +82,7 @@ mod tests {
         assert_eq!(value["features"]["checkpoint"], true);
         assert_eq!(value["features"]["seed"], true);
         assert_eq!(value["features"]["adopt"], true);
+        assert_eq!(value["features"]["adoptRemote"], true);
         assert_eq!(value["features"]["branch"], cfg!(unix));
         assert_eq!(value["features"]["history"], cfg!(unix));
     }

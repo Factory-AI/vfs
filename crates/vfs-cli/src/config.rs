@@ -45,24 +45,7 @@ pub(crate) fn current_shell_path() -> Option<String> {
 pub fn remote_config() -> Option<RemoteConfig> {
     let reader = EnvReader::new();
     let url = reader.string(REMOTE_URL_ENV)?;
-    let concurrency =
-        reader
-            .string(REMOTE_CONCURRENCY_ENV)
-            .map_or(DEFAULT_REMOTE_CONCURRENCY, |value| {
-                value
-                    .parse::<usize>()
-                    .ok()
-                    .filter(|value| *value >= 1)
-                    .unwrap_or_else(|| {
-                        tracing::warn!(
-                            "Ignoring invalid {}={:?}; using default {}",
-                            REMOTE_CONCURRENCY_ENV,
-                            value,
-                            DEFAULT_REMOTE_CONCURRENCY
-                        );
-                        DEFAULT_REMOTE_CONCURRENCY
-                    })
-            });
+    let concurrency = remote_concurrency_with_reader(&reader);
     let stream_interval_ms = reader.string(REMOTE_STREAM_INTERVAL_MS_ENV).map_or(
         DEFAULT_REMOTE_STREAM_INTERVAL_MS,
         |value| {
@@ -83,6 +66,30 @@ pub fn remote_config() -> Option<RemoteConfig> {
         concurrency,
         stream_interval_ms,
     })
+}
+
+pub(crate) fn remote_concurrency() -> usize {
+    remote_concurrency_with_reader(&EnvReader::new())
+}
+
+fn remote_concurrency_with_reader(reader: &EnvReader) -> usize {
+    reader
+        .string(REMOTE_CONCURRENCY_ENV)
+        .map_or(DEFAULT_REMOTE_CONCURRENCY, |value| {
+            value
+                .parse::<usize>()
+                .ok()
+                .filter(|value| *value >= 1)
+                .unwrap_or_else(|| {
+                    tracing::warn!(
+                        "Ignoring invalid {}={:?}; using default {}",
+                        REMOTE_CONCURRENCY_ENV,
+                        value,
+                        DEFAULT_REMOTE_CONCURRENCY
+                    );
+                    DEFAULT_REMOTE_CONCURRENCY
+                })
+        })
 }
 
 // ─── private sort-spill dir ──────────────────────────────────────────────────
@@ -310,6 +317,9 @@ mod tests {
         let _snapshot = EnvSnapshot::capture(CONFIG_ENV_KEYS);
 
         assert_eq!(remote_config(), None);
+        std::env::set_var(REMOTE_CONCURRENCY_ENV, "12");
+        assert_eq!(remote_config(), None);
+        assert_eq!(remote_concurrency(), 12);
     }
 
     #[test]

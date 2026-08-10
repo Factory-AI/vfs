@@ -651,15 +651,23 @@ pub enum Command {
         #[arg(long)]
         cipher: Option<String>,
     },
-    /// Create a portable database by materializing partial-origin files
+    /// Hydrate remote chunks and optionally create a portable database
     Materialize {
         /// Agent ID or database path
         #[arg(add = ArgValueCompleter::new(id_or_path_completer))]
         id_or_path: String,
 
         /// Target database path to create
-        #[arg(long)]
-        output: PathBuf,
+        #[arg(
+            long,
+            required_unless_present = "in_place",
+            conflicts_with = "in_place"
+        )]
+        output: Option<PathBuf>,
+
+        /// Hydrate the source database offline without creating a copy
+        #[arg(long, required_unless_present = "output", conflicts_with = "output")]
+        in_place: bool,
 
         /// Reopen and verify the materialized database
         #[arg(long)]
@@ -1079,6 +1087,60 @@ mod tests {
             "--remote",
             "--base",
             "/tmp/checkout",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn materialize_requires_exactly_one_destination_mode() {
+        let in_place =
+            Args::try_parse_from(["vfs", "materialize", "session-1", "--in-place", "--verify"])
+                .unwrap();
+        match in_place.command {
+            Command::Materialize {
+                output,
+                in_place,
+                verify,
+                ..
+            } => {
+                assert_eq!(output, None);
+                assert!(in_place);
+                assert!(verify);
+            }
+            other => panic!("expected materialize command, got {other:?}"),
+        }
+
+        let output = Args::try_parse_from([
+            "vfs",
+            "materialize",
+            "session-1",
+            "--output",
+            "/tmp/materialized.db",
+            "--verify",
+        ])
+        .unwrap();
+        match output.command {
+            Command::Materialize {
+                output,
+                in_place,
+                verify,
+                ..
+            } => {
+                assert_eq!(output, Some(PathBuf::from("/tmp/materialized.db")));
+                assert!(!in_place);
+                assert!(verify);
+            }
+            other => panic!("expected materialize command, got {other:?}"),
+        }
+
+        assert!(Args::try_parse_from(["vfs", "materialize", "session-1"]).is_err());
+        assert!(Args::try_parse_from([
+            "vfs",
+            "materialize",
+            "session-1",
+            "--in-place",
+            "--output",
+            "/tmp/materialized.db",
         ])
         .is_err());
     }
