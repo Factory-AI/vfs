@@ -330,6 +330,16 @@ Seatbelt spot-checks to real hardware; see
 
 ## Getting started
 
+Install the latest release — the installer picks the right build for your
+platform (Linux and macOS, x86_64 and arm64) and puts `vfs` plus a
+`vfs-cli-update` self-updater in `$CARGO_HOME/bin` (default `~/.cargo/bin`):
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Factory-AI/vfs/releases/latest/download/vfs-cli-installer.sh | sh
+```
+
+Or build from source:
+
 ```bash
 cargo +nightly build --release --workspace --bins
 install -m 0755 target/release/vfs ~/.local/bin/
