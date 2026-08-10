@@ -45,6 +45,67 @@ Error: base checkout ./some-other-commit is at 3cf0b0a…, but the session requi
 pin 6b8da73…; check out the pin before adopting
 ```
 
+## Getting started
+
+Install the latest release — the installer picks the right build for your
+platform (Linux and macOS, x86_64 and arm64) and puts `vfs` plus a
+`vfs-cli-update` self-updater in `$CARGO_HOME/bin` (default `~/.cargo/bin`):
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Factory-AI/vfs/releases/latest/download/vfs-cli-installer.sh | sh
+```
+
+Or build from source:
+
+```bash
+cargo +nightly build --release --workspace --bins
+install -m 0755 target/release/vfs ~/.local/bin/
+```
+
+Initialize a filesystem and inspect it without ever mounting:
+
+```console
+$ vfs init my-agent
+Created agent filesystem: .vfs/my-agent.db
+Agent ID: my-agent
+
+$ vfs fs my-agent ls
+f hello.txt
+
+$ vfs fs my-agent cat hello.txt
+hello from agent
+```
+
+Read the agent's tool-call timeline:
+
+```console
+$ vfs timeline my-agent
+ID   TOOL                 STATUS       DURATION STARTED
+4    execute_code         pending            -- 2024-01-05 09:44:20
+3    api_call             error           300ms 2024-01-05 09:44:15
+2    read_file            success          50ms 2024-01-05 09:44:10
+1    web_search           success        1200ms 2024-01-05 09:43:45
+```
+
+Mount it as a real filesystem (FUSE on Linux, NFS on macOS):
+
+```console
+$ vfs mount my-agent ./mnt
+$ echo "hello" > ./mnt/hello.txt
+```
+
+Or sandbox a program over your current directory — copy-on-write, host
+untouched:
+
+```console
+$ vfs run --session my-session -- bash
+# ... every write lands in the delta database ...
+$ exit
+
+$ vfs ps
+$ vfs diff my-session
+```
+
 ## Forking a live session
 
 Try a risky refactor without betting the session on it. `vfs branch` forks a
@@ -187,6 +248,21 @@ transaction, drops the recorded remote, and re-verifies integrity; run it
 twice and the second pass is a no-op. `backup --materialize` and
 `materialize --output` do the same for copies.
 
+## The rest of the CLI
+
+* `vfs exec` — one-shot command over a temporary mount, unmounted after.
+* `vfs clone` — bulk-ingest a git repository straight into the database.
+* `vfs serve nfs` / `vfs serve mcp` — export over NFS, or expose filesystem
+  and KV tools to agents over MCP.
+* `--key` / `--cipher` — local at-rest encryption.
+* `vfs backup`, `integrity`, `migrate`, `materialize`, `prune` — portable
+  backups, corruption checks, schema migration, partial-origin
+  materialization, mount and artifact-store cleanup.
+
+The **[User Manual](docs/MANUAL.md)** documents every command; its reference
+is generated from the CLI's own argument definitions, so it cannot drift from
+`vfs --help`.
+
 ## Why it's a database
 
 Vfs stores everything an agent does — every file it writes, every piece of
@@ -256,6 +332,31 @@ Startup failures use reserved exit statuses — `3` live, `4` mount/sandbox
 install failed, `5` session missing or malformed, `126`/`127` exec conventions
 — so a daemon can branch on them. The wrapped command's own status passes
 through untouched. Full contract in [docs/MANUAL.md](docs/MANUAL.md).
+
+## How it works
+
+At the core is the [agent filesystem](docs/SPEC.md), a SQLite storage system
+built on [Turso](https://github.com/tursodatabase/turso). The schema separates
+namespace (dentries) from data (inodes + chunked/inline content), which is
+what buys hard links, POSIX metadata, sparse files, and SQL-queryable history.
+Schema v0.8 content-addresses file chunks, records replayable row deltas, and
+pins immutable root snapshots. Session metadata remains inside the same file,
+which is why pack generation, seed provenance, and retained history travel
+with an artifact instead of depending on sidecars left on the sender.
+
+On Linux the FUSE backend dispatches through a bounded worker pool with a
+read/write lane split, kernel-cache acceleration (entry/attr TTLs, writeback
+cache, readdirplus), zero-message opens, and an optional FUSE-over-io_uring
+transport. Every one of those is an acceleration structure reconstructible
+from the database: the two safety properties — one portable database holds all
+virtual filesystem state, and sandboxed writes never reach the host — hold
+regardless of cache configuration. Tunables are declared in the generated
+[docs/KNOBS.md](docs/KNOBS.md) ledger.
+
+## Using Vfs as a library
+
+`vfs-core` exposes the same engine the CLI uses: filesystem, key-value store,
+and tool-call audit trail over one database. See `cargo doc -p vfs-core`.
 
 ## Relationship to upstream AgentFS
 
@@ -327,107 +428,6 @@ runtime for real — the NFS mount path, the Seatbelt read-scoping check, and
 the remote-tier suites all run on macos-latest — leaving a short list of
 Seatbelt spot-checks to real hardware; see
 [docs/TESTING.md](docs/TESTING.md). No other platforms are supported.
-
-## Getting started
-
-Install the latest release — the installer picks the right build for your
-platform (Linux and macOS, x86_64 and arm64) and puts `vfs` plus a
-`vfs-cli-update` self-updater in `$CARGO_HOME/bin` (default `~/.cargo/bin`):
-
-```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Factory-AI/vfs/releases/latest/download/vfs-cli-installer.sh | sh
-```
-
-Or build from source:
-
-```bash
-cargo +nightly build --release --workspace --bins
-install -m 0755 target/release/vfs ~/.local/bin/
-```
-
-Initialize a filesystem and inspect it without ever mounting:
-
-```console
-$ vfs init my-agent
-Created agent filesystem: .vfs/my-agent.db
-Agent ID: my-agent
-
-$ vfs fs my-agent ls
-f hello.txt
-
-$ vfs fs my-agent cat hello.txt
-hello from agent
-```
-
-Read the agent's tool-call timeline:
-
-```console
-$ vfs timeline my-agent
-ID   TOOL                 STATUS       DURATION STARTED
-4    execute_code         pending            -- 2024-01-05 09:44:20
-3    api_call             error           300ms 2024-01-05 09:44:15
-2    read_file            success          50ms 2024-01-05 09:44:10
-1    web_search           success        1200ms 2024-01-05 09:43:45
-```
-
-Mount it as a real filesystem (FUSE on Linux, NFS on macOS):
-
-```console
-$ vfs mount my-agent ./mnt
-$ echo "hello" > ./mnt/hello.txt
-```
-
-Or sandbox a program over your current directory — copy-on-write, host
-untouched:
-
-```console
-$ vfs run --session my-session -- bash
-# ... every write lands in the delta database ...
-$ exit
-
-$ vfs ps
-$ vfs diff my-session
-```
-
-## The rest of the CLI
-
-* `vfs exec` — one-shot command over a temporary mount, unmounted after.
-* `vfs clone` — bulk-ingest a git repository straight into the database.
-* `vfs serve nfs` / `vfs serve mcp` — export over NFS, or expose filesystem
-  and KV tools to agents over MCP.
-* `--key` / `--cipher` — local at-rest encryption.
-* `vfs backup`, `integrity`, `migrate`, `materialize`, `prune` — portable
-  backups, corruption checks, schema migration, partial-origin
-  materialization, mount and artifact-store cleanup.
-
-The **[User Manual](docs/MANUAL.md)** documents every command; its reference
-is generated from the CLI's own argument definitions, so it cannot drift from
-`vfs --help`.
-
-## Using Vfs as a library
-
-`vfs-core` exposes the same engine the CLI uses: filesystem, key-value store,
-and tool-call audit trail over one database. See `cargo doc -p vfs-core`.
-
-## How it works
-
-At the core is the [agent filesystem](docs/SPEC.md), a SQLite storage system
-built on [Turso](https://github.com/tursodatabase/turso). The schema separates
-namespace (dentries) from data (inodes + chunked/inline content), which is
-what buys hard links, POSIX metadata, sparse files, and SQL-queryable history.
-Schema v0.8 content-addresses file chunks, records replayable row deltas, and
-pins immutable root snapshots. Session metadata remains inside the same file,
-which is why pack generation, seed provenance, and retained history travel
-with an artifact instead of depending on sidecars left on the sender.
-
-On Linux the FUSE backend dispatches through a bounded worker pool with a
-read/write lane split, kernel-cache acceleration (entry/attr TTLs, writeback
-cache, readdirplus), zero-message opens, and an optional FUSE-over-io_uring
-transport. Every one of those is an acceleration structure reconstructible
-from the database: the two safety properties — one portable database holds all
-virtual filesystem state, and sandboxed writes never reach the host — hold
-regardless of cache configuration. Tunables are declared in the generated
-[docs/KNOBS.md](docs/KNOBS.md) ledger.
 
 ## FAQ
 
