@@ -27,6 +27,8 @@ RUN_WORK_DIR=""
 SECRET_DIR=""
 RUN_SESSION_DENY=""
 RUN_SESSION_ALLOW=""
+RUN_SESSION_MISSING=""
+RUN_SESSION_NOEXEC=""
 
 usage() {
     sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
@@ -128,6 +130,8 @@ cleanup() {
         safe_rm_secret_dir "$SECRET_DIR"
         safe_rm_run_session "$RUN_SESSION_DENY"
         safe_rm_run_session "$RUN_SESSION_ALLOW"
+        safe_rm_run_session "$RUN_SESSION_MISSING"
+        safe_rm_run_session "$RUN_SESSION_NOEXEC"
     elif [[ -n "$WORK_DIR" || -n "$MOUNT_DIR" ]]; then
         printf 'Kept work directory: %s\n' "$WORK_DIR" >&2
         printf 'Kept mount directory: %s\n' "$MOUNT_DIR" >&2
@@ -322,5 +326,83 @@ if [[ "$allow_status" -ne 0 ]] || ! grep -q 'vfs-read-scope-secret' "$REPORT_DIR
     exit 1
 fi
 printf 'Read of --allow path succeeded as expected.\n'
+
+# --- seatbelt profile paths with spaces and quotes --------------------------
+# Dynamic profile paths travel as Seatbelt `(param "NAME")` references with
+# -D NAME=value definitions on the sandbox-exec command line. Homing the
+# session store and the base directory under names containing spaces and a
+# double quote exercises every parameterized path; a regression back to
+# string interpolation fails to mount or run.
+
+printf 'Running seatbelt quoted-path checks...\n'
+
+QUOTE_HOME="$RUN_WORK_DIR/home with \"quote\""
+QUOTE_BASE="$RUN_WORK_DIR/base with \"quote\" dir"
+mkdir -p "$QUOTE_HOME" "$QUOTE_BASE"
+RUN_SESSION_QUOTES="macos-read-scope-quotes-$$-$(date +%s)"
+
+set +e
+(
+    cd "$QUOTE_BASE"
+    HOME="$QUOTE_HOME" \
+    XDG_CACHE_HOME="$QUOTE_HOME/.cache" \
+    XDG_CONFIG_HOME="$QUOTE_HOME/.config" \
+        "$VFS_RESOLVED" run --session "$RUN_SESSION_QUOTES" \
+        /bin/sh -c 'printf quoted-path-ok >probe.txt && /bin/cat probe.txt'
+) >"$REPORT_DIR/quoted-paths.log" 2>&1
+quotes_status=$?
+set -e
+
+if ! grep -q 'Welcome to Vfs' "$REPORT_DIR/quoted-paths.log"; then
+    printf 'FAILED: vfs run never reached the sandbox under a quoted path. See %s/quoted-paths.log\n' "$REPORT_DIR" >&2
+    exit 1
+fi
+if [[ "$quotes_status" -ne 0 ]] || ! grep -q 'quoted-path-ok' "$REPORT_DIR/quoted-paths.log"; then
+    printf 'FAILED: session under a directory with spaces/quotes did not mount and run (exit %s). See %s/quoted-paths.log\n' "$quotes_status" "$REPORT_DIR" >&2
+    exit 1
+fi
+printf 'Session under spaced/quoted directories mounted and ran.\n'
+
+# --- run exit-status parity --------------------------------------------------
+# The reserved startup exit statuses are a daemon contract: 127 for a missing
+# command and 126 for a present but non-executable one, matching vfs exec and
+# the Linux run path.
+
+printf 'Running exit-status parity checks...\n'
+
+RUN_SESSION_MISSING="macos-read-scope-missing-$$-$(date +%s)"
+RUN_SESSION_NOEXEC="macos-read-scope-noexec-$$-$(date +%s)"
+
+set +e
+(
+    cd "$RUN_WORK_DIR"
+    "$VFS_RESOLVED" run --session "$RUN_SESSION_MISSING" \
+        /nonexistent-vfs-validation-command
+) >"$REPORT_DIR/exit-missing.log" 2>&1
+missing_status=$?
+set -e
+
+if [[ "$missing_status" -ne 127 ]]; then
+    printf 'FAILED: run of a missing command exited %s, expected 127. See %s/exit-missing.log\n' "$missing_status" "$REPORT_DIR" >&2
+    exit 1
+fi
+
+printf '#!/bin/sh\n' >"$RUN_WORK_DIR/not-executable"
+chmod 0644 "$RUN_WORK_DIR/not-executable"
+
+set +e
+(
+    cd "$RUN_WORK_DIR"
+    "$VFS_RESOLVED" run --session "$RUN_SESSION_NOEXEC" \
+        "$RUN_WORK_DIR/not-executable"
+) >"$REPORT_DIR/exit-noexec.log" 2>&1
+noexec_status=$?
+set -e
+
+if [[ "$noexec_status" -ne 126 ]]; then
+    printf 'FAILED: run of a non-executable file exited %s, expected 126. See %s/exit-noexec.log\n' "$noexec_status" "$REPORT_DIR" >&2
+    exit 1
+fi
+printf 'Exit-status parity held (127 missing, 126 non-executable).\n'
 
 printf 'macOS NFS git + run read-scoping validation passed. Logs: %s\n' "$REPORT_DIR"
