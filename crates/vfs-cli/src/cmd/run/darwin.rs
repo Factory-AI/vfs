@@ -311,8 +311,8 @@ pub(super) fn preflight_exec_exit_code(
             .unwrap_or(false)
     }
 
-    const NOT_FOUND: (i32, &'static str) = (127, "command not found");
-    const NOT_EXECUTABLE: (i32, &'static str) = (126, "not executable");
+    const NOT_FOUND: (i32, &str) = (127, "command not found");
+    const NOT_EXECUTABLE: (i32, &str) = (126, "not executable");
 
     // A command containing a slash is used as a path, resolved against the
     // child's working directory; only a bare name searches PATH.
