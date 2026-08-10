@@ -54,7 +54,9 @@ wait_pid_exit() {
 unmount_path() {
     local path="$1"
     [ -n "$path" ] || return
-    if command -v fusermount3 >/dev/null 2>&1; then
+    if [ "$(uname -s)" = "Darwin" ]; then
+        /sbin/umount "$path" 2>/dev/null || /sbin/umount -f "$path" 2>/dev/null || true
+    elif command -v fusermount3 >/dev/null 2>&1; then
         fusermount3 -uz "$path" 2>/dev/null || true
     elif command -v fusermount >/dev/null 2>&1; then
         fusermount -u "$path" 2>/dev/null || true
@@ -73,9 +75,20 @@ stop_live() {
     LIVE_LOG=""
 }
 
-case "$(uname -s)" in
-    Linux) ;;
-    *) skip "requires Linux namespaces and FUSE" ;;
+OS_NAME="$(uname -s)"
+case "$OS_NAME" in
+    Linux)
+        [ -e /dev/fuse ] || skip "requires /dev/fuse for FUSE mounts"
+        if [ -r /proc/sys/kernel/unprivileged_userns_clone ] &&
+            [ "$(cat /proc/sys/kernel/unprivileged_userns_clone)" = "0" ]; then
+            skip "unprivileged user namespaces are disabled"
+        fi
+        ;;
+    Darwin)
+        [ -x /sbin/mount_nfs ] || skip "requires /sbin/mount_nfs for NFS mounts"
+        [ -x /usr/bin/sandbox-exec ] || skip "requires sandbox-exec"
+        ;;
+    *) skip "requires Linux (FUSE) or macOS (NFS)" ;;
 esac
 
 [ -n "$VFS_BIN" ] || command -v cargo >/dev/null 2>&1 ||
@@ -85,12 +98,6 @@ command -v git >/dev/null 2>&1 || skip "git is unavailable"
 command -v sha256sum >/dev/null 2>&1 || skip "sha256sum is unavailable"
 command -v truncate >/dev/null 2>&1 || skip "truncate is unavailable"
 [ -x /bin/bash ] || skip "/bin/bash is unavailable"
-[ -e /dev/fuse ] || skip "requires /dev/fuse for FUSE mounts"
-
-if [ -r /proc/sys/kernel/unprivileged_userns_clone ] &&
-    [ "$(cat /proc/sys/kernel/unprivileged_userns_clone)" = "0" ]; then
-    skip "unprivileged user namespaces are disabled"
-fi
 
 if [ -z "$VFS_BIN" ]; then
     cargo +nightly build --quiet --manifest-path "$CLI_DIR/Cargo.toml" >/dev/null 2>&1 ||
