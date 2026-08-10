@@ -113,6 +113,42 @@ Revert rewinds filesystem and overlay state only. KV values and the tool-call
 audit trail remain intact, and the restored state becomes the new history
 floor rather than preserving a forked future.
 
+## Checkpointing to a remote tier
+
+`vfs checkpoint` publishes a consistent point of a session to S3-compatible
+object storage (or a `file://` path — same wire, no credentials). The remote
+holds three kinds of objects: content-addressed chunk bytes shared by every
+session under the prefix, an immutable *metadata artifact* per checkpoint —
+the whole database with chunk bytes hollowed out — and one mutable
+`manifest.json` per session. The manifest write is the only commit point:
+until it lands and reads back verbatim, the checkpoint did not happen.
+
+```console
+$ export VFS_REMOTE_URL="file:///tmp/vfs-remote"
+$ vfs run --session remote-demo -- sh -c 'dd if=/dev/urandom of=data.bin bs=64K count=4 status=none'
+$ vfs checkpoint remote-demo --json
+{"sessionId":"remote-demo","seq":10,…,"uploadedChunks":5,"reusedChunks":0,…}
+
+$ vfs checkpoint remote-demo --json   # nothing changed; nothing re-uploads
+{"sessionId":"remote-demo","seq":10,…,"uploadedChunks":0,"reusedChunks":5,…}
+```
+
+Live sessions checkpoint through the mount's control socket after a drain, so
+every write acknowledged before the call is covered — the seq token in the
+output names exactly the state the remote now holds. While a session runs
+with `VFS_REMOTE_URL` set, a background streamer uploads chunk objects ahead
+of time so the explicit checkpoint has less left to ship; it never touches
+the manifest, so consistency points stay the ones you asked for.
+
+The metadata artifact is a wire shape, not a live database: every writable
+open refuses it, `vfs integrity` names its state, `--require-portable` fails
+it, and `vfs backup` rejects it. Branch sessions fold their parent chain
+before upload, so the remote stays branch-agnostic like `pack`. Encrypted
+sessions refuse to checkpoint — shipping plaintext chunks from an
+at-rest-encrypted database would quietly undo the encryption. A lazy
+`vfs adopt --remote` that installs directly from this tier is the next
+planned phase.
+
 ## Why it's a database
 
 Vfs stores everything an agent does — every file it writes, every piece of

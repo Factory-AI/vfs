@@ -1302,6 +1302,85 @@ Implementations MAY extend the key-value store schema with additional functional
 
 Such extensions SHOULD use separate tables to maintain referential integrity.
 
+## Remote Tier
+
+The remote tier replicates a session to S3-compatible object storage (or a
+`file://` root, which is the same wire) as three object kinds under one
+configured prefix:
+
+```text
+chunks/<blake3-hex>                 immutable raw chunk bytes
+sessions/<id>/meta/<sha256>.db      immutable hollowed metadata artifact
+sessions/<id>/manifest.json         mutable per-session head pointer
+```
+
+Chunk objects are keyed by the lowercase hex of the raw 32-byte BLAKE3 digest
+that identifies the same bytes in `fs_chunk`, so identical content
+deduplicates across sessions sharing a prefix, and uploads are idempotent by
+construction. Object contents are verified against their key digest on every
+consumption; a mismatch MUST refuse the object.
+
+### Hollow metadata artifact
+
+A metadata artifact is the complete session database — inodes, namespace,
+inline bytes, journal, root snapshots, overlay and provenance configuration,
+key-value rows, and tool calls — with every `fs_chunk.data` value replaced by
+the empty blob and the `fs_config` key `chunks_hollow` set to `1`. Digests
+and refcounts are preserved. It is content-addressed by the SHA-256 of the
+published single-file form, mirroring the whole-artifact contracts used by
+the local artifact store.
+
+The hollow state is a wire shape, not a live database:
+
+- Every mutation-capable open MUST refuse a hollow database (enforced at the
+  schema gate before any normalization write). Read-only opens remain valid.
+- `integrity` MUST report the state (`storage.chunks_hollow`); portable-mode
+  verification MUST fail it. Chunk byte-vs-digest verification is skipped
+  only while the marker is set; an empty chunk body without the marker is
+  corruption.
+- `backup` MUST refuse a hollow source.
+- Hydration (`hydrate_chunks`) refills every chunk from a `ChunkSource`,
+  verifies each against its digest, and clears the marker in the same
+  transaction; a hollow database becomes a normal database only through it.
+
+### Checkpoint protocol
+
+`vfs checkpoint` publishes one consistent point:
+
+1. Acquire a drained snapshot of the session database (control socket for a
+   live session, exclusive lock otherwise). Every write acknowledged before
+   the call MUST be covered.
+2. On the private staging copy: materialize any branch parent chain and clear
+   `parent_artifact` (the remote wire is branch-agnostic, matching `pack`),
+   refusing on a missing or drifted parent.
+3. Upload chunk objects the remote lacks, then the metadata artifact, then
+   the manifest. The manifest PUT is the single commit point; the writer MUST
+   read it back and verify it before reporting success. Objects uploaded
+   before a failed manifest write are orphans, harmless by content
+   addressing.
+4. Report the journal head sequence as the checkpoint token.
+
+The manifest carries `sessionId`, `headSeq`, `historyEpoch`, `historyValid`,
+`generation`, `artifactVersion`, optional `seedPin`, the metadata object
+reference (`key`, `sha256`, `bytes`), `chunkCount`, `chunkBytes`,
+`createdAtMs`, and `vfsVersion`. Fields are additive; consumers MUST ignore
+unknown fields. A checkpoint of a session whose journaling was disabled MUST
+publish `historyValid:false` rather than letting a maintenance open
+revalidate the epoch on staging.
+
+Sessions with local at-rest encryption MUST refuse to checkpoint: chunk
+objects are plaintext, and publishing them would silently downgrade the
+encryption boundary.
+
+### Background streamer
+
+A mount owner configured with a remote MAY stream chunk objects ahead of any
+checkpoint to amortize upload latency. The streamer writes only
+`chunks/<digest>` objects, never the manifest or metadata: explicit
+checkpoints are the only consistency points. Its state MUST be
+reconstructible from the database plus one remote listing — losing it costs
+at most redundant idempotent uploads.
+
 ## Revision History
 
 ### Version 0.8
@@ -1324,6 +1403,9 @@ Such extensions SHOULD use separate tables to maintain referential integrity.
   history floors
 - The v0.7 → v0.8 migration discards the old non-replayable journal and
   establishes one migration root at epoch 1 through sequence 0
+- Added the `chunks_hollow` marker in `fs_config` identifying a remote
+  metadata artifact whose chunk bytes live in object storage; hollow
+  databases refuse every mutation-capable open
 
 ### Version 0.7
 

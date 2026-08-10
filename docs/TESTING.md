@@ -124,6 +124,14 @@ VFS_GATE_STRICT=1 VFS_BIN="$PWD/target/release/vfs" \
   crates/vfs-cli/tests/test-history-revert-e2e.sh
 ```
 
+`test-remote-checkpoint-e2e.sh` owns the release-binary remote tier against a
+`file://` remote: offline and live-under-churn checkpoints, wire-layout and
+manifest assertions, hollow-artifact containment, idempotent re-checkpoint,
+delta-only re-upload, branch chain materialization, journal-off honesty, the
+background streamer, failure injection against an unwritable remote, and a
+full hydration round trip proving the remote holds everything needed to
+reconstruct. Run it the same way, substituting its path.
+
 ## Python validation gates
 
 All harnesses take `--vfs-bin` (or `VFS_BIN`); build a release binary

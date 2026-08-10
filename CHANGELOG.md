@@ -1,11 +1,15 @@
 # Changelog
 
-## [Unreleased] - Replayable history and session branching
+## [Unreleased] - Replayable history, session branching, and the remote tier
 
 This release builds one time-travel path from content-addressed storage through
 replayable filesystem history: `vfs branch` can fork the current state or a
 retained historical boundary, `vfs history` exposes those boundaries, and
 offline `vfs revert` publishes a checked reconstruction back over a session.
+The same content-addressed store now extends off the machine: `vfs checkpoint`
+publishes sessions to S3-compatible object storage as chunk objects plus a
+hollowed metadata artifact, replacing the turso page-level sync family as the
+one replication mechanism.
 The database and artifact schema advances through v0.7 content addressing to
 v0.8 replay history. `artifactVersion` changes from `0.7` to `0.8`; `adopt`
 migrates supported older artifacts forward automatically, while existing
@@ -92,6 +96,28 @@ pack/adopt manifest fields and reserved exit statuses remain unchanged.
   publication, rollback, integrity verification, and run/resume crash
   recovery. KV and tool-call rows remain outside the rewind.
 - `vfs version --json` advertises `features.branch` and `features.history`.
+- `vfs checkpoint <SESSION_ID> [--json]` publishes a consistent session point
+  to S3-compatible object storage or a `file://` root (`VFS_REMOTE_URL`):
+  content-addressed `chunks/<blake3>` objects, an immutable hollowed metadata
+  artifact carrying the whole database authority, and a per-session
+  `manifest.json` whose PUT is the single commit point, read back before the
+  command reports success. Live sessions snapshot through the control socket
+  after a drain, so the printed seq token names exactly the state the remote
+  holds; branch sessions fold their parent chain first, keeping the wire
+  branch-agnostic. Encrypted sessions refuse (plaintext chunk upload would
+  downgrade at-rest encryption), and journal-off sessions publish
+  `historyValid:false` honestly. `vfs version --json` advertises
+  `features.checkpoint`.
+- A mount-owned background streamer uploads chunk objects ahead of explicit
+  checkpoints when the remote is configured
+  (`VFS_REMOTE_STREAM_INTERVAL_MS`, 0 disables). It never writes the
+  manifest, keeps no persistent state, and dies with the mount.
+- Hollow metadata artifacts are contained like partial-origin state: every
+  writable open refuses them, `integrity` reports `storage.chunks_hollow`,
+  `--require-portable` fails them, and `backup` rejects them. Hydration
+  refills every chunk with per-digest BLAKE3 verification in one
+  transaction. The new chunk byte-vs-digest integrity check applies to
+  every non-hollow database.
 
 ### Fixed
 
