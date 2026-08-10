@@ -57,7 +57,7 @@ $ vfs branch demo --session probe
 {"manifestVersion":1,"sessionId":"probe","parentSessionId":"demo",
  "parentArtifactSha256":"4b0dc4a…","artifactPath":"…/.vfs/artifacts/4b0dc4a….db",
  "basePath":"/home/you/src/checkout","seedPin":"6b8da73…","parentLive":true,
- "vfsVersion":"1.0.2"}
+ "vfsVersion":"1.1.0"}
 
 $ vfs run --session probe -- bash -c 'printf "risky refactor\n" > experiment.txt'
 

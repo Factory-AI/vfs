@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased] - Replayable history, session branching, and the remote tier
+## [1.1.0] - 2026-08-09 - Replayable history, session branching, and the remote tier
 
 This release builds one time-travel path from content-addressed storage through
 replayable filesystem history: `vfs branch` can fork the current state or a
