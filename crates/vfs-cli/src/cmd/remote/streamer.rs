@@ -45,6 +45,9 @@ pub(crate) async fn stream_once(
             let Some(data) = vfs.chunk_data(&digest).await? else {
                 return Ok((digest, None));
             };
+            if data.is_empty() {
+                return Ok((digest, None));
+            }
             let bytes = data.len() as u64;
             store
                 .put(&chunk_key(&digest), Bytes::from(data))
@@ -197,17 +200,22 @@ mod tests {
         let mut uploaded = HashSet::new();
 
         let first_digests = vfs.chunk_digests().await.unwrap();
-        let first_bytes = futures_util::future::join_all(
+        let first_data = futures_util::future::join_all(
             first_digests.iter().map(|digest| vfs.chunk_data(digest)),
         )
-        .await
-        .into_iter()
-        .map(|result| result.unwrap().unwrap().len() as u64)
-        .sum::<u64>();
+        .await;
+        let first_streamable = first_data
+            .iter()
+            .filter(|result| !result.as_ref().unwrap().as_ref().unwrap().is_empty())
+            .count();
+        let first_bytes = first_data
+            .into_iter()
+            .map(|result| result.unwrap().unwrap().len() as u64)
+            .sum::<u64>();
         let first = stream_once(&vfs, &store, &mut uploaded, 2).await.unwrap();
-        assert_eq!(first.uploaded, first_digests.len());
+        assert_eq!(first.uploaded, first_streamable);
         assert_eq!(first.bytes, first_bytes);
-        assert_eq!(uploaded.len(), first_digests.len());
+        assert_eq!(uploaded.len(), first_streamable);
         assert_remote_chunks_match_keys(&store).await;
 
         assert_eq!(
@@ -217,13 +225,18 @@ mod tests {
 
         let before = uploaded.clone();
         write_chunked_file(&vfs, "/second.bin", 117).await;
-        let expected_delta = vfs
-            .chunk_digests()
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|digest| !before.contains(digest))
-            .count();
+        let mut expected_delta = 0;
+        for digest in vfs.chunk_digests().await.unwrap() {
+            if !before.contains(&digest)
+                && vfs
+                    .chunk_data(&digest)
+                    .await
+                    .unwrap()
+                    .is_some_and(|data| !data.is_empty())
+            {
+                expected_delta += 1;
+            }
+        }
         let third = stream_once(&vfs, &store, &mut uploaded, 2).await.unwrap();
         assert_eq!(third.uploaded, expected_delta);
         assert_eq!(uploaded.len(), before.len() + expected_delta);
@@ -238,7 +251,18 @@ mod tests {
         write_chunked_file(&vfs, "/seeded.bin", 29).await;
         let store = local_store(remote.path());
         let digests = vfs.chunk_digests().await.unwrap();
-        let existing = digests[0];
+        let mut streamable = Vec::new();
+        for digest in digests {
+            if vfs
+                .chunk_data(&digest)
+                .await
+                .unwrap()
+                .is_some_and(|data| !data.is_empty())
+            {
+                streamable.push(digest);
+            }
+        }
+        let existing = streamable[0];
         let existing_data = Bytes::from_static(b"already remote");
         store
             .put(&chunk_key(&existing), existing_data.clone())
@@ -259,12 +283,32 @@ mod tests {
         assert_eq!(uploaded, HashSet::from([existing]));
 
         let report = stream_once(&vfs, &store, &mut uploaded, 3).await.unwrap();
-        assert_eq!(report.uploaded, digests.len() - 1);
-        assert_eq!(uploaded.len(), digests.len());
+        assert_eq!(report.uploaded, streamable.len() - 1);
+        assert_eq!(uploaded.len(), streamable.len());
         assert_eq!(
             store.get(&chunk_key(&existing)).await.unwrap(),
             existing_data
         );
+    }
+
+    #[tokio::test]
+    async fn stream_once_skips_hollow_chunk_rows() {
+        let local = tempfile::tempdir().unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        let vfs = open_vfs(local.path()).await;
+        write_chunked_file(&vfs, "/hollow.bin", 43).await;
+        let conn = vfs.get_connection().await.unwrap();
+        vfs_core::schema::hollow_chunks(&conn).await.unwrap();
+        drop(conn);
+        let store = local_store(remote.path());
+        let mut uploaded = HashSet::new();
+
+        assert_eq!(
+            stream_once(&vfs, &store, &mut uploaded, 2).await.unwrap(),
+            StreamReport::default()
+        );
+        assert!(uploaded.is_empty());
+        assert!(store.list("chunks/").await.unwrap().is_empty());
     }
 
     #[cfg(unix)]

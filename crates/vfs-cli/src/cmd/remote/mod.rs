@@ -3,10 +3,81 @@
 mod store;
 pub(crate) mod streamer;
 
+use std::fs;
+use std::path::{Path, PathBuf};
+
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use vfs_core::{error::Error as VfsError, ChunkSource};
 
 pub use store::RemoteStore;
+
+/// CLI-owned object-store adapter for core chunk resolution.
+pub(crate) struct RemoteChunkSource {
+    store: RemoteStore,
+    remote_url: String,
+}
+
+impl RemoteChunkSource {
+    pub(crate) fn new(remote_url: &str) -> Result<Self> {
+        Ok(Self {
+            store: RemoteStore::new(remote_url)?,
+            remote_url: remote_url.to_string(),
+        })
+    }
+}
+
+#[async_trait]
+impl ChunkSource for RemoteChunkSource {
+    async fn fetch(&self, digest: &[u8; 32]) -> vfs_core::error::Result<Vec<u8>> {
+        let digest_hex = hex::encode(digest);
+        self.store
+            .get(&chunk_key(digest))
+            .await
+            .map(|bytes| bytes.to_vec())
+            .map_err(|error| {
+                VfsError::Internal(format!(
+                    "failed to fetch remote chunk {digest_hex} from {}: {error:#}",
+                    self.remote_url
+                ))
+            })
+    }
+}
+
+/// Path of the persisted object-store locator for an installed session.
+pub(crate) fn remote_url_path(run_dir: &Path) -> PathBuf {
+    run_dir.join("remote")
+}
+
+/// Publish the object-store locator before the session database commit point.
+pub(crate) fn write_remote_url(run_dir: &Path, remote_url: &str) -> Result<()> {
+    if remote_url.trim().is_empty() {
+        anyhow::bail!("remote session URL must not be empty");
+    }
+    let path = remote_url_path(run_dir);
+    fs::write(&path, remote_url.as_bytes())
+        .with_context(|| format!("Failed to publish remote session URL {}", path.display()))?;
+    super::pack::sync_file_and_parent(&path)
+}
+
+/// Read the object-store locator persisted by remote adoption.
+pub(crate) fn read_remote_url(run_dir: &Path) -> Result<Option<String>> {
+    let path = remote_url_path(run_dir);
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to read remote session URL {}", path.display()));
+        }
+    };
+    let remote_url = contents.trim();
+    if remote_url.is_empty() {
+        anyhow::bail!("remote session URL {} is empty", path.display());
+    }
+    Ok(Some(remote_url.to_string()))
+}
 
 /// CLI-edge configuration for the remote tier.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +143,8 @@ pub fn metadata_key(session_id: &str, sha256_hex: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
+    use url::Url;
 
     #[test]
     fn remote_key_layout_is_pinned() {
@@ -128,5 +201,60 @@ mod tests {
             RemoteManifest::from_json(&serde_json::to_string(&extended).unwrap()).unwrap(),
             manifest
         );
+    }
+
+    #[test]
+    fn remote_url_sidecar_round_trips() {
+        let run_dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_remote_url(run_dir.path()).unwrap(), None);
+
+        write_remote_url(run_dir.path(), "file:///tmp/vfs-remote").unwrap();
+        assert_eq!(
+            read_remote_url(run_dir.path()).unwrap().as_deref(),
+            Some("file:///tmp/vfs-remote")
+        );
+        assert_eq!(
+            remote_url_path(run_dir.path()),
+            run_dir.path().join("remote")
+        );
+    }
+
+    #[test]
+    fn remote_url_sidecar_refuses_empty_content() {
+        let run_dir = tempfile::tempdir().unwrap();
+        fs::write(remote_url_path(run_dir.path()), " \n").unwrap();
+        let error = read_remote_url(run_dir.path()).unwrap_err();
+        assert!(error.to_string().contains("is empty"));
+    }
+
+    #[tokio::test]
+    async fn remote_chunk_source_fetches_file_objects() {
+        let remote = tempfile::tempdir().unwrap();
+        let url = Url::from_directory_path(remote.path()).unwrap().to_string();
+        let source = RemoteChunkSource::new(&url).unwrap();
+        let bytes = b"remote chunk bytes";
+        let digest = *blake3::hash(bytes).as_bytes();
+        source
+            .store
+            .put(&chunk_key(&digest), Bytes::copy_from_slice(bytes))
+            .await
+            .unwrap();
+
+        assert_eq!(source.fetch(&digest).await.unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn remote_chunk_source_translates_fetch_errors_with_digest_context() {
+        let remote = tempfile::tempdir().unwrap();
+        let url = Url::from_directory_path(remote.path()).unwrap().to_string();
+        let source = RemoteChunkSource::new(&url).unwrap();
+        let digest = [0x7a; 32];
+
+        let error = source.fetch(&digest).await.unwrap_err();
+        assert!(matches!(error, VfsError::Internal(_)));
+        let message = error.to_string();
+        assert!(message.contains(&hex::encode(digest)));
+        assert!(message.contains(&url));
+        assert!(message.contains("Failed to get remote object"));
     }
 }

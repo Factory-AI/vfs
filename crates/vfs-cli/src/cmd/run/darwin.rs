@@ -387,8 +387,10 @@ pub async fn run(options: RunOptions) -> Result<()> {
         .context("Database path contains non-UTF8 characters")?;
 
     let encrypted = encryption.is_some();
-    let mut options =
-        VfsOptions::with_path(db_path_str).with_core_config(crate::config::core_config_from_env());
+    let mut options = super::with_session_chunk_source(
+        VfsOptions::with_path(db_path_str).with_core_config(crate::config::core_config_from_env()),
+        &session.run_dir,
+    )?;
     if let Some(encryption) = encryption {
         options = options.with_encryption(encryption);
     }

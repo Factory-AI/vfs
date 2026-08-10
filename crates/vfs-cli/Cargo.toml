@@ -27,6 +27,7 @@ vfs-mount = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 blake3 = { workspace = true }
 bytes = { workspace = true }
 hex = { workspace = true }
@@ -56,5 +57,4 @@ uuid = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
-async-trait = { workspace = true }
 tempfile = { workspace = true }

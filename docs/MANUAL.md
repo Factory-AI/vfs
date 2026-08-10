@@ -472,6 +472,7 @@ vfs adopt [OPTIONS] <SESSION_ID>
 **Options:**
 
 - `--db <PATH>` — Packed session database produced by `vfs pack`
+- `--remote` — Install the hollow metadata artifact from VFS_REMOTE_URL
 - `--base <PATH>` — The receiver's base git checkout for the session
 - `--pin <COMMIT>` — Git commit the base checkout must be at (required only when the artifact does not record a seed pin)
 - `--json` — Emit machine-readable JSON (adopt output is always JSON)

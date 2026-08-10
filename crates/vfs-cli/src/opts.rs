@@ -540,8 +540,17 @@ pub enum Command {
         session_id: String,
 
         /// Packed session database produced by `vfs pack`
-        #[arg(long, value_name = "PATH")]
-        db: PathBuf,
+        #[arg(
+            long,
+            value_name = "PATH",
+            required_unless_present = "remote",
+            conflicts_with = "remote"
+        )]
+        db: Option<PathBuf>,
+
+        /// Install the hollow metadata artifact from VFS_REMOTE_URL
+        #[arg(long, conflicts_with = "db")]
+        remote: bool,
 
         /// The receiver's base git checkout for the session
         #[arg(long, value_name = "PATH", add = ArgValueCompleter::new(PathCompleter::dir()))]
@@ -1011,18 +1020,67 @@ mod tests {
             Command::Adopt {
                 session_id,
                 db,
+                remote,
                 base,
                 pin,
                 json,
             } => {
                 assert_eq!(session_id, "session-1");
-                assert_eq!(db, PathBuf::from("/tmp/packed.db"));
+                assert_eq!(db, Some(PathBuf::from("/tmp/packed.db")));
+                assert!(!remote);
                 assert_eq!(base, PathBuf::from("/tmp/checkout"));
                 assert_eq!(pin.as_deref(), Some("abc123"));
                 assert!(json);
             }
             other => panic!("expected adopt command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn remote_adopt_options_parse_without_a_db_value() {
+        let args = Args::try_parse_from([
+            "vfs",
+            "adopt",
+            "session-1",
+            "--remote",
+            "--base",
+            "/tmp/checkout",
+        ])
+        .unwrap();
+
+        match args.command {
+            Command::Adopt {
+                session_id,
+                db,
+                remote,
+                base,
+                ..
+            } => {
+                assert_eq!(session_id, "session-1");
+                assert_eq!(db, None);
+                assert!(remote);
+                assert_eq!(base, PathBuf::from("/tmp/checkout"));
+            }
+            other => panic!("expected adopt command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn adopt_requires_exactly_one_input_source() {
+        assert!(
+            Args::try_parse_from(["vfs", "adopt", "session-1", "--base", "/tmp/checkout"]).is_err()
+        );
+        assert!(Args::try_parse_from([
+            "vfs",
+            "adopt",
+            "session-1",
+            "--db",
+            "/tmp/packed.db",
+            "--remote",
+            "--base",
+            "/tmp/checkout",
+        ])
+        .is_err());
     }
 
     #[test]

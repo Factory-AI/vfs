@@ -293,8 +293,13 @@ async fn record_run_audit(
     let db_path_str = db_path
         .to_str()
         .context("Database path contains non-UTF8 characters")?;
-    let mut options =
-        VfsOptions::with_path(db_path_str).with_core_config(crate::config::core_config_from_env());
+    let run_dir = db_path
+        .parent()
+        .context("Session database has no run directory")?;
+    let mut options = super::with_session_chunk_source(
+        VfsOptions::with_path(db_path_str).with_core_config(crate::config::core_config_from_env()),
+        run_dir,
+    )?;
     if let Some(encryption) = encryption {
         options = options.with_encryption(encryption);
     }
@@ -361,8 +366,14 @@ async fn mount_session_fs(
         .db_path
         .to_str()
         .context("Database path contains non-UTF8 characters")?;
-    let mut options =
-        VfsOptions::with_path(db_path_str).with_core_config(crate::config::core_config_from_env());
+    let run_dir = session
+        .db_path
+        .parent()
+        .context("Session database has no run directory")?;
+    let mut options = super::with_session_chunk_source(
+        VfsOptions::with_path(db_path_str).with_core_config(crate::config::core_config_from_env()),
+        run_dir,
+    )?;
     if let Some(encryption) = encryption {
         options = options.with_encryption(encryption);
     }

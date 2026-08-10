@@ -81,6 +81,7 @@ async fn checkpoint_session(
     }
     let base_path = super::run::read_session_base_path(&paths)?;
     refuse_encrypted_session(&paths.db_path)?;
+    refuse_hollow_session(&paths.db_path).await?;
 
     let staging = paths
         .run_dir
@@ -235,6 +236,23 @@ fn refuse_encrypted_session(db_path: &Path) -> Result<()> {
         bail!(
             "vfs checkpoint does not support encrypted sessions; uploading plaintext chunks would weaken at-rest confidentiality"
         );
+    }
+    Ok(())
+}
+
+async fn refuse_hollow_session(db_path: &Path) -> Result<()> {
+    let vfs = Vfs::open_read_only(db_path)
+        .await
+        .context("Failed to inspect session chunk storage before checkpointing")?;
+    let conn = vfs
+        .get_connection()
+        .await
+        .context("Failed to connect to session chunk storage")?;
+    let hollow = schema::chunks_hollow(&conn)
+        .await
+        .context("Failed to inspect session chunk storage")?;
+    if hollow {
+        bail!("vfs checkpoint refuses hollow sessions; materialize the session first");
     }
     Ok(())
 }
@@ -649,6 +667,35 @@ mod tests {
         .await
         .expect_err("encrypted checkpoint must fail");
         assert!(error.to_string().contains("encrypted sessions"));
+        assert!(RemoteStore::new(&config.url)?.list("").await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hollow_session_refuses_before_uploading_objects() -> Result<()> {
+        let fixture = fixture(true).await?;
+        let db_path =
+            super::super::run::SessionPaths::new(fixture.home.path(), &fixture.session_id).db_path;
+        let db = Builder::new_local(db_path.to_str().unwrap())
+            .build()
+            .await?;
+        let conn = db.connect()?;
+        schema::hollow_chunks(&conn).await?;
+        drop(conn);
+        drop(db);
+
+        let config = remote_config(&fixture.remote);
+        let error = checkpoint_session(
+            &mut Vec::new(),
+            fixture.home.path(),
+            fixture.session_id,
+            true,
+            Some(config.clone()),
+            test_core_config(true),
+        )
+        .await
+        .expect_err("hollow checkpoint must fail");
+        assert!(error.to_string().contains("materialize the session first"));
         assert!(RemoteStore::new(&config.url)?.list("").await?.is_empty());
         Ok(())
     }

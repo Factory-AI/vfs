@@ -3,13 +3,16 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use vfs_core::{schema, Vfs, VfsOptions};
 
 use super::pack::SessionStillRunning;
+use super::remote::{manifest_key, RemoteChunkSource, RemoteManifest, RemoteStore};
 use super::safety::{build_local_database, remove_sqlite_sidecars_after_checkpoint};
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -23,36 +26,59 @@ pub struct AdoptManifest {
     schema_version: String,
     seeded_paths: Vec<String>,
     vfs_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remote: Option<bool>,
+}
+
+enum AdoptInput {
+    Local(PathBuf),
+    Remote(String),
 }
 
 /// Install a transferred session artifact and print its machine-readable manifest.
 pub async fn handle_adopt_command(
     stdout: &mut impl Write,
     session_id: String,
-    db: PathBuf,
+    db: Option<PathBuf>,
+    remote: bool,
     base: PathBuf,
     pin: Option<String>,
     _json: bool,
 ) -> Result<()> {
     let home = dirs::home_dir().context("Failed to get home directory")?;
-    adopt_session(stdout, &home, session_id, db, base, pin).await
+    let input = match (db, remote) {
+        (Some(db), false) => AdoptInput::Local(db),
+        (None, true) => AdoptInput::Remote(
+            crate::config::remote_config()
+                .context("vfs adopt --remote requires VFS_REMOTE_URL to be configured")?
+                .url,
+        ),
+        _ => bail!("exactly one of --db or --remote is required"),
+    };
+    adopt_session(stdout, &home, session_id, input, base, pin).await
 }
 
 async fn adopt_session(
     stdout: &mut impl Write,
     home: &Path,
     session_id: String,
-    db: PathBuf,
+    input: AdoptInput,
     base: PathBuf,
     pin: Option<String>,
 ) -> Result<()> {
     if !VfsOptions::validate_agent_id(&session_id) {
         bail!("invalid session ID: {session_id}");
     }
-    let source_db = std::path::absolute(&db).context("Failed to resolve --db path")?;
-    if !source_db.is_file() {
-        bail!("session artifact not found: {}", source_db.display());
-    }
+    let input = match input {
+        AdoptInput::Local(db) => {
+            let source_db = std::path::absolute(&db).context("Failed to resolve --db path")?;
+            if !source_db.is_file() {
+                bail!("session artifact not found: {}", source_db.display());
+            }
+            AdoptInput::Local(source_db)
+        }
+        remote => remote,
+    };
     let base_path = std::path::absolute(&base).context("Failed to resolve --base path")?;
     if !base_path.is_dir() {
         bail!(
@@ -87,16 +113,37 @@ async fn adopt_session(
 
     let staging =
         StagedArtifact::new(session_dir.join(format!(".delta.db.adopt-{}.tmp", Uuid::new_v4())));
-    super::pack::copy_database_family(&source_db, staging.path())
-        .context("Failed to stage the session artifact")?;
+    let (remote_manifest, remote_url) = match input {
+        AdoptInput::Local(source_db) => {
+            super::pack::copy_database_family(&source_db, staging.path())
+                .context("Failed to stage the session artifact")?;
+            (None, None)
+        }
+        AdoptInput::Remote(remote_url) => {
+            let remote = RemoteStore::new(&remote_url)?;
+            let (manifest, metadata) = fetch_verified_remote_input(&remote, &session_id).await?;
+            fs::write(staging.path(), metadata)
+                .context("Failed to stage the remote session metadata")?;
+            super::pack::sync_file_and_parent(staging.path())?;
+            (Some(manifest), Some(remote_url))
+        }
+    };
     verify_artifact_integrity(staging.path()).await?;
     let artifact_version = migrate_artifact_to_current(staging.path()).await?;
 
-    let vfs = Vfs::open(VfsOptions::with_path(staging.path().to_string_lossy()))
+    let mut options = VfsOptions::with_path(staging.path().to_string_lossy());
+    if let Some(remote_url) = remote_url.as_deref() {
+        options = options.with_chunk_source(Arc::new(RemoteChunkSource::new(remote_url)?));
+    }
+    let vfs = Vfs::open(options)
         .await
         .context("Failed to open the staged session artifact")?;
     let metadata = vfs.session_metadata().await?;
     let recorded_pin = vfs.seed_pin().await?;
+    if let Some(manifest) = remote_manifest.as_ref() {
+        verify_remote_manifest_against_db(&vfs, manifest, &metadata, recorded_pin.as_deref())
+            .await?;
+    }
     vfs.fs
         .finalize()
         .await
@@ -119,6 +166,9 @@ async fn adopt_session(
     fs::write(base_path_file, base_path.to_string_lossy().as_bytes())
         .context("Failed to publish session base path")?;
     super::pack::sync_file_and_parent(base_path_file)?;
+    if let Some(remote_url) = remote_url.as_deref() {
+        super::remote::write_remote_url(&session_dir, remote_url)?;
+    }
     fs::rename(staging.path(), &db_path).with_context(|| {
         format!(
             "Failed to install adopted session database {}",
@@ -137,9 +187,174 @@ async fn adopt_session(
         schema_version: artifact_version.to_string(),
         seeded_paths: metadata.seeded_paths,
         vfs_version: super::version::VERSION.to_string(),
+        remote: remote_url.as_ref().map(|_| true),
     };
     serde_json::to_writer(&mut *stdout, &manifest)?;
     writeln!(stdout)?;
+    Ok(())
+}
+
+async fn fetch_verified_remote_input(
+    remote: &RemoteStore,
+    session_id: &str,
+) -> Result<(RemoteManifest, Vec<u8>)> {
+    let manifest_bytes = remote
+        .get(&manifest_key(session_id))
+        .await
+        .with_context(|| format!("Failed to fetch remote manifest for session {session_id}"))?;
+    let manifest_json = std::str::from_utf8(&manifest_bytes)
+        .context("Remote session manifest is not valid UTF-8")?;
+    let manifest = RemoteManifest::from_json(manifest_json)?;
+    if manifest.session_id != session_id {
+        bail!(
+            "remote manifest session ID {:?} does not match requested session {session_id:?}",
+            manifest.session_id
+        );
+    }
+    verify_manifest_artifact_version(&manifest.artifact_version)?;
+
+    let metadata = remote
+        .get(&manifest.metadata.key)
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to fetch remote session metadata {:?}",
+                manifest.metadata.key
+            )
+        })?
+        .to_vec();
+    let actual_bytes = u64::try_from(metadata.len()).context("Remote metadata size exceeds u64")?;
+    if actual_bytes != manifest.metadata.bytes {
+        bail!(
+            "remote session metadata length mismatch: manifest declares {} bytes, fetched {actual_bytes}",
+            manifest.metadata.bytes
+        );
+    }
+    let actual_sha256 = hex::encode(Sha256::digest(&metadata));
+    if actual_sha256 != manifest.metadata.sha256 {
+        bail!(
+            "remote session metadata SHA-256 mismatch: manifest declares {}, fetched {actual_sha256}",
+            manifest.metadata.sha256
+        );
+    }
+    Ok((manifest, metadata))
+}
+
+fn verify_manifest_artifact_version(marker: &str) -> Result<schema::SchemaVersion> {
+    let Some(version) = schema::SchemaVersion::parse(marker) else {
+        if numeric_version(marker)
+            .zip(numeric_version(schema::CURRENT.as_str()))
+            .is_some_and(|(found, current)| found > current)
+        {
+            bail!(
+                "remote manifest requires artifact version {marker}, newer than the newest supported artifact version {} (vfs {}); upgrade vfs to adopt it",
+                schema::CURRENT,
+                super::version::VERSION
+            );
+        }
+        bail!(
+            "remote manifest artifact version {marker:?} is unsupported by vfs {}; supported range is {} through {}",
+            super::version::VERSION,
+            schema::MIN_SUPPORTED,
+            schema::CURRENT
+        );
+    };
+    if version < schema::MIN_SUPPORTED {
+        bail!(
+            "remote manifest artifact version {version} is older than the oldest supported artifact version {}; create a newer checkpoint",
+            schema::MIN_SUPPORTED
+        );
+    }
+    if version > schema::CURRENT {
+        bail!(
+            "remote manifest requires artifact version {version}, newer than the newest supported artifact version {} (vfs {}); upgrade vfs to adopt it",
+            schema::CURRENT,
+            super::version::VERSION
+        );
+    }
+    Ok(version)
+}
+
+fn numeric_version(marker: &str) -> Option<(u64, u64)> {
+    let (major, minor) = marker.split_once('.')?;
+    Some((major.parse().ok()?, minor.parse().ok()?))
+}
+
+async fn verify_remote_manifest_against_db(
+    vfs: &Vfs,
+    manifest: &RemoteManifest,
+    metadata: &vfs_core::SessionMetadata,
+    seed_pin: Option<&str>,
+) -> Result<()> {
+    if manifest.generation != metadata.generation {
+        bail!(
+            "remote manifest generation {} does not match staged database generation {}",
+            manifest.generation,
+            metadata.generation
+        );
+    }
+    if manifest.seed_pin.as_deref() != seed_pin {
+        bail!(
+            "remote manifest seed pin {:?} does not match staged database seed pin {:?}",
+            manifest.seed_pin,
+            seed_pin
+        );
+    }
+
+    let history = vfs
+        .history_status()
+        .await
+        .context("Failed to read staged database history status")?;
+    if manifest.history_epoch != history.epoch || manifest.history_valid != history.valid {
+        bail!(
+            "remote manifest history claims do not match staged database: manifest epoch {}/valid {}, database epoch {}/valid {}",
+            manifest.history_epoch,
+            manifest.history_valid,
+            history.epoch,
+            history.valid
+        );
+    }
+
+    let conn = vfs
+        .get_connection()
+        .await
+        .context("Failed to inspect staged remote metadata")?;
+    let mut rows = conn
+        .query(
+            "SELECT seq FROM fs_op_journal ORDER BY seq DESC LIMIT 1",
+            (),
+        )
+        .await?;
+    let head_seq = rows
+        .next()
+        .await?
+        .map(|row| row.get::<i64>(0))
+        .transpose()?
+        .unwrap_or(0);
+    drop(rows);
+    if manifest.head_seq != head_seq {
+        bail!(
+            "remote manifest head sequence {} does not match staged database head sequence {head_seq}",
+            manifest.head_seq
+        );
+    }
+
+    let mut rows = conn.query("SELECT COUNT(*) FROM fs_chunk", ()).await?;
+    let chunk_count = rows
+        .next()
+        .await?
+        .context("staged database chunk count query returned no row")?
+        .get::<i64>(0)?;
+    let chunk_count =
+        u64::try_from(chunk_count).context("staged database has a negative chunk count")?;
+    if manifest.chunk_count != chunk_count {
+        bail!(
+            "remote manifest chunk count {} does not match staged database chunk count {chunk_count}",
+            manifest.chunk_count
+        );
+    }
+    // Hollow metadata intentionally omits chunk bytes, so chunkBytes cannot be
+    // recomputed locally; every fetched object is verified by the core resolver.
     Ok(())
 }
 
@@ -270,8 +485,10 @@ fn resolve_expected_pin(
 mod tests {
     use std::process::Command;
 
+    use bytes::Bytes;
     use tempfile::{tempdir, TempDir};
     use turso::Builder;
+    use url::Url;
     use vfs_core::OverlayFS;
 
     use super::*;
@@ -357,7 +574,7 @@ mod tests {
             &mut stdout,
             &fixture.home,
             session_id.to_string(),
-            artifact.to_path_buf(),
+            AdoptInput::Local(artifact.to_path_buf()),
             fixture.receiver_base.clone(),
             pin.map(str::to_string),
         )
@@ -379,6 +596,7 @@ mod tests {
         assert_eq!(manifest.schema_version, schema::CURRENT.as_str());
         assert_eq!(manifest.seeded_paths, vec!["tracked.txt".to_string()]);
         assert_eq!(manifest.vfs_version, super::super::version::VERSION);
+        assert_eq!(manifest.remote, None);
 
         let session_dir = fixture.session_dir("adopt-happy");
         assert_eq!(
@@ -563,6 +781,123 @@ mod tests {
             .await
             .expect_err("locked session must be refused");
         assert!(error.downcast_ref::<SessionStillRunning>().is_some());
+        Ok(())
+    }
+
+    fn remote_manifest(session_id: &str, metadata_key: &str, metadata: &[u8]) -> RemoteManifest {
+        RemoteManifest {
+            session_id: session_id.to_string(),
+            head_seq: 0,
+            history_epoch: 1,
+            history_valid: true,
+            generation: 0,
+            artifact_version: schema::CURRENT.as_str().to_string(),
+            seed_pin: None,
+            metadata: super::super::remote::RemoteMetadata {
+                key: metadata_key.to_string(),
+                sha256: hex::encode(Sha256::digest(metadata)),
+                bytes: metadata.len() as u64,
+            },
+            chunk_count: 0,
+            chunk_bytes: 0,
+            created_at_ms: 0,
+            vfs_version: super::super::version::VERSION.to_string(),
+        }
+    }
+
+    fn remote_store() -> Result<(TempDir, RemoteStore)> {
+        let remote = tempfile::tempdir()?;
+        let url = Url::from_directory_path(remote.path())
+            .map_err(|()| anyhow::anyhow!("failed to create file remote URL"))?
+            .to_string();
+        let store = RemoteStore::new(&url)?;
+        Ok((remote, store))
+    }
+
+    #[tokio::test]
+    async fn remote_input_refuses_a_wrong_session_id() -> Result<()> {
+        let (_remote, store) = remote_store()?;
+        let manifest = remote_manifest("other-session", "metadata.db", b"metadata");
+        store
+            .put(
+                &manifest_key("requested-session"),
+                Bytes::from(manifest.to_json()?),
+            )
+            .await?;
+
+        let error = fetch_verified_remote_input(&store, "requested-session")
+            .await
+            .expect_err("wrong session id must fail");
+        assert!(error
+            .to_string()
+            .contains("does not match requested session"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remote_input_refuses_a_future_artifact_version() -> Result<()> {
+        let (_remote, store) = remote_store()?;
+        let mut manifest = remote_manifest("future-session", "metadata.db", b"metadata");
+        manifest.artifact_version = "999.0".to_string();
+        store
+            .put(
+                &manifest_key("future-session"),
+                Bytes::from(manifest.to_json()?),
+            )
+            .await?;
+
+        let error = fetch_verified_remote_input(&store, "future-session")
+            .await
+            .expect_err("future artifact version must fail");
+        let message = error.to_string();
+        assert!(message.contains("upgrade vfs"));
+        assert!(message.contains("999.0"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remote_input_refuses_a_metadata_sha_mismatch() -> Result<()> {
+        let (_remote, store) = remote_store()?;
+        let metadata = b"metadata";
+        let mut manifest = remote_manifest("sha-session", "metadata.db", metadata);
+        manifest.metadata.sha256 = "00".repeat(32);
+        store
+            .put(
+                &manifest_key("sha-session"),
+                Bytes::from(manifest.to_json()?),
+            )
+            .await?;
+        store
+            .put("metadata.db", Bytes::copy_from_slice(metadata))
+            .await?;
+
+        let error = fetch_verified_remote_input(&store, "sha-session")
+            .await
+            .expect_err("metadata sha mismatch must fail");
+        assert!(error.to_string().contains("SHA-256 mismatch"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remote_input_refuses_short_metadata() -> Result<()> {
+        let (_remote, store) = remote_store()?;
+        let metadata = b"short";
+        let mut manifest = remote_manifest("short-session", "metadata.db", metadata);
+        manifest.metadata.bytes += 1;
+        store
+            .put(
+                &manifest_key("short-session"),
+                Bytes::from(manifest.to_json()?),
+            )
+            .await?;
+        store
+            .put("metadata.db", Bytes::copy_from_slice(metadata))
+            .await?;
+
+        let error = fetch_verified_remote_input(&store, "short-session")
+            .await
+            .expect_err("short metadata must fail");
+        assert!(error.to_string().contains("length mismatch"));
         Ok(())
     }
 

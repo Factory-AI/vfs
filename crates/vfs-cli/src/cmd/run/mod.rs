@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use vfs_core::VfsOptions;
 
 #[cfg(unix)]
@@ -197,6 +198,17 @@ pub(crate) fn read_session_base_path(paths: &SessionPaths) -> Result<PathBuf> {
         .into());
     }
     Ok(base_path)
+}
+
+pub(crate) fn with_session_chunk_source(options: VfsOptions, run_dir: &Path) -> Result<VfsOptions> {
+    let Some(remote_url) = crate::cmd::remote::read_remote_url(run_dir)? else {
+        return Ok(options);
+    };
+    Ok(
+        options.with_chunk_source(Arc::new(crate::cmd::remote::RemoteChunkSource::new(
+            &remote_url,
+        )?)),
+    )
 }
 
 #[cfg(any(test, target_os = "linux"))]

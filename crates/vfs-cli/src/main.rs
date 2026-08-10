@@ -370,6 +370,7 @@ fn dispatch(args: Args) -> anyhow::Result<()> {
         Command::Adopt {
             session_id,
             db,
+            remote,
             base,
             pin,
             json,
@@ -379,6 +380,7 @@ fn dispatch(args: Args) -> anyhow::Result<()> {
                 &mut std::io::stdout(),
                 session_id,
                 db,
+                remote,
                 base,
                 pin,
                 json,
