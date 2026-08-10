@@ -481,12 +481,16 @@ also exercises the `/System/Volumes/Preboot` metadata literal that lets
 path resolution reach the dyld cryptex root, which used to be a manual
 spot-check.
 
-What still needs a manual run on real hardware before a release that
-advertises macOS: the rest of the shell suite (CI runs only the two remote
-suites there), and two Seatbelt spot-checks the suites do not reach —
-dynamic profile paths travel as Seatbelt `(param "NAME")` references with
-`-D NAME=value` definitions on the `/usr/bin/sandbox-exec` command line, so
-confirm a session under a directory with spaces or quotes in its name still
-mounts and runs; and `vfs run <missing-command>` must exit `127` (`126` for
-a present but non-executable file), matching `vfs exec` and the Linux run
-path.
+The former manual Seatbelt spot-checks are legs of this script now, so CI
+covers them: a session homed and based under directories with spaces and a
+double quote in their names must mount and run (dynamic profile paths
+travel as Seatbelt `(param "NAME")` references with `-D NAME=value`
+definitions on the `/usr/bin/sandbox-exec` command line, and a regression
+back to string interpolation fails here), and `vfs run` must exit `127` for
+a missing command and `126` for a present but non-executable one, matching
+`vfs exec` and the Linux run path.
+
+What macOS CI still does not cover: the rest of the shell suite — only the
+two remote-tier suites run on macos-latest, so a change touching mount
+lifecycle, MCP, or CLI surfaces beyond those suites has no macOS runtime
+coverage until its owning suite is made platform-aware the same way.

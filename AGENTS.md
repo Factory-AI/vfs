@@ -231,12 +231,12 @@ Not regressions — deliberate, documented state. Don't "fix" them by accident.
   invisible until the gate runs somewhere unusual.
 * **macOS runtime coverage is CI-real but narrower than Linux.** The
   macos-latest jobs run clippy, the workspace tests, the NFS + Seatbelt
-  runtime validation script, and both remote-tier suites over the NFS mount
-  path. The session control socket and the chunk streamer exist only in the
-  Linux mount owner, so the live-checkpoint and streamer legs never run on a
-  Mac, and the rest of the shell suite plus the Seatbelt spot-checks in
-  docs/TESTING.md still need a manual hardware run before a release that
-  advertises macOS.
+  runtime validation script (including the quoted-path and 127/126
+  exit-parity legs), and both remote-tier suites over the NFS mount path.
+  The session control socket and the chunk streamer exist only in the Linux
+  mount owner, so the live-checkpoint and streamer legs never run on a Mac,
+  and the rest of the shell suite has no macOS coverage until each suite is
+  made platform-aware like the remote pair.
 * **NFS `UNSTABLE`+`COMMIT` is deliberately unimplemented.** Every WRITE is
   `FILE_SYNC`-honest and `NFSPROC3_COMMIT` returns `PROC_UNAVAIL`. Implementing
   it with imperfect verifier semantics reintroduces the data-loss class
