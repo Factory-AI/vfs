@@ -455,6 +455,7 @@ pub(super) struct VfsWriteBatcher {
     /// (`VFS_BATCH_TXN_BYTES`). See `drain_pending_batched`.
     txn_max_bytes: usize,
     journal: JournalCtx,
+    chunk_resolver: store::ChunkResolver,
     /// Tier 4 mitigation: parking_lot `RwLock` so `peek_pending` /
     /// `peek_pending_max_end` can acquire read-only access without contending
     /// with writers. The lock is never held across an `.await`, so a sync
@@ -484,6 +485,7 @@ impl VfsWriteBatcher {
         invalidate: Invalidate,
         config: &BatcherConfig,
         journal: JournalCtx,
+        chunk_resolver: store::ChunkResolver,
     ) -> Self {
         Self {
             pool,
@@ -496,6 +498,7 @@ impl VfsWriteBatcher {
             txn_max_inodes: config.txn_max_inodes.max(1),
             txn_max_bytes: config.txn_max_bytes.max(1),
             journal,
+            chunk_resolver,
             state: RwLock::new(VfsWriteBatcherState::default()),
             commit_lock: AsyncMutex::new(()),
         }
@@ -783,6 +786,7 @@ impl VfsWriteBatcher {
                     *ino,
                     geometry,
                     &normalized_refs,
+                    &self.chunk_resolver,
                     preserve_times.get(ino).copied().unwrap_or(false),
                     pending_times.get(ino),
                 )

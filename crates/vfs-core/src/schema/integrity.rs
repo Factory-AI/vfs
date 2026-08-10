@@ -605,7 +605,7 @@ async fn check_portability_status(
     };
     let chunks_hollow = super::chunks_hollow(conn).await?;
     let hollow_chunks = if chunks_hollow && table_exists(conn, "fs_chunk").await? {
-        scalar_i64(conn, "SELECT COUNT(*) FROM fs_chunk").await?
+        scalar_i64(conn, "SELECT COUNT(*) FROM fs_chunk WHERE length(data) = 0").await?
     } else {
         0
     };

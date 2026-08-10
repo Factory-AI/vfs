@@ -227,7 +227,9 @@ async fn require_schema_current_for_mount_precheck(
         .await
         .map_err(|err| SdkError::Internal(format!("{err:#}")))?;
     let conn = db.connect()?;
-    vfs_core::schema::require_current(&conn).await
+    vfs_core::schema::require_current(&conn, false)
+        .await
+        .map(|_| ())
 }
 
 /// Mount the agent filesystem using NFS over localhost.

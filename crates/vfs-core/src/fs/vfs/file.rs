@@ -24,6 +24,10 @@ pub struct VfsFile {
     pub(super) attr_cache: Arc<AttrCache>,
     pub(super) pending_view: Option<BatcherPendingView>,
     pub(super) write_drain: Option<BatcherDrain>,
+    /// Captured once at open: full hydration is an offline operation, so a
+    /// live filesystem never transitions out of hollow state underneath a
+    /// handle.
+    pub(super) chunk_resolver: store::ChunkResolver,
     /// Same semantics as the field on `Vfs`; cloned at open time so the
     /// hot read/write path doesn't have to chase an extra indirection.
     pub(super) overlay_reads: bool,
@@ -86,6 +90,7 @@ impl File for VfsFile {
                 self.ino,
                 self.geometry(),
                 &metadata,
+                &self.chunk_resolver,
                 offset,
                 base_window,
             )
@@ -136,8 +141,16 @@ impl File for VfsFile {
         let conn = self.pool.get_connection().await?;
         let mut txn = MutationTxn::begin(&conn, self.journal.clone()).await?;
         let ranges = [WriteRangeRef { offset, data }];
-        let result =
-            store::write_ranges(txn.conn(), self.ino, self.geometry(), &ranges, false, None).await;
+        let result = store::write_ranges(
+            txn.conn(),
+            self.ino,
+            self.geometry(),
+            &ranges,
+            &self.chunk_resolver,
+            false,
+            None,
+        )
+        .await;
         match result {
             Ok(changes) => {
                 txn.record_storage_changes("write", changes).await?;
@@ -180,6 +193,7 @@ impl File for VfsFile {
             self.ino,
             self.geometry(),
             &range_refs,
+            &self.chunk_resolver,
             false,
             None,
         )
@@ -226,7 +240,14 @@ impl File for VfsFile {
         self.drain_writes().await?;
         let conn = self.pool.get_connection().await?;
         let mut txn = MutationTxn::begin(&conn, self.journal.clone()).await?;
-        let result = store::truncate(txn.conn(), self.ino, self.geometry(), new_size).await;
+        let result = store::truncate(
+            txn.conn(),
+            self.ino,
+            self.geometry(),
+            new_size,
+            &self.chunk_resolver,
+        )
+        .await;
         match result {
             Ok(changes) => {
                 txn.record_storage_changes("truncate", changes).await?;

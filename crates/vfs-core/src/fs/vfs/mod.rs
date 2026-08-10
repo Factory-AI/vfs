@@ -144,6 +144,8 @@ pub struct Vfs {
     /// Async drain/enqueue surface. Code holding a pooled connection must not
     /// have access to this surface.
     write_drain: Option<BatcherDrain>,
+    /// Captured at open because full hydration is offline-only.
+    chunk_resolver: store::ChunkResolver,
     /// Concrete batcher retained only for white-box unit tests.
     #[cfg(test)]
     write_batcher: Option<Arc<VfsWriteBatcher>>,
@@ -199,7 +201,8 @@ impl Vfs {
         db_path: Option<PathBuf>,
         config: CoreConfig,
     ) -> Result<Self> {
-        Self::from_pool_with_path_config_and_reap_hooks(pool, db_path, config, Vec::new()).await
+        Self::from_pool_with_path_config_and_reap_hooks(pool, db_path, config, Vec::new(), None)
+            .await
     }
 
     pub(crate) async fn from_read_only_pool(
@@ -213,6 +216,7 @@ impl Vfs {
 
         let chunk_size = Self::read_chunk_size(&conn).await?;
         let inline_threshold = Self::read_inline_threshold(&conn).await?;
+        let hollow = schema::chunks_hollow(&conn).await?;
         config.geometry = Geometry {
             chunk_size,
             inline_threshold,
@@ -232,6 +236,7 @@ impl Vfs {
             attr_cache: Arc::new(AttrCache::new(ATTR_CACHE_MAX_SIZE)),
             pending_view: None,
             write_drain: None,
+            chunk_resolver: store::ChunkResolver::new(hollow, None),
             #[cfg(test)]
             write_batcher: None,
             #[cfg(test)]
@@ -248,6 +253,7 @@ impl Vfs {
         db_path: Option<PathBuf>,
         mut config: CoreConfig,
         reap_hooks: Vec<Arc<dyn ReapHook>>,
+        chunk_source: Option<Arc<dyn schema::ChunkSource>>,
     ) -> Result<Self> {
         // finalize() resolves this path for sidecar removal long after the
         // caller may have changed the working directory (mount teardown
@@ -258,7 +264,8 @@ impl Vfs {
         // Initialize or migrate schema first. The schema module owns DDL and
         // stamps SQLite's user-version inside the DDL transaction.
         let journal = journal::JournalCtx::new(config.journal_enabled);
-        Self::initialize_schema(&conn, journal.clone()).await?;
+        let hollow =
+            Self::initialize_schema(&conn, journal.clone(), chunk_source.is_some()).await?;
         super::history::reconcile_epoch(&conn, config.journal_enabled).await?;
 
         // Get chunk_size from config (or use default)
@@ -269,6 +276,7 @@ impl Vfs {
             inline_threshold,
         };
         let core_config = Arc::new(config);
+        let chunk_resolver = store::ChunkResolver::new(hollow, chunk_source);
 
         let attr_cache = Arc::new(AttrCache::new(ATTR_CACHE_MAX_SIZE));
         // Tier Three Axis D: default the write batcher to ON. CLI callers pass
@@ -286,6 +294,7 @@ impl Vfs {
                 invalidate,
                 &core_config.batcher,
                 journal.clone(),
+                chunk_resolver.clone(),
             ));
             let (pending_view, write_drain) = VfsWriteBatcher::split(&batcher);
             (Some(pending_view), Some(write_drain), Some(batcher))
@@ -315,6 +324,7 @@ impl Vfs {
             attr_cache,
             pending_view,
             write_drain,
+            chunk_resolver,
             #[cfg(test)]
             write_batcher: _write_batcher,
             #[cfg(test)]
@@ -349,6 +359,10 @@ impl Vfs {
         self.journal.clone()
     }
 
+    pub(in crate::fs) fn chunk_resolver(&self) -> &store::ChunkResolver {
+        &self.chunk_resolver
+    }
+
     /// Configured journal retention horizon, in retained operations.
     pub fn journal_retention_ops(&self) -> usize {
         self.core_config.journal_retention_ops
@@ -374,8 +388,12 @@ impl Vfs {
     }
 
     /// Initialize the database schema
-    async fn initialize_schema(conn: &Connection, journal: journal::JournalCtx) -> Result<()> {
-        schema::require_current(conn).await?;
+    async fn initialize_schema(
+        conn: &Connection,
+        journal: journal::JournalCtx,
+        has_chunk_source: bool,
+    ) -> Result<bool> {
+        let hollow = schema::require_current(conn, has_chunk_source).await?;
         let mut txn = MutationTxn::begin(conn, journal).await?;
 
         // Ensure root directory exists with correct ownership
@@ -453,7 +471,7 @@ impl Vfs {
             }
             None => txn.rollback().await?,
         }
-        Ok(())
+        Ok(hollow)
     }
 
     /// Read chunk size from config
@@ -1128,6 +1146,7 @@ impl Vfs {
             attr_cache: self.attr_cache.clone(),
             pending_view: self.pending_view.clone(),
             write_drain: self.write_drain.clone(),
+            chunk_resolver: self.chunk_resolver.clone(),
             overlay_reads: self.overlay_reads,
             journal: self.journal_ctx(),
             _open_guard: Some(self.lifecycle.guard(ino)),

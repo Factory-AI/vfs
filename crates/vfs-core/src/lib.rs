@@ -145,6 +145,8 @@ impl Vfs {
             .core_config
             .clone()
             .unwrap_or_else(CoreConfig::from_env);
+        let chunk_source = options.chunk_source.clone();
+        let has_chunk_source = chunk_source.is_some();
 
         // Validate base directory if provided
         if let Some(ref path) = options.base {
@@ -179,7 +181,7 @@ impl Vfs {
         // schema-owned callers read or write sidecar sections. Old schema
         // versions are rejected here; upgrades are `vfs migrate`'s job.
         let mut conn = pool.get_connection().await?;
-        if let Err(error) = schema::require_current(&conn).await {
+        if let Err(error) = schema::require_current(&conn, has_chunk_source).await {
             conn.mark_unhealthy_if_fatal(&error);
             return Err(error);
         }
@@ -202,22 +204,24 @@ impl Vfs {
             None
         };
 
-        Self::build_from_pool_and_path(pool, db_path_for_fs, core_config, Vec::new()).await
+        Self::build_from_pool_and_path(pool, db_path_for_fs, core_config, Vec::new(), chunk_source)
+            .await
     }
 
     async fn build_from_pool_and_config(
         pool: ConnectionPool,
         core_config: CoreConfig,
     ) -> Result<Self> {
-        let kv = KvStore::from_pool(pool.clone()).await?;
         let fs = fs::Vfs::from_pool_with_path_config_and_reap_hooks(
             pool.clone(),
             None,
             core_config,
             Vec::new(),
+            None,
         )
         .await?;
-        let tools = ToolCalls::from_pool(pool.clone()).await?;
+        let kv = KvStore::from_initialized_pool(pool.clone());
+        let tools = ToolCalls::from_initialized_pool(pool.clone());
 
         Ok(Self {
             pool,
@@ -232,16 +236,18 @@ impl Vfs {
         db_path: Option<PathBuf>,
         core_config: CoreConfig,
         reap_hooks: Vec<Arc<dyn fs::vfs::ReapHook>>,
+        chunk_source: Option<Arc<dyn ChunkSource>>,
     ) -> Result<Self> {
-        let kv = KvStore::from_pool(pool.clone()).await?;
         let fs = fs::Vfs::from_pool_with_path_config_and_reap_hooks(
             pool.clone(),
             db_path,
             core_config,
             reap_hooks,
+            chunk_source,
         )
         .await?;
-        let tools = ToolCalls::from_pool(pool.clone()).await?;
+        let kv = KvStore::from_initialized_pool(pool.clone());
+        let tools = ToolCalls::from_initialized_pool(pool.clone());
 
         Ok(Self {
             pool,
@@ -315,7 +321,7 @@ impl Vfs {
             .ok_or_else(|| Error::InvalidUtf8Path(staging_path.display().to_string()))?;
         let db = Builder::new_local(path).build().await?;
         let conn = db.connect()?;
-        schema::require_current(&conn).await?;
+        schema::require_current(&conn, false).await?;
         let info = fs::history::reconstruct(&conn, staging_path, target_seq).await?;
         let mut rows = conn.query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await?;
         while rows.next().await?.is_some() {}

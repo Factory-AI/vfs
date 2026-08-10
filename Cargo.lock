@@ -3736,6 +3736,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "criterion",
+ "futures-util",
  "libc",
  "lru",
  "parking_lot",

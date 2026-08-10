@@ -1,5 +1,6 @@
 use crate::error::Result;
 use crate::pool::ConnectionPool;
+#[cfg(test)]
 use crate::schema;
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
@@ -26,11 +27,8 @@ impl KvStore {
         Ok(kv)
     }
 
-    /// Create a KV store from a connection pool
-    pub(crate) async fn from_pool(pool: ConnectionPool) -> Result<Self> {
-        let kv = Self { pool };
-        kv.initialize().await?;
-        Ok(kv)
+    pub(crate) fn from_initialized_pool(pool: ConnectionPool) -> Self {
+        Self { pool }
     }
 
     pub(crate) fn from_read_only_pool(pool: ConnectionPool) -> Self {
@@ -38,9 +36,10 @@ impl KvStore {
     }
 
     /// Initialize the database schema
+    #[cfg(test)]
     async fn initialize(&self) -> Result<()> {
         let conn = self.pool.get_connection().await?;
-        schema::require_current(&conn).await
+        schema::require_current(&conn, false).await.map(|_| ())
     }
 
     /// Set a key-value pair

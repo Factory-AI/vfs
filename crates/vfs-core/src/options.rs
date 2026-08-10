@@ -1,7 +1,9 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::config::CoreConfig;
 use crate::error::{Error, Result};
+use crate::schema::ChunkSource;
 
 /// Directory containing vfs databases
 pub fn vfs_dir() -> &'static std::path::Path {
@@ -18,7 +20,7 @@ pub struct EncryptionConfig {
 }
 
 /// Configuration options for opening a Vfs instance
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct VfsOptions {
     /// Optional unique identifier for the agent.
     /// - If Some(id): Creates persistent storage at `.vfs/{id}.db`
@@ -32,9 +34,24 @@ pub struct VfsOptions {
     pub(crate) base: Option<PathBuf>,
     /// Encryption configuration for database at rest
     pub(crate) encryption: Option<EncryptionConfig>,
+    /// Content-addressed source for lazily resolving hollow chunk rows.
+    pub(crate) chunk_source: Option<Arc<dyn ChunkSource>>,
     /// Typed core runtime configuration. When omitted, [`CoreConfig::from_env`]
     /// is evaluated once by [`Vfs::open`](crate::Vfs::open).
     pub core_config: Option<CoreConfig>,
+}
+
+impl std::fmt::Debug for VfsOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VfsOptions")
+            .field("id", &self.id)
+            .field("path", &self.path)
+            .field("base", &self.base)
+            .field("encryption", &self.encryption)
+            .field("chunk_source", &self.chunk_source.is_some())
+            .field("core_config", &self.core_config)
+            .finish()
+    }
 }
 
 impl VfsOptions {
@@ -85,6 +102,7 @@ impl VfsOptions {
             path: None,
             base: None,
             encryption: None,
+            chunk_source: None,
             core_config: None,
         }
     }
@@ -96,6 +114,7 @@ impl VfsOptions {
             path: None,
             base: None,
             encryption: None,
+            chunk_source: None,
             core_config: None,
         }
     }
@@ -107,6 +126,7 @@ impl VfsOptions {
             path: Some(path.into()),
             base: None,
             encryption: None,
+            chunk_source: None,
             core_config: None,
         }
     }
@@ -114,6 +134,12 @@ impl VfsOptions {
     /// Set typed core runtime configuration.
     pub fn with_core_config(mut self, core_config: CoreConfig) -> Self {
         self.core_config = Some(core_config);
+        self
+    }
+
+    /// Supply content-addressed bytes for a hollow metadata artifact.
+    pub fn with_chunk_source(mut self, chunk_source: Arc<dyn ChunkSource>) -> Self {
+        self.chunk_source = Some(chunk_source);
         self
     }
 

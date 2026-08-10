@@ -3142,6 +3142,7 @@
             },
             &config,
             fs.journal_ctx(),
+            fs.chunk_resolver.clone(),
         ))
     }
 

@@ -556,7 +556,7 @@ mod tests {
         let conn = db.connect()?;
         let source = FileRemoteSource { store };
         assert_eq!(
-            hydrate_chunks(&conn, &source).await?,
+            hydrate_chunks(&conn, &source, 4).await?,
             fixture.pre_hollow_chunks.len() as u64
         );
         drop(conn);

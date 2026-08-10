@@ -101,6 +101,10 @@ impl ToolCalls {
         Ok(tc)
     }
 
+    pub(crate) fn from_initialized_pool(pool: ConnectionPool) -> Self {
+        Self { pool }
+    }
+
     pub(crate) fn from_read_only_pool(pool: ConnectionPool) -> Self {
         Self { pool }
     }
@@ -108,7 +112,7 @@ impl ToolCalls {
     /// Initialize the database schema
     async fn initialize(&self) -> Result<()> {
         let conn = self.pool.get_connection().await?;
-        schema::require_current(&conn).await
+        schema::require_current(&conn, false).await.map(|_| ())
     }
 
     /// Start a new tool call and mark it as pending
