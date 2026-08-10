@@ -1,17 +1,25 @@
-use std::collections::HashSet;
+// Everything here has its only production consumer in the Linux mount owner
+// (`CtlServer`), so items shared with the tests carry `any(linux, test)` and
+// macOS lib builds compile this module down to nothing rather than failing
+// -D dead-code.
+
+#[cfg(any(target_os = "linux", test))]
+use {
+    super::{chunk_key, RemoteStore},
+    anyhow::{Context, Result},
+    bytes::Bytes,
+    futures_util::{stream, StreamExt},
+    std::collections::HashSet,
+    vfs_core::Vfs,
+};
 
 #[cfg(target_os = "linux")]
-use std::{sync::Arc, time::Duration};
+use {
+    super::RemoteConfig,
+    std::{sync::Arc, time::Duration},
+};
 
-use anyhow::{Context, Result};
-use bytes::Bytes;
-use futures_util::{stream, StreamExt};
-use vfs_core::Vfs;
-
-#[cfg(target_os = "linux")]
-use super::RemoteConfig;
-use super::{chunk_key, RemoteStore};
-
+#[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct StreamReport {
     pub(crate) uploaded: usize,
@@ -19,6 +27,7 @@ pub(crate) struct StreamReport {
 }
 
 /// Upload every locally present chunk not already known to exist remotely.
+#[cfg(any(target_os = "linux", test))]
 pub(crate) async fn stream_once(
     vfs: &Vfs,
     store: &RemoteStore,
